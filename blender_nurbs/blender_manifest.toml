@@ -1,0 +1,18 @@
+schema_version = "1.0.0"
+
+id = "nurbs_modeling"
+version = "0.1.0"
+name = "NURBS Modeling"
+tagline = "Interactive NURBS surface tools on the USD BRep kernel"
+maintainer = "ckbrd"
+type = "add-on"
+
+blender_version_min = "5.0.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+platforms = ["macos-arm64"]
+
+tags = ["Modeling", "Mesh"]
+
+[permissions]
+files = "Writes temporary files to exchange B-rep data with the kernel"

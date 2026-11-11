@@ -1,0 +1,142 @@
+# Builds the kernel module (USD BRep / SMLib + bindings + our extension) for
+# macOS (arm64 + Intel), Windows x64 and Linux x64, runs the headless tests in
+# Blender on each, and packages one extension zip with all three.
+#
+# Not yet run: written on macOS, where only the macOS build was tried. Expect to
+# adjust the Windows / Linux steps on the first run (see README, Build the kernel).
+
+name: Kernel
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ["kernel_build/**", "blender_nurbs/**", "tests/**", ".github/workflows/kernel.yml"]
+
+env:
+  USD_BREP_COMMIT: 3fd5b9548d19aa8c12c29bc9637a96d42a06f8a5   # the commit the macOS build uses
+  PYBIND11_VERSION: "2.13.6"
+  BLENDER_SERIES: "5.2"
+  BLENDER_VERSION: "5.2.1"
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - id: py
+        uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: Sources
+        shell: bash
+        run: |
+          git init -q third_party/usd-brep
+          git -C third_party/usd-brep remote add origin https://github.com/NVIDIA-Omniverse/usd-brep.git
+          git -C third_party/usd-brep fetch -q --depth 1 origin "$USD_BREP_COMMIT"
+          git -C third_party/usd-brep checkout -q FETCH_HEAD
+          python -m pip install --target third_party/pybind11_pkg "pybind11==$PYBIND11_VERSION"
+      - name: Build (universal arm64 + x86_64)
+        run: |
+          cmake -S kernel_build -B kernel_build/build -DCMAKE_BUILD_TYPE=Release \
+                -DPython3_EXECUTABLE="${{ steps.py.outputs.python-path }}" \
+                -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.2
+          cmake --build kernel_build/build -j4
+          file blender_nurbs/kernel/_nproto_kernel.*
+      - uses: actions/upload-artifact@v4
+        with: { name: kernel-macos, path: "blender_nurbs/kernel/_nproto_kernel.*" }
+
+  build-windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - id: py
+        uses: actions/setup-python@v5
+        with: { python-version: "3.13", architecture: x64 }
+      - name: Sources
+        shell: bash
+        run: |
+          git init -q third_party/usd-brep
+          git -C third_party/usd-brep remote add origin https://github.com/NVIDIA-Omniverse/usd-brep.git
+          git -C third_party/usd-brep fetch -q --depth 1 origin "$USD_BREP_COMMIT"
+          git -C third_party/usd-brep checkout -q FETCH_HEAD
+          python -m pip install --target third_party/pybind11_pkg "pybind11==$PYBIND11_VERSION"
+      - name: Build (x64, static C runtime)
+        shell: bash
+        run: |
+          cmake -S kernel_build -B kernel_build/build -A x64 -DPython3_EXECUTABLE="${{ steps.py.outputs.python-path }}"
+          cmake --build kernel_build/build --config Release -j4
+          ls -la blender_nurbs/kernel/
+      - uses: actions/upload-artifact@v4
+        with: { name: kernel-windows, path: "blender_nurbs/kernel/_nproto_kernel.*" }
+
+  build-linux:
+    runs-on: ubuntu-24.04
+    # glibc 2.28, like the oldest systems Blender 5.x runs on: a module built here loads on newer ones too
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    env:
+      PY: /opt/python/cp313-cp313/bin/python
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sources
+        run: |
+          git config --global --add safe.directory '*'
+          git init -q third_party/usd-brep
+          git -C third_party/usd-brep remote add origin https://github.com/NVIDIA-Omniverse/usd-brep.git
+          git -C third_party/usd-brep fetch -q --depth 1 origin "$USD_BREP_COMMIT"
+          git -C third_party/usd-brep checkout -q FETCH_HEAD
+          $PY -m pip install -q cmake
+          $PY -m pip install --target third_party/pybind11_pkg "pybind11==$PYBIND11_VERSION"
+      - name: Build (x64)
+        run: |
+          CMAKE=$(dirname $PY)/cmake
+          $CMAKE -S kernel_build -B kernel_build/build -DCMAKE_BUILD_TYPE=Release -DPython3_EXECUTABLE=$PY
+          $CMAKE --build kernel_build/build -j4
+          ls -la blender_nurbs/kernel/
+      - uses: actions/upload-artifact@v4
+        with: { name: kernel-linux, path: "blender_nurbs/kernel/_nproto_kernel.*" }
+
+  # The headless test suite in Blender itself, with the module just built.
+  test:
+    needs: [build-macos, build-windows, build-linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, kernel: kernel-macos, blender: macos-arm64.dmg }
+          - { os: windows-2022, kernel: kernel-windows, blender: windows-x64.zip }
+          - { os: ubuntu-24.04, kernel: kernel-linux, blender: linux-x64.tar.xz }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: "${{ matrix.kernel }}", path: blender_nurbs/kernel }
+      - name: Blender ${{ env.BLENDER_VERSION }}
+        shell: bash
+        run: |
+          f="blender-$BLENDER_VERSION-${{ matrix.blender }}"
+          curl -sSfLO "https://download.blender.org/release/Blender$BLENDER_SERIES/$f"
+          case "$f" in
+            *.dmg)    hdiutil attach -quiet -nobrowse -mountpoint /tmp/bl "$f"
+                      echo "BLENDER=/tmp/bl/Blender.app/Contents/MacOS/Blender" >> "$GITHUB_ENV" ;;
+            *.zip)    unzip -q "$f"; echo "BLENDER=$PWD/${f%.zip}/blender.exe" >> "$GITHUB_ENV" ;;
+            *.tar.xz) tar xf "$f"; echo "BLENDER=$PWD/${f%.tar.xz}/blender" >> "$GITHUB_ENV"
+                      sudo apt-get update -qq
+                      sudo apt-get install -y -qq libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 \
+                           libsm6 libgl1 libegl1 libwayland-client0 libwayland-cursor0 libdecor-0-0 ;;
+          esac
+      - name: Headless tests
+        shell: bash
+        run: |
+          "$BLENDER" -b --factory-startup --python tests/test_headless.py 2>&1 | tee test.log
+          grep -E "^FAIL" test.log || true
+          grep -q "^ALL OK" test.log
+
+  package:
+    needs: [build-macos, build-windows, build-linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { pattern: "kernel-*", path: blender_nurbs/kernel, merge-multiple: true }
+      - run: python3 tools/package_extension.py
+      - uses: actions/upload-artifact@v4
+        with: { name: nurbs_modeling-extension, path: dist/*.zip }

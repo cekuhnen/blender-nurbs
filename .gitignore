@@ -1,0 +1,16 @@
+# build outputs (CI builds the kernel for each platform)
+kernel_build/build/
+dist/
+blender_nurbs/kernel/_nproto_kernel.*
+__pycache__/
+*.pyc
+
+# fetched by the workflow at a pinned commit (USD BRep) / pip (pybind11)
+third_party/
+
+# your own scenes
+Blend Files/
+*.blend
+*.blend1
+
+.DS_Store
