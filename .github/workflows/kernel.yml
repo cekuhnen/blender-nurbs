@@ -20,7 +20,7 @@ env:
 
 jobs:
   build-macos:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - id: py
@@ -101,7 +101,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-14, kernel: kernel-macos, blender: macos-arm64.dmg }
+          - { os: macos-15, kernel: kernel-macos, blender: macos-arm64.dmg }
           - { os: windows-2022, kernel: kernel-windows, blender: windows-x64.zip }
           - { os: ubuntu-24.04, kernel: kernel-linux, blender: linux-x64.tar.xz }
     runs-on: ${{ matrix.os }}
