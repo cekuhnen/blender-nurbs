@@ -119,6 +119,42 @@ def _edge_mid(e):
     return pts[1] if len(pts) == 3 else None
 
 
+def corner_pieces(d, ang_deg=0.05):
+    """Curve data (degree, points, knots, weights) split at its sharp corners:
+    the interior knots of full multiplicity where the tangent turns by more
+    than ang_deg. Splitting there is exact (no knot insertion): the curve
+    passes through the CV at such a knot. Returns [data] when it has none."""
+    np = _np()
+    p = int(d["degree"])
+    out, cur = [], {"degree": p, "points": [list(q) for q in d["points"]],
+                    "knots": [float(k) for k in d["knots"]],
+                    "weights": list(d["weights"]) if d.get("weights") else None}
+    cos_max = float(np.cos(np.radians(ang_deg)))
+    while True:
+        U, P, W = cur["knots"], cur["points"], cur["weights"]
+        n, cut = len(P), None
+        for t in sorted(set(U[p + 1:len(U) - p - 1])):
+            s = U.index(t)
+            if U.count(t) != p or p < 1:
+                continue
+            j = s - 1                          # the CV the curve passes through at t
+            if j < 1 or j + 1 >= n:
+                continue
+            a, b = np.subtract(P[j], P[j - 1]), np.subtract(P[j + 1], P[j])
+            la, lb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+            if la < 1e-15 or lb < 1e-15:
+                continue
+            if float(a @ b) / (la * lb) < cos_max:
+                cut = (s, t)
+                break
+        if cut is None:
+            out.append(cur)
+            return out
+        s, t = cut
+        out.append({"degree": p, "points": P[:s], "knots": U[:s + p] + [t], "weights": W[:s] if W else None})
+        cur = {"degree": p, "points": P[s - 1:], "knots": [t] + U[s:], "weights": W[s - 1:] if W else None}
+
+
 class CurveCutter:
     """A cutting curve projected along a direction: splits by parallel
     projection; a point is 'inside' when it projects inside the curve outline."""
@@ -141,16 +177,25 @@ class CurveCutter:
     def split(self, b, ref):
         """Exact imprint of the curve swept along the projection direction (a
         cutter sheet long enough to pass through the target). The kernel's
-        parallel projection can drop pieces of loops that cross a seam."""
+        parallel projection can drop pieces of loops that cross a seam. A
+        cutter with sharp corners (a line-arc-line notch, a polyline) is
+        imprinted one smooth piece at a time: one sheet with creases let the
+        intersection lose a sliver at a corner (a 0.15 mm gap in a spoon's
+        notch, so the loop did not close); a piece's end is a sheet edge,
+        which the imprint meets exactly."""
         np = _np()
         lo, hi = (np.array(v) for v in b.bounding_box())
         P = np.array(_poly(curve(self.data), 64))
         reach = float(np.linalg.norm(hi - lo)) + float(np.max(np.linalg.norm(P - 0.5 * (lo + hi), axis=1)))
         L = 4.0 * (reach or 1.0)
-        c = sm.translate(curve(self.data), tuple(-0.5 * L * self.dir))
-        sheet = ext.brep_from_surface(sm.create_extrude_surface(c, tuple(L * self.dir)))
-        return sm.boolean_with_options(b, sheet, operation=sm.BooleanOp.UNION, imprinting=True,
-                                       keep_other_brep=True)
+        for piece in corner_pieces(self.data):
+            c = sm.translate(curve(piece), tuple(-0.5 * L * self.dir))
+            sheet = ext.brep_from_surface(sm.create_extrude_surface(c, tuple(L * self.dir)))
+            b = sm.boolean_with_options(b, sheet, operation=sm.BooleanOp.UNION, imprinting=True,
+                                        keep_other_brep=True)
+            if b is None:
+                return None
+        return b
 
     def inside(self, p):
         if not self.closed:

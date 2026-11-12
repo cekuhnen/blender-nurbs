@@ -6011,4 +6011,67 @@ check("Delete Faces (X / Delete in Face mode): picked faces go; a body whose fac
       r == {'FINISHED'} and _left == 3 and r2 == {'FINISHED'} and _pname not in bpy.data.objects, f"{_left}")
 _vw.sel_mode = {"BODY"}
 
+# --- Trim with a cornered cutter (a notch: line, arc, line): imprinted one smooth piece at a time, the loop
+#     closes exactly (one creased sheet let the intersection lose a sliver at a corner)
+import importlib.util as _ilu
+_wspec = _ilu.spec_from_file_location("nproto_worker_t", os.path.join(os.path.dirname(features.__file__), "kernel",
+                                                                       "worker.py"))
+_wk = _ilu.module_from_spec(_wspec)
+_wspec.loader.exec_module(_wk)
+_d = {"degree": 2, "points": [[0, 0, 0], [0.5, 0, 0], [1, 0, 0], [1.5, 0.5, 0], [1, 1, 0], [0.5, 1, 0], [0, 1, 0]],
+      "knots": [0, 0, 0, 1, 1, 2, 2, 3, 3, 3], "weights": None}     # line, a turn, line: corners at 1 and 2
+_pcs = _wk.corner_pieces(_d)
+_kc0 = _wk.curve(_d)
+_err = 0.0
+for _pc in _pcs:
+    _kp = _wk.curve(_pc)
+    _a, _b = _kp.parameter_range()
+    for _t in np.linspace(_a, _b, 9):
+        _err = max(_err, float(np.linalg.norm(np.array(_kp.evaluate(_t)) - np.array(_kc0.evaluate(_t)))))
+check("trim cutter split at its sharp corners, exactly (the same curve, piece by piece)",
+      len(_pcs) == 3 and _err < 1e-12 and len(_wk.corner_pieces({**_d, "points": [[0, 0, 0], [0.5, 0, 0], [1, 0, 0],
+                                                                                 [1.5, 0, 0], [2, 0, 0], [2.5, 0, 0],
+                                                                                 [3, 0, 0]]})) == 1, f"{len(_pcs)} {_err:.1e}")
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+_ns = [nurbs(f"NT{k}", [(x, -w, 0.0), (x, 0, 0.5 + 0.3 * (k == 1)), (x, w, 0.0)], order=3)
+       for k, (x, w) in enumerate(((-2.0, 1.0), (0.0, 1.5), (2.0, 1.0)))]
+bpy.ops.nproto.loft(inputs=ins(*[(c_, "S0") for c_ in _ns])); _nb = ctx.active_object; _nb.name = "NT_Bowl"
+_notch = poly("NT_notch", [(-3, -0.6, 2), (-1.2, -0.6, 2), (-1.2, 0.6, 2), (-3, 0.6, 2)])      # a squared notch
+bpy.ops.object.select_all(action='DESELECT')
+r = bpy.ops.nproto.trim(action="KEEP", target="NT_Bowl", cutters=ins((_notch, "S0")), ref_point=(1, 0, 0.6),
+                        normal=(0, 0, 1), view_dir=(0, 0, -1), projection="Z")
+_bn = store.get_brep(_nb)
+_ends = []
+for e_ in _bn.edges():
+    t0_, t1_ = e_.parameter_range()
+    _ends.append((np.array(e_.point_at(t0_)), np.array(e_.point_at(t1_))))
+_open = max(min(np.linalg.norm(p_ - q_) for j_, (a2_, z2_) in enumerate(_ends) if j_ != i_ for q_ in (a2_, z2_))
+            for i_, (a_, z_) in enumerate(_ends) for p_ in (a_, z_))
+check("trim with a squared notch (a polyline cutter with corners): one face, its loop closes exactly",
+      r == {'FINISHED'} and _bn.face_count() == 1 and len(_ends) >= 6 and _open < 1e-9, f"{len(_ends)} edges, open {_open:.1e}")
+
+# --- A rebuild that numbers B-rep edges differently: features built on them follow their edge (by place)
+_mk = features._edge_marks(_nb)
+_n = len(_mk)
+_sz = float(np.ptp(np.concatenate(_mk), axis=0).max())
+_sw35 = list(_mk); _sw35[3], _sw35[5] = _mk[5], _mk[3]
+check("edge renumbering: same place keeps its number, a rotation / a swap moves, a nudge does not",
+      features.edge_moves(_mk, _mk) == {} and features.edge_moves(_mk, [m + 1e-4 * _sz for m in _mk]) == {}
+      and features.edge_moves(_mk, _mk[1:] + _mk[:1]) == {i: (i - 1) % _n for i in range(_n)}
+      and features.edge_moves(_mk, _sw35) == {3: 5, 5: 3}
+      and features.edge_moves(_mk, [_mk[0]] * _n) == {}, str(features.edge_moves(_mk, _sw35)))
+_k_mid = min(range(_n), key=lambda i: abs(_mk[i][1][0] - (-1.2)) + abs(_mk[i][1][1]))     # the notch's middle edge
+_other = (_k_mid + 2) % _n
+bpy.ops.object.select_all(action='DESELECT')
+r = bpy.ops.nproto.dup_edge(inputs=ins((_nb, f"E{_k_mid}"))); _ec = ctx.active_object
+_ref0 = features.history(_ec)["inputs"][0][1]
+features.rebuild(_nb, ctx, force=True)                       # same numbering: nothing renamed
+_ref1 = features.history(_ec)["inputs"][0][1]
+_old = list(_mk); _old[_k_mid], _old[_other] = _mk[_other], _mk[_k_mid]      # before, that edge had another number
+features._remap_dependents(_nb, _old, turned=False)
+_ref2 = features.history(_ec)["inputs"][0][1]
+check("edge renumbering: a feature on a trimmed edge keeps its edge (same numbers stay, a renumbered one follows)",
+      r == {'FINISHED'} and _ref0 == _ref1 == f"E{_k_mid}" and _ref2 == f"E{_other}", f"{_ref0} {_ref1} {_ref2}")
+
 print("ALL OK" if ok else "SOME FAILED")

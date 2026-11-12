@@ -1012,42 +1012,70 @@ def _swap_own(obj, entries):
         _write_stack(obj, entries)
 
 
-def _remap_dependents(obj, old_marks):
-    """obj turned over: its iso edges U0 / U1 swapped and its B-rep edges may
-    be numbered differently. Every feature built from its edges is renamed to
-    keep the same edges (old_marks: obj's edges before, from _edge_marks)."""
-    new_marks = _edge_marks(obj)
+def edge_moves(old_marks, new_marks):
+    """{old number: new number} for B-rep edges renumbered by a rebuild (a trim
+    imprinted another way, an input that changed shape). An edge keeps its
+    number unless another edge is clearly nearer to where it was (less than
+    half as far); two edges never move onto the same one (then both stay)."""
+    if not old_marks or not new_marks:
+        return {}
+    pts = np.concatenate([np.asarray(m, float) for m in old_marks])
+    tiny = 1e-9 * max(float(np.ptp(pts, axis=0).max()), 1e-12)
 
-    def e_map(ref):
-        try:
-            i = int(ref[1:])
-            a = old_marks[i]
-        except (ValueError, IndexError):
-            return ref
-        best = None
-        for j, b in enumerate(new_marks):
-            d = min(np.abs(a - b).max(), np.abs(a - b[::-1]).max())
-            if best is None or d < best[0]:
-                best = (d, j)
-        return f"E{best[1]}" if best is not None else ref
+    def dist(a, b):
+        return min(np.abs(a - b).max(), np.abs(a - b[::-1]).max())
+
+    moves = {}
+    for i, a in enumerate(old_marks):
+        d = [dist(a, b) for b in new_marks]
+        j = int(np.argmin(d))
+        if j != i and not (i < len(new_marks) and d[i] <= 2.0 * d[j] + tiny):
+            moves[i] = j
+    taken = {}
+    for i, j in moves.items():
+        taken.setdefault(j, []).append(i)
+    kept = set(range(min(len(old_marks), len(new_marks)))) - set(moves)   # edges that stay put keep theirs
+    return {i: j for i, j in moves.items() if len(taken[j]) == 1 and j not in kept}
+
+
+def _names_edges(obj):
+    """Does a feature built from obj name its B-rep edges (E#)?"""
+    return any('"E' in str(o.get(k, "")) for o in _dependents(obj) for k in (PROP_HIST, PROP_STACK))
+
+
+def _remap_dependents(obj, old_marks, turned=True):
+    """obj rebuilt: its B-rep edges may be numbered differently, and when it
+    turned over (turned) its iso edges U0 / U1 swapped too. Every feature
+    built from its edges is renamed to keep the same edges (old_marks: obj's
+    edges before, from _edge_marks)."""
+    moves = edge_moves(old_marks, _edge_marks(obj))
 
     def remap(ref):
-        if is_edge_ref(ref):
+        if turned and is_edge_ref(ref):
             return _swap_u(ref)
         if is_brep_edge_ref(ref):
-            return e_map(ref)
+            try:
+                return f"E{moves[int(ref[1:])]}"
+            except (ValueError, KeyError):
+                return ref
         return ref
 
     for o in _dependents(obj):
         if PROP_HIST in o:
             h = json.loads(o[PROP_HIST])
-            h["refs"] = [remap(r) if o.get(f"nproto_in_{i}") is obj else r for i, r in enumerate(h["refs"])]
-            o[PROP_HIST] = json.dumps(h)
+            refs = [remap(r) if o.get(f"nproto_in_{i}") is obj else r for i, r in enumerate(h["refs"])]
+            if refs != h["refs"]:
+                h["refs"] = refs
+                o[PROP_HIST] = json.dumps(h)
         if PROP_STACK in o:
             raw = json.loads(o[PROP_STACK])
+            changed = False
             for k, e in enumerate(raw):
-                e["refs"] = [remap(r) if o.get(f"nproto_sin_{k}_{i}") is obj else r for i, r in enumerate(e["refs"])]
-            o[PROP_STACK] = json.dumps(raw)
+                refs = [remap(r) if o.get(f"nproto_sin_{k}_{i}") is obj else r for i, r in enumerate(e["refs"])]
+                if refs != e["refs"]:
+                    e["refs"], changed = refs, True
+            if changed:
+                o[PROP_STACK] = json.dumps(raw)
 
 
 PROP_KEY = "nproto_build_key"
@@ -1145,9 +1173,12 @@ def rebuild(obj, context=None, force=False):
 
 def _rebuild(obj, context, h, entries, steps):
     turned = [None]
+    before = _edge_marks(obj) if obj.type == 'MESH' and _names_edges(obj) else None
     result = _rebuild_inner(obj, context, h, entries, steps, turned)
     if turned[0] is not None:
         _remap_dependents(obj, turned[0])
+    elif before:
+        _remap_dependents(obj, before, turned=False)     # features on its edges follow them
     return result
 
 
