@@ -6014,10 +6014,23 @@ _vw.sel_mode = {"BODY"}
 # --- Trim with a cornered cutter (a notch: line, arc, line): imprinted one smooth piece at a time, the loop
 #     closes exactly (one creased sheet let the intersection lose a sliver at a corner)
 import importlib.util as _ilu
-_wspec = _ilu.spec_from_file_location("nproto_worker_t", os.path.join(os.path.dirname(features.__file__), "kernel",
-                                                                       "worker.py"))
-_wk = _ilu.module_from_spec(_wspec)
-_wspec.loader.exec_module(_wk)
+_kdir = os.path.join(os.path.dirname(features.__file__), "kernel")
+_ksm = features._k()[0]
+check("extension policy: the kernel loads inside the add-on's package (no top-level module, no sys.path entry)",
+      _ksm.__name__.endswith(".kernel._nproto_kernel") and "_nproto_kernel" not in sys.modules
+      and not any(os.path.normpath(p) == os.path.normpath(_kdir) for p in sys.path), _ksm.__name__)
+# The worker runs in its own Python and imports the kernel from its folder. Loaded here, in this process, it
+# gets the kernel already loaded (a compiled module cannot load twice); both are taken back afterwards.
+_path0 = list(sys.path)
+sys.modules["_nproto_kernel"] = _ksm
+try:
+    _wspec = _ilu.spec_from_file_location("nproto_worker_t", os.path.join(_kdir, "worker.py"))
+    _wk = _ilu.module_from_spec(_wspec)
+    _wspec.loader.exec_module(_wk)
+finally:
+    sys.path[:] = _path0
+    for _m in ("_nproto_kernel", "harden"):
+        sys.modules.pop(_m, None)
 _d = {"degree": 2, "points": [[0, 0, 0], [0.5, 0, 0], [1, 0, 0], [1.5, 0.5, 0], [1, 1, 0], [0.5, 1, 0], [0, 1, 0]],
       "knots": [0, 0, 0, 1, 1, 2, 2, 3, 3, 3], "weights": None}     # line, a turn, line: corners at 1 and 2
 _pcs = _wk.corner_pieces(_d)
