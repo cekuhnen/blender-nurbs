@@ -698,4 +698,122 @@ class NPROTO_OT_extend_curve(bpy.types.Operator):
         return ("START",) if da < db else ("END",)
 
 
-classes = (NPROTO_OT_rebuild_curve, NPROTO_OT_extend_curve)
+# --------------------------------------------------------------------------
+# Degree: what the Active Object panel shows for a curve (Blender's spline
+# panel says Order U = degree + 1)
+# --------------------------------------------------------------------------
+
+def spline_info(sp):
+    """{"degree", "cvs", "spans", "kind", "rational"} of a Blender spline."""
+    if sp.type == 'BEZIER':
+        n = len(sp.bezier_points)
+        return {"degree": 3, "cvs": n, "spans": max(n - 1 + (1 if sp.use_cyclic_u else 0), 0),
+                "kind": "Bezier", "rational": False}
+    n = len(sp.points)
+    if sp.type == 'POLY':
+        return {"degree": 1, "cvs": n, "spans": max(n - 1 + (1 if sp.use_cyclic_u else 0), 0),
+                "kind": "polyline", "rational": False}
+    p = max(1, min(sp.order_u, n) - 1)
+    if sp.use_cyclic_u:
+        spans, kind = n, "closed"
+    elif sp.use_bezier_u:
+        spans, kind = max((n - 1) // p, 1), "piecewise Bezier"
+    else:
+        spans, kind = max(n - p, 1), ("open" if sp.use_endpoint_u else "unclamped ends")
+    rational = any(abs(pt.co[3] - 1.0) > 1e-9 for pt in sp.points)
+    return {"degree": p, "cvs": n, "spans": spans, "kind": kind, "rational": rational}
+
+
+def degree_note(info):
+    """What the degree means for the curvature comb, or None."""
+    if info["rational"] or info["spans"] < 2:
+        return None
+    if info["degree"] == 2:
+        return "Degree 2: the curvature jumps or kinks at every knot, the comb steps there. Degree 3+ flows (G2)."
+    if info["kind"] == "piecewise Bezier" and info["degree"] >= 3:
+        return "Piecewise Bezier: the spans meet at stacked knots, where the comb can step."
+    return None
+
+
+class NPROTO_OT_curve_degree(bpy.types.Operator):
+    """Set the curve's degree, keeping its CVs (the shape follows the new
+    degree). Blender's spline panel calls this Order U, which is degree + 1.
+    Rebuild Curve keeps the shape instead"""
+    bl_idname = "nproto.curve_degree"
+    bl_label = "Curve Degree"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    degree: IntProperty(name="Degree", default=3, min=1, max=MAX_DEGREE)
+    spline: IntProperty(name="Spline", default=-1, min=-1, description="-1: every NURBS spline")
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if obj is None or obj.type != 'CURVE':
+            self.report({'WARNING'}, "Make a curve active")
+            return {'CANCELLED'}
+        splines = list(obj.data.splines)
+        targets = splines if self.spline < 0 else splines[self.spline:self.spline + 1]
+        done, short = 0, 0
+        for sp in targets:
+            if sp.type != 'NURBS':
+                continue
+            if len(sp.points) < self.degree + 1:
+                short += 1
+                continue
+            sp.order_u = self.degree + 1
+            done += 1
+        obj.data.update_tag()
+        if hasattr(obj, "update_tag"):
+            obj.update_tag()
+        if short and not done:
+            self.report({'WARNING'}, f"Degree {self.degree} needs at least {self.degree + 1} CVs")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Degree {self.degree} (Blender: Order U {self.degree + 1})"
+                    + (f" · {short} spline(s) have too few CVs" if short else ""))
+        return {'FINISHED'}
+
+
+def draw_curve_info(layout, context, obj):
+    """The Curve box of the Active Object panel: per spline its degree, CVs,
+    spans and kind; Degree 1-5 buttons (same CVs); a note when the degree
+    makes the comb step; Rebuild as degree 3 keeping the shape."""
+    from . import features
+    splines = list(obj.data.splines)
+    if not splines:
+        return
+    box = layout.box()
+    box.label(text=f"Curve: {len(splines)} spline(s)" if len(splines) > 1 else "Curve", icon='CURVE_NCURVE')
+    editable = not features.has_history(obj)
+    notes = set()
+    for i, sp in enumerate(splines[:3]):
+        info = spline_info(sp)
+        col = box.column(align=True)
+        head = f"Spline {i + 1}: " if len(splines) > 1 else ""
+        extra = " · rational" if info["rational"] else ""
+        col.label(text=f"{head}degree {info['degree']} · {info['cvs']} CVs · {info['spans']} span(s) · "
+                       f"{info['kind']}{extra}")
+        if sp.type == 'NURBS' and editable:
+            row = col.row(align=True)
+            row.label(text="Degree")
+            for d in range(1, MAX_DEGREE + 1):
+                sub = row.row(align=True)
+                sub.enabled = info["cvs"] >= d + 1
+                op = sub.operator("nproto.curve_degree", text=str(d), depress=(d == info["degree"]))
+                op.degree, op.spline = d, i
+            col.label(text=f"Blender: Order U {info['degree'] + 1} (= degree + 1)")
+        note = degree_note(info)
+        if note:
+            notes.add(note)
+    if len(splines) > 3:
+        box.label(text=f"... and {len(splines) - 3} more spline(s)")
+    for note in sorted(notes):
+        box.label(text=note, icon='INFO')
+    if notes and editable:
+        op = box.operator("nproto.rebuild_curve", text="Rebuild as Degree 3 (same shape, smooth comb)",
+                          icon='FILE_REFRESH')
+        op.rc_degree, op.rc_cvs = "3", 0
+    elif not editable:
+        box.label(text="Built by its history: set the degree in its Feature box", icon='MODIFIER')
+
+
+classes = (NPROTO_OT_rebuild_curve, NPROTO_OT_extend_curve, NPROTO_OT_curve_degree)

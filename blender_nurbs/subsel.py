@@ -490,14 +490,15 @@ def _on_load(_):
 
 
 def draw_tool_header(self, context):
-    """Body | Face | Edge at the left of the tool settings bar: always on
-    top, whatever tool is active, never scrolled away."""
+    """Body | Face | Edge in the tool settings bar, right after Blender's own
+    tool settings (its selection-mode icons; see ui._hook_tool_settings):
+    always on top, whatever tool is active."""
     v = getattr(context.window_manager, "nproto_view", None)
     if v is None or context.mode != 'OBJECT' or _load_kernel() is None:
         return
+    self.layout.separator()
     row = self.layout.row(align=True)
     row.prop(v, "sel_mode", expand=True)
-    self.layout.separator()
     ensure_running()
 
 

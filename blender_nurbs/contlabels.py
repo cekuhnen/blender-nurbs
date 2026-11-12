@@ -424,6 +424,20 @@ def next_value(values, cur, step):
 # Operator: step one edge's continuity
 # --------------------------------------------------------------------------
 
+def redo_operator(context, obj):
+    """The operator whose Adjust Last Operation panel is up for obj: the last
+    one run, when it made obj (obj is active and a feature of that kind).
+    None once anything else has been done."""
+    if obj is None:
+        return None
+    h = features.history(obj)
+    ops = context.window_manager.operators
+    if not h or not len(ops) or context.view_layer.objects.active != obj:
+        return None
+    op = ops[-1]
+    return op if op.bl_idname.lower() == f"nproto_ot_{h['op']}" else None
+
+
 class NPROTO_OT_cycle_continuity(bpy.types.Operator):
     """Step this edge's continuity (Free → G0 → G1 → G2); Ctrl or Shift+click steps back"""
     bl_idname = "nproto.cycle_continuity"
@@ -452,7 +466,46 @@ class NPROTO_OT_cycle_continuity(bpy.types.Operator):
     def invoke(self, context, event):
         if event.ctrl or event.shift:
             self.step = -1
+        if self._redo_panel(context):
+            # not registered: the feature's own Adjust Last Operation panel stays up
+            return {'CANCELLED'}
         return self.execute(context)
+
+    def _redo_panel(self, context):
+        """Right after the feature was made its Adjust Last Operation panel is
+        still up: change the value in it and redo the operator (as the panel
+        does), instead of editing the history, which would replace the panel.
+        False when that doesn't apply (the history is edited instead)."""
+        obj = bpy.data.objects.get(self.obj_name)
+        op = redo_operator(context, obj)
+        if op is None:
+            return False
+        ls = labels(obj)
+        if not 0 <= self.index < len(ls):
+            return False
+        L = ls[self.index]
+        param = L["param"]
+        if len(L["values"]) < 2 or ":" in param or param not in op.properties.bl_rna.properties:
+            return False
+        old = getattr(op.properties, param)
+        new = next_value(L["values"], L["value"], self.step)
+        try:
+            setattr(op.properties, param, new)
+            done = 'FINISHED' in bpy.ops.ed.undo_redo()
+        except Exception as exc:
+            print("NURBS continuity: redo of the last operator failed, editing the history", exc)
+            done = False
+        if not done:
+            try:
+                setattr(op.properties, param, old)
+            except Exception:
+                pass
+            return False
+        self.report({'INFO'}, f"{L['name']}: {SHORT[new]} (in the {getattr(op, 'name', '') or 'last operation'} panel)")
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+        return True
 
     def execute(self, context):
         from . import feature_ui

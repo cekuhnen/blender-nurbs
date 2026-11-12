@@ -396,6 +396,8 @@ def header_analyze(self, context):
         return
     from . import subsel
     subsel.draw_mode_buttons(self.layout, context)
+    if load_kernel() is not None:
+        draw_display_toggles(self.layout, v, icons_only=True)
     on = [n for n, k in (("Zebra", "show_zebra"), ("Draft", "show_draft"), ("Curvature", "show_curvature"),
                          ("Matcap", "show_matcap"), ("Comb", "show_comb"), ("Surface Combs", "show_iso_combs"))
           if getattr(v, k)]
@@ -432,7 +434,8 @@ class VIEW3D_PT_nproto_active(_SidePanel, bpy.types.Panel):
         if obj is None:
             return False
         from . import feature_ui as _fui
-        return store.is_nurbs(obj) or _fui.shows_feature(obj, context)
+        return (store.is_nurbs(obj) or (obj.type == 'CURVE' and len(obj.data.splines) > 0)
+                or _fui.shows_feature(obj, context))
 
     def draw(self, context):
         lay = self.layout
@@ -460,6 +463,9 @@ class VIEW3D_PT_nproto_active(_SidePanel, bpy.types.Panel):
         _fui.draw_feature(lay, context)
 
         obj = context.view_layer.objects.active
+        if obj is not None and obj.type == 'CURVE':
+            from .curvetools import draw_curve_info
+            draw_curve_info(lay, context, obj)
         if store.is_nurbs(obj):
             box = lay.box()
             brep = store.get_brep(obj)
@@ -497,10 +503,52 @@ class VIEW3D_PT_nproto_analyze_side(_SidePanel, bpy.types.Panel):
         draw_analyze(col, context)
 
 
-class VIEW3D_PT_nproto_settings(_SidePanel, bpy.types.Panel):
-    """History and display settings"""
-    bl_label = "Settings"
+DISPLAY_TOGGLES = (("show_edges", "Edges", 'MOD_WIREFRAME'), ("show_cvs", "CVs / Hulls", 'OUTLINER_DATA_LATTICE'),
+                   ("show_cont_labels", "Feature Labels", 'FONT_DATA'))
+
+
+def draw_display_toggles(layout, v, icons_only=False):
+    """Edges / CVs / Hulls / Feature Labels: in the Display panel, and as icons
+    in the 3D view header (always at hand)."""
+    row = layout.row(align=True)
+    for prop, text, icon in DISPLAY_TOGGLES:
+        row.prop(v, prop, text="" if icons_only else text, icon=icon, toggle=True)
+    return row
+
+
+class VIEW3D_PT_nproto_display(_SidePanel, bpy.types.Panel):
+    """What the viewport shows of NURBS objects (also as icons in the 3D view header)"""
+    bl_label = "Display"
     bl_order = 6
+
+    @classmethod
+    def poll(cls, context):
+        return load_kernel() is not None
+
+    def draw(self, context):
+        row = draw_display_toggles(self.layout, context.window_manager.nproto_view)
+        row.scale_y = 1.3
+
+
+class VIEW3D_PT_nproto_tessellation(_SidePanel, bpy.types.Panel):
+    """How finely surfaces are meshed for display (not their exact shape)"""
+    bl_label = "Tessellation"
+    bl_parent_id = "VIEW3D_PT_nproto_display"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        s = context.scene.nproto_settings
+        col = self.layout.column(align=True)
+        col.prop(s, "chord_tolerance")
+        col.prop(s, "angle_tolerance")
+        col.prop(s, "edge_angle_tolerance")
+        col.prop(s, "max_edge_rel")
+
+
+class VIEW3D_PT_nproto_history(_SidePanel, bpy.types.Panel):
+    """Construction history: on / off, live update, pause, clean up"""
+    bl_label = "History"
+    bl_order = 7
     bl_options = {'DEFAULT_CLOSED'}
 
     @classmethod
@@ -510,9 +558,7 @@ class VIEW3D_PT_nproto_settings(_SidePanel, bpy.types.Panel):
     def draw(self, context):
         lay = self.layout
         s = context.scene.nproto_settings
-        v = context.window_manager.nproto_view
         col = lay.column(align=True)
-        col.label(text="History")
         col.prop(s, "construction_history")
         sub = col.row()
         sub.enabled = s.construction_history
@@ -524,33 +570,48 @@ class VIEW3D_PT_nproto_settings(_SidePanel, bpy.types.Panel):
         col.operator("nproto.collect_inputs", icon='OUTLINER_COLLECTION')
         col.operator("nproto.rebuild", icon='FILE_REFRESH')
 
-        col = lay.column(align=True)
-        col.label(text="Display")
-        row = col.row(align=True)
-        row.prop(v, "show_edges", toggle=True)
-        row.prop(v, "show_cvs", toggle=True)
-        row.prop(v, "show_cont_labels", text="Feature Labels", toggle=True)
-        col.prop(s, "chord_tolerance")
-        col.prop(s, "angle_tolerance")
-        col.prop(s, "edge_angle_tolerance")
-        col.prop(s, "max_edge_rel")
-
 
 classes = (NPROTO_OT_rebuild_waiting, NprotoSettings, NprotoView, VIEW3D_PT_nproto_active, VIEW3D_PT_nproto_analyze,
-           VIEW3D_PT_nproto_analyze_side, VIEW3D_PT_nproto_settings)
+           VIEW3D_PT_nproto_analyze_side, VIEW3D_PT_nproto_display, VIEW3D_PT_nproto_tessellation,
+           VIEW3D_PT_nproto_history)
+
+
+def _hook_tool_settings():
+    """Body | Face | Edge right after Blender's tool settings in the tool header
+    (its selection-mode icons), before the spacer and Options: an append lands
+    after Options at the far right, a prepend before Blender's own. The
+    header draws tool settings, spacer, mode settings, so its tool-settings
+    step is wrapped (undone in unregister)."""
+    from . import subsel
+    cls = bpy.types.VIEW3D_HT_tool_header
+    if getattr(cls.draw_tool_settings, "_nproto_wrapped", False):
+        return
+    orig = cls.draw_tool_settings
+
+    def draw_tool_settings(self, context):
+        draw_tool_settings._nproto_orig(self, context)
+        subsel.draw_tool_header(self, context)
+    draw_tool_settings._nproto_wrapped = True
+    draw_tool_settings._nproto_orig = orig
+    cls.draw_tool_settings = draw_tool_settings
+
+
+def _unhook_tool_settings():
+    cls = bpy.types.VIEW3D_HT_tool_header
+    f = cls.draw_tool_settings
+    if getattr(f, "_nproto_wrapped", False):
+        cls.draw_tool_settings = f._nproto_orig
 
 
 def register():
     bpy.types.Scene.nproto_settings = PointerProperty(type=NprotoSettings)
     bpy.types.WindowManager.nproto_view = PointerProperty(type=NprotoView)
     bpy.types.VIEW3D_HT_header.append(header_analyze)
-    from . import subsel
-    bpy.types.VIEW3D_HT_tool_header.prepend(subsel.draw_tool_header)
+    _hook_tool_settings()
 
 
 def unregister():
-    from . import subsel
-    bpy.types.VIEW3D_HT_tool_header.remove(subsel.draw_tool_header)
+    _unhook_tool_settings()
     bpy.types.VIEW3D_HT_header.remove(header_analyze)
     del bpy.types.Scene.nproto_settings
     del bpy.types.WindowManager.nproto_view

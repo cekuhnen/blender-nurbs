@@ -102,50 +102,105 @@ def _exact_edge_curve(obj, ref):
     return ext.curve_from_cvs(int(deg), Pw, [float(k) for k in U], W)
 
 
+def brep_edge_iso(obj, ref, n=9):
+    """(face surface, iso ref, lo, hi) when B-rep edge `ref` runs along a side
+    of its face's surface: "U0" / "U1" / "V0" / "V1", and the stretch of that
+    side it covers (lo..hi, 0..1 along the side). That is an untrimmed side of
+    a trimmed face, whole or cut short by a trim. None for a trim curve, an
+    edge between two faces, or an edge off the surface."""
+    sm, _ = _k()
+    try:
+        edges = store.get_brep(obj).edges()
+        e = edges[int(ref[1:])]
+        faces = e.faces()
+    except Exception:
+        return None
+    if len(faces) != 1:
+        return None
+    s = faces[0].surface()
+    (u0, u1), (v0, v1) = s.u_domain(), s.v_domain()
+    t0, t1 = e.parameter_range()
+    pts = np.array([e.point_at(t0 + (t1 - t0) * k / (n - 1)) for k in range(n)], float)
+    size = float(np.ptp(pts, axis=0).max()) or 1.0
+    uv = []
+    for q in pts:
+        cp = sm.surface_closest_point(s, tuple(map(float, q)))
+        w = cp[1][0]
+        u, v = float(w.x), float(w.y)
+        if np.linalg.norm(np.array(s.evaluate(u, v), float) - q) > 1e-7 * size:
+            return None
+        uv.append((u, v))
+    uv = np.array(uv)
+    for iso, col, val in (("U0", 0, u0), ("U1", 0, u1), ("V0", 1, v0), ("V1", 1, v1)):
+        span = (u1 - u0) if col == 0 else (v1 - v0)
+        if np.all(np.abs(uv[:, col] - val) <= 1e-6 * span):
+            a, b = (v0, v1) if col == 0 else (u0, u1)
+            w = (uv[:, 1 - col] - a) / (b - a)
+            lo, hi = float(w.min()), float(w.max())
+            lo = 0.0 if lo < 1e-6 else lo
+            hi = 1.0 if hi > 1.0 - 1e-6 else hi
+            return (s, iso, lo, hi) if hi - lo > 1e-6 else None
+    return None
+
+
+def _iso_side(ext, surf, ref, R, T):
+    """Exact rows of the surface's side `ref` (U0 / U1 / V0 / V1), world space."""
+    d = ext.surface_cvs(surf)
+    if d.get("weights") and max(abs(w - 1.0) for w in d["weights"]) > 1e-12:
+        return None
+    nu, nv = d["count_u"], d["count_v"]
+    G = np.array(d["points"], float).reshape(nu, nv, 3)
+    if ref in ("V0", "V1"):
+        G = G.transpose(1, 0, 2)
+        Ua, deg_a, Ue, deg_e = list(d["knots_v"]), d["degree_v"], list(d["knots_u"]), d["degree_u"]
+    else:
+        Ua, deg_a, Ue, deg_e = list(d["knots_u"]), d["degree_u"], list(d["knots_v"]), d["degree_v"]
+    end = ref[1] == "1"
+    if end:                      # outward = increasing parameter at the far end: mirror it to the start
+        G = G[::-1]
+        lo, hi = Ua[0], Ua[-1]
+        Ua = [lo + hi - u for u in reversed(Ua)]
+    p = deg_a
+    P0 = G[0]
+    D = DD = None
+    if p >= 1 and len(G) > 1:
+        d1 = p / (Ua[p + 1] - Ua[1])
+        Su = d1 * (G[1] - G[0])                  # dS/du at the edge (u increasing inward)
+        D = -Su                                  # outward
+        DD = np.zeros_like(P0)
+        if p >= 2 and len(G) > 2:
+            a1 = (G[1] - G[0]) / (Ua[p + 1] - Ua[1])
+            a2 = (G[2] - G[1]) / (Ua[p + 2] - Ua[2])
+            DD = p * (p - 1) / (Ua[p + 1] - Ua[2]) * (a2 - a1)
+    lo, hi = Ue[0], Ue[-1]
+    knots = [(u - lo) / (hi - lo) for u in Ue]
+    tw = lambda A: None if A is None else A @ R.T
+    return {"deg": int(deg_e), "knots": knots, "P": P0 @ R.T + T, "D": tw(D), "DD": tw(DD)}
+
+
 def exact_side(obj, ref):
     """Exact CV rows of a loft input on its own layout: {"deg", "knots" (0..1),
     "P", "D", "DD"} in world space; D / DD are the outward cross first / second
-    derivative rows of an untrimmed surface edge (None for a curve). None when
-    not available exactly (trimmed B-rep edge, rational)."""
+    derivative rows of a surface edge (None for a curve). A B-rep edge counts
+    when it runs along a side of its face's surface (an untrimmed side of a
+    trimmed face): that side's rows, cut exactly to the edge's stretch. None
+    when not available exactly (a trim curve, rational)."""
     sm, ext = _k()
     M = np.array(geom.world_matrix(obj), dtype=float)
     R, T = M[:3, :3], M[:3, 3]
     if is_edge_ref(ref):
         if not store.is_natural(obj):
             return None
-        d = ext.surface_cvs(store.get_surfaces(obj)[0])
-        if d.get("weights") and max(abs(w - 1.0) for w in d["weights"]) > 1e-12:
-            return None
-        nu, nv = d["count_u"], d["count_v"]
-        G = np.array(d["points"], float).reshape(nu, nv, 3)
-        if ref in ("V0", "V1"):
-            G = G.transpose(1, 0, 2)
-            Ua, deg_a, Ue, deg_e = list(d["knots_v"]), d["degree_v"], list(d["knots_u"]), d["degree_u"]
-        else:
-            Ua, deg_a, Ue, deg_e = list(d["knots_u"]), d["degree_u"], list(d["knots_v"]), d["degree_v"]
-        end = ref[1] == "1"
-        if end:                      # outward = increasing parameter at the far end: mirror it to the start
-            G = G[::-1]
-            lo, hi = Ua[0], Ua[-1]
-            Ua = [lo + hi - u for u in reversed(Ua)]
-        p = deg_a
-        P0 = G[0]
-        D = DD = None
-        if p >= 1 and len(G) > 1:
-            d1 = p / (Ua[p + 1] - Ua[1])
-            Su = d1 * (G[1] - G[0])                  # dS/du at the edge (u increasing inward)
-            D = -Su                                  # outward
-            DD = np.zeros_like(P0)
-            if p >= 2 and len(G) > 2:
-                a1 = (G[1] - G[0]) / (Ua[p + 1] - Ua[1])
-                a2 = (G[2] - G[1]) / (Ua[p + 2] - Ua[2])
-                DD = p * (p - 1) / (Ua[p + 1] - Ua[2]) * (a2 - a1)
-        lo, hi = Ue[0], Ue[-1]
-        knots = [(u - lo) / (hi - lo) for u in Ue]
-        tw = lambda A: None if A is None else A @ R.T
-        return {"deg": int(deg_e), "knots": knots, "P": P0 @ R.T + T, "D": tw(D), "DD": tw(DD)}
+        return _iso_side(ext, store.get_surfaces(obj)[0], ref, R, T)
     if is_brep_edge_ref(ref):
-        return None
+        hit = brep_edge_iso(obj, ref)
+        if hit is None:
+            return None
+        surf, iso, lo, hi = hit
+        side = _iso_side(ext, surf, iso, R, T)
+        if side is None or (lo == 0.0 and hi == 1.0):
+            return side
+        return geom.sub_side(side, lo, hi)
     d = ext.curve_cvs(input_curve(obj, ref))       # already world space
     if d.get("weights") and max(abs(w - 1.0) for w in d["weights"]) > 1e-12:
         return None
@@ -299,6 +354,13 @@ def _build_loft(inputs, p):
             sb = geom.reverse_side(sb)           # follow the samples' orientation (auto align / flip)
         if np.linalg.norm(sa["P"][0] - a.P[0]) > np.linalg.norm(sa["P"][-1] - a.P[0]):
             sa = geom.reverse_side(sa)
+        if not _same_layout(sa, sb):
+            # two exact layouts that differ (degree 2 beside 3, other knots): raise and
+            # refine both exactly to one layout, rather than fitting samples
+            try:
+                sa, sb = geom.compatible_sides(sa, sb)
+            except Exception as exc:
+                print("Loft: exact sides not compatible, sampling", exc)
         if _same_layout(sa, sb):
             return geom.blend_loft_exact(sa, sb, a, b, p.get("cont_a", "G0"), p.get("cont_b", "G0"),
                                          p.get("tan_a", 1.0), p.get("tan_b", 1.0),

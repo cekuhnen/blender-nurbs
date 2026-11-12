@@ -110,16 +110,9 @@ def interp_matrix(params, U, p, n_cvs):
     return A
 
 
-def fit_rows(rows, degree=3, tol=None, fallback=True, max_cvs=None):
-    """Fit several point rows (same sample count) with ONE shared
-    parameterization and knot vector, so the resulting curves are compatible.
-
-    rows: list of (N,3) arrays. With `tol`, uses the fewest CVs that fit all
-    rows within tol; otherwise interpolates (N CVs).
-    Returns (cv_rows list of (n,3), knots, degree)."""
+def row_params(rows):
+    """Averaged chord-length parameters (0..1) shared by point rows."""
     N = len(rows[0])
-    p = min(degree, N - 1)
-    # averaged chord-length parameters over all rows
     acc = np.zeros(N)
     for R in rows:
         d = np.linalg.norm(np.diff(R, axis=0), axis=1)
@@ -132,17 +125,32 @@ def fit_rows(rows, degree=3, tol=None, fallback=True, max_cvs=None):
         # repeated samples (e.g. a sweep folding over a cusp): blend in uniform
         # parameters, else the interpolation matrix is singular and CVs explode
         params = 0.8 * params + 0.2 * np.linspace(0.0, 1.0, N)
+    return params
+
+
+def fit_rows(rows, degree=3, tol=None, fallback=True, max_cvs=None, params=None):
+    """Fit several point rows (same sample count) with ONE shared
+    parameterization and knot vector, so the resulting curves are compatible.
+
+    rows: list of (N,3) arrays. With `tol` (one value, or one per row), uses
+    the fewest CVs that fit every row within its tol; otherwise interpolates
+    (N CVs). params: the shared parameters (default: row_params(rows)).
+    Returns (cv_rows list of (n,3), knots, degree)."""
+    N = len(rows[0])
+    p = min(degree, N - 1)
+    params = row_params(rows) if params is None else np.asarray(params, float)
     B = np.hstack(rows)  # (N, 3*len(rows))
 
     # Lightest net first: least-squares fit with the fewest CVs that keeps every
     # row within `tol` of its samples (ends exact). Falls back to interpolation.
-    if tol is not None and tol > 0:
+    tols = None if tol is None else np.broadcast_to(np.asarray(tol, float), (len(rows),))
+    if tols is not None and np.all(tols > 0):
         for n_cvs in range(p + 1, N if max_cvs is None else min(N, max_cvs + 1)):
             U = _ls_knots(params, n_cvs, p)
             X = _ls_fit(params, B, U, p, n_cvs)
             A = interp_matrix(params, U, p, n_cvs)
             err = np.abs(A @ X - B).reshape(N, -1, 3)
-            if np.linalg.norm(err, axis=2).max() <= tol:
+            if np.all(np.linalg.norm(err, axis=2).max(axis=0) <= tols):
                 return [X[:, 3 * i:3 * i + 3] for i in range(len(rows))], U, p
         if not fallback:
             return None
@@ -488,39 +496,34 @@ def align_closed(prev, cur, n=720, keep_deg=1.0):
     return reseat_closed(cur, wrap(0.5 * (lo + hi)))
 
 
-def compatible_curves(curves, tol=1e-7):
-    """The sections on one degree and one knot vector, exactly: each range
+def compatible_arrays(items, tol=1e-7):
+    """Clamped B-splines on one degree and one knot vector, exactly. items:
+    [(degree, knots, CV array (n, dim))] -- any columns (homogeneous CVs, or
+    an edge's rows with its cross derivatives side by side). Each range is
     mapped to 0..1, degrees raised (by Bezier pieces) to the highest, knots
-    closer than tol taken as one, then every knot inserted into every
-    section to its highest multiplicity. Returns (degree, knots, [homogeneous
-    CVs (m, 4)]). (The kernel's own merge nudges knots -- 0.25 to
-    0.2499999994, 1 to 0.99999998788 beside 1 -- and leaves knot vectors the
-    kernel then refuses.)"""
+    closer than tol taken as one, then every knot inserted into every item to
+    its highest multiplicity. Returns (degree, knots, [arrays])."""
     from .kernel.classa import insert_knot, bezier_pieces
     from .curvejoin import elevate
-    _, ext = _k()
     data = []
-    for c in curves:
-        d = ext.curve_cvs(c)
-        p = int(d["degree"])
-        U = [float(k) for k in d["knots"]]
-        P = np.array(d["points"], float)
-        w = np.array(d["weights"], float) if d.get("weights") else np.ones(len(P))
+    for p, U, A in items:
+        p = int(p)
+        U = [float(k) for k in U]
         a, b = U[0], U[-1]
         U = [(k - a) / (b - a) for k in U]
         U[:p + 1], U[-(p + 1):] = [0.0] * (p + 1), [1.0] * (p + 1)
-        data.append([p, U, np.c_[P * w[:, None], w]])
+        data.append([p, U, np.asarray(A, float)])
     q = max(it[0] for it in data)
     for it in data:
-        p, U, Pw = it
+        p, U, A = it
         if p == q:
             continue
         br = sorted(set(U))
-        pieces = [elevate(np.asarray(s_, float), q) for s_ in bezier_pieces(Pw, U, p)]
+        pieces = [elevate(np.asarray(s_, float), q) for s_ in bezier_pieces(A, U, p)]
         it[2] = np.vstack([pieces[0]] + [s_[1:] for s_ in pieces[1:]])
         it[1] = [0.0] * (q + 1) + [k for k in br[1:-1] for _ in range(q)] + [1.0] * (q + 1)
         it[0] = q
-    # one value for knots closer than tol, across all sections
+    # one value for knots closer than tol, across all items
     vals = sorted({k for _, U, _ in data for k in U[q + 1:-q - 1]})
     reps = []
     for v in vals:
@@ -535,12 +538,76 @@ def compatible_curves(curves, tol=1e-7):
         mult = max(sum(1 for k in U if k == v) for _, U, _ in data)
         for it in data:
             while sum(1 for k in it[1] if k == v) < mult:
-                Pw, U = insert_knot(it[2], it[1], q, v)
-                it[2], it[1] = np.asarray(Pw, float), U
+                A, U = insert_knot(it[2], it[1], q, v)
+                it[2], it[1] = np.asarray(A, float), U
     U0 = data[0][1]
     if any(len(U) != len(U0) or any(abs(x - y) > 1e-12 for x, y in zip(U, U0)) for _, U, _ in data):
+        raise ValueError("the curves could not be given one layout")
+    return q, U0, [A for _, _, A in data]
+
+
+def compatible_curves(curves, tol=1e-7):
+    """The sections on one degree and one knot vector, exactly (see
+    compatible_arrays). Returns (degree, knots, [homogeneous CVs (m, 4)]).
+    (The kernel's own merge nudges knots -- 0.25 to 0.2499999994, 1 to
+    0.99999998788 beside 1 -- and leaves knot vectors the kernel then refuses.)"""
+    _, ext = _k()
+    items = []
+    for c in curves:
+        d = ext.curve_cvs(c)
+        P = np.array(d["points"], float)
+        w = np.array(d["weights"], float) if d.get("weights") else np.ones(len(P))
+        items.append((int(d["degree"]), d["knots"], np.c_[P * w[:, None], w]))
+    try:
+        return compatible_arrays(items, tol)
+    except ValueError:
         raise ValueError("the sections could not be given one layout")
-    return q, U0, [Pw for _, _, Pw in data]
+
+
+_SIDE_ROWS = ("P", "D", "DD")
+
+
+def _side_array(s):
+    keys = [k for k in _SIDE_ROWS if s.get(k) is not None]
+    return keys, np.hstack([np.asarray(s[k], float) for k in keys])
+
+
+def _side_from(keys, deg, knots, A):
+    out = {"deg": int(deg), "knots": [float(k) for k in knots], "P": None, "D": None, "DD": None}
+    for i, k in enumerate(keys):
+        out[k] = A[:, 3 * i:3 * i + 3].copy()
+    return out
+
+
+def compatible_sides(sa, sb, tol=1e-9):
+    """Two exact loft sides ({"deg", "knots", "P", "D", "DD"}) on one degree and
+    one knot vector, exactly: the edge rows and their cross-derivative rows
+    are curves on the same layout, so they are raised and refined together."""
+    (ka, A), (kb, B) = _side_array(sa), _side_array(sb)
+    q, U, (A2, B2) = compatible_arrays([(sa["deg"], sa["knots"], A), (sb["deg"], sb["knots"], B)], tol)
+    return _side_from(ka, q, U, A2), _side_from(kb, q, U, B2)
+
+
+def sub_side(s, lo, hi):
+    """The stretch lo..hi (0..1 along the edge) of an exact loft side, exactly
+    (knot insertion), with its knots mapped back to 0..1."""
+    from .kernel.classa import insert_knot
+    p = int(s["deg"])
+    keys, A = _side_array(s)
+    U = [float(k) for k in s["knots"]]
+    snap = lambda t: next((k for k in U if abs(k - t) <= 1e-9), t)
+    lo, hi = snap(lo), snap(hi)
+    for t in (lo, hi):
+        if 0.0 < t < 1.0:
+            while sum(1 for k in U if k == t) < p:
+                A, U = insert_knot(A, U, p, t)
+                A = np.asarray(A, float)
+    last_lo = max(i for i, k in enumerate(U) if k == lo)
+    inner = [k for k in U if lo < k < hi]
+    n = p + 1 + len(inner)
+    s0 = last_lo - p
+    knots = [0.0] * (p + 1) + [(k - lo) / (hi - lo) for k in inner] + [1.0] * (p + 1)
+    return _side_from(keys, p, knots, A[s0:s0 + n])
 
 
 def open_skin(curves, degree=3):
@@ -746,6 +813,48 @@ def _side_rows(es, cont, tangent, curvature, n_deg, scale):
     return rows
 
 
+def _difference_rows(rows_a, rows_b, tol, size):
+    """Side rows [R0, R1, R2] as [R0, R1 - R0, R2 - 2 R1 + R0] (b's reversed,
+    as in the surface) and a tolerance for each: for an edge row tol, at most
+    1e-5 of that edge's length (the continuity check allows a gap of 1e-4 of
+    it; tol, 1e-4 of the whole loft, let a trimmed edge's row stray past
+    that); a 1e-4 angle for the tangent rows, 0.1 % for the curvature rows."""
+    def side(R):
+        out = [R[0]]
+        if len(R) > 1:
+            out.append(R[1] - R[0])
+        if len(R) > 2:
+            out.append(R[2] - 2 * R[1] + R[0])
+        return out
+    def tols(F):
+        if tol is None:
+            return [None] * len(F)
+        edge = float(np.sum(np.linalg.norm(np.diff(F[0], axis=0), axis=1)))
+        t = [min(tol, max(1e-5 * edge, 1e-9 * size))]
+        if len(F) > 1:
+            t.append(max(1e-4 * float(np.median(np.linalg.norm(F[1], axis=1))), 1e-7 * size))
+        if len(F) > 2:
+            t.append(max(1e-3 * float(np.max(np.linalg.norm(F[2], axis=1))), 1e-7 * size))
+        return t
+    Fa, Fb = side(rows_a), side(rows_b)
+    ta, tb = tols(Fa), tols(Fb)
+    F = Fa + Fb[::-1]
+    t = ta + tb[::-1]
+    return F, (None if tol is None else t)
+
+
+def _undifference_rows(G, na, nb):
+    """CV rows back from fitted difference rows (inverse of _difference_rows)."""
+    def side(H):
+        out = [H[0]]
+        if len(H) > 1:
+            out.append(H[1] + H[0])
+        if len(H) > 2:
+            out.append(H[2] + 2 * out[1] - out[0])
+        return out
+    return side(G[:na]) + side(G[na:][::-1])[::-1]
+
+
 def blend_loft(a, b, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.0, cur_a=0.0, cur_b=0.0, fit_tol=1e-4,
                degree_v=3):
     """a, b: EdgeSample. Returns a kernel B-spline surface; u runs a -> b."""
@@ -761,21 +870,42 @@ def blend_loft(a, b, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.0, cur_a=0.0, 
     allp = np.vstack(rows)
     size = float(np.linalg.norm(allp.max(axis=0) - allp.min(axis=0))) or 1.0
     tol = fit_tol * size if fit_tol else None
+    # The G1 / G2 rows are fitted as differences from the edge row (the cross
+    # tangent, the cross curvature term), each held to its own tolerance -- an
+    # angle and a curvature, not a distance: fitted within tol in position, the
+    # rows of a handle-to-bowl loft left its tangent 0.1-0.8 degrees off, the
+    # result depending on Samples. The fit is linear in the rows, so the CVs
+    # are the same as fitting the rows themselves.
+    F, tols = _difference_rows(rows_a, rows_b, tol, size)
+    params = row_params(rows)
     fit = None
     if tol and degree_v < 3:
         # the inputs' own (lower) degree first, as ONE span: a line stays a
         # line. More spans of it are not taken: a polyline through the samples
         # of a curved edge passes them "within tol" yet kinks at every one
         q = max(1, degree_v)
-        fit = fit_rows(rows, q, tol=tol, fallback=False, max_cvs=q + 1)
+        fit = fit_rows(F, q, tol=tols, fallback=False, max_cvs=q + 1, params=params)
     if fit is None:
-        fit = fit_rows(rows, 3, tol=tol)
-    cv_rows, knots_v, deg_v = fit
+        fit = fit_rows(F, 3, tol=tols, params=params)
+    G, knots_v, deg_v = fit
+    cv_rows = _undifference_rows(G, len(rows_a), len(rows_b))
     pts = []
     for R in cv_rows:
         pts.extend(tuple(map(float, p)) for p in R)
     knots_u = [0.0] * (n_deg + 1) + [1.0] * (n_deg + 1)
     return ext.surface_from_cvs(n_deg, deg_v, pts, knots_u, [float(x) for x in knots_v])
+
+
+def _mean_row_length(D, deg, knots, n=17):
+    """Mean length of the vector curve with CVs D (degree, knots) along 0..1."""
+    _, ext = _k()
+    try:
+        c = ext.curve_from_cvs(int(deg), [tuple(map(float, q)) for q in D], [float(k) for k in knots], None)
+        t0, t1 = c.parameter_range()
+        return float(np.mean([np.linalg.norm(np.array(c.evaluate(float(t)), float))
+                              for t in np.linspace(t0, t1, n)]))
+    except Exception:
+        return 0.0
 
 
 def blend_loft_exact(sa, sb, a, b, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.0, cur_a=0.0, cur_b=0.0):
@@ -796,7 +926,11 @@ def blend_loft_exact(sa, sb, a, b, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.
         rows = [s["P"]]
         if k == 0:
             return rows
-        dm = float(np.mean(np.linalg.norm(es.D, axis=1))) or 1.0
+        # the mean length of the cross derivative the rows are built from (the exact
+        # D rows, evaluated along the edge). The EdgeSample of a B-rep edge holds unit
+        # directions: dividing by its mean (1) left a trimmed bowl's side rows 11x too
+        # short, so the loft hugged the bowl and turned sharply away from it.
+        dm = _mean_row_length(s["D"], s["deg"], s["knots"]) or float(np.mean(np.linalg.norm(es.D, axis=1))) or 1.0
         lam = tangent * scale / dm
         P1 = s["P"] + (lam / n_deg) * s["D"]
         rows.append(P1)

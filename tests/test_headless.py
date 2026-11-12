@@ -1317,7 +1317,7 @@ _hl = poly("SB_hl", [(3, -0.4, 600.4), (3, 0.4, 600.4)])
 bpy.ops.nproto.extrude(inputs=ins((_hl, "S0")), distance=3.0, direction="X"); _hd = ctx.active_object
 _er = min(("U0", "U1", "V0", "V1"), key=lambda e_: abs(np.mean(np.array(geom.boundary_points(store.get_surfaces(_hd)[0], e_, 5))[:, 0]
                                                                + geom.world_matrix(_hd).translation.x) - 3))
-for _smp in (8, 24):
+for _smp in (5, 7, 8, 9, 12, 24):
     r = bpy.ops.nproto.loft(inputs=json.dumps([[_hd.name, _er], [_bowl.name, _eb]]), cont_a="G2", cont_b="G2", samples=_smp)
     _sp = ctx.active_object
     _d = ext.surface_cvs(store.get_surfaces(_sp)[0])
@@ -2653,7 +2653,7 @@ check("sketch modal: clicked CV curve is G1 to the face chosen with T, with an A
       r == {'FINISHED'} and h_ is not None and e0.get("face") == src2[3] and e0.get("mode") == "SURFACE"
       and e0.get("cont") == "G1" and tilt < 1e-5, f"{r} {e0} tilt {tilt:.1e}° {cv.msgs}")
 # Line: G1 start on the rim = tangent to the edge there
-ln = _fake(_dt.NPROTO_OT_draw_line, polyline=False, start_cont="G1", line_mode="EDGE")
+ln = _fake(_dt.NPROTO_OT_draw_line, polyline=False, start_mode="TANGENT", line_mode="EDGE")
 ln._edit, ln._lines, ln._start, ln._lock, ln._start_refs = None, [], None, None, None
 ln._reset_typing()
 ln.sketch_start(fc)
@@ -2670,7 +2670,7 @@ check("sketch modal: a Line started on the rim with S (G1) runs tangent to the r
 r = ln.modal(fc, _ev('RIGHTMOUSE'))
 check("sketch modal: the tangent line is made", r == {'FINISHED'} and ctx.active_object.type == 'CURVE')
 # Line at the seam corner: two edges meet (the rim, the seam); T switches which one the tangent follows
-ln = _fake(_dt.NPROTO_OT_draw_line, polyline=False, start_cont="G1", line_mode="EDGE")
+ln = _fake(_dt.NPROTO_OT_draw_line, polyline=False, start_mode="TANGENT", line_mode="EDGE")
 ln._edit, ln._lines, ln._start, ln._lock, ln._start_refs = None, [], None, None, None
 ln._reset_typing()
 ln.sketch_start(fc)
@@ -2695,7 +2695,7 @@ ln.modal(fc, _ev('ESC'))
 # Polyline: click, click, click, click the first point -> closed, then right-click
 for o in list(bpy.data.objects):
     bpy.data.objects.remove(o)
-pl_ = _fake(_dt.NPROTO_OT_draw_line, polyline=True, start_cont="G0", line_mode="EDGE")
+pl_ = _fake(_dt.NPROTO_OT_draw_line, polyline=True, start_mode="FREE", line_mode="EDGE")
 pl_._edit, pl_._lines, pl_._start, pl_._lock, pl_._start_refs = None, [], None, None, None
 pl_._reset_typing()
 pl_.sketch_start(fc)
@@ -2715,7 +2715,7 @@ for o in list(bpy.data.objects):
     bpy.data.objects.remove(o)
 bpy.ops.nproto.add_primitive(kind="PLANE", width=2, depth=2, pl_degree_u=1, pl_degree_v=1, spans_u=1, spans_v=1)
 def _new_ln():
-    f = _fake(_dt.NPROTO_OT_draw_line, polyline=False, start_cont="G1", line_mode="EDGE")
+    f = _fake(_dt.NPROTO_OT_draw_line, polyline=False, start_mode="TANGENT", line_mode="EDGE")
     f._edit, f._lines, f._start, f._lock, f._start_refs = None, [], None, None, None
     f._reset_typing()
     f.sketch_start(fc)
@@ -3901,7 +3901,8 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "cycle_continuity", "de
               "import_step", "open_step", "history_focus", "history_toggle_hide", "tree_step", "step_unfocus", "mute_step", "patch_add_guides",
               "patch_auto_corners", "patch_corner", "patch_remove_guide", "rebuild", "rebuild_waiting", "remove_step",
               "restore_inputs", "sync_feature", "tab_edit", "continuity", "continuity_clear", "section_add", "section_orient",
-              "section_targets", "section_curves", "section_remove", "subsel_picker", "bake_feature", "delete_feature"}
+              "section_targets", "section_curves", "section_remove", "subsel_picker", "bake_feature", "delete_feature",
+              "curve_degree"}
 _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto) if n not in _not_tools}
 _tool_ops = [o_ for o_ in _in_panels if o_ not in ("nproto.add_primitive", "nproto.boolean")] + ["nproto.boolean"]
 _bool_ops = sorted(e["props"].get("operation") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r
@@ -3925,7 +3926,10 @@ _act = ctx.view_layer.objects.active
 try:
     _shown = _ui.VIEW3D_PT_nproto_active.poll(ctx)
     _top = _draw(_ui.VIEW3D_PT_nproto_active)
-    _rest = [_draw(_ui.VIEW3D_PT_nproto_analyze_side), _draw(_ui.VIEW3D_PT_nproto_settings)]
+    _rest = [_draw(_ui.VIEW3D_PT_nproto_analyze_side), _draw(_ui.VIEW3D_PT_nproto_display),
+             _draw(_ui.VIEW3D_PT_nproto_tessellation), _draw(_ui.VIEW3D_PT_nproto_history)]
+    _hrec = []
+    _ui.header_analyze(_NS(layout=_FakeLay(_hrec)), ctx)
     ctx.view_layer.objects.active = None
     _hidden = not _ui.VIEW3D_PT_nproto_active.poll(ctx)
     _side_err = None
@@ -3936,6 +3940,14 @@ finally:
     ctx.view_layer.objects.active = _act
 check("UI: Active Object panel shows for a NURBS object, hides with nothing active; Analyze and Settings draw",
       _side_err is None and _shown and _hidden and store.is_nurbs(_act), f"{_side_err} active={_act and _act.name}")
+_tog = ["show_edges", "show_cvs", "show_cont_labels"]
+check("UI: Settings split -- Display (the three toggles), Tessellation (closed, its four values), History; the "
+      "toggles also sit as icons in the 3D view header",
+      _side_err is None and [e["prop"] for e in _rest[1] if "prop" in e] == _tog
+      and len([e for e in _rest[2] if "prop" in e]) == 4
+      and "construction_history" in [e.get("prop") for e in _rest[3]]
+      and [e["prop"] for e in _hrec if e.get("prop") in _tog] == _tog
+      and 'DEFAULT_CLOSED' in _ui.VIEW3D_PT_nproto_tessellation.bl_options, str(_hrec))
 
 # --- Edit CVs on a Patch: trims fitted tightly (re-lifting the edges keeps them in place),
 #     history and the exact B-rep kept unless a CV moves
@@ -5280,5 +5292,550 @@ except Exception:
 check("kernel guard: Edge.point_at / Curve.evaluate are wrapped; a hair past the end evaluates the end",
       getattr(type(_ce).evaluate, "_nproto_safe", False) and getattr(_smh.Edge.point_at, "_nproto_safe", False) and _hair_ok,
       f"far past the end raises: {_far_raises}")
+
+# --- Line: Perpendicular / Tangent end snaps, lines tangent to two circles, square / parallel directions
+from blender_nurbs import linesolve as _lsv
+
+
+def _circ(c, r):
+    c = np.asarray(c, float)
+    return _lsv.Curve(lambda t: (c + r * np.array([math.cos(t), math.sin(t), 0.0]),
+                                 r * np.array([-math.sin(t), math.cos(t), 0.0]),
+                                 -r * np.array([math.cos(t), math.sin(t), 0.0])), 0.0, 2 * math.pi)
+
+
+_C1, _C2 = _circ((0, 0, 0), 1.0), _circ((4, 0, 0), 0.5)
+_tp = _lsv.from_point(_C1, (3, 0, 0), "tan")
+check("line solve: the two tangent points from a point to a circle (x = r^2 / d)", len(_tp) == 2 and all(
+    abs(Q[0] - 1 / 3) < 1e-12 and abs(abs(Q[1]) - math.sqrt(8 / 9)) < 1e-12 for _, Q in _tp), str(_tp))
+_seeds = [s_ for a_ in (0.0, 1.5, 3.1, 4.7) for s_ in _lsv.seeds_from(_C1, a_, _C2)]
+_tt = _lsv.between(_C1, "tan", _C2, "tan", _seeds)
+_exp = []                       # outer tangents: cos = (r1 - r2) / d; inner: (r1 + r2) / d
+for _cth, _sg in ((0.125, 1), (0.375, -1)):
+    for _sy in (1, -1):
+        _sth = _sy * math.sqrt(1 - _cth * _cth)
+        _exp.append((np.array([_cth, _sth, 0]), np.array([4 + _sg * 0.5 * _cth, _sg * 0.5 * _sth, 0])))
+check("line solve: two circles have four lines tangent to both, all found exactly", len(_tt) == 4 and all(
+    any(np.allclose(Q1, a_, atol=1e-12) and np.allclose(Q2, b_, atol=1e-12) for _, _, Q1, Q2 in _tt)
+    for a_, b_ in _exp), str([(s_[2], s_[3]) for s_ in _tt]))
+_pp = _lsv.between(_C1, "perp", _C2, "perp", _seeds)
+_tq = _lsv.between(_C1, "tan", _C2, "perp", _seeds)
+check("line solve: square to both circles runs along the line of centres; tangent to one, square to the other",
+      len(_pp) == 4 and all(abs(Q1[1]) < 1e-12 and abs(Q2[1]) < 1e-12 for _, _, Q1, Q2 in _pp)
+      and len(_tq) == 4 and all(abs(np.linalg.norm(Q1) - 1) < 1e-12 and abs((Q2 - Q1) @ Q1) < 1e-12
+                                and abs(np.cross(Q2 - Q1, Q2 - (4, 0, 0))[2]) < 1e-12 for _, _, Q1, Q2 in _tq))
+_ln = _lsv.Curve(lambda t: (np.array([-2.0, -3, 0]) + t * np.array([7.0, 4, 0]), np.array([7.0, 4, 0]), np.zeros(3)),
+                 0.0, 1.0)
+_ft = _lsv.from_point(_ln, (0, 0, 0), "perp")
+check("line solve: the foot of the perpendicular on a line; a straight line has no tangent points",
+      _ln.straight and len(_ft) == 1 and np.allclose(_ft[0][1], (0.8, -1.4, 0), atol=1e-12)
+      and _lsv.from_point(_ln, (0, 0, 0), "tan") == [], str(_ft))
+check("line solve: no tangent from a point off the circle's plane (a right angle still works)",
+      _lsv.from_point(_C1, (3, 0, 0.5), "tan") == [] and len(_lsv.from_point(_C1, (3, 0, 0.5), "perp")) == 2)
+check("line solve: square to a circle lies in its plane, square to a line in the drawing plane",
+      np.allclose(np.abs(_lsv.side_direction(_C1, 0.0)), (1, 0, 0))
+      and np.allclose(np.abs(_lsv.side_direction(_ln, 0.3, (0, 0, 1))), np.abs(np.array([-4.0, 7, 0]) / math.sqrt(65))))
+# the add-on's own circles, through the kernel
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=0.6)
+_KA = ctx.active_object
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=0.3)
+_KB = ctx.active_object
+_KA.location, _KB.location = (-1, 0, 0), (1, 0, 0)
+ctx.view_layer.update()
+_smk = features._k()[0]
+_kA = _lsv.kernel_curve(features.input_curve(_KA, "S0"), _smk)
+_kB = _lsv.kernel_curve(features.input_curve(_KB, "S0"), _smk)
+_ktt = _lsv.between(_kA, "tan", _kB, "tan", _lsv.seeds_from(_kA, _lsv.nearest_t(_kA, (-0.9, 0.6, 0)), _kB))
+
+
+def _ksin(c, t, V):
+    D = c.at(t)[2]
+    return float(np.linalg.norm(np.cross(D, V)) / (np.linalg.norm(D) * np.linalg.norm(V)))
+
+
+check("line solve on kernel circles: both lines tangent to both on the side clicked, exact to rounding",
+      len(_ktt) == 2 and all(Q1[1] > 0 and _ksin(_kA, a_, Q2 - Q1) < 1e-9 and _ksin(_kB, b_, Q2 - Q1) < 1e-9
+                             for a_, b_, Q1, Q2 in _ktt), str([(s_[2], s_[3]) for s_ in _ktt]))
+_Tk = _sn.collect([_KA, _KB])
+_nl = _Tk.near_lines(_snap_view(), _px(-0.4, 0.0) + (5, 0), 2 * _sn.SNAP_PX)
+check("snap: the curves passing near the mouse, nearest first",
+      len(_nl) >= 1 and _Tk.line_info(_nl[0][0])[1][:2] == (_KA.name, "S0") and abs(_nl[0][1] - 5.0) < 0.1, str(_nl))
+
+
+# the Line tool's own logic, on a stand-in (a modal operator cannot run headless)
+class _FakeLine(_dt.SketchMixin):
+    start_mode, line_mode = "FREE", "EDGE"
+
+
+for _nm in ("_curve", "_start_curve", "_solutions", "_apply_start"):
+    setattr(_FakeLine, _nm, _dt.NPROTO_OT_draw_line.__dict__[_nm])
+_fl = _FakeLine()
+_fl._curves, _fl._solved, _fl._lock = {}, {}, None
+_fl._plane = (np.zeros(3), np.array([0, 0, 1.0]), np.array([1.0, 0, 0]), np.array([0, 1.0, 0]))
+_fl._start, _fl._start_refs = np.array([0.8, 0.0, 0.0]), None
+_sol = _fl._solutions((_KA.name, "S0"), _kA)
+_lab = sorted(s_[0] for s_ in _sol)
+check("Line: from a free start the end snaps Perpendicular (2) and Tangent (2) to a circle",
+      _lab == ["Perpendicular"] * 2 + ["Tangent"] * 2
+      and all(abs(np.linalg.norm(Q - (-1, 0, 0)) - 0.6) < 1e-6 for _, _, Q in _sol), str(_lab))
+_ta = _lsv.nearest_t(_kA, (-1.0, 0.6, 0))
+_fl._start = _kA.at(_ta)[1]
+_fl._start_refs = {"cands": [{"src": (_KA.name, "S0", "NEAREST", None)}], "i": 0}
+_fl.start_mode = "TANGENT"
+_sol2 = _fl._solutions((_KB.name, "S0"), _kB)
+_both = [s_ for s_ in _sol2 if s_[0] == "Tangent to both"]
+check("Line: a Tangent start slides along its circle to a line tangent to both circles",
+      len(_both) == 2 and all(np.linalg.norm(A_ - _fl._start) > 1e-3 and A_[1] > 0 for _, A_, _ in _both)
+      and any(s_[0] == "Tangent · Perpendicular" for s_ in _sol2), str([s_[0] for s_ in _sol2]))
+_fl._apply_start()
+_tan_ok = _fl._lock == "T" and abs(_fl._tvec[1]) < 1e-6 * np.linalg.norm(_fl._tvec)
+_fl.start_mode = "PERP"
+_fl._apply_start()
+check("Line: a Tangent start leaves along the circle, a Perpendicular one square to it (in its plane)",
+      _tan_ok and _fl._lock == "T" and _fl._tkind == "square" and np.allclose(np.abs(_fl._tvec), (0, 1, 0), atol=1e-6),
+      f"{_fl._tvec}")
+_fl._lock, _fl._akind = "A", "square"
+check("Line: the A lock reads 'square to the line'", "square to the line" in _fl.lock_text())
+
+# ...and through the modal code: mouse moves and clicks in the fake top view (1 unit = 250 px)
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=0.6)
+_MA = ctx.active_object
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=0.3)
+_MB = ctx.active_object
+_MA.location, _MB.location = (-1, 0, 0), (1, 0, 0)
+ctx.view_layer.update()
+bpy.ops.nproto.draw_line(data=json.dumps({"lines": [[[-1.5, -1.3, 0.0], [1.5, -0.7, 0.0]]], "edit": ""}))
+_ML = ctx.active_object
+
+
+def _ln_tool(**props):
+    f = _fake(_dt.NPROTO_OT_draw_line, **dict(dict(polyline=False, start_mode="FREE", line_mode="EDGE"), **props))
+    f._edit, f._lines, f._start, f._lock, f._start_refs = None, [], None, None, None
+    f._reset_typing()
+    f.sketch_start(fc)
+    return f
+
+
+def _at(f, q, px=(0, 0), **kw):
+    xy = np.array(_wpx(q[0], q[1])) + px
+    f.modal(fc, _ev('MOUSEMOVE', xy, 'NOTHING', **kw))
+    return xy
+
+
+def _click(f, q, px=(0, 0)):
+    xy = _at(f, q, px)
+    f.modal(fc, _ev('LEFTMOUSE', xy))
+
+
+_c1, _r1, _c2, _r2 = np.array([-1.0, 0, 0]), 0.6, np.array([1.0, 0, 0]), 0.3
+# a free start, the end Tangent to a circle
+_S = np.array([0.0, 1.5, 0])
+_d = _S - _c1
+_dh, _ca = _d / np.linalg.norm(_d), _r1 / np.linalg.norm(_d)
+_Qt = _c1 + _r1 * (_ca * _dh + math.sqrt(1 - _ca * _ca) * np.array([-_dh[1], _dh[0], 0]))
+f = _ln_tool()
+_click(f, _S)
+_at(f, _Qt, (3, 2))
+_lab = _drw.sketch_overlay["snap_label"]
+f.modal(fc, _ev('LEFTMOUSE', np.array(_wpx(*_Qt[:2])) + (3, 2)))
+_L0 = f._lines[0] if f._lines else (np.zeros(3), np.zeros(3))
+check("Line modal: from a free start the end snaps Tangent to a circle (exact tangent point)",
+      _lab == "Tangent" and np.linalg.norm(_L0[0] - _S) < 1e-9 and np.linalg.norm(_L0[1] - _Qt) < 1e-6,
+      f"{_lab} {_L0} want {_Qt}")
+f.modal(fc, _ev('ESC'))
+# a Tangent start on the big circle's top (a CV on the curve): it slides to the line tangent to both circles
+_ct = (_r1 - _r2) / np.linalg.norm(_c2 - _c1)
+_nt = np.array([_ct, math.sqrt(1 - _ct * _ct), 0])
+_Q1, _Q2 = _c1 + _r1 * _nt, _c2 + _r2 * _nt
+f = _ln_tool(start_mode="TANGENT")
+_click(f, (-1.0, 0.6))
+_lk = f._lock
+_at(f, _Q2, (2, 3))
+_lab = _drw.sketch_overlay["snap_label"]
+f.modal(fc, _ev('LEFTMOUSE', np.array(_wpx(*_Q2[:2])) + (2, 3)))
+_L0 = f._lines[0] if f._lines else (np.zeros(3), np.zeros(3))
+check("Line modal: a Tangent start on a circle's quarter point (a CV) leaves tangent, then slides to the line "
+      "tangent to both circles", _lk == "T" and _lab == "Tangent to both" and np.linalg.norm(_L0[0] - _Q1) < 1e-6
+      and np.linalg.norm(_L0[1] - _Q2) < 1e-6, f"{_lk} {_lab} {_L0} want {_Q1} {_Q2}")
+f.modal(fc, _ev('ESC'))
+# a free start, the end Perpendicular to a line
+_S = np.array([-0.2, 1.2, 0])
+_LA, _LD = np.array([-1.5, -1.3, 0]), np.array([3.0, 0.6, 0])
+_foot = _LA + _LD * ((_S - _LA) @ _LD) / (_LD @ _LD)
+f = _ln_tool()
+_click(f, _S)
+_at(f, _foot, (3, -2))
+_lab = _drw.sketch_overlay["snap_label"]
+f.modal(fc, _ev('LEFTMOUSE', np.array(_wpx(*_foot[:2])) + (3, -2)))
+_L0 = f._lines[0] if f._lines else (np.zeros(3), np.zeros(3))
+check("Line modal: the end snaps Perpendicular to a line (its foot)",
+      _lab == "Perpendicular" and np.linalg.norm(_L0[1] - _foot) < 1e-6, f"{_lab} {_L0} want {_foot}")   # curves are float32
+f.modal(fc, _ev('ESC'))
+# A / Shift+A over the line: the next line runs parallel / square to it
+_dirs = {}
+for _sh in (False, True):
+    f = _ln_tool()
+    _at(f, (-1.0, -1.2))
+    f.modal(fc, _ev('A', _wpx(-1.0, -1.2), shift=_sh))
+    _kind = (f._lock, getattr(f, "_akind", None))
+    _click(f, (-1.5, 1.6))
+    _click(f, (0.8, 1.95) if not _sh else (-1.2, 0.2))
+    a_, b_ = f._lines[0] if f._lines else (np.zeros(3), np.ones(3))
+    _dirs[_sh] = (_kind, (b_ - a_) / np.linalg.norm(b_ - a_))
+    f.modal(fc, _ev('ESC'))
+_ud = _LD / np.linalg.norm(_LD)
+check("Line modal: A draws parallel to the line under the mouse, Shift+A square to it",
+      _dirs[False][0] == ("A", "parallel") and abs(abs(_dirs[False][1] @ _ud) - 1) < 1e-9
+      and _dirs[True][0] == ("A", "square") and abs(_dirs[True][1] @ _ud) < 1e-6, str(_dirs))
+
+# --- Key hints: a short header, a grouped panel that wraps to the width, the mouse basics in the status bar
+from blender_nurbs import hints as _hn
+_meas = lambda t: (7.0 * len(t), 12.0)
+_rows = [("Place", [_hn.key("0-9", "length"), _hn.key("Tab", "angle"), _hn.key("Enter", "place")]),
+         ("Direction", [_hn.key("H V", "horizontal / vertical", on=True), _hn.key("X Y Z", "axis"),
+                        _hn.key("Shift+X/Y/Z", "plane"), _hn.key("Shift", "15°"), _hn.key("Ctrl", "grid")]),
+         ("Start", [_hn.cycle("S", ["free", "tangent", "perpendicular"], "tangent")]),
+         ("Polyline", [_hn.toggle("P", "", False)]),
+         ("", [_hn.note("Tangent chains are picked together; click a picked edge again to un-pick it.")])]
+_wW, _hW, _opsW = _hn.layout(_rows, _meas, 2000)
+_wN, _hN, _opsN = _hn.layout(_rows, _meas, 380)
+_lines = lambda ops: len({round(o[2]) for o in ops if o[0] == "text"})
+_right = lambda ops: max((o[1] + o[3]) if o[0] == "cap" else (o[1] + _meas(o[3])[0]) for o in ops)
+check("hints: one line per group on a wide view; on a small one the rows wrap and stay inside the width",
+      _lines(_opsW) == 5 and _lines(_opsN) > 5 and _right(_opsN) <= 380 - 8 + 1e-9 and _wN <= 380 and _hN > _hW,
+      f"{_lines(_opsW)} / {_lines(_opsN)} lines, right edge {_right(_opsN):.0f}, {_wN:.0f} x {_hN:.0f}")
+_sty = {o[3]: o[4] for o in _opsW if o[0] == "text"}
+_cap = {o[5]: o[6] for o in _opsW if o[0] == "cap"}
+check("hints: a cycling key shows every option with the current one lit, a toggle shows off dimmed, an active "
+      "lock is lit", _sty.get("tangent") == "on" and _sty.get("free") == "off" and _sty.get("perpendicular") == "off"
+      and _sty.get("off") == "off" and _sty.get("horizontal / vertical") == "on" and _cap.get("H") == "on"
+      and _cap.get("X") == "cap" and _sty.get("Place") == "label", f"{_sty} {_cap}")
+
+
+class _HArea:
+    def __init__(self):
+        self.text, self.regions = "unset", []
+    def header_text_set(self, t):
+        self.text = t
+    def tag_redraw(self):
+        pass
+    def as_pointer(self):
+        return 4242
+
+
+_hc = _types.SimpleNamespace(area=_HArea(), workspace=None)
+_head = _hn.show(_hc, "Line", ["place the end", "", "Length 2 ft"], _rows, [("MOUSE_LMB", "Place")])
+_spec_ok = _hn.HUD["spec"] is not None and _hn.HUD["area"] == 4242
+_hn.clear(_hc)
+check("hints: the header holds only the live state (no key list); clear() drops header and panel",
+      _head == "Line  ·  place the end  ·  Length 2 ft" and _spec_ok and _hc.area.text is None
+      and _hn.HUD["spec"] is None, _head)
+_was = _hn.collapsed()
+_hn.handle(_types.SimpleNamespace(type='F1', value='PRESS', unicode=""))
+_c1_ = _hn.collapsed()
+_hn.handle(_types.SimpleNamespace(type='SLASH', value='PRESS', unicode="?"))
+check("hints: F1 or ? collapses the panel and brings it back", _c1_ != _was and _hn.collapsed() == _was)
+_reg = lambda t, x, y, w, h: _types.SimpleNamespace(type=t, x=x, y=y, width=w, height=h)
+_win = _reg('WINDOW', 0, 21, 1200, 800)
+_side = [_reg('TOOLS', 0, 21, 44, 800), _reg('UI', 900, 21, 300, 800)]
+_ins_hidden = _hn._insets(_types.SimpleNamespace(regions=[_win] + _side + [_reg('HUD', 0, 0, 280, 287)]), _win)
+_ins = _hn._insets(_types.SimpleNamespace(regions=[_win] + _side + [_reg('HUD', 54, 31, 260, 120)]), _win)
+check("hints: the free width excludes the toolbar and the sidebar; a hidden redo panel (parked below the view, "
+      "still sized) is ignored, a shown one is found", _ins_hidden == (44, 300, None) and _ins == (44, 300, (54, 314, 130)),
+      f"{_ins_hidden} {_ins}")
+_p0 = _hn.place(400, 90, 1200, _ins_hidden)
+_p1 = _hn.place(400, 90, 1200, _ins)
+_p2 = _hn.place(700, 90, 1200, _ins)
+check("hints: the panel sits centred at the bottom of the free width; beside a shown redo panel when there is room, "
+      "else above it", _p0 == (272, 10) and _p1 == (407, 10) and _p2 == (122, 140), f"{_p0} {_p1} {_p2}")
+# every converted tool fills the panel: the sketch tools through their modal code
+f = _ln_tool(start_mode="TANGENT")
+_at(f, (1.6, 1.7))
+_sp = _hn.HUD["spec"]
+_grp = [r[0] for r in _sp["rows"]] if _sp else []
+_start = [i for r in _sp["rows"] if r[0] == "Start" for i in r[1]] if _sp else []
+check("hints: Draw Line shows its groups, the start mode lit, a short header",
+      _grp == ["Type", "Direction", "Start", "Reference", "Polyline"] and _start and _start[0]["current"] == "tangent"
+      and fc.area.text.startswith("Line  ·  click the start") and "Backspace" not in fc.area.text, f"{_grp} {fc.area.text}")
+f.modal(fc, _ev('ESC'))
+check("hints: leaving the tool clears the header and the panel", fc.area.text is None and _hn.HUD["spec"] is None)
+_cvh = _fake(_dt.NPROTO_OT_draw_curve, mode="CV", degree="3", closed=False, start_cont="G1", end_cont="G2",
+             edge_mode="EDGE")
+_cvh._edit, _cvh._pts, _cvh._snapinfo, _cvh._frames, _cvh._start_refs = None, [], [], {}, None
+_cvh.sketch_start(fc)
+_cvh._status(fc)
+_ends = [i for r in _hn.HUD["spec"]["rows"] if r[0] == "Ends" for i in r[1]]
+check("hints: CV Curve shows start / end continuity as choices with the current ones lit",
+      [e["current"] for e in _ends] == ["G1", "G2"] and fc.area.text.startswith("CV Curve"), str(_ends))
+_cvh.sketch_end(fc)
+from blender_nurbs import ops_trim as _otm
+_efr = _otm.NPROTO_OT_edge_fillet.pick_rows(_types.SimpleNamespace(
+    _picks=[], _ties=[], pick_min=1, extra_keys=_otm.NPROTO_OT_edge_fillet.extra_keys,
+    extra_help=_otm.NPROTO_OT_edge_fillet.extra_help))
+check("hints: a picking tool lists its own keys and its advice (Edge Fillet: Alt+click, A)",
+      [r[0] for r in _efr] == ["Pick", "Also", ""] and [i["keys"] for i in _efr[1][1]] == [["Alt+LMB"], ["A"]]
+      and "un-pick" in _efr[2][1][0]["note"], str(_efr))
+
+# number-pad digits (and the top-row ones under Emulate Numpad, which arrive as number-pad keys): they change the
+# view until the first click, then they type the value
+f = _ln_tool()
+_pass0 = _dt.SketchMixin.passthrough(f, fc, _ev('NUMPAD_3'))
+_click(f, (-1.5, 1.6))
+_pass1 = _dt.SketchMixin.passthrough(f, fc, _ev('NUMPAD_3'))
+for _t in ('NUMPAD_3', 'NUMPAD_PERIOD', 'NUMPAD_5'):
+    f.modal(fc, _ev(_t, _wpx(0.5, 1.6)))
+_typed = f._buf
+f.modal(fc, _ev('RET', _wpx(0.5, 1.6)))
+_L0 = f._lines[0] if f._lines else (np.zeros(3), np.zeros(3))
+check("Line: number-pad digits change the view before the first click, then type the length (3.5 placed)",
+      _pass0 and not _pass1 and _typed == "3.5" and abs(np.linalg.norm(_L0[1] - _L0[0]) - _dt.parse_length(ctx, "3.5")) < 1e-9,
+      f"{_pass0} {_pass1} '{_typed}' {_L0}")
+f.modal(fc, _ev('ESC'))
+
+# --- G2 loft to the untrimmed side of a trimmed surface (a spoon's bowl to its handle): that side is exact,
+#     whole or cut short by the trim, so the loft is exact at any Samples; two exact layouts are matched exactly
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+from blender_nurbs import contlabels as _clb
+_tb = [nurbs(f"TB{k}", [(x, -w, 0.0), (x, 0, 0.5 + 0.3 * (k == 1)), (x, w, 0.0)], order=3)
+       for k, (x, w) in enumerate(((-2.0, 1.0), (0.0, 1.5), (2.0, 1.0)))]
+bpy.ops.nproto.loft(inputs=ins(*[(c_, "S0") for c_ in _tb])); _tbw = ctx.active_object; _tbw.name = "TB_Bowl"
+_tcut = poly("TB_cut", [(1.2, -3, 5), (1.2, 3, 5)])
+bpy.ops.object.select_all(action='DESELECT')
+bpy.ops.nproto.trim(action="KEEP", target="TB_Bowl", cutters=ins((_tcut, "S0")), ref_point=(0, 0, 0.6),
+                    normal=(0, 0, 1), view_dir=(0, 0, -1), projection="Z")
+_e_end = _trim_edge(_tbw, lambda m: abs(m.x + 2.0) < 1e-4)                 # the first section: a whole side
+_e_long = _trim_edge(_tbw, lambda m: m.y < -0.9 and m.x < 1.0)             # a long side, cut short at x = 1.2
+_e_cut = _trim_edge(_tbw, lambda m: abs(m.x - 1.2) < 1e-3)                 # the trim curve itself
+_iso_end, _iso_long = features.brep_edge_iso(_tbw, _e_end), features.brep_edge_iso(_tbw, _e_long)
+check("a trimmed surface's untouched side is found as that side of its surface (whole, or the stretch the trim "
+      "left), the trim curve is not", not store.is_natural(_tbw) and _iso_end is not None and _iso_end[2:] == (0.0, 1.0)
+      and _iso_long is not None and 0.0 <= _iso_long[2] < _iso_long[3] < 1.0 and (_iso_long[3] - _iso_long[2]) > 0.7
+      and features.brep_edge_iso(_tbw, _e_cut) is None, f"{_iso_end and _iso_end[1:]} {_iso_long and _iso_long[1:]}")
+
+
+def _plate(name, a, b, d, direction):
+    pl_ = poly(name, [a, b])
+    bpy.ops.nproto.extrude(inputs=ins((pl_, "S0")), distance=d, direction=direction)
+    return ctx.active_object
+
+
+def _near_side(o, test):
+    s_ = store.get_surfaces(o)[0]; M_ = geom.world_matrix(o)
+    for e_ in ("U0", "U1", "V0", "V1"):
+        if test(M_ @ Vector(geom.boundary_points(s_, e_, 3)[1])):
+            return e_
+
+
+_pe = _plate("TB_pe", (-5, -0.8, 0.3), (-5, 0.8, 0.3), 2.0, "X")             # up to x = -3, facing the first section
+_pl = _plate("TB_pl", (-1.5, -4.5, 0.2), (0.5, -4.5, 0.2), 1.5, "Y")         # up to y = -3, facing the long side
+_res = {}
+for _nm, _p_, _side, _e in (("whole side", _pe, _near_side(_pe, lambda m: abs(m.x + 3) < 1e-6), _e_end),
+                            ("side cut short", _pl, _near_side(_pl, lambda m: abs(m.y + 3) < 1e-6), _e_long)):
+    _lay = set()
+    for _smp in (5, 9, 24):
+        r = bpy.ops.nproto.loft(inputs=json.dumps([[_p_.name, _side], [_tbw.name, _e]]), cont_a="G2", cont_b="G2",
+                                samples=_smp)
+        _lo = ctx.active_object
+        _d = ext.surface_cvs(store.get_surfaces(_lo)[0])
+        _lay.add((_d["degree_v"], _d["count_v"], tuple(round(k_, 9) for k_ in _d["knots_v"])))
+        _m = [_clb.measure(_lo, _p_, _side, 2), _clb.measure(_lo, _tbw, _e, 2)]
+        _res.setdefault(_nm, []).append((r, max(m_["angle"] for m_ in _m), max(m_["curv"] for m_ in _m),
+                                         max(m_["gap"] for m_ in _m)))
+    _res[_nm + " layouts"] = _lay
+_Gl = np.array(ext.surface_cvs(store.get_surfaces(_lo)[0])["points"]).reshape(_d["count_u"], _d["count_v"], 3)
+_gap = lambda i: float(np.mean(np.linalg.norm(_Gl[i + 1] - _Gl[i], axis=1)))
+_ratio = _gap(0) / _gap(_d["count_u"] - 2)
+check("G2 loft to a trimmed surface's side: its tangent rows as long as the plate's (both tangent 1) -- they were "
+      "11x too short, the loft hugged the bowl and turned sharply away", 0.5 < _ratio < 2.0,
+      f"first gaps {_gap(0):.4f} / {_gap(_d['count_u'] - 2):.4f}")
+check("G2 loft to a trimmed bowl's untouched side (whole, and cut short by the trim): exact at any Samples -- one "
+      "layout (the bowl's, the plate's line raised to it), angle and curvature at rounding",
+      all(len(_res[k_ + " layouts"]) == 1 and next(iter(_res[k_ + " layouts"]))[0] == 2
+          and all(r_ == {'FINISHED'} and a_ < 1e-4 and c_ < 1e-5 and g_ < 1e-9 for r_, a_, c_, g_ in _res[k_])
+          for k_ in ("whole side", "side cut short")), str(_res))
+# exactness of the tools: a side cut to a stretch, two sides put on one layout -- the same curves
+_rng = np.random.default_rng(7)
+_side3 = {"deg": 3, "knots": [0, 0, 0, 0, 0.3, 0.6, 1, 1, 1, 1], "P": _rng.normal(size=(6, 3)),
+          "D": _rng.normal(size=(6, 3)), "DD": _rng.normal(size=(6, 3))}
+_side2 = {"deg": 2, "knots": [0, 0, 0, 0.5, 1, 1, 1], "P": _rng.normal(size=(4, 3)), "D": _rng.normal(size=(4, 3)),
+          "DD": None}
+def _ev_side(sd_, key, t):
+    c_ = ext.curve_from_cvs(int(sd_["deg"]), [tuple(map(float, p_)) for p_ in sd_[key]], [float(k_) for k_ in sd_["knots"]], None)
+    return np.array(c_.evaluate(float(t)), float)
+_sub = geom.sub_side(_side3, 0.2, 0.75)
+_err_sub = max(np.linalg.norm(_ev_side(_sub, k_, t_) - _ev_side(_side3, k_, 0.2 + 0.55 * t_))
+               for k_ in ("P", "D", "DD") for t_ in np.linspace(0, 1, 11))
+_c2, _c3 = geom.compatible_sides(_side2, _side3)
+_err_cmp = max(max(np.linalg.norm(_ev_side(_c2, k_, t_) - _ev_side(_side2, k_, t_)) for k_ in ("P", "D") for t_ in np.linspace(0, 1, 11)),
+               max(np.linalg.norm(_ev_side(_c3, k_, t_) - _ev_side(_side3, k_, t_)) for k_ in ("P", "D", "DD") for t_ in np.linspace(0, 1, 11)))
+check("exact sides: cut to a stretch, and two layouts (degree 2 and 3) put on one, the curves don't move",
+      _err_sub < 1e-12 and _err_cmp < 1e-12 and _c2["deg"] == _c3["deg"] == 3 and _c2["knots"] == _c3["knots"]
+      and _c2["DD"] is None, f"{_err_sub:.1e} {_err_cmp:.1e}")
+# second derivatives at a surface's border: z = -(1 - u)^3 has z_uu = 0 at u = 1, z_uuu = 6 (the old one-sided
+# difference gave the value half a step inside: -3e-5)
+from blender_nurbs import square as _sqr
+_cub = ext.surface_from_cvs(3, 1, [(x_, y_, z_) for x_, z_ in ((0, -1), (1 / 3, 0), (2 / 3, 0), (1, 0)) for y_ in (0, 1)],
+                            [0, 0, 0, 0, 1, 1, 1, 1], [0, 0, 1, 1])
+_d2 = _sqr._second(_cub, 1.0, 0.5)[2]
+_d2i = _sqr._second(_cub, 0.5, 0.5)[2]
+check("second derivatives at a surface's border are second-order accurate (z_uu = 0 at u = 1, -3 at u = 0.5)",
+      abs(_d2[2]) < 1e-7 and abs(_d2i[2] + 3.0) < 1e-6, f"{_d2} {_d2i}")
+
+# --- Degree, not Order: the Curve box (degree, CVs, spans; Degree buttons keep the CVs) and knot ticks on the comb
+from blender_nurbs import curvetools as _ctl, diagnostics as _dgn
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+_q2 = nurbs("DG_Q2", [(0, 0, 0), (1, 1.5, 0), (3, 1.2, 0), (4.5, 0, 0)], order=3)   # degree 2, two spans
+_q3 = nurbs("DG_Q3", [(0, 0, 0), (1, 1.5, 0), (2, 2.0, 0), (3, 1.5, 0), (4, 0, 0)], order=4)
+_pl = poly("DG_PL", [(0, 0, 0), (2, 0, 0), (3, 1, 0)])
+_i2, _i3 = _ctl.spline_info(_q2.data.splines[0]), _ctl.spline_info(_q3.data.splines[0])
+check("Curve box: an Order U 3 spline reads as degree 2 with 2 spans and a note on its comb; degree 3 has none",
+      (_i2["degree"], _i2["cvs"], _i2["spans"], _i2["kind"]) == (2, 4, 2, "open") and _ctl.degree_note(_i2)
+      and (_i3["degree"], _i3["spans"]) == (3, 2) and _ctl.degree_note(_i3) is None, f"{_i2} {_i3}")
+_mk = lambda o: _dgn.comb_knots(o, 64)[0]
+_k2, _k3, _kp = _mk(_q2), _mk(_q3), _mk(_pl)
+_P2, _K2 = _dgn.comb_data(_q2, 64)[0]
+_kap2 = np.linalg.norm(_K2, axis=1)
+_step = float(np.max(np.abs(np.diff(_kap2))))
+check("comb: a tick at every knot -- orange where a degree-2 curve's curvature jumps, grey on degree 3, red at a "
+      "polyline's bend; the jump is drawn as a step", [k_[2] for k_ in _k2] == ["jump"]
+      and [k_[2] for k_ in _k3] == ["smooth"] and [k_[2] for k_ in _kp] == ["corner"]
+      and _step > 0.05 * float(_kap2.max()), f"{[k_[2] for k_ in _k2]} {[k_[2] for k_ in _k3]} {[k_[2] for k_ in _kp]} step {_step:.3f}")
+ctx.view_layer.objects.active = _q2
+r = bpy.ops.nproto.curve_degree(degree=3, spline=0)
+_ord = _q2.data.splines[0].order_u
+r2 = bpy.ops.nproto.curve_degree(degree=4, spline=0)
+check("Degree buttons: degree 3 sets Order U 4 on the same 4 CVs; degree 4 needs 5 CVs and is refused",
+      r == {'FINISHED'} and _ord == 4 and len(_q2.data.splines[0].points) == 4 and r2 == {'CANCELLED'}
+      and _q2.data.splines[0].order_u == 4)
+_q2.data.splines[0].order_u = 3
+
+
+class _RecLay:
+    def __init__(self, rec): object.__setattr__(self, "_rec", rec)
+    def __setattr__(self, k, v): pass
+    def __getattr__(self, name):
+        rec = self._rec
+        def f(*a, **k):
+            if name == "operator":
+                e = {"op": a[0], "text": k.get("text"), "depress": k.get("depress"), "props": {}}
+                rec.append(e)
+                return _FakeProps(e["props"])
+            if name == "label":
+                rec.append({"label": k.get("text", a[0] if a else "")})
+            return _RecLay(rec)
+        return f
+
+
+_rec = []
+_ctl.draw_curve_info(_RecLay(_rec), ctx, _q2)
+_labels = [e["label"] for e in _rec if "label" in e]
+_degs = [e for e in _rec if e.get("op") == "nproto.curve_degree"]
+_reb = [e for e in _rec if e.get("op") == "nproto.rebuild_curve"]
+check("Curve box draws: degree / CVs / spans, Degree 1-5 with 2 pressed, Blender's Order U beside it, the note and "
+      "Rebuild as degree 3", any("degree 2 · 4 CVs · 2 span(s)" in l_ for l_ in _labels)
+      and [e["text"] for e in _degs] == ["1", "2", "3", "4", "5"] and [e["depress"] for e in _degs].index(True) == 1
+      and any("Order U 3" in l_ for l_ in _labels) and any(l_.startswith("Degree 2: the curvature jumps or kinks") for l_ in _labels)
+      and len(_reb) == 1 and _reb[0]["props"] == {"rc_degree": "3", "rc_cvs": 0}, str(_rec))
+ctx.view_layer.objects.active = _q2
+for o in ctx.selected_objects:
+    o.select_set(False)
+_q2.select_set(True)
+r = bpy.ops.nproto.rebuild_curve(rc_degree="3", rc_cvs=0)
+_kr = _dgn.comb_knots(_q2, 64)[0]
+check("Rebuild as degree 3 (the box's button) leaves no curvature jump on the comb",
+      r == {'FINISHED'} and _q2.data.splines[0].order_u == 4 and all(k_[2] == "smooth" for k_ in _kr),
+      f"{r} order {_q2.data.splines[0].order_u} {[k_[2] for k_ in _kr]}")
+
+# --- While drawing: the comb on the CV Curve preview (K), the sidebar usable (mouse moves pass through),
+#     Emulate Numpad's top-row digits set the degree; Body / Face / Edge at the right of the tool header;
+#     a G-label click while the feature's redo panel is up changes the value there
+_v = ctx.window_manager.nproto_view
+_comb0 = _v.show_comb
+_v.show_comb = False
+_cvk = _fake(_dt.NPROTO_OT_draw_curve, mode="CV", degree="2", closed=False, start_cont="G0", end_cont="G0",
+             edge_mode="EDGE")
+_cvk._edit, _cvk._pts, _cvk._snapinfo, _cvk._frames, _cvk._start_refs = None, [], [], {}, None
+_cvk.sketch_start(fc)
+for _q in ((-1.5, -1.5), (-0.5, 1.2), (0.7, 1.0), (1.6, -1.2)):
+    _cvk.modal(fc, _ev('MOUSEMOVE', _wpx(*_q), 'NOTHING'))
+    _cvk.modal(fc, _ev('LEFTMOUSE', _wpx(*_q)))
+_cvk.modal(fc, _ev('MOUSEMOVE', _wpx(1.8, -1.8), 'NOTHING'))
+_no_comb = _drw.sketch_overlay.get("comb")
+_cvk.modal(fc, _ev('K', _wpx(1.8, -1.8)))
+_cg = _drw.sketch_overlay.get("comb")
+_show = _v.show_comb
+_khint = [i for r in _hn.HUD["spec"]["rows"] if r[0] == "Show" for i in r[1]] if _hn.HUD["spec"] else []
+check("CV Curve: K turns the curvature comb on the curve being drawn on (the Analyze switch), with its knot ticks",
+      _no_comb is None and _show and _cg is not None and len(_cg[0]) > 20 and len(_cg[1]) > 20
+      and len(_cg[2]["jump"]) >= 2 and _khint and _khint[0]["current"] == "on",
+      f"{_no_comb is None} {_show} {None if _cg is None else (len(_cg[0]), {k: len(v_) for k, v_ in _cg[2].items()})}")
+_out = _types.SimpleNamespace(type='MOUSEMOVE', value='NOTHING', mouse_x=1500.0, mouse_y=500.0, shift=False, ctrl=False,
+                              alt=False, oskey=False, unicode="")
+_inn = _types.SimpleNamespace(type='MOUSEMOVE', value='NOTHING', mouse_x=500.0, mouse_y=500.0, shift=False, ctrl=False,
+                              alt=False, oskey=False, unicode="")
+check("sketch tools: a mouse move over the sidebar goes to the UI (its buttons respond), one in the view does not",
+      _dt.SketchMixin.passthrough(_cvk, fc, _out) and not _dt.SketchMixin.passthrough(_cvk, fc, _inn))
+_emu = ctx.preferences.inputs.use_emulate_numpad
+ctx.preferences.inputs.use_emulate_numpad = True
+_np_mine = _dt.SketchMixin.passthrough(_cvk, fc, _ev('NUMPAD_4'))
+_cvk.modal(fc, _ev('NUMPAD_4', _wpx(1.8, -1.8)))
+_deg4 = _cvk.degree
+ctx.preferences.inputs.use_emulate_numpad = False
+_np_view = _dt.SketchMixin.passthrough(_cvk, fc, _ev('NUMPAD_4'))
+ctx.preferences.inputs.use_emulate_numpad = _emu
+check("CV Curve: with Emulate Numpad the top-row digits (sent as number-pad keys) set the degree; without it the "
+      "number pad still changes the view", not _np_mine and _deg4 == "4" and _np_view, f"{_np_mine} {_deg4} {_np_view}")
+_cvk.modal(fc, _ev('ESC'))
+_v.show_comb = _comb0
+check("leaving CV Curve clears the comb preview", _drw.sketch_overlay.get("comb") is None)
+from blender_nurbs import subsel as _ssl
+_hdr = bpy.types.VIEW3D_HT_tool_header._dyn_ui_initialize()
+_dts = bpy.types.VIEW3D_HT_tool_header.draw_tool_settings
+_calls = []
+_orig_dts = getattr(_dts, "_nproto_orig", None)
+if _orig_dts is not None:
+    _dts._nproto_orig = lambda self, c: _calls.append("blender")
+    _sv = _ssl.draw_tool_header
+    _ssl.draw_tool_header = lambda self, c: _calls.append("nurbs")
+    try:
+        _dts(None, ctx)
+    finally:
+        _dts._nproto_orig, _ssl.draw_tool_header = _orig_dts, _sv
+check("Body / Face / Edge come right after Blender's tool settings (before the spacer and Options), not at either "
+      "end of the tool header", getattr(_dts, "_nproto_wrapped", False) and _calls == ["blender", "nurbs"]
+      and _ssl.draw_tool_header not in _hdr, f"{_calls} {[f.__name__ for f in _hdr]}")
+# the redo panel's operator: the last one run, when it made the active feature
+_lft = bpy.data.objects.new("RD_loft", None)
+ctx.collection.objects.link(_lft)
+_lft[features.PROP_HIST] = json.dumps({"op": "loft", "refs": [], "params": {"cont_a": "G0"}})
+ctx.view_layer.objects.active = _lft
+
+
+class _FOpProps:
+    def __init__(self):
+        self.cont_a = "G0"
+        self.bl_rna = _types.SimpleNamespace(properties={"cont_a": None})
+
+
+_fop = _types.SimpleNamespace(bl_idname="NPROTO_OT_loft", name="Loft", properties=_FOpProps())
+_fctx = _types.SimpleNamespace(window_manager=_types.SimpleNamespace(operators=[_fop]), view_layer=ctx.view_layer)
+_got = _clb.redo_operator(_fctx, _lft)
+_fctx2 = _types.SimpleNamespace(window_manager=_types.SimpleNamespace(
+    operators=[_types.SimpleNamespace(bl_idname="VIEW3D_OT_select")]), view_layer=ctx.view_layer)
+check("label click: the redo panel's operator is found only while it is the last one run and made the active "
+      "feature", _got is _fop and _clb.redo_operator(_fctx2, _lft) is None)
+bpy.data.objects.remove(_lft)
+# _in_view: a hidden redo panel (parked below the view, still sized) does not hide the view's corner
+from blender_nurbs.ops import PickMixin as _PM
+_reg2 = lambda t, x, y, w, h: _types.SimpleNamespace(type=t, x=x, y=y, width=w, height=h)
+_ar = _types.SimpleNamespace(regions=[_reg2('WINDOW', 0, 21, 1200, 800), _reg2('HUD', 0, 0, 280, 287)])
+_ar2 = _types.SimpleNamespace(regions=[_reg2('WINDOW', 0, 21, 1200, 800), _reg2('HUD', 10, 31, 280, 287)])
+_evc = _types.SimpleNamespace(mouse_x=100.0, mouse_y=100.0)
+check("a click in the view's bottom-left corner reaches the tool when the redo panel is hidden, not when it shows",
+      _PM._in_view(_types.SimpleNamespace(area=_ar), _evc) and not _PM._in_view(_types.SimpleNamespace(area=_ar2), _evc))
 
 print("ALL OK" if ok else "SOME FAILED")

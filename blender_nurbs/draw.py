@@ -12,11 +12,10 @@ _handle_px = None
 _label_cache = {}
 pick_overlay = {"hover": None, "picked": []}  # filled by the modal pick operator
 # filled by the sketch tools (CV Curve / Line): world-space polylines and points
-sketch_overlay = {"curves": [], "hull": [], "cvs": [], "snap": None, "snap_label": None, "guide": [], "axes": [],
-                  "refs": [], "cursor": None}
+sketch_overlay = {"curves": [], "hull": [], "cvs": [], "snap": None, "snap_label": None, "axes": [],
+                  "refs": [], "cursor": None, "comb": None}
 COL_CURSOR = (1.0, 1.0, 1.0, 1.0)
 COL_SNAP = (0.25, 1.0, 0.45, 1.0)
-COL_GUIDE = (0.6, 0.6, 0.6, 0.8)
 
 COL_EDGE = (0.05, 0.05, 0.05, 1.0)
 COL_EDGE_SEL = (1.0, 0.55, 0.1, 1.0)
@@ -31,6 +30,8 @@ COL_GHOST = (0.2, 0.85, 1.0, 0.9)
 # ghost; an object hidden with H while active is not one
 ghost = {"name": None}
 COL_HOVER = (1.0, 0.95, 0.2, 1.0)
+# the curve a drawing tool is making: as thin as the curvature comb outline
+SKETCH_W = 1.5
 COL_PICKS = [(0.1, 0.8, 1.0, 1.0), (1.0, 0.25, 0.6, 1.0), (0.3, 1.0, 0.4, 1.0)]
 
 
@@ -318,16 +319,17 @@ def _draw():
     if pick_overlay["hover"]:
         _draw_lines(_lines_from_polylines([pick_overlay["hover"]], _IDENT), COL_HOVER, 4.0)
     so = sketch_overlay
-    if so["guide"]:
-        _draw_lines(_lines_from_polylines([so["guide"]], _IDENT), COL_GUIDE, 1.0)
     for pl, col in so.get("axes") or []:          # X / Y / Z lock: the axis (or the plane's two axes)
         _draw_lines(_lines_from_polylines([pl], _IDENT), col, 1.5)
     for pl, col, w in so.get("refs") or []:       # the edge (white) / face (beige) a G1 / G2 end follows
         _draw_lines(_lines_from_polylines([pl], _IDENT), col, w)
+    if so.get("comb"):                     # CV Curve with the comb on: under the curve being drawn
+        from . import diagnostics
+        diagnostics.draw_comb_geometry(_draw_lines, so["comb"])
     if so["hull"]:
         _draw_lines(_lines_from_polylines([so["hull"]], _IDENT), COL_HULL, 1.5)
     for pl in so["curves"]:
-        _draw_lines(_lines_from_polylines([pl], _IDENT), COL_HOVER, 3.0)
+        _draw_lines(_lines_from_polylines([pl], _IDENT), COL_HOVER, SKETCH_W)
     if so["cvs"]:
         _draw_points(so["cvs"], COL_CV, 7.0)
     if so["snap"] is not None:
@@ -359,7 +361,8 @@ def _draw_paused(ctx, region):
     font = 0
     blf.size(font, 13)
     w, h = blf.dimensions(font, txt)
-    x, y = (region.width - w) / 2, 28
+    from . import hints
+    x, y = (region.width - w) / 2, max(28, hints.HUD["top"] + 14)     # above a tool's key hints
     sh = gpu.shader.from_builtin('UNIFORM_COLOR')
     gpu.state.blend_set('ALPHA')
     sh.uniform_float("color", (0.05, 0.05, 0.05, 0.75))
@@ -380,6 +383,11 @@ def _draw_px():
     region, rv3d = ctx.region, ctx.region_data
     if rv3d is None:
         return
+    from . import hints
+    try:
+        hints.draw(ctx, region, _box)
+    except Exception as exc:
+        print("NURBS key hints:", exc)
     _draw_paused(ctx, region)
     _draw_snap_label(region, rv3d)
     from . import contcheck

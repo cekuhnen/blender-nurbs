@@ -651,12 +651,14 @@ class NPROTO_OT_trim_curves(bpy.types.Operator):
                                        [[Vector(p) for p in self._samples[k][0]] for k in self._cutters])
 
     def _status(self, context, extra=""):
+        from . import hints
         who = "all visible curves" if self._cutter_names is None else "the selected curves"
+        rows = [("Trim", [hints.toggle("V", "apparent (as seen in this view)", self._apparent),
+                          hints.key("Backspace", "undo"), hints.key("Enter", "done")])]
         if self._edit:
-            who += "; Edit Mode: only the curves being edited are trimmed"
-        context.area.header_text_set(
-            f"Trim Curves: click the part to delete (cut by {who}{', apparent' if self._apparent else ''})"
-            f"{extra}   LMB trim · V apparent · Backspace undo · Enter/RMB done · Esc cancel")
+            rows.append(("", [hints.note("Edit Mode: only the curves being edited are trimmed.")]))
+        hints.show(context, "Trim Curves", [f"click the part to delete (cut by {who})", extra.strip(" ·")], rows,
+                   [("MOUSE_LMB", "Trim"), ("MOUSE_RMB", "Done"), ("EVENT_ESC", "Undo all")])
 
     def _hit(self, context, event, max_px=18.0):
         from bpy_extras import view3d_utils
@@ -744,16 +746,20 @@ class NPROTO_OT_trim_curves(bpy.types.Operator):
         self._load(context)
 
     def _end(self, context):
+        from . import hints
         draw.pick_overlay["picked"] = []
         draw.pick_overlay["hover"] = None
-        context.area.header_text_set(None)
-        context.area.tag_redraw()
+        hints.clear(context)
 
     def modal(self, context, event):
         from .ops import PickMixin
         if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM'}:
             return {'PASS_THROUGH'}
-        if event.type in {'LEFTMOUSE', 'RIGHTMOUSE'} and not PickMixin._in_view(context, event):
+        from . import hints
+        if hints.handle(event):
+            context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+        if event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MOUSEMOVE'} and not PickMixin._in_view(context, event):
             return {'PASS_THROUGH'}
         if event.type == 'MOUSEMOVE':
             self._hover_update(context, event)

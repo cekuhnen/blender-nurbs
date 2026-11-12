@@ -110,27 +110,30 @@ def _foot(surf, q, uv0=None):
 
 
 def _second(surf, u, v):
-    """Su, Sv, Suu, Suv, Svv by finite differences of the first derivatives
-    (one-sided at the domain border)."""
+    """Su, Sv, Suu, Suv, Svv by finite differences of the first derivatives:
+    central inside the domain, the second-order one-sided formula at its border
+    (where every edge of an untrimmed surface lies). A plain one-sided
+    difference there is the derivative half a step inside: 0.7 % off in the
+    cross curvature of a G2 loft's edge, which changes fast across it."""
     (u0, u1), (v0, v1) = surf.u_domain(), surf.v_domain()
     hu, hv = 1e-5 * (u1 - u0), 1e-5 * (v1 - v0)
     _, su, sv = (np.array(x, float) for x in surf.derivatives(u, v))
 
-    def d(axis):
-        if axis == 0:
-            a, b = max(u - hu, u0), min(u + hu, u1)
-            _, sua, sva = surf.derivatives(a, v)
-            _, sub, svb = surf.derivatives(b, v)
-            return (np.array(sub) - np.array(sua)) / (b - a), (np.array(svb) - np.array(sva)) / (b - a)
-        a, b = max(v - hv, v0), min(v + hv, v1)
-        _, sua, _ = surf.derivatives(u, a)
-        _, sub, _ = surf.derivatives(u, b)
-        _, _, sva = surf.derivatives(u, a)
-        _, _, svb = surf.derivatives(u, b)
-        return (np.array(sub) - np.array(sua)) / (b - a), (np.array(svb) - np.array(sva)) / (b - a)
+    def at(uu, vv):
+        _, a, b = surf.derivatives(uu, vv)
+        return np.array(a, float), np.array(b, float)
 
-    suu, svu = d(0)
-    suv, svv = d(1)
+    def d(t, lo, hi, h, f):
+        """(dSu, dSv) along one parameter at t (f(t) gives the first derivatives)."""
+        if t - h >= lo and t + h <= hi:
+            (a0, b0), (a1, b1) = f(t - h), f(t + h)
+            return (a1 - a0) / (2 * h), (b1 - b0) / (2 * h)
+        s_ = 1.0 if t - h < lo else -1.0          # step into the domain
+        (a1, b1), (a2, b2) = f(t + s_ * h), f(t + 2 * s_ * h)
+        return (s_ * (-3 * su + 4 * a1 - a2) / (2 * h), s_ * (-3 * sv + 4 * b1 - b2) / (2 * h))
+
+    suu, svu = d(u, u0, u1, hu, lambda t: at(t, v))
+    suv, svv = d(v, v0, v1, hv, lambda t: at(u, t))
     return su, sv, suu, 0.5 * (suv + svu), svv
 
 

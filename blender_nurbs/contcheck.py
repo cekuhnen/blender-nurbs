@@ -841,21 +841,26 @@ class NPROTO_OT_continuity(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def _status(self, context, extra=""):
+        from . import hints
         v = context.window_manager.nproto_view
         if self._first is not None:
-            msg = f"Continuity: {self._first[0].name} {self._first[1]} -- pick the edge it meets"
+            msg = f"{self._first[0].name} {self._first[1]}: pick the edge it meets"
         else:
-            msg = "Continuity: click an edge (a joined edge, or a surface edge); click a checked edge to remove it"
-        context.area.header_text_set(
-            f"{msg}{extra}   ·   showing {v.cont_level} (0 / 1 / 2)   ·   comb +/-   ·   C clear   ·   "
-            "Tab cycle overlapping   ·   Enter / Esc done")
+            msg = "click an edge (a joined edge, or a surface edge); click a checked edge to remove it"
+        rows = [("Show", [hints.cycle("0 1 2", ["G0", "G1", "G2"], v.cont_level),
+                          hints.key("+ -", "comb size")]),
+                ("Edges", [hints.key("Tab", "cycle overlapping", on=True if len(self._ties) > 1 else None),
+                           hints.key("Backspace", "undo"), hints.key("C", "clear all")])]
+        hints.show(context, "Continuity", [msg, extra.strip(" ·")], rows,
+                   [("MOUSE_LMB", "Pick edge"), ("EVENT_RETURN", "Done"), ("EVENT_ESC", "Done")])
 
     def _end(self, context):
         TOOL["running"], TOOL["stop"] = False, False
         _drop_pending()
         draw.pick_overlay["hover"] = None
         if context.area is not None:
-            context.area.header_text_set(None)
+            from . import hints
+            hints.clear(context)
         _redraw(context)
 
     def modal(self, context, event):
@@ -866,8 +871,12 @@ class NPROTO_OT_continuity(bpy.types.Operator):
             return {'CANCELLED'}
         if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM'}:
             return {'PASS_THROUGH'}
-        if event.type in {'LEFTMOUSE', 'RIGHTMOUSE'} and not PickMixin._in_view(context, event):
+        if event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MOUSEMOVE'} and not PickMixin._in_view(context, event):
             return {'PASS_THROUGH'}
+        from . import hints
+        if hints.handle(event):
+            context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
         if event.type == 'MOUSEMOVE':
             self._hover(context, event)
             return {'RUNNING_MODAL'}

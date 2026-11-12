@@ -4,7 +4,9 @@
   kernel): a "hair" at every sample, length = curvature x scale, pointing away
   from the centre of curvature, plus the envelope through the hair tips.
   Inflections show as the comb switching sides, curvature jumps (G1 joins) as
-  steps in the envelope.
+  steps in the envelope. Knots (where spans meet) get a tick across the curve:
+  grey where the curve is smooth there, orange where its curvature jumps (a
+  degree-2 curve does at every knot), red at a corner.
 * Zebra stripes on NURBS surfaces: reflection stripes computed per pixel by a
   small GPU shader (any shading mode, materials untouched). Stripes run
   vertically or horizontally on screen. G0 -> stripes break, G1 -> stripes
@@ -30,29 +32,82 @@ COMB_HAIR_W = 1.0
 COMB_ENV_W = 1.5
 COMB_SPAN = 0.2
 COL_COMB, COL_ENVELOPE = COMB_HAIR, COMB_ENVELOPE
+KNOT_COL = {"smooth": (0.78, 0.78, 0.78, 0.75), "jump": (1.0, 0.6, 0.15, 1.0), "corner": (1.0, 0.2, 0.2, 1.0)}
+KNOT_JUMP = 0.01        # curvature changing by more than 1 % across a knot counts as a jump
+KNOT_CORNER_DEG = 0.05  # the tangent turning by more than this across a knot is a corner
+KNOT_TICK = 0.03        # tick half-length, times the curve's size
 
 
 # --------------------------------------------------------------------------
 # Curvature comb
 # --------------------------------------------------------------------------
 
-def curvature_samples(kcurve, n):
+def _frame(sm, kcurve, t):
+    """(point, first derivative, curvature vector) at t."""
+    d = sm.evaluate_curve(kcurve, float(t))
+    p = np.array(d["point"], float)
+    d1 = np.array(d["tangent"], float)
+    d2 = np.array(d["curvature"], float)
+    s = float(d1 @ d1)
+    k = np.cross(np.cross(d1, d2), d1) / (s * s) if s > 1e-30 else np.zeros(3)
+    return p, d1, k
+
+
+def interior_knots(kcurve):
+    """The curve's knots strictly inside its range (where its spans meet)."""
+    from . import store
+    _, ext = store._k()
+    t0, t1 = kcurve.parameter_range()
+    eps = 1e-12 * (t1 - t0)
+    return sorted({float(k) for k in ext.curve_cvs(kcurve)["knots"] if t0 + eps < k < t1 - eps})
+
+
+def curvature_samples(kcurve, n, knots=()):
     """(points, curvature vectors) along a kernel curve: kappa = |k|, k points to
-    the centre of curvature. Uses the exact 1st / 2nd derivatives."""
+    the centre of curvature. Uses the exact 1st / 2nd derivatives. knots: also
+    sampled a hair before and after each (a jump there draws as a clean step)."""
     from .kernel import load
     sm = load()
     t0, t1 = kcurve.parameter_range()
+    h = 1e-7 * (t1 - t0)
+    ts = sorted(set(np.linspace(t0, t1, n).tolist()) | {t for k in knots for t in (k - h, k + h)})
     P, Kv = [], []
-    for t in np.linspace(t0, t1, n):
-        d = sm.evaluate_curve(kcurve, float(t))
-        p = np.array(d["point"], float)
-        d1 = np.array(d["tangent"], float)
-        d2 = np.array(d["curvature"], float)
-        s = float(d1 @ d1)
-        k = np.cross(np.cross(d1, d2), d1) / (s * s) if s > 1e-30 else np.zeros(3)
+    for t in ts:
+        p, _, k = _frame(sm, kcurve, t)
         P.append(p)
         Kv.append(k)
     return np.array(P), np.array(Kv)
+
+
+def knot_marks(kcurve, knots, ref):
+    """[(point, unit tick direction, kind)] at the knots: "corner" (the tangent
+    turns), "jump" (the curvature jumps: G1 there), "smooth". ref: the curve's
+    largest curvature (a jump must be a sizeable part of it)."""
+    from .kernel import load
+    sm = load()
+    t0, t1 = kcurve.parameter_range()
+    h = 1e-7 * (t1 - t0)
+    out = []
+    for k in knots:
+        p, da, ka = _frame(sm, kcurve, k - h)
+        _, db, kb = _frame(sm, kcurve, k + h)
+        cosang = float(da @ db) / ((np.linalg.norm(da) * np.linalg.norm(db)) or 1.0)
+        ang = float(np.degrees(np.arccos(min(1.0, max(-1.0, cosang)))))
+        mag = max(float(np.linalg.norm(ka)), float(np.linalg.norm(kb)))
+        if ang > KNOT_CORNER_DEG:
+            kind = "corner"
+        elif float(np.linalg.norm(kb - ka)) > KNOT_JUMP * max(mag, 0.05 * ref):
+            kind = "jump"
+        else:
+            kind = "smooth"
+        n_ = ka if np.linalg.norm(ka) >= np.linalg.norm(kb) else kb
+        if np.linalg.norm(n_) <= 1e-12 * max(ref, 1e-30):
+            t = da / (np.linalg.norm(da) or 1.0)
+            n_ = np.cross(t, (0.0, 0.0, 1.0))
+            if np.linalg.norm(n_) < 1e-6:
+                n_ = np.cross(t, (1.0, 0.0, 0.0))
+        out.append((p, n_ / (np.linalg.norm(n_) or 1.0), kind))
+    return out
 
 
 _comb_cache = {}
@@ -78,22 +133,71 @@ def _curve_key(obj):
     return hash(tuple(parts))
 
 
-def comb_data(obj, samples):
-    """Cached comb samples for every spline of a curve object (world space)."""
+def _comb_entry(obj, samples):
     key = (_curve_key(obj), samples)
     hit = _comb_cache.get(obj.session_uid)
     if hit and hit[0] == key:
-        return hit[1]
-    out = []
+        return hit
+    out, marks = [], []
     M = geom.world_matrix(obj)
     for sp in obj.data.splines:
         try:
             kc = geom.spline_to_kernel_curve(sp, M)
-            out.append(curvature_samples(kc, samples))
+            ks = interior_knots(kc)
+            P, Kv = curvature_samples(kc, samples, ks)
+            out.append((P, Kv))
+            marks.append(knot_marks(kc, ks, float(np.linalg.norm(Kv, axis=1).max())))
         except Exception:
             continue
-    _comb_cache[obj.session_uid] = (key, out)
-    return out
+    hit = _comb_cache[obj.session_uid] = (key, out, marks)
+    return hit
+
+
+def comb_data(obj, samples):
+    """Cached comb samples for every spline of a curve object (world space)."""
+    return _comb_entry(obj, samples)[1]
+
+
+def comb_knots(obj, samples):
+    """Cached knot marks for every spline (see knot_marks)."""
+    return _comb_entry(obj, samples)[2]
+
+
+def comb_geometry(P, Kv, marks, scale):
+    """Line pairs of one comb: (hairs, envelope, {kind: knot ticks}). Scale 1:
+    the longest hair is a fifth of the curve's size."""
+    kap = np.linalg.norm(Kv, axis=1)
+    size = float(np.linalg.norm(np.ptp(P, axis=0))) or 1.0
+    ref = float(kap.max()) or 1.0
+    L = scale * COMB_SPAN * size / ref
+    tips = P - L * Kv                     # hairs point away from the centre of curvature
+    hairs, env = [], []
+    for a, b in zip(P, tips):
+        hairs += [Vector(a), Vector(b)]
+    for a, b in zip(tips[:-1], tips[1:]):
+        env += [Vector(a), Vector(b)]
+    w = KNOT_TICK * size
+    ticks = {k: [] for k in KNOT_COL}
+    for p, n_, kd in marks:
+        ticks[kd] += [Vector(p - w * n_), Vector(p + w * n_)]
+    return hairs, env, ticks
+
+
+def draw_comb_geometry(draw_lines, geo):
+    """Draw comb_geometry(): green hairs, magenta envelope, knot ticks (grey
+    smooth, orange curvature jump, red corner)."""
+    hairs, env, ticks = geo
+    draw_lines(hairs, COMB_HAIR, COMB_HAIR_W)
+    draw_lines(env, COMB_ENVELOPE, COMB_ENV_W)
+    for kind in ("smooth", "jump", "corner"):
+        draw_lines(ticks.get(kind, []), KNOT_COL[kind], 1.5 if kind == "smooth" else 2.5)
+
+
+def kernel_comb(kc, samples, scale):
+    """comb_geometry() of a kernel curve (the sketch tools' live preview)."""
+    ks = interior_knots(kc)
+    P, Kv = curvature_samples(kc, samples, ks)
+    return comb_geometry(P, Kv, knot_marks(kc, ks, float(np.linalg.norm(Kv, axis=1).max())), scale)
 
 
 def draw_combs(ctx, draw_lines):
@@ -108,23 +212,11 @@ def draw_combs(ctx, draw_lines):
     for obj in objs:
         try:
             data = comb_data(obj, int(v.comb_samples))
+            marks = comb_knots(obj, int(v.comb_samples))
         except Exception:
             continue
-        # Scale 1: the longest hair is a fifth of the curve's size
-        for P, Kv in data:
-            kap = np.linalg.norm(Kv, axis=1)
-            size = float(np.linalg.norm(np.ptp(P, axis=0))) or 1.0
-            ref = float(kap.max()) or 1.0
-            L = v.comb_scale * COMB_SPAN * size / ref
-            tips = P - L * Kv                     # hairs point away from the centre of curvature
-            hairs = []
-            for a, b in zip(P, tips):
-                hairs += [Vector(a), Vector(b)]
-            env = []
-            for a, b in zip(tips[:-1], tips[1:]):
-                env += [Vector(a), Vector(b)]
-            draw_lines(hairs, COMB_HAIR, COMB_HAIR_W)
-            draw_lines(env, COMB_ENVELOPE, COMB_ENV_W)
+        for si, (P, Kv) in enumerate(data):
+            draw_comb_geometry(draw_lines, comb_geometry(P, Kv, marks[si] if si < len(marks) else (), v.comb_scale))
     gpu.state.depth_test_set('LESS_EQUAL')
 
 

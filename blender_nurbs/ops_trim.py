@@ -96,22 +96,34 @@ class NPROTO_OT_trim(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def _status(self, context, extra=""):
+        from . import hints
         if self._stage == 0:
-            msg = "Trim: click the surface region to keep / discard (Action and Project in F9)"
+            state = ["click the surface region to keep / discard", "Action and Project in F9"]
         else:
-            msg = (f"Trim {self._target.name}: pick cutting curves / edges, or click a cutting surface"
-                   f" ({len(self._cuts)} picked) · Enter to trim")
-        context.area.header_text_set(msg + extra + "   Tab cycle overlaps · Backspace undo · Esc cancel")
+            state = [f"{self._target.name}: pick cutting curves / edges, or click a cutting surface",
+                     f"{len(self._cuts)} picked"]
+        state.append(extra.strip(" ·[]"))
+        rows = [("Pick", [hints.key("Tab", "cycle overlapping", on=True if getattr(self, "_ties", None) else None),
+                          hints.key("Backspace", "undo"),
+                          hints.key("Enter", "trim", on=True if self._stage and self._cuts else False)])]
+        hints.show(context, "Trim", state, rows, [("MOUSE_LMB", "Pick"), ("EVENT_ESC", "Cancel")])
 
     def _end(self, context):
+        from . import hints
         draw.pick_overlay["picked"] = []
         draw.pick_overlay["hover"] = None
-        context.area.header_text_set(None)
-        context.area.tag_redraw()
+        hints.clear(context)
 
     def modal(self, context, event):
         if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM'}:
             return {'PASS_THROUGH'}
+        from .ops import PickMixin
+        if event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MOUSEMOVE'} and not PickMixin._in_view(context, event):
+            return {'PASS_THROUGH'}            # the sidebar / headers stay usable
+        from . import hints
+        if hints.handle(event):
+            context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
         if event.type in {'ESC', 'RIGHTMOUSE'} and event.value == 'PRESS':
             self._end(context)
             return {'CANCELLED'}
@@ -842,7 +854,8 @@ class NPROTO_OT_edge_fillet(AskValue, PickMixin, bpy.types.Operator):
     pick_max = 4096
     finish_on_min = False
     toggle_picks = True
-    extra_help = " · tangent chains picked together (Alt+click: single edge) · click again to un-pick · A all · Enter fillet"
+    extra_keys = [("Alt+LMB", "single edge"), ("A", "all edges")]
+    extra_help = "Tangent chains are picked together; click a picked edge again to un-pick it. Enter fillets."
 
     inputs: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     fit_pending: BoolProperty(options={'HIDDEN', 'SKIP_SAVE'})  # set by invoke: check the radius once

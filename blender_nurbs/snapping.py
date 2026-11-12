@@ -31,7 +31,7 @@ SNAP_PX = 12.0
 TIE_PX = 1.5            # targets this close in rank count as overlapping: nearest the viewer wins
 BONUS = {"first": 4.0, "end": 4.0, "mid": 2.0, "center": 2.0, "cv": 0.0}
 LABELS = {"first": "Close", "end": "End", "mid": "Mid", "center": "Center", "cv": "CV",
-          "edge": "Edge", "curve": "On Curve"}
+          "edge": "Edge", "curve": "On Curve", "perp": "Perpendicular", "tan": "Tangent"}
 CURVE_PER = 32          # samples per Bezier span for the on-curve search
 CENTER_ACC = 1e-6       # kernel centroid accuracy (1e-3 left a disk's centre 4e-6 off)
 _CENTERS = {}           # session_uid -> (rev, {face index: local centre or None})
@@ -160,6 +160,28 @@ class Targets:
         k = hit[_choose(dist[hit], (za + s * (zb - za))[hit])]
         W, refine, kind, src, _ = self._lines[self.owner[k]]
         return np.asarray(refine(int(self.seg[k]), float(s[k])), float), kind, None, src
+
+    def near_lines(self, view, mouse, radius, limit=3):
+        """[(line index, distance in px)] of the curves / edges passing within
+        `radius` px of the mouse, nearest first."""
+        if not len(self.A):
+            return []
+        mouse = np.asarray(mouse, float)
+        a, _, oka = view.project(self.A)
+        b, _, okb = view.project(self.B)
+        dv = b - a
+        s = np.clip(((mouse - a) * dv).sum(axis=1) / np.maximum((dv * dv).sum(axis=1), 1e-18), 0.0, 1.0)
+        dist = np.linalg.norm(a + s[:, None] * dv - mouse, axis=1)
+        best = {}
+        for i in np.flatnonzero(oka & okb & (dist <= radius)):
+            k = int(self.owner[i])
+            if self._lines[k][3] is not None and (k not in best or dist[i] < best[k]):
+                best[k] = float(dist[i])
+        return sorted(best.items(), key=lambda kv: kv[1])[:limit]
+
+    def line_info(self, k):
+        """(world polyline, src) of line k."""
+        return self._lines[k][0], self._lines[k][3]
 
     def line_index(self, name, ref):
         """Index of the curve / surface edge (object name, ref), or None."""

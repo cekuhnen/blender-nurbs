@@ -8,7 +8,9 @@ from bpy.props import FloatVectorProperty, BoolProperty, EnumProperty, FloatProp
 from bpy_extras import view3d_utils
 from mathutils import Vector
 
-from . import draw, features, geom, store
+from . import draw, features, geom, hints, store
+
+MOUSE_PICK = [("MOUSE_LMB", "Pick"), ("EVENT_RETURN", "Finish"), ("EVENT_ESC", "Cancel")]
 from .kernel import load as load_kernel
 
 CONT_ITEMS = [
@@ -183,14 +185,36 @@ class PickMixin:
 
     def _status(self, context):
         n = len(self._picks)
-        msg = f"{self.bl_label}: pick input {n + 1}" + (
-            f" (Enter to finish)" if n >= self.pick_min else "")
+        state = [f"pick input {n + 1}", "Enter to finish" if n >= self.pick_min else ""]
         ties = getattr(self, "_ties", [])
         if len(ties) > 1:
             cur = ties[self._cycle % len(ties)]
-            msg += f"   [{cur[0].name} {cur[1]} · {len(ties)} overlapping, Tab to cycle]"
-        context.area.header_text_set(msg + "   LMB pick · Shift+LMB keep picking · Backspace undo · Esc cancel"
-                                     + getattr(self, "extra_help", ""))
+            state.append(f"{cur[0].name} {cur[1]} · {len(ties)} overlapping")
+        hints.show(context, self.bl_label, state, self.pick_rows(), MOUSE_PICK)
+
+    def pick_rows(self):
+        """The picking keys for the hint panel (hints.py), plus the tool's own
+        (extra_keys: [(keys, text)]) and its advice (extra_help)."""
+        n = len(getattr(self, "_picks", []))
+        rows = [("Pick", [hints.key("Shift+LMB", "keep picking"),
+                          hints.key("Tab", "cycle overlapping", on=True if len(getattr(self, "_ties", [])) > 1 else None),
+                          hints.key("Backspace", "undo"),
+                          hints.key("Enter", "finish", on=True if n >= self.pick_min else False)])]
+        extra = getattr(self, "extra_keys", ())
+        if extra:
+            rows.append(("Also", [hints.key(k, t) for k, t in extra]))
+        tip = getattr(self, "extra_help", "").strip().strip("·").strip()
+        if tip.startswith("(") and tip.endswith(")"):
+            tip = tip[1:-1]
+        if tip:
+            rows.append(("", [hints.note(tip)]))
+        return rows
+
+    def hints_key(self, context, event):
+        if hints.handle(event):
+            context.area.tag_redraw()
+            return True
+        return False
 
     def _update_hover(self, context, event):
         ties = _near_candidates(context, event, self._cands)
@@ -220,13 +244,14 @@ class PickMixin:
     def _end(self, context):
         draw.pick_overlay["picked"] = []
         draw.pick_overlay["hover"] = None
-        context.area.header_text_set(None)
-        context.area.tag_redraw()
+        hints.clear(context)
 
     def modal(self, context, event):
         if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM'}:
             return {'PASS_THROUGH'}
-        if event.type in {'LEFTMOUSE', 'RIGHTMOUSE'} and not self._in_view(context, event):
+        if self.hints_key(context, event):
+            return {'RUNNING_MODAL'}
+        if event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MOUSEMOVE'} and not self._in_view(context, event):
             # a click on the sidebar / header (e.g. the CVs / Hulls toggle): let the UI have it
             return {'PASS_THROUGH'}
         if event.type == 'MOUSEMOVE':
@@ -293,6 +318,8 @@ class PickMixin:
             return False
         for r in area.regions:   # overlapping regions (region overlap draws the sidebar over the view)
             if r.type in {'UI', 'HEADER', 'TOOL_HEADER', 'TOOLS', 'HUD', 'ASSET_SHELF'} and r.width > 1 and r.height > 1:
+                if r.type == 'HUD' and r.y < win.y:
+                    continue         # a hidden Adjust Last Operation panel keeps its size, parked below the view
                 if r.x <= x < r.x + r.width and r.y <= y < r.y + r.height:
                     return False
         return True
@@ -615,9 +642,8 @@ class NPROTO_OT_planar(PickMixin, bpy.types.Operator):
     def _status(self, context):
         super()._status(context)
         if self._picks:
-            context.area.header_text_set(
-                f"Planar: {len(self._picks)} edge(s)/curve(s) picked, profile not closed yet · "
-                "keep picking (Enter fills what you have)   Tab cycle · Backspace undo · Esc cancel")
+            hints.show(context, "Planar", [f"{len(self._picks)} edge(s) / curve(s) picked, profile not closed yet",
+                                           "keep picking (Enter fills what you have)"], self.pick_rows(), MOUSE_PICK)
 
     def expand_pick(self, cand):
         obj, ref = cand[0], cand[1]

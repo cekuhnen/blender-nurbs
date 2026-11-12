@@ -8,7 +8,13 @@ CV Curve
   making a corner). Degree 1-5; C closes the curve (periodic).
 Line
   Two clicks per line; each line is its own 2-CV curve (or, with Polyline,
-  connected lines become one degree-1 curve).
+  connected lines become one degree-1 curve). Once the start is placed, the
+  end also snaps where the line meets a curve or edge at a right angle
+  (Perpendicular) or touches it (Tangent; planar curves, in their plane).
+  S: the start leaves tangent to, or square to, the curve it was snapped on;
+  such a start slides along that curve to meet a second curve Perpendicular /
+  Tangent (a line tangent to two circles). A / Shift+A over a line or curve:
+  the direction stays parallel / square to it (linesolve.py).
 
 Points land on the drawing plane: the grid plane in an axis-aligned
 orthographic view (Top / Front / Side), else the view plane, through the 3D
@@ -35,9 +41,12 @@ import math
 
 import numpy as np
 
-from . import curvejoin, curvetools, geom, snapping
+from . import curvejoin, curvetools, geom, hints, linesolve, snapping
 
 SNAP_PX = snapping.SNAP_PX
+SPECIAL_PX = 2.0 * SNAP_PX      # how near a Perpendicular / Tangent point the mouse must be
+MOUSE_SKETCH = [("MOUSE_LMB", "Place"), ("MOUSE_RMB", "Done"), ("EVENT_ESC", "Cancel")]
+MOUSE_SHAPE = [("MOUSE_LMB", "Place"), ("EVENT_ESC", "Cancel")]
 ANGLE_STEP = math.radians(15.0)
 
 
@@ -182,6 +191,19 @@ def build_spec_ends(clicks, mode, deg, ends):
     else:
         X, p, specs = align.align_open(S, max(1, min(deg, len(S) - 1)), ends)
     return spec([tuple(x) for x in X], order=p + 1), specs
+
+
+def preview_comb(sp, samples, scale):
+    """Curvature comb (diagnostics.comb_geometry) of a spline spec: the CV
+    Curve preview's, while it is drawn."""
+    from . import diagnostics, store
+    _, ext = store._k()
+    deg, P, W, U = geom.blender_nurbs_to_clamped(sp["points"], sp["weights"], sp["order"], sp["cyclic"],
+                                                 sp["endpoint"], sp["bezier"])
+    rational = any(abs(w - 1.0) > 1e-12 for w in W)
+    kc = ext.curve_from_cvs(int(deg), [tuple(map(float, q)) for q in P], [float(k) for k in U],
+                            [float(w) for w in W] if rational else None)
+    return diagnostics.kernel_comb(kc, samples, scale)
 
 
 def spec_polyline(sp, per=24):
@@ -375,6 +397,11 @@ from .primitives import PROFILE_SHAPES  # noqa: E402
 DEGREE_ITEMS = [(str(d), str(d), "") for d in range(1, curvejoin.MAX_DEGREE + 1)]
 MODE_ITEMS = [("CV", "CVs", "Every click places a control point"),
               ("THROUGH", "Through Points", "The curve passes through every click")]
+# number-pad keys that type a value once a tool takes typing (Blender's Emulate
+# Numpad sends the top-row digits as these too); before that they change the view
+DEGREE_PAD = {f"NUMPAD_{i}": i for i in range(1, 6)}
+NUMPAD_CHARS = {f"NUMPAD_{i}": str(i) for i in range(10)} | {
+    "NUMPAD_PERIOD": ".", "NUMPAD_MINUS": "-", "NUMPAD_PLUS": "+", "NUMPAD_SLASH": "/", "NUMPAD_ASTERIX": "*"}
 PASS_KEYS = {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM', 'MOUSEROTATE',
              'NDOF_MOTION', 'NUMPAD_0', 'NUMPAD_1', 'NUMPAD_2', 'NUMPAD_3', 'NUMPAD_4', 'NUMPAD_5', 'NUMPAD_6',
              'NUMPAD_7', 'NUMPAD_8', 'NUMPAD_9', 'NUMPAD_PERIOD', 'NUMPAD_PLUS', 'NUMPAD_MINUS', 'ACCENT_GRAVE'}
@@ -432,14 +459,36 @@ class SketchMixin:
         self._hover_cand = None
         self._edge_lock = None      # (object, ref): L locked the point onto this edge / curve
         self._last_edge = None      # the edge last slid along: it stays the reference at its ends
-        draw.sketch_overlay.update(curves=[], hull=[], cvs=[], snap=None, snap_label=None, guide=[], axes=[],
-                                   refs=[], cursor=None)
+        draw.sketch_overlay.update(curves=[], hull=[], cvs=[], snap=None, snap_label=None, axes=[],
+                                   refs=[], cursor=None, comb=None)
 
     def sketch_end(self, context):
-        draw.sketch_overlay.update(curves=[], hull=[], cvs=[], snap=None, snap_label=None, guide=[], axes=[],
-                                   refs=[], cursor=None)
-        context.area.header_text_set(None)
-        context.area.tag_redraw()
+        draw.sketch_overlay.update(curves=[], hull=[], cvs=[], snap=None, snap_label=None, axes=[],
+                                   refs=[], cursor=None, comb=None)
+        hints.clear(context)
+
+    # -- key hints (hints.py) shared by the sketch tools ----------------------
+    def direction_hints(self, extra=()):
+        """Direction keys; the active lock lit."""
+        lk = getattr(self, "_lock", None)
+        on = lambda c: True if c else None
+        return ([hints.key("H V", "horizontal / vertical", on=on(lk in ("H", "V"))),
+                 hints.key("X Y Z", "axis", on=on(lk in ("X", "Y", "Z"))),
+                 hints.key("Shift+X/Y/Z", "plane", on=on(lk in ("-X", "-Y", "-Z")))]
+                + list(extra) + [hints.key("Shift", "15°"), hints.key("Ctrl", "grid")])
+
+    def reference_hints(self, mode):
+        """Which edge / face an end follows: T next, L lock onto it, F edge or face."""
+        return [hints.key("T", "next edge / face"),
+                hints.key("L", "lock onto the edge", on=True if getattr(self, "_edge_lock", None) else None),
+                hints.cycle("F", ["edge", "face"], "face" if mode == "SURFACE" else "edge")]
+
+    def hints_key(self, context, event):
+        """? / F1: collapse or expand the key panel. True when handled."""
+        if hints.handle(event):
+            context.area.tag_redraw()
+            return True
+        return False
 
     # -- the 3D view's drawing region (the tool may be started from the sidebar,
     #    whose region is not the one we draw in) --------------------------
@@ -544,18 +593,20 @@ class SketchMixin:
             P, kind, src = self._snaps.slide(self._view(context), mouse, k)
             return P, (kind, None, src)
         lock = getattr(self, "_lock", None)
-        if lock and lock[-1] in "XYZT":
+        if lock and (lock[-1] in "XYZT" or (lock == "A" and prev is not None)):
             # world axis lock (X / Y / Z) or plane lock (Shift+X / Y / Z), from
-            # the previous point, or from the 3D cursor for the first one
+            # the previous point, or from the 3D cursor for the first one; a
+            # direction taken from a line (A) only once there is a previous point
             base = prev if prev is not None else np.array(context.scene.cursor.location, float)
             hit = self._snaps.pick(self._view(context), mouse, extra, edges=False)
             region, rv3d = self._win(context)
             ray = (np.array(view3d_utils.region_2d_to_origin_3d(region, rv3d, Vector(mouse)), float),
                    np.array(view3d_utils.region_2d_to_vector_3d(region, rv3d, Vector(mouse)), float))
             step = self._grid_step(context, base) if event.ctrl and hit is None else None
+            vec = getattr(self, "_tvec", None) if lock[-1] == "T" else getattr(self, "_avec", None) \
+                if lock == "A" else None
             P = axis_lock_point(lock, base, ray, None if hit is None else hit[0],
-                                self._ray_point(context, Vector(mouse), plane), step,
-                                getattr(self, "_tvec", None) if lock[-1] == "T" else None)
+                                self._ray_point(context, Vector(mouse), plane), step, vec)
             return P, None
         axis = None
         if prev is not None:
@@ -623,8 +674,11 @@ class SketchMixin:
 
     def lock_text(self):
         lk = getattr(self, "_lock", None)
+        if lk == "A":
+            return " · " + ("parallel to" if getattr(self, "_akind", "parallel") == "parallel" else "square to") \
+                + " the line (A)"
         if lk == "T":
-            return " · tangent to the edge"
+            return " · square to the edge" if getattr(self, "_tkind", "tangent") == "square" else " · tangent to the edge"
         if lk == "-T":
             return " · in the face's tangent plane"
         if lk and lk[-1] in "XYZ":
@@ -645,11 +699,13 @@ class SketchMixin:
         """Coloured guide lines of the active world axis lock through its base."""
         lk = getattr(self, "_lock", None)
         out = []
-        if lk and lk[-1] in "XYZT":
+        if lk and (lk[-1] in "XYZT" or (lk == "A" and prev is not None)):
             base = np.asarray(prev if prev is not None else context.scene.cursor.location, float)
             rv3d = self._win(context)[1]
             big = 50.0 * max(float(getattr(rv3d, "view_distance", 10.0)), 1e-3)
-            if lk[-1] == "T":
+            if lk == "A":
+                dirs, cols = [np.asarray(self._avec, float)], [COL_TANGENT]
+            elif lk[-1] == "T":
                 t = np.asarray(self._tvec, float)
                 dirs = plane_axes(t) if lk[0] == "-" else [t / (np.linalg.norm(t) or 1.0)]
                 cols = [COL_TANGENT] * len(dirs)
@@ -731,11 +787,30 @@ class SketchMixin:
         if self._plane is None:
             self._plane = self._view_plane(context, P)
 
+    def typing_ready(self):
+        """Typed values are taken now (the tool's first point is placed)."""
+        return False
+
+    def numpad_keys(self, event):
+        """Number-pad keys this tool uses itself (not the view)."""
+        return False
+
+    @staticmethod
+    def typed_char(event):
+        """The character a key press types: its text, or a number-pad key's."""
+        if event.value != 'PRESS':
+            return ""
+        return getattr(event, "unicode", "") or NUMPAD_CHARS.get(event.type, "")
+
     def passthrough(self, context, event):
         from .ops import PickMixin
+        if event.type in NUMPAD_CHARS and (self.typing_ready() or self.numpad_keys(event)):
+            return False            # a digit being typed (or a degree key), not a view change
         if event.type in PASS_KEYS:
             return True
-        return event.type in {'LEFTMOUSE', 'RIGHTMOUSE'} and not PickMixin._in_view(context, event)
+        # outside the view (the sidebar, a header): clicks and mouse moves go to
+        # the UI -- its buttons only respond after the mouse has moved over them
+        return event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MOUSEMOVE'} and not PickMixin._in_view(context, event)
 
 
 # --------------------------------------------------------------------------
@@ -749,6 +824,14 @@ EDGE_MODES = [("SURFACE", "Tangent to Surface", "On a surface edge the curve sta
                                                 "(G2: matches its normal curvature); curves are continued"),
               ("EDGE", "Continue Edge", "On a surface edge the curve continues the edge itself, like on a curve")]
 LAST_INFO = {"text": ""}
+START_MODES = [("FREE", "Free", "The line leaves its start in any direction"),
+               ("TANGENT", "Tangent", "A line started on an edge or curve leaves tangent to it, and slides along it "
+                                      "to meet a second curve Tangent / Perpendicular"),
+               ("PERP", "Perpendicular", "A line started on an edge or curve leaves square to it, and slides along "
+                                         "it to meet a second curve Tangent / Perpendicular")]
+START_TEXT = {"FREE": "free", "TANGENT": "tangent", "PERP": "perpendicular"}
+SLIDE_LABEL = {("tan", "tan"): "Tangent to both", ("perp", "perp"): "Perpendicular to both",
+               ("tan", "perp"): "Tangent · Perpendicular", ("perp", "tan"): "Perpendicular · Tangent"}
 
 
 class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
@@ -804,14 +887,20 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
 
     def _status(self, context):
         n = len(self._pts)
-        conds = "" if self.closed else f", start {self.start_cont} · end {self.end_cont}"
-        context.area.header_text_set(
-            f"CV Curve [{'CVs' if self.mode == 'CV' else 'Through Points'}, degree {self.degree}{conds}"
-            f"{self.lock_text()}]: {n} point(s)   "
-            "LMB place · Ctrl grid · Shift 15° · H/V horizontal/vertical · X/Y/Z axis · Shift+X/Y/Z plane · "
-            "S/E start/end G0-G2 · T which edge / face · L lock onto the edge · F face or edge "
-            f"[{'face' if self.edge_mode == 'SURFACE' else 'edge'}] · M mode · 1-5 degree · C close · "
-            "Backspace undo · Enter/RMB done · Esc cancel")
+        conts = ["G0", "G1", "G2"]
+        rows = [("Place", [hints.key("Backspace", "undo"), hints.toggle("C", "close", self.closed),
+                           hints.key("Enter", "done")]),
+                ("Direction", self.direction_hints())]
+        if not self.closed:
+            rows.append(("Ends", [hints.cycle("S", conts, self.start_cont, "start"),
+                                  hints.cycle("E", conts, self.end_cont, "end")]))
+        rows += [("Reference", self.reference_hints(self.edge_mode)),
+                 ("Curve", [hints.cycle("M", ["CVs", "through points"],
+                                        "CVs" if self.mode == "CV" else "through points"),
+                            hints.cycle("1-5", [str(d) for d in range(1, 6)], str(self.degree), "degree")]),
+                ("Show", [hints.toggle("K", "curvature comb",
+                                       bool(getattr(context.window_manager.nproto_view, "show_comb", False)))])]
+        hints.show(context, "CV Curve", [f"{n} point(s)", self.lock_text().strip(" ·")], rows, MOUSE_SKETCH)
 
     # -- end conditions ---------------------------------------------------
     def _cond(self, src, P, cont):
@@ -878,18 +967,28 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
         self.axis_guides(context, self._pts[-1] if self._pts else None)
         st = getattr(self, "_start_refs", None)
         self.show_refs([st["cands"][st["i"]]] if st and st["cands"] and not self.closed else [])
+        ov["comb"] = None
         if len(pts) >= 2:
             try:
                 sp, _ = self._spec(pts, [self._src(x) for x in sn])
                 ov["curves"] = [[Vector(p) for p in spec_polyline(sp, 16)]]
                 ov["hull"] = [Vector(p) for p in sp["points"]]
+                v = getattr(context.window_manager, "nproto_view", None)
+                if v is not None and v.show_comb:
+                    ov["comb"] = preview_comb(sp, int(v.comb_samples), v.comb_scale)
             except Exception:
                 pass
         context.area.tag_redraw()
 
+    def numpad_keys(self, event):
+        # Emulate Numpad sends the top-row 1-5 as number-pad keys: here they set the degree
+        return event.type in DEGREE_PAD and bpy.context.preferences.inputs.use_emulate_numpad
+
     def modal(self, context, event):
         if self.passthrough(context, event):
             return {'PASS_THROUGH'}
+        if self.hints_key(context, event):
+            return {'RUNNING_MODAL'}
         prev = self._pts[-1] if self._pts else None
         first = [(self._pts[0], None, "first")] if len(self._pts) >= 3 else []
         hover = lambda: self.pick_point(context, event, first, prev)
@@ -965,8 +1064,14 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
             self.mode = "THROUGH" if self.mode == "CV" else "CV"
             self._preview(context, hover())
             self._status(context)
-        elif event.value == 'PRESS' and event.type in {'ONE', 'TWO', 'THREE', 'FOUR', 'FIVE'}:
-            self.degree = str(['ONE', 'TWO', 'THREE', 'FOUR', 'FIVE'].index(event.type) + 1)
+        elif event.value == 'PRESS' and (event.type in {'ONE', 'TWO', 'THREE', 'FOUR', 'FIVE'}
+                                         or self.numpad_keys(event)):
+            self.degree = str(DEGREE_PAD.get(event.type) or ['ONE', 'TWO', 'THREE', 'FOUR', 'FIVE'].index(event.type) + 1)
+            self._preview(context, hover())
+            self._status(context)
+        elif event.value == 'PRESS' and event.type == 'K':
+            v = context.window_manager.nproto_view
+            v.show_comb = not v.show_comb             # the same switch as Analyze > Curvature Comb
             self._preview(context, hover())
             self._status(context)
         elif event.value == 'PRESS' and event.type == 'C':
@@ -1064,17 +1169,20 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
 
 class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
     """Draw straight lines: click the start, then click the end or type a
-    length (Tab: angle) and press Enter. H / V lock horizontal / vertical,
-    X / Y / Z a world axis (Shift+X / Y / Z: the plane of the other two),
-    Shift snaps to 15 degrees, Ctrl to the grid. S: a start snapped onto an
-    edge or curve leaves tangent to it (T picks which edge / face, F tangent to
-    the face or the edge). Each line is its own 2-CV curve"""
+    length (Tab: angle) and press Enter. The end snaps Perpendicular and
+    Tangent to curves and edges. H / V lock horizontal / vertical, X / Y / Z a
+    world axis (Shift+X / Y / Z: the plane of the other two), A / Shift+A
+    parallel / square to the line or curve under the mouse, Shift snaps to 15
+    degrees, Ctrl to the grid. S: a start snapped onto an edge or curve leaves
+    tangent or square to it, and slides along it to meet a second curve
+    Tangent / Perpendicular (T picks which edge / face, F the face or the
+    edge). Each line is its own 2-CV curve"""
     bl_idname = "nproto.draw_line"
     bl_label = "Line"
     bl_options = {'REGISTER', 'UNDO'}
 
-    start_cont: EnumProperty(name="Start", items=CONT_ITEMS[:2], default="G0", options={'HIDDEN'},
-                             description="G1: a line started on an edge or curve leaves tangent to it")
+    start_mode: EnumProperty(name="Start", items=START_MODES, default="FREE", options={'HIDDEN'},
+                             description="How a line started on an edge or curve leaves it")
     line_mode: EnumProperty(name="On Surface Edges", items=EDGE_MODES, default="EDGE", options={'HIDDEN'})
 
     polyline: BoolProperty(name="Polyline", default=False,
@@ -1094,6 +1202,8 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
         self._edit = _edit_target(context)
         self._lines, self._start, self._lock = [], None, None
         self._start_refs = None
+        self._seg_start = None          # where the line starts while the start slides (Tangent to both, ...)
+        self._curves, self._solved = {}, {}
         self._reset_typing()
         self.sketch_start(context)
         context.window_manager.modal_handler_add(self)
@@ -1101,6 +1211,9 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     # -- typed input ------------------------------------------------------
+    def typing_ready(self):
+        return getattr(self, "_start", None) is not None
+
     def _reset_typing(self):
         self._buf, self._field, self._len, self._ang = "", "LEN", None, None
         self._angle_lock = None
@@ -1121,18 +1234,31 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
     def _target(self, context, event):
         """End point under the mouse with locks, snapping and typed values."""
         L, A = self._live(context)
+        self._seg_start = None
         if self._start is not None:
             self._angle_lock = A
             if A is not None:
                 self._lock = None
         P, snap = self.pick_point(context, event, self._extra(), self._start)
+        if snap is not None and snap[0] == "cv" and snap[2] is None and P is not None:
+            # a CV that lies on its curve (a circle's quarter points): that curve is its reference
+            on = self._snaps.through(P)
+            if on:
+                src, cand, n = self._choose_ref(P, on[0][0], "cv")
+                self._hover_cand = cand
+                snap = (snap[0], snap[1], src, snap[3])
+        if self._start is not None and L is None and A is None:
+            sp = self._special(context, event, P, snap)
+            if sp is not None:
+                return sp
         if self._start is None or L is None:
             return P, snap
         O, n, u, v = self._plane
         if A is not None:
             d = math.cos(math.radians(A)) * u + math.sin(math.radians(A)) * v
-        elif getattr(self, "_lock", None) in ('H', 'V', 'X', 'Y', 'Z', 'T'):
-            d = {'H': u, 'V': v, 'T': np.asarray(getattr(self, "_tvec", u), float)}.get(self._lock, AXES.get(self._lock))
+        elif getattr(self, "_lock", None) in ('H', 'V', 'X', 'Y', 'Z', 'T', 'A'):
+            d = {'H': u, 'V': v, 'T': np.asarray(getattr(self, "_tvec", u), float),
+                 'A': np.asarray(getattr(self, "_avec", u), float)}.get(self._lock, AXES.get(self._lock))
             d = d / (np.linalg.norm(d) or 1.0)
             if P is not None and float((P - self._start) @ d) < 0:
                 d = -d
@@ -1145,10 +1271,10 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
     def _status(self, context, length=None, angle=None):
         us = context.scene.unit_settings
         fmt = lambda x: bpy.utils.units.to_string(us.system, 'LENGTH', x * (us.scale_length or 1.0), precision=4)
-        txt = f"Line: {len(self._lines)} drawn · " + (
-            ("click the next point (on the first one closes it)" if self.polyline and self._lines
-             and self._start is not None and np.linalg.norm(self._start - self._lines[-1][1]) <= 1e-9
-             else "place the end") if self._start is not None else "click the start")
+        step = (("click the next point (on the first one closes it)" if self.polyline and self._lines
+                 and self._start is not None and np.linalg.norm(self._start - self._lines[-1][1]) <= 1e-9
+                 else "place the end") if self._start is not None else "click the start")
+        state = [step, f"{len(self._lines)} drawn" if self._lines else ""]
         if self._start is not None:
             L, A = self._live(context)
             lt = (self._buf + "_" if self._field == "LEN" and self._buf else
@@ -1156,26 +1282,40 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
             at = (self._buf + "_" if self._field == "ANG" and self._buf else
                   (f"{A:g}°" if A is not None else (f"{angle:.1f}°" if angle is not None else "-")))
             mark = lambda f, t: f"[{t}]" if self._field == f else t
-            txt += f"   Length {mark('LEN', lt)}  Angle {mark('ANG', at)}{self.lock_text()}"
-        context.area.header_text_set(
-            txt + "   type a length · Tab angle · Enter place · H/V horizontal/vertical · X/Y/Z axis · "
-            "Shift+X/Y/Z plane · Shift 15° · Ctrl grid · "
-            f"S tangent start [{self.start_cont}] · T which edge / face · L lock onto the edge · "
-            f"F face or edge [{'face' if self.line_mode == 'SURFACE' else 'edge'}] · "
-            f"P polyline [{'on' if self.polyline else 'off'}] · Backspace undo · RMB done · Esc cancel")
+            state += [f"Length {mark('LEN', lt)}", f"Angle {mark('ANG', at)}"]
+        state.append(self.lock_text().strip(" ·"))
+        if self.start_mode != "FREE":
+            state.append(f"start {START_TEXT[self.start_mode]}")
+        lk, ak = getattr(self, "_lock", None), getattr(self, "_akind", None)
+        on = lambda c: True if c else None
+        ready = self._start is not None
+        rows = [("Type", [hints.key("123", "an exact length (3, 2' 6\", 10mm)" if ready else
+                                    "an exact length, after the first click",
+                                    on=on(ready and self._field == "LEN" and self._buf) if ready else False),
+                          hints.key("Tab", "switch to the angle", on=on(self._field == "ANG")),
+                          hints.key("Enter", "place it"), hints.key("Backspace", "delete / undo")]),
+                ("Direction", self.direction_hints([hints.key("A", "parallel", on=on(lk == "A" and ak == "parallel")),
+                                                    hints.key("Shift+A", "square",
+                                                              on=on(lk == "A" and ak == "square"))])),
+                ("Start", [hints.cycle("S", [START_TEXT[m[0]] for m in START_MODES], START_TEXT[self.start_mode])]),
+                ("Reference", self.reference_hints(self.line_mode)),
+                ("Polyline", [hints.toggle("P", "", self.polyline)])]
+        hints.show(context, "Line", state, rows, MOUSE_SKETCH)
 
-    # -- G1 start: tangent to the edge / curve it was snapped onto -----------
+    # -- Tangent / Perpendicular start: the edge / curve it was snapped onto ---
     def ref_mode(self):
         return self.line_mode
 
-    def _apply_tangent(self):
-        """Lock the line's direction to the start reference: along the edge's
-        tangent (continue it), or in the face's tangent plane."""
+    def _apply_start(self):
+        """Lock the line's direction to the start reference. Tangent: along the
+        edge's tangent (continue it), or in the face's tangent plane.
+        Perpendicular: square to the edge, in the curve's plane (a planar curve),
+        in the face's tangent plane (F), else in the drawing plane."""
         from . import align, store
         if getattr(self, "_lock", None) in ("T", "-T"):
             self._lock = None
         st = self._start_refs
-        if self._start is None or self.start_cont != "G1" or not st or not st["cands"]:
+        if self._start is None or self.start_mode == "FREE" or not st or not st["cands"]:
             return
         name, ref, snap, face = st["cands"][st["i"]]["src"]
         obj = bpy.data.objects.get(name)
@@ -1187,10 +1327,147 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
         except Exception as exc:
             print("Line: no tangent at", name, ref, exc)
             return
+        if self.start_mode == "PERP":
+            d = None
+            if mode == "SURFACE" and surf is not None:
+                d = np.cross(np.asarray(surf[0], float), D)
+            else:
+                c = self._curve((name, ref))
+                if c is not None:
+                    d = linesolve.side_direction(c, linesolve.nearest_t(c, self._start),
+                                                 self._plane[1] if self._plane is not None else None)
+            if d is not None and np.linalg.norm(d) > 1e-12:
+                self._lock, self._tvec, self._tkind = "T", np.asarray(d, float), "square"
+            return
         if mode == "SURFACE" and surf is not None:
-            self._lock, self._tvec = "-T", np.asarray(surf[0], float)
+            self._lock, self._tvec, self._tkind = "-T", np.asarray(surf[0], float), "tangent"
         elif np.linalg.norm(D) > 1e-12:
-            self._lock, self._tvec = "T", np.asarray(D, float)
+            self._lock, self._tvec, self._tkind = "T", np.asarray(D, float), "tangent"
+
+    # -- Perpendicular / Tangent end snaps -----------------------------------
+    def _curve(self, key):
+        """The curve / edge (object name, ref) for linesolve, cached; None if
+        it cannot be evaluated."""
+        if getattr(self, "_curves", None) is None:
+            self._curves = {}
+        if key not in self._curves:
+            from . import features, store
+            c = None
+            obj = bpy.data.objects.get(key[0])
+            if obj is not None:
+                try:
+                    c = linesolve.kernel_curve(features.input_curve(obj, key[1]), store._k()[0])
+                except Exception as exc:
+                    print("Line: cannot evaluate", key, exc)
+            self._curves[key] = c
+        return self._curves[key]
+
+    def _start_curve(self):
+        """(key, curve, t, kind) of a Tangent / Perpendicular start on a curve, or None."""
+        st = self._start_refs
+        if self.start_mode == "FREE" or not st or not st["cands"] or self._start is None:
+            return None
+        src = st["cands"][st["i"]]["src"]
+        key = (src[0], src[1])
+        c = self._curve(key)
+        if c is None:
+            return None
+        return key, c, linesolve.nearest_t(c, self._start), "tan" if self.start_mode == "TANGENT" else "perp"
+
+    def _solutions(self, key, c):
+        """[(kind label, start point, end point)] on curve `key` for the current
+        start: from the fixed start point, or -- a Tangent / Perpendicular start
+        on a curve -- sliding along that curve. Cached per start."""
+        sc = self._start_curve()
+        ck = (key, tuple(np.round(self._start, 12)), sc[0] if sc else None, sc[3] if sc else None,
+              self.line_mode, self._start_refs["i"] if sc else 0)
+        if getattr(self, "_solved", None) is None:
+            self._solved = {}
+        if ck in self._solved:
+            return self._solved[ck]
+        out = []
+        if sc is None:
+            for kind in ("perp", "tan"):
+                for _, Q in linesolve.from_point(c, self._start, kind):
+                    out.append((snapping.LABELS[kind], np.asarray(self._start, float), Q))
+        elif key != sc[0]:
+            k1 = sc[3]
+            for k2 in ("tan", "perp"):
+                for _, _, Q1, Q2 in linesolve.between(sc[1], k1, c, k2, linesolve.seeds_from(sc[1], sc[2], c)):
+                    out.append((SLIDE_LABEL[(k1, k2)], Q1, Q2))
+        self._solved[ck] = out
+        return out
+
+    def _special(self, context, event, P, snap):
+        """(end point, snap) when the mouse is near a point where the line
+        meets the curve / edge under it Perpendicular or Tangent, else None.
+        Not with a lock of your own, Ctrl, Shift or a lock onto an edge; a
+        point snap (end, middle, centre, CV) nearer the mouse still wins."""
+        if getattr(self, "_lock", None) not in (None, "T", "-T") or event.ctrl or event.shift \
+                or getattr(self, "_edge_lock", None) or getattr(self, "_angle_lock", None) is not None:
+            return None
+        view, mouse = self._view(context), self._mouse(context, event)
+        best = None
+        for k, _ in self._snaps.near_lines(view, mouse, SPECIAL_PX):
+            W, src = self._snaps.line_info(k)
+            c = self._curve((src[0], src[1]))
+            if c is None:
+                continue
+            for label, A, Q in self._solutions((src[0], src[1]), c):
+                q = self._to_px(context, Q)
+                if q is None:
+                    continue
+                d = float(np.linalg.norm(q - mouse))
+                if d <= SPECIAL_PX and (best is None or d < best[0]):
+                    best = (d, label, A, Q, W, src)
+        if best is None:
+            return None
+        if snap is not None and P is not None and snap[0] not in ("edge", "curve"):
+            q = self._to_px(context, P)
+            if q is not None and float(np.linalg.norm(q - mouse)) <= best[0]:
+                return None
+        d, label, A, Q, W, src = best
+        if np.linalg.norm(A - self._start) > 1e-12:
+            self._seg_start = A
+        self._hover_cand = {"src": tuple(src[:2]) + ("NEAREST", None), "edge": W, "face": None}
+        return Q, ("tan" if label.startswith("Tan") else "perp", None, tuple(src[:2]) + ("NEAREST", None), label)
+
+    # -- A / Shift+A: parallel / square to a line or curve ---------------------
+    def _direction_key(self, context, event):
+        """Lock the direction parallel (A) or square (Shift+A) to the line /
+        curve under the mouse, at the point nearest it; again: unlock."""
+        kind = "square" if event.shift else "parallel"
+        if getattr(self, "_lock", None) == "A" and getattr(self, "_akind", None) == kind:
+            self._lock = None
+            return
+        self._target(context, event)
+        cand = getattr(self, "_hover_cand", None)
+        key = tuple(cand["src"][:2]) if cand else None
+        W = cand["edge"] if cand else None
+        if key is None:
+            near = self._snaps.near_lines(self._view(context), self._mouse(context, event), SNAP_PX, limit=1)
+            if not near:
+                self.report({'INFO'}, "A: hover a line or curve to draw parallel / square to it")
+                return
+            W, src = self._snaps.line_info(near[0][0])
+            key = (src[0], src[1])
+        c = self._curve(key)
+        if c is None:
+            return
+        P = self._ray_point(context, Vector(self._mouse(context, event)),
+                            self._plane or self._view_plane(context, np.array(context.scene.cursor.location, float)))
+        t = linesolve.nearest_t(c, P if P is not None else c.W[0]) if not c.straight else c.t0
+        if kind == "parallel":
+            d = c.at(t)[2]
+        else:
+            plane = self._plane or self._view_plane(context, np.array(context.scene.cursor.location, float))
+            d = linesolve.side_direction(c, t, plane[1])
+        if d is None or np.linalg.norm(d) <= 1e-12:
+            return
+        self._lock, self._avec, self._akind = "A", np.asarray(d, float) / np.linalg.norm(d), kind
+        self._aref = [Vector(p) for p in W] if W is not None else None
+        self._angle_lock = None
+        self._edge_lock = None
 
     def _new_start_refs(self, snap):
         self._start_refs = dict(self._refs, cands=list(self._refs["cands"])) \
@@ -1206,33 +1483,35 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
         ov = draw.sketch_overlay
         lines = [[Vector(a), Vector(b)] for a, b in self._lines]
         length = angle = None
-        guide = []
+        a = self._seg_start if getattr(self, "_seg_start", None) is not None else self._start
         if self._start is not None and hover and hover[0] is not None:
-            lines.append([Vector(self._start), Vector(hover[0])])
-            d = hover[0] - self._start
+            lines.append([Vector(a), Vector(hover[0])])
+            d = hover[0] - a
             length = float(np.linalg.norm(d))
             if self._plane is not None:
                 O, n, u, v = self._plane
                 angle = plane_angle(d, u, v)
-                big = 1e3 * max(length, 1e-3)
-                guide = [Vector(self._start - big * u), Vector(self._start + big * u)]   # horizontal reference
         ov["curves"] = lines
-        ov["guide"] = guide
-        ov["cvs"] = [Vector(p) for ab in self._lines for p in ab] + ([Vector(self._start)] if self._start is not None else [])
+        ov["cvs"] = [Vector(p) for ab in self._lines for p in ab] + ([Vector(a)] if a is not None else [])
         ov["snap"] = Vector(hover[0]) if hover and hover[1] is not None else None
         ov["snap_label"] = hover[1][3] if hover and hover[1] is not None else None
         ov["cursor"] = Vector(hover[0]) if hover and hover[0] is not None else None
         self.axis_guides(context, self._start)
         st = getattr(self, "_start_refs", None)
-        self.show_refs([st["cands"][st["i"]]] if self._start is not None and st and st["cands"]
-                       and self.start_cont == "G1" else [])
+        extra = [st["cands"][st["i"]]] if self._start is not None and st and st["cands"] \
+            and self.start_mode != "FREE" else []
+        if getattr(self, "_lock", None) == "A" and getattr(self, "_aref", None):
+            extra.append({"edge": self._aref, "face": None})
+        self.show_refs(extra)
         self._status(context, length, angle)
         context.area.tag_redraw()
 
     def _commit(self, P, chain):
-        if np.linalg.norm(P - self._start) <= 1e-9:
+        a = self._seg_start if getattr(self, "_seg_start", None) is not None else self._start
+        if np.linalg.norm(P - a) <= 1e-9:
             return
-        self._lines.append((self._start, P))
+        self._lines.append((np.asarray(a, float), P))
+        self._seg_start = None
         # typed lines, and every line with Polyline on, chain on from their end
         self._start = next_start(self._lines, P, chain)
         self._reset_typing()
@@ -1243,10 +1522,12 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
     def modal(self, context, event):
         if self.passthrough(context, event):
             return {'PASS_THROUGH'}
+        if self.hints_key(context, event):
+            return {'RUNNING_MODAL'}
         if not hasattr(self, "_buf"):
             self._reset_typing()
         typing = self._start is not None
-        ch = event.unicode if event.value == 'PRESS' else ""
+        ch = self.typed_char(event)
         if typing and ch and (ch in "0123456789.-+*/'\"" or (self._buf and (ch.isalpha() or ch == " "))) \
                 and not (event.ctrl or event.alt or event.oskey):
             self._buf += ch
@@ -1266,7 +1547,7 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
                     self._lock = None            # an axis lock holds for one point
                 self._edge_lock = None           # so does a lock onto an edge
                 self._new_start_refs(snap)
-                self._apply_tangent()
+                self._apply_start()
             else:
                 self._commit(P, chain=self.polyline)     # Polyline: keep clicking to add segments
             self._preview(context, (P, None) if self._start is None else self._target(context, event))
@@ -1300,13 +1581,18 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
             self._ang = None
             self._preview(context, self._target(context, event))
         elif event.value == 'PRESS' and event.type == 'S' and not self._buf:
-            self.start_cont = "G0" if self.start_cont == "G1" else "G1"
-            self._apply_tangent()
+            order = [m[0] for m in START_MODES]
+            self.start_mode = order[(order.index(self.start_mode) + 1) % len(order)]
+            self._apply_start()
+            self._preview(context, self._target(context, event))
+        elif event.value == 'PRESS' and event.type == 'A' and not self._buf:
+            self._direction_key(context, event)
+            self._ang = None
             self._preview(context, self._target(context, event))
         elif event.value == 'PRESS' and event.type == 'T' and not self._buf:
             if self._start is not None and self._start_refs:
                 self.cycle_ref(self._start_refs)
-                self._apply_tangent()
+                self._apply_start()
             else:
                 self._target(context, event)
                 self.cycle_ref()
@@ -1323,7 +1609,7 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
                 self._choose_ref(self._start, src)
                 self._new_start_refs((None, None, src))
                 self._refs = None
-                self._apply_tangent()
+                self._apply_start()
             self._preview(context, self._target(context, event))
         elif event.value == 'PRESS' and event.type == 'P' and not self._buf:
             self.polyline = not self.polyline
@@ -1420,6 +1706,9 @@ class NPROTO_OT_draw_plane(SketchMixin, bpy.types.Operator):
         self._preview(context, self.pick_point(context, event))
         return {'RUNNING_MODAL'}
 
+    def typing_ready(self):
+        return getattr(self, "_start", None) is not None
+
     def _reset_typing(self):
         self._buf, self._field, self._sx, self._sy = "", "X", None, None
 
@@ -1445,8 +1734,8 @@ class NPROTO_OT_draw_plane(SketchMixin, bpy.types.Operator):
     def _status(self, context, rect=None):
         us = context.scene.unit_settings
         fmt = lambda x: bpy.utils.units.to_string(us.system, 'LENGTH', x * (us.scale_length or 1.0), precision=4)
-        txt = "Plane: " + ("click the opposite corner" if self._start is not None else
-                           "click the centre" if self.from_center else "click a corner")
+        state = ["click the opposite corner" if self._start is not None else
+                 "click the centre" if self.from_center else "click a corner"]
         if self._start is not None:
             X, Y = self._live(context)
             xs = (self._buf + "_" if self._field == "X" and self._buf else
@@ -1454,12 +1743,19 @@ class NPROTO_OT_draw_plane(SketchMixin, bpy.types.Operator):
             ys = (self._buf + "_" if self._field == "Y" and self._buf else
                   fmt(Y) if Y is not None else (fmt(rect[2]) if rect else "-"))
             mark = lambda f, t: f"[{t}]" if self._field == f else t
-            txt += f"   X {mark('X', xs)}  Y {mark('Y', ys)}"
-        context.area.header_text_set(
-            txt + f"   degree {self.degree_u} x {self.degree_v}, {self.spans_u} x {self.spans_v} span(s) · "
-            "type X · Tab Y · Enter place · "
-            f"C from centre [{'on' if self.from_center else 'off'}] · Shift square · Ctrl grid · "
-            "X/Y/Z axis (first click) · Backspace undo · Esc cancel")
+            state += [f"X {mark('X', xs)}", f"Y {mark('Y', ys)}"]
+        state.append(f"degree {self.degree_u} x {self.degree_v}, {self.spans_u} x {self.spans_v} span(s)")
+        lk = getattr(self, "_lock", None)
+        ready = self._start is not None
+        rows = [("Type", [hints.key("123", "an exact X size" if ready else "an exact X size, after the first click",
+                                    on=(True if self._field == "X" and self._buf else None) if ready else False),
+                          hints.key("Tab", "switch to the Y size", on=True if self._field == "Y" else None),
+                          hints.key("Enter", "place it"), hints.key("Backspace", "delete / undo")]),
+                ("Shape", [hints.toggle("C", "from centre", self.from_center), hints.key("Shift", "square"),
+                           hints.key("Ctrl", "grid")]),
+                ("Direction", [hints.key("X Y Z", "axis (first click)",
+                                         on=True if lk and lk[-1] in "XYZ" else None)])]
+        hints.show(context, "Plane", state, rows, MOUSE_SHAPE)
 
     def _preview(self, context, hover=None, event=None):
         ov = draw.sketch_overlay
@@ -1491,8 +1787,10 @@ class NPROTO_OT_draw_plane(SketchMixin, bpy.types.Operator):
     def modal(self, context, event):
         if self.passthrough(context, event):
             return {'PASS_THROUGH'}
+        if self.hints_key(context, event):
+            return {'RUNNING_MODAL'}
         typing = self._start is not None
-        ch = event.unicode if event.value == 'PRESS' else ""
+        ch = self.typed_char(event)
         if typing and ch and (ch in "0123456789.-+*/'\"" or (self._buf and (ch.isalpha() or ch == " "))) \
                 and not (event.ctrl or event.alt or event.oskey):
             self._buf += ch
@@ -1670,6 +1968,9 @@ class NPROTO_OT_draw_profile(SketchMixin, bpy.types.Operator):
                 out.append({"src": s3 + (None,), "edge": W, "face": None})
         return out
 
+    def typing_ready(self):
+        return getattr(self, "_center", None) is not None
+
     def _sizes(self):
         if self.shape in ("CIRCLE", "ELLIPSE"):
             return {"radius": self.radius, "radius2": self.radius2}
@@ -1738,16 +2039,22 @@ class NPROTO_OT_draw_profile(SketchMixin, bpy.types.Operator):
     def _status(self, context, sizes=None):
         us = context.scene.unit_settings
         fmt = lambda x: bpy.utils.units.to_string(us.system, 'LENGTH', x * (us.scale_length or 1.0), precision=4)
-        txt = f"Profile [{self.shape.title()}]: " + ("drag or type the size" if self._center is not None
-                                                     else "click on a curve or surface edge")
+        state = ["drag or type the size" if self._center is not None else "click on a curve or surface edge"]
         if self._center is not None and sizes:
-            txt += "   " + "  ".join(f"{k.replace('width', 'X').replace('depth', 'Y').title()} {fmt(v)}"
-                                     for k, v in sizes.items() if k in ("radius", "radius2", "width", "depth"))
+            state += [f"{k.replace('width', 'X').replace('depth', 'Y').title()} {fmt(v)}"
+                      for k, v in sizes.items() if k in ("radius", "radius2", "width", "depth")]
             if self._buf:
-                txt += f"   [{self._buf}_]"
-        context.area.header_text_set(
-            txt + "   C circle · E ellipse · S square · R rectangle · T which edge / face · L lock onto the edge · "
-            "type the size · Tab second size · Enter place · Ctrl grid · Esc cancel")
+                state.append(f"[{self._buf}_]")
+        rows = [("Shape", [hints.cycle("C E S R", [p[1].lower() for p in PROFILE_SHAPES], self.shape.lower())]),
+                ("Type", [hints.key("123", "an exact size" if self._center is not None else
+                                    "an exact size, after the first click",
+                                    on=None if self._center is not None else False),
+                          hints.key("Tab", "switch to the second size"),
+                          hints.key("Enter", "place it"), hints.key("Ctrl", "grid")]),
+                ("Reference", [hints.key("T", "next edge / face"),
+                               hints.key("L", "lock onto the edge",
+                                         on=True if getattr(self, "_edge_lock", None) else None)])]
+        hints.show(context, f"Profile ({self.shape.lower()})", state, rows, MOUSE_SHAPE)
 
     def _preview(self, context, event):
         from .primitives import profile_spec
@@ -1787,8 +2094,10 @@ class NPROTO_OT_draw_profile(SketchMixin, bpy.types.Operator):
     def modal(self, context, event):
         if self.passthrough(context, event):
             return {'PASS_THROUGH'}
+        if self.hints_key(context, event):
+            return {'RUNNING_MODAL'}
         placed = self._center is not None
-        ch = event.unicode if event.value == 'PRESS' else ""
+        ch = self.typed_char(event)
         if placed and ch and (ch in "0123456789.-+*/'\"" or (self._buf and (ch.isalpha() or ch == " "))) \
                 and not (event.ctrl or event.alt or event.oskey):
             self._buf += ch
