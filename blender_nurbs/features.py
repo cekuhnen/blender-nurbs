@@ -733,6 +733,20 @@ def history_inputs(obj):
     return [obj[k] for k in obj.keys() if k.startswith(("nproto_in_", "nproto_sin_")) and obj[k] is not None]
 
 
+def depends_on(obj, other, limit=500):
+    """Is obj built (directly or through other objects) from `other`?"""
+    seen, todo = set(), [obj]
+    while todo:
+        o = todo.pop()
+        for src in history_inputs(o):
+            if src is other:
+                return True
+            if src.name not in seen and len(seen) < limit:
+                seen.add(src.name)
+                todo.append(src)
+    return False
+
+
 # Features whose surface faces whichever way its inputs happen to run: built
 # from edges of other surfaces it is turned to face the same way as they do
 # (matcaps / shading / a later Join agree across the edges); Flip Normal turns

@@ -4561,6 +4561,36 @@ check("step focus: a step picked in the tree reads like a feature (Feature: <ste
 check("step focus: the fillet step knows its face (highlighted while open; CVs / Hulls shows just its net)",
       _sf_ok and _ssf.step_faces(_tj) == [], f"{_sf} areas {[round(f.area(), 3) for f in _tjf]}")
 
+# --- two surfaces trimmed by each other follow their inputs (the rebuild order does not matter) ---
+from blender_nurbs import history as _hist
+from blender_nurbs.contcheck import edge_kind as _ek_kind
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0); _mca = ctx.active_object
+_mca.location = (0, 2000, 0); ctx.view_layer.update()
+bpy.ops.nproto.extrude(inputs=ins((_mca, "S0")), distance=3.0, direction="Z"); _mA = ctx.active_object; _mA.name = "MT_A"
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=0.4); _mcb = ctx.active_object
+_mcb.location = (0, 2000, 1.5); _mcb.rotation_euler = (0, math.radians(90), 0); ctx.view_layer.update()
+bpy.ops.nproto.extrude(inputs=ins((_mcb, "S0")), distance=2.0, direction="X"); _mB = ctx.active_object; _mB.name = "MT_B"
+r1 = bpy.ops.nproto.trim(target="MT_A", cutters=json.dumps([["MT_B", "SURF"]]), ref_point=(1, 2000, 1.5),
+                         normal=(0, 0, 1), action="DELETE", scope="THROUGH")
+r2 = bpy.ops.nproto.trim(target="MT_B", cutters=json.dumps([["MT_A", "SURF"]]), ref_point=(0.5, 2000, 1.9),
+                         normal=(0, 0, 1), action="DELETE", scope="THROUGH")
+_sel(_mA, _mB); bpy.ops.nproto.join(tolerance=1e-3); _mj = ctx.active_object
+def _open_n(o):
+    return sum(1 for i in range(len(store.get_brep(o).edges())) if _ek_kind(o, f"E{i}") == "open")
+_mj_area0, _mj_open0, _mA_area0 = area(_mj), _open_n(_mj), area(_mA)
+_hp = json.loads(_mcb[features.PROP_HIST]); _hp["params"]["radius"] = 0.55
+_mcb[features.PROP_HIST] = json.dumps(_hp)
+features.rebuild(_mcb, ctx, force=True)
+for _o in (_mA, _mB, _mj):     # the order that broke: A first, while B still has its old shape
+    features.rebuild(_o, ctx)
+_mj_area1, _mj_open1, _mA_area1 = area(_mj), _open_n(_mj), area(_mA)
+# the hole in A is now the radius-0.55 crossing: A lost more area, the body still closes up along it
+check("two surfaces trimmed by each other, joined: changing one circle's radius re-trims BOTH (whichever rebuilds "
+      "first) and the joined body follows, still closed along the crossing",
+      r1 == {'FINISHED'} and r2 == {'FINISHED'} and _mj_open0 == 3 and _mj_open1 == 3
+      and _mA_area1 < _mA_area0 - 0.2 and abs(_mj_area1 - _mj_area0) > 0.05,
+      f"open {_mj_open0}->{_mj_open1} A {_mA_area0:.3f}->{_mA_area1:.3f} body {_mj_area0:.3f}->{_mj_area1:.3f}")
+
 # --- Class-A on a closed rim of two edges (a tilted cap on a round wall): light patches, no kernel fallback ---
 bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0); _cc2 = ctx.active_object
 _cc2.location = (0, 1200, -1); ctx.view_layer.update()

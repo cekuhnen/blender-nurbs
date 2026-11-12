@@ -45,7 +45,19 @@ def apply_trim(obj, text, inputs, p):
     curves, cutters = [], {}
     for src, ref_s in inputs:
         if ref_s == "SURF":
-            cutters[f"c{len(cutters)}"] = src
+            cutter = src
+            if features.depends_on(src, obj):
+                # two surfaces trimmed by each other: the cutter's trimmed shape is
+                # itself cut by this surface, so whichever of the two rebuilds first
+                # would cut with the other's OLD shape (and the pair stops following
+                # its inputs). Cut with its untrimmed shape as it is now.
+                try:
+                    bt = features.base_text(src)
+                except Exception:
+                    bt = None
+                if bt:
+                    cutter = (bt, jobs.xform(src))
+            cutters[f"c{len(cutters)}"] = cutter
         else:
             kc = features.input_curve(src, ref_s)
             cj = jobs.curve_json(kc)
