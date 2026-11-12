@@ -1555,9 +1555,10 @@ _s1 = store.get_surfaces(_r1)[0]
 _seam = np.array(_s1.evaluate(_s1.u_domain()[0], sum(_s1.v_domain()) / 2)) if True else None
 _ang = math.degrees(math.atan2(*(_seam[[1, 0]])))
 _d = store.get_surfaces(_r0)[0]
-check("revolve seam angle: same area, seam turned to 120 deg", abs(store.get_brep(_r0).area(1e-7) - store.get_brep(_r1).area(1e-7)) < 1e-6
+_ar0, _ar1 = store.get_brep(_r0).area(1e-7), store.get_brep(_r1).area(1e-7)
+check("revolve seam angle: same area, seam turned to 120 deg", abs(_ar0 - _ar1) < 1e-5 * max(_ar0, 1.0)
       and (abs(_ang - 120) < 0.5 or abs(_ang - 120 + 360) < 0.5 or abs(_ang + 240) < 0.5 or abs(np.degrees(np.arctan2(_seam[1], _seam[0])) - 120) < 0.5),
-      f"seam at {np.degrees(np.arctan2(_seam[1], _seam[0])):.1f} deg")
+      f"seam at {np.degrees(np.arctan2(_seam[1], _seam[0])):.1f} deg, areas {_ar0:.9f} / {_ar1:.9f}")
 
 # revolve of a MULTI-SPAN profile covers the whole profile (kernel revolve only did span 1)
 _cu = bpy.data.curves.new("RV_ms", 'CURVE'); _cu.dimensions = '3D'
@@ -5051,5 +5052,20 @@ check("Edge mode: picked edges are what Edge Fillet / Continuity Check take; the
       and all(isinstance(j, dict) and j["G2"][1] for j in _jj), f"{_ssel.selected_edges(ctx)} {_nadd} {_jj}")
 _vw.sel_mode = "BODY"
 check("Body mode: the picks go", _ssel.PROP not in _sb and _ssel.get(_sb) == (None, []))
+
+# curve evaluation a hair past the end of the range works on every kernel build (Linux / Windows refuse
+# the end point by a rounding step where macOS takes it); really out of range still raises
+from blender_nurbs.kernel import load as _klh
+_smh = _klh()
+_ce = _smh.create_curve_interp_points([(float(x), float(np.sin(x)), 0.0) for x in np.linspace(0.0, 3.0, 8)])
+_ct0, _ct1 = _ce.parameter_range()
+_hair_ok = np.linalg.norm(np.array(_ce.evaluate(_ct1 + 1e-13 * (_ct1 - _ct0))) - np.array(_ce.evaluate(_ct1))) < 1e-9
+try:
+    _ce.evaluate(_ct1 + 0.5 * (_ct1 - _ct0)); _far_raises = False
+except Exception:
+    _far_raises = True
+check("kernel guard: Edge.point_at / Curve.evaluate are wrapped; a hair past the end evaluates the end",
+      getattr(type(_ce).evaluate, "_nproto_safe", False) and getattr(_smh.Edge.point_at, "_nproto_safe", False) and _hair_ok,
+      f"far past the end raises: {_far_raises}")
 
 print("ALL OK" if ok else "SOME FAILED")

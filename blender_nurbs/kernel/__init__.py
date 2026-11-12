@@ -29,6 +29,11 @@ def load():
             f"for Python {sys.version_info.major}.{sys.version_info.minor}."
         )
         return None
+    try:      # end-of-range curve evaluation that every kernel build accepts
+        from .harden import harden
+        harden(_sm)
+    except Exception as exc:
+        print("NURBS kernel: evaluation guard not installed:", exc)
     sm = _sm
     ext = _sm.blender_ext
     error = None
