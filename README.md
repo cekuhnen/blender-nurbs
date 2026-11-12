@@ -3,9 +3,14 @@
 **A Class-A NURBS surface modeling toolkit for Blender**, built on NVIDIA's open-source
 [USD BRep](https://github.com/NVIDIA-Omniverse/usd-brep) kernel.
 
-Shape a car body, a product shell or any concept form with exact NURBS curves and
-surfaces right in Blender, not only with SubD. Every surface is exact: check it with
+Explore a product idea, a concept form or a car body part with NURBS curves and
+surfaces right in Blender, alongside SubD. Every surface is exact: check it with
 zebra and curvature tools, then take it to your CAD app as STEP.
+
+<p align="center">
+  <img src="docs/images/spoon-zebra.png" width="900"
+       alt="A spoon modeled in NURBS Proto: the bowl's end and the neck, with zebra stripes, CV hulls and G2 continuity labels on their edges">
+</p>
 
 ## Install
 
