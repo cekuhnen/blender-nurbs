@@ -1,16 +1,26 @@
 # Builds the kernel module (USD BRep / SMLib + bindings + our extension) for
 # macOS (Apple Silicon), Windows x64 and Linux x64, runs the headless tests in
-# Blender on each, and packages one extension zip with all three.
+# Blender on each, and packages the extension: one zip per platform and one
+# with all three, each checked by Blender's own validator.
 #
-# Not yet run: written on macOS, where only the macOS build was tried. Expect to
-# adjust the Windows / Linux steps on the first run (see README, Build the kernel).
+# Release: run it by hand with "release" ticked (or push a tag v<version>) and,
+# once the tests pass on all three, the zips are published as a GitHub Release
+# tagged v<version> (the version in blender_nurbs/blender_manifest.toml) -- a
+# pre-release unless the commit is on main.
 
 name: Kernel
 
 on:
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish the zips as a GitHub Release v<manifest version> (after the tests pass)"
+        type: boolean
+        default: false
   push:
-    paths: ["kernel_build/**", "blender_nurbs/**", "tests/**", ".github/workflows/kernel.yml"]
+    branches: ["**"]
+    tags: ["v*"]
+    paths: ["kernel_build/**", "blender_nurbs/**", "tests/**", "tools/**", ".github/workflows/kernel.yml"]
 
 env:
   USD_BREP_COMMIT: 3fd5b9548d19aa8c12c29bc9637a96d42a06f8a5   # the commit the macOS build uses
@@ -137,6 +147,66 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { pattern: "kernel-*", path: blender_nurbs/kernel, merge-multiple: true }
-      - run: python3 tools/package_extension.py
+      - name: Zips (one per platform, one with all three)
+        run: python3 tools/package_extension.py --split
+      - name: Check the zips with Blender
+        run: |
+          f="blender-$BLENDER_VERSION-linux-x64.tar.xz"
+          curl -sSfLO "https://download.blender.org/release/Blender$BLENDER_SERIES/$f"
+          tar xf "$f"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 \
+               libsm6 libgl1 libegl1 libwayland-client0 libwayland-cursor0 libdecor-0-0
+          for z in dist/*.zip; do
+            "./${f%.tar.xz}/blender" --factory-startup --command extension validate "$z"
+          done
       - uses: actions/upload-artifact@v4
         with: { name: nurbs_modeling-extension, path: dist/*.zip }
+
+  # The zips as a GitHub Release, for users to download (no GitHub login, no expiry).
+  release:
+    needs: [test, package]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/download-artifact@v4
+        with: { name: nurbs_modeling-extension, path: dist }
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' blender_nurbs/blender_manifest.toml)
+          tag="v$version"
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "$tag" ]]; then
+            echo "tag $GITHUB_REF_NAME does not match the manifest version $version"; exit 1
+          fi
+          pre=--prerelease
+          if git branch -r --contains "$GITHUB_SHA" | grep -qx '  origin/main'; then pre=; fi
+          cat > notes.md <<EOF
+          NURBS Modeling $version for Blender 5.0 or newer (tested on Blender $BLENDER_VERSION), built from \`${GITHUB_SHA::7}\`.
+
+          **Download the zip for your system:**
+
+          | System | File |
+          |---|---|
+          | macOS, Apple Silicon (M1 or newer) | \`nurbs_modeling-$version-macos_arm64.zip\` |
+          | Windows, 64-bit (x64) | \`nurbs_modeling-$version-windows_x64.zip\` |
+          | Linux, 64-bit (x64) | \`nurbs_modeling-$version-linux_x64.zip\` |
+          | Any of the three (larger) | \`nurbs_modeling-$version.zip\` |
+
+          **Install:** in Blender, Edit > Preferences > Get Extensions, the menu at the top right > *Install from Disk...*, pick the zip. Or drag the zip into Blender's window. Intel Macs and Windows on ARM are not supported yet.
+
+          Built from the same files that passed the headless test suite on all three systems; every zip passed Blender's extension validator.
+          EOF
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/*.zip --clobber
+            gh release edit "$tag" --notes-file notes.md
+          else
+            gh release create "$tag" dist/*.zip --target "$GITHUB_SHA" --title "NURBS Modeling $version" \
+                                                --notes-file notes.md $pre
+          fi

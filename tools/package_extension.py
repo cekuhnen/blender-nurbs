@@ -1,7 +1,13 @@
 """Package the add-on as a Blender extension zip with the kernel builds it has.
 
     python3 tools/package_extension.py            # -> dist/nurbs_modeling-<version>.zip
+    python3 tools/package_extension.py --split    # ... and one zip per platform:
+                                                  #    dist/nurbs_modeling-<version>-macos_arm64.zip, ...
     python3 tools/package_extension.py --check    # only list the kernel builds found
+
+The all-platform zip holds every kernel build; a per-platform zip only its
+own (a fraction of the size), named like Blender's own `extension build
+--split-platforms`.
 
 The kernel is a compiled module, one file per platform, all side by side in
 blender_nurbs/kernel/ (Python loads the one whose suffix matches it):
@@ -66,9 +72,37 @@ def kernel_builds():
     return out
 
 
+def write_zip(zpath, ext_id, manifest, keep_kernels):
+    """The add-on as an extension zip: its manifest replaced by `manifest`, and
+    of the kernel builds only those named in keep_kernels."""
+    with tempfile.TemporaryDirectory() as tmp:
+        stage = os.path.join(tmp, ext_id)
+        shutil.copytree(ADDON, stage, ignore=shutil.ignore_patterns(*SKIP))
+        for name in os.listdir(os.path.join(stage, "kernel")):
+            if name.startswith("_nproto_kernel.") and name not in keep_kernels:
+                os.remove(os.path.join(stage, "kernel", name))
+        with open(os.path.join(stage, "blender_manifest.toml"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(manifest)
+        with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+            for dirpath, dirs, files in os.walk(stage):
+                dirs[:] = sorted(d for d in dirs if not any(fnmatch.fnmatch(d, s) for s in SKIP))
+                for fn in sorted(files):
+                    if any(fnmatch.fnmatch(fn, s) for s in SKIP):
+                        continue
+                    full = os.path.join(dirpath, fn)
+                    z.write(full, os.path.relpath(full, stage))
+    print("wrote", zpath, f"({os.path.getsize(zpath) / 1e6:.1f} MB)")
+
+
+def with_platforms(manifest, platforms):
+    return re.sub(r'^platforms\s*=.*$', "platforms = [" + ", ".join(f'"{p}"' for p in platforms) + "]",
+                  manifest, count=1, flags=re.M)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--check", action="store_true", help="only list the kernel builds found")
+    ap.add_argument("--split", action="store_true", help="also write one zip per platform")
     ap.add_argument("--out", default=os.path.join(ROOT, "dist"), help="output folder")
     args = ap.parse_args()
 
@@ -86,25 +120,14 @@ def main():
     manifest = open(os.path.join(ADDON, "blender_manifest.toml"), encoding="utf-8").read()
     version = re.search(r'^version\s*=\s*"([^"]+)"', manifest, re.M).group(1)
     ext_id = re.search(r'^id\s*=\s*"([^"]+)"', manifest, re.M).group(1)
-    manifest = re.sub(r'^platforms\s*=.*$', "platforms = [" + ", ".join(f'"{p}"' for p in platforms) + "]",
-                      manifest, count=1, flags=re.M)
 
     os.makedirs(args.out, exist_ok=True)
-    zpath = os.path.join(args.out, f"{ext_id}-{version}.zip")
-    with tempfile.TemporaryDirectory() as tmp:
-        stage = os.path.join(tmp, ext_id)
-        shutil.copytree(ADDON, stage, ignore=shutil.ignore_patterns(*SKIP))
-        with open(os.path.join(stage, "blender_manifest.toml"), "w", encoding="utf-8", newline="\n") as f:
-            f.write(manifest)
-        with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
-            for dirpath, dirs, files in os.walk(stage):
-                dirs[:] = sorted(d for d in dirs if not any(fnmatch.fnmatch(d, s) for s in SKIP))
-                for fn in sorted(files):
-                    if any(fnmatch.fnmatch(fn, s) for s in SKIP):
-                        continue
-                    full = os.path.join(dirpath, fn)
-                    z.write(full, os.path.relpath(full, stage))
-    print("wrote", zpath, f"({os.path.getsize(zpath) / 1e6:.1f} MB)")
+    write_zip(os.path.join(args.out, f"{ext_id}-{version}.zip"), ext_id, with_platforms(manifest, platforms),
+              set(builds))
+    if args.split:
+        for plat in platforms:
+            write_zip(os.path.join(args.out, f"{ext_id}-{version}-{plat.replace('-', '_')}.zip"), ext_id,
+                      with_platforms(manifest, [plat]), {n for n, ps in builds.items() if plat in ps})
     return 0
 
 

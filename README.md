@@ -335,14 +335,20 @@ The Windows module uses the static C runtime, so it needs no Visual C++ redistri
 
 The build copies the module into `blender_nurbs/kernel/` under a temporary name and renames it over the old one, so a running Blender keeps the module it loaded (writing into a loaded library can crash it on macOS); restart Blender to use the new build. On Windows a loaded `.pyd` can't be replaced at all, so close Blender before building. Worker jobs start a fresh process and use the new module at once.
 
-**Status:** only macOS has been built and tested. This script's arm64 build is byte-identical to the one before, and all headless tests pass with it. The Windows and Linux builds are prepared but not yet compiled; their first run will likely need small fixes.
+**Status:** the macOS arm64, Windows x64 and Linux x64 modules all build on GitHub Actions (below), and the headless test suite runs in Blender on each. Locally only the macOS build has been tried. Linux and Windows builds of the kernel refuse to evaluate a curve one rounding step past the end of its range, where the macOS build clamps; `kernel/harden.py` wraps those calls so every build behaves the same.
 
-**All three at once (GitHub Actions):** `.github/workflows/kernel.yml` builds the module on macOS (arm64), Windows x64 and Linux x64 (manylinux_2_28). It then runs the headless test suite in Blender 5.2.1 on each and packages one extension zip with all three modules. It runs on a push that touches the add-on, the kernel build or the tests, or by hand (workflow_dispatch). The project has to be a GitHub repository for this; `.gitignore` keeps `third_party/`, build trees and the built modules out of it.
+**All three at once (GitHub Actions):** `.github/workflows/kernel.yml` builds the module on macOS (arm64), Windows x64 and Linux x64 (manylinux_2_28). It then runs the headless test suite in Blender 5.2.1 on each and packages the extension: one zip per platform and one with all three, each checked with Blender's `extension validate`. It runs on a push that touches the add-on, the kernel build, the tests or the packaging, or by hand (workflow_dispatch). The project has to be a GitHub repository for this; `.gitignore` keeps `third_party/`, build trees and the built modules out of it.
 
-**Package:** `python3 tools/package_extension.py` zips `blender_nurbs/` into `dist/nurbs_modeling-<version>.zip`. Its manifest lists exactly the platforms whose module is present (a macOS module is read to tell arm64, Intel or both), so Blender won't install it where it has no kernel. `--check` only lists the modules found. Check a zip with:
+**Release:** run the workflow by hand with **release** ticked (Actions > Kernel > Run workflow), or push a tag `v<version>`. Once the tests pass on all three systems, the zips are published as the GitHub Release `v<version>`, with the version from `blender_manifest.toml` (raise it first). It's a pre-release unless the commit is on `main`. A release that already exists gets its zips replaced.
 
 ```bash
-/Applications/Blender.app/Contents/MacOS/Blender --factory-startup --command extension validate dist/nurbs_modeling-0.1.0.zip
+gh workflow run kernel.yml --ref <branch> -f release=true
+```
+
+**Package:** `python3 tools/package_extension.py` zips `blender_nurbs/` into `dist/nurbs_modeling-<version>.zip`. `--split` also writes one zip per platform (`dist/nurbs_modeling-<version>-macos_arm64.zip`, `-windows_x64`, `-linux_x64`), each with only its own module. A zip's manifest lists exactly the platforms whose module it holds (a macOS module is read to tell arm64, Intel or both), so Blender won't install it where it has no kernel. `--check` only lists the modules found. Check a zip with:
+
+```bash
+/Applications/Blender.app/Contents/MacOS/Blender --factory-startup --command extension validate dist/nurbs_modeling-0.2.0.zip
 ```
 
 Kernel files written by the add-on use `\n` line endings on every platform. Python on Windows would otherwise write `\r\n` into the B-rep text the C++ reader parses.
@@ -400,9 +406,17 @@ What remains is mostly the kernel itself. Its tessellation at the zebra's 1° ta
 
 ## Install
 
-Symlink or copy `blender_nurbs/` into
+**From a release:** download the zip for your system from the repository's
+[Releases](https://github.com/cekuhnen/blender-nurbs/releases)
+(`nurbs_modeling-<version>-macos_arm64.zip`, `-windows_x64.zip` or `-linux_x64.zip`).
+In Blender 5.0 or newer: Edit → Preferences → Get Extensions → the menu at the top right →
+**Install from Disk…**, then pick the zip (or drag the zip into Blender's window).
+Intel Macs and Windows on ARM have no kernel build yet.
+
+**From the source (development):** symlink or copy `blender_nurbs/` into
 `~/Library/Application Support/Blender/5.2/extensions/user_default/`, then enable
-**NURBS Modeling** in Preferences → Add-ons.
+**NURBS Modeling** in Preferences → Add-ons. It needs the kernel module built for
+your system in `blender_nurbs/kernel/` (see Build the kernel).
 
 ## Known limits (prototype)
 
