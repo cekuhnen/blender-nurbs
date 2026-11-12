@@ -344,6 +344,236 @@ def ring_order(curves, n=16):
     return greedy if length(greedy) < 0.98 * length(given) else given
 
 
+def chain_order(curves, n=16):
+    """Order of the sections of an open loft: the given one, unless a chain
+    through their centres from one end to the other is clearly shorter (a
+    selection comes in no particular order: three stacked circles taken
+    bottom, top, middle loft up and fold back down)."""
+    C = [sample_curve(c, n).mean(axis=0) for c in curves]
+    k = len(C)
+    if k < 3:
+        return list(range(k))
+
+    def length(order):
+        return sum(np.linalg.norm(C[order[i]] - C[order[i + 1]]) for i in range(len(order) - 1))
+    given = list(range(k))
+    best = given
+    for start in range(k):                     # every start: greedy nearest neighbour
+        chain, left = [start], set(given) - {start}
+        while left:
+            j = min(left, key=lambda q: np.linalg.norm(C[q] - C[chain[-1]]))
+            chain.append(j)
+            left.remove(j)
+        if length(chain) < length(best) - 1e-12:
+            best = chain
+    if length(best) >= 0.98 * length(given):
+        return given
+    return best if best[0] <= best[-1] else best[::-1]
+
+
+def is_closed_curve(curve, tol=1e-6):
+    t0, t1 = curve.parameter_range()
+    a, b = np.array(curve.evaluate(t0)), np.array(curve.evaluate(t1))
+    P = sample_curve(curve, 16)
+    size = float(np.linalg.norm(np.ptp(P, axis=0))) or 1.0
+    return float(np.linalg.norm(a - b)) <= tol * size
+
+
+def _area_vector(P):
+    c = P.mean(axis=0)
+    return 0.5 * np.cross(P[:-1] - c, P[1:] - c).sum(axis=0)
+
+
+def reseat_closed(curve, t):
+    """The same closed curve starting (and ending) at parameter t: t inserted
+    to full multiplicity, the two pieces swapped and joined at the old start.
+    Exact (rational curves too); the parameter range stays the same."""
+    from .kernel.classa import insert_knot
+    _, ext = _k()
+    d = ext.curve_cvs(curve)
+    p = int(d["degree"])
+    U = [float(k) for k in d["knots"]]
+    a, b = U[0], U[-1]
+    eps = 1e-9 * (b - a)
+    if t - a <= 1e-6 * (b - a) or b - t <= 1e-6 * (b - a):      # starts there already
+        return curve
+    t = next((k for k in U if abs(k - t) <= 1e-6 * (b - a)), t)  # (next to) a knot: use it
+    P = np.array(d["points"], float)
+    w = np.array(d["weights"], float) if d.get("weights") else np.ones(len(P))
+    Pw = np.c_[P * w[:, None], w]
+    while sum(abs(k - t) <= 1e-12 for k in U) < p:
+        Pw, U = insert_knot(Pw, U, p, t)
+    Pw = np.asarray(Pw, float)
+    s0 = next(i for i, k in enumerate(U) if abs(k - t) <= 1e-12)    # t sits at U[s0 .. s0+p-1]
+    j = s0 - 1                                                       # the CV the curve passes at t
+    first, second = Pw[:j + 1], Pw[j:]
+    first = first * (second[-1, 3] / first[0, 3])                    # same point (and weight) where they join
+    K2 = [t] * (p + 1) + U[s0 + p:len(U) - (p + 1)] + [b] * (p + 1)
+    K1 = [a] * (p + 1) + U[p + 1:s0] + [t] * (p + 1)
+    knots = K2[:-1] + [k + (b - a) for k in K1[p + 1:]]
+    H = np.vstack([second, first[1:]])
+    knots = [k - (t - a) for k in knots]
+    knots[:p + 1] = [a] * (p + 1)                    # exactly (0.9999999999999999 is another knot to a merge)
+    knots[-(p + 1):] = [b] * (p + 1)
+    for i in range(1, len(knots)):
+        if abs(knots[i] - knots[i - 1]) <= eps:
+            knots[i] = knots[i - 1]
+    pts = [tuple(float(x) for x in q) for q in H[:, :3] / H[:, 3:]]
+    wts = [float(x) for x in H[:, 3]]
+    rational = any(abs(x - 1.0) > 1e-12 for x in wts)
+    return ext.curve_from_cvs(p, pts, knots, wts if rational else None)
+
+
+def _turn(a, b):
+    """The smallest rotation taking unit vector a to unit vector b."""
+    v, c = np.cross(a, b), float(a @ b)
+    if c < -1.0 + 1e-9:
+        return -np.eye(3)
+    K = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + K + K @ K / (1.0 + c)
+
+
+def align_closed(prev, cur, n=720, keep_deg=1.0):
+    """A closed section turned to run like the one before it (the same way
+    round) and to start where it starts (the same direction from its centre,
+    carried over from the previous section's plane by the smallest turn):
+    with different seams the loft twists between them. A start within
+    keep_deg of that is left as it is."""
+    if not (is_closed_curve(prev) and is_closed_curve(cur)):
+        return cur
+    A = sample_curve(prev, 64)
+    B = sample_curve(cur, 64)
+    na, nb = _area_vector(A), _area_vector(B)
+    la, lb = float(np.linalg.norm(na)), float(np.linalg.norm(nb))
+    if la < 1e-12 or lb < 1e-12:
+        return cur
+    na, nb = na / la, nb / lb
+    ca, cb = A[:-1].mean(axis=0), B[:-1].mean(axis=0)
+    d = cb - ca
+    dl = float(np.linalg.norm(d))
+    if dl > 1e-12 and abs(na @ d) > 0.2 * dl and abs(nb @ d) > 0.2 * dl:
+        same = (na @ d > 0) == (nb @ d > 0)          # both wound the same way along the loft
+    else:
+        same = float(na @ nb) >= 0.0
+    if not same:
+        cur = reverse_curve(cur)
+        B = B[::-1]
+        nb = -nb
+    ref = _turn(na, nb) @ (A[0] - ca)
+    ref = ref - (ref @ nb) * nb
+    if np.linalg.norm(ref) < 1e-12:
+        return cur
+    ref /= np.linalg.norm(ref)
+    t0, t1 = cur.parameter_range()
+
+    def wrap(t):
+        return t0 + (t - t0) % (t1 - t0)
+
+    def score(t):                                     # cos of the angle to the start direction
+        v = np.array(cur.evaluate(wrap(t))) - cb
+        v = v - (v @ nb) * nb
+        return float(v @ ref) / (np.linalg.norm(v) or 1.0)
+    if score(t0) >= math.cos(math.radians(keep_deg)):
+        return cur                                    # starts there already
+    ts = np.linspace(t0, t1, n, endpoint=False)
+    i = int(np.argmax([score(t) for t in ts]))
+    h = (t1 - t0) / n
+    lo, hi = ts[i] - h, ts[i] + h
+    for _ in range(30):                               # golden section around the best sample
+        m1, m2 = lo + 0.382 * (hi - lo), lo + 0.618 * (hi - lo)
+        if score(m1) > score(m2):
+            hi = m2
+        else:
+            lo = m1
+    return reseat_closed(cur, wrap(0.5 * (lo + hi)))
+
+
+def compatible_curves(curves, tol=1e-7):
+    """The sections on one degree and one knot vector, exactly: each range
+    mapped to 0..1, degrees raised (by Bezier pieces) to the highest, knots
+    closer than tol taken as one, then every knot inserted into every
+    section to its highest multiplicity. Returns (degree, knots, [homogeneous
+    CVs (m, 4)]). (The kernel's own merge nudges knots -- 0.25 to
+    0.2499999994, 1 to 0.99999998788 beside 1 -- and leaves knot vectors the
+    kernel then refuses.)"""
+    from .kernel.classa import insert_knot, bezier_pieces
+    from .curvejoin import elevate
+    _, ext = _k()
+    data = []
+    for c in curves:
+        d = ext.curve_cvs(c)
+        p = int(d["degree"])
+        U = [float(k) for k in d["knots"]]
+        P = np.array(d["points"], float)
+        w = np.array(d["weights"], float) if d.get("weights") else np.ones(len(P))
+        a, b = U[0], U[-1]
+        U = [(k - a) / (b - a) for k in U]
+        U[:p + 1], U[-(p + 1):] = [0.0] * (p + 1), [1.0] * (p + 1)
+        data.append([p, U, np.c_[P * w[:, None], w]])
+    q = max(it[0] for it in data)
+    for it in data:
+        p, U, Pw = it
+        if p == q:
+            continue
+        br = sorted(set(U))
+        pieces = [elevate(np.asarray(s_, float), q) for s_ in bezier_pieces(Pw, U, p)]
+        it[2] = np.vstack([pieces[0]] + [s_[1:] for s_ in pieces[1:]])
+        it[1] = [0.0] * (q + 1) + [k for k in br[1:-1] for _ in range(q)] + [1.0] * (q + 1)
+        it[0] = q
+    # one value for knots closer than tol, across all sections
+    vals = sorted({k for _, U, _ in data for k in U[q + 1:-q - 1]})
+    reps = []
+    for v in vals:
+        if reps and v - reps[-1][-1] <= tol:
+            reps[-1].append(v)
+        else:
+            reps.append([v])
+    snap = {v: g[0] for g in reps for v in g}
+    for it in data:
+        it[1] = [snap.get(k, k) for k in it[1]]
+    for v in [g[0] for g in reps]:
+        mult = max(sum(1 for k in U if k == v) for _, U, _ in data)
+        for it in data:
+            while sum(1 for k in it[1] if k == v) < mult:
+                Pw, U = insert_knot(it[2], it[1], q, v)
+                it[2], it[1] = np.asarray(Pw, float), U
+    U0 = data[0][1]
+    if any(len(U) != len(U0) or any(abs(x - y) > 1e-12 for x, y in zip(U, U0)) for _, U, _ in data):
+        raise ValueError("the sections could not be given one layout")
+    return q, U0, [Pw for _, _, Pw in data]
+
+
+def open_skin(curves, degree=3):
+    """Open loft through the sections in order: the sections made compatible
+    (one knot vector), each column of matching CVs interpolated in homogeneous
+    coordinates on the same averaged chord-length parameters (as closed_skin).
+    The surface holds every section exactly. U runs along the loft, V along
+    the sections (like the kernel's skin, so its edges keep their names)."""
+    sm, ext = _k()
+    n = len(curves)
+    if n < 2:
+        raise ValueError("a loft needs at least 2 sections")
+    pu, Uu, Hs = compatible_curves(curves)
+    m = len(Hs[0])
+    H = np.array(Hs, float)                                                 # (n, m, 4) homogeneous
+    P = H[..., :3] / H[..., 3:]
+    d = np.linalg.norm(np.diff(P, axis=0), axis=2)                          # (n-1, m)
+    tot = d.sum(axis=0)
+    d = np.where(tot > 1e-12, d / np.where(tot > 1e-12, tot, 1.0), 1.0 / (n - 1))
+    t = np.concatenate([[0.0], np.cumsum(d.mean(axis=1))])
+    t /= t[-1]
+    q = max(1, min(int(degree), n - 1))
+    Uv = [0.0] * (q + 1) + [float(np.mean(t[j:j + q])) for j in range(1, n - q)] + [1.0] * (q + 1)
+    A = interp_matrix(t, Uv, q, n)
+    X = np.linalg.solve(A, H.reshape(n, -1)).reshape(n, m, 4)
+    if (X[..., 3] <= 1e-9).any():
+        raise ValueError("these sections give a loft with non-positive weights")
+    pts = [tuple(float(x) for x in X[i, j, :3] / X[i, j, 3]) for i in range(n) for j in range(m)]
+    wts = [float(X[i, j, 3]) for i in range(n) for j in range(m)]
+    rational = any(abs(w - 1.0) > 1e-12 for w in wts)
+    return ext.surface_from_cvs(q, pu, pts, Uv, Uu, wts if rational else None)
+
+
 def closed_skin(curves, degree=3):
     """Closed (periodic) loft: through every section in order and back to the
     first, smooth all round (C2 for degree 3, the seam included). The sections
@@ -356,14 +586,10 @@ def closed_skin(curves, degree=3):
     n = len(curves)
     if n < 3:
         raise ValueError("a closed loft needs at least 3 sections")
-    sm.make_curves_compatible(curves)
-    rows = [ext.curve_cvs(c) for c in curves]
-    pu, Uu, m = int(rows[0]["degree"]), [float(k) for k in rows[0]["knots"]], len(rows[0]["points"])
-    if any(len(r["points"]) != m or int(r["degree"]) != pu for r in rows):
-        raise ValueError("the sections could not be given one layout")
-    P = np.array([r["points"] for r in rows], float)                        # (n, m, 3)
-    W = np.array([r["weights"] if r.get("weights") else [1.0] * m for r in rows], float)
-    H = np.concatenate([P * W[..., None], W[..., None]], axis=2)            # homogeneous
+    pu, Uu, Hs = compatible_curves(curves)
+    m = len(Hs[0])
+    H = np.array(Hs, float)                                                 # (n, m, 4) homogeneous
+    P = H[..., :3] / H[..., 3:]
     d = np.linalg.norm(np.roll(P, -1, axis=0) - P, axis=2)                  # section i -> i+1, round
     tot = d.sum(axis=0)
     d = np.where(tot > 1e-12, d / np.where(tot > 1e-12, tot, 1.0), 1.0 / n)

@@ -3900,7 +3900,7 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "cycle_continuity", "de
               "import_step", "open_step", "history_focus", "history_toggle_hide", "tree_step", "step_unfocus", "mute_step", "patch_add_guides",
               "patch_auto_corners", "patch_corner", "patch_remove_guide", "rebuild", "rebuild_waiting", "remove_step",
               "restore_inputs", "sync_feature", "tab_edit", "continuity", "continuity_clear", "section_add", "section_orient",
-              "section_targets", "section_curves", "section_remove", "subsel_picker"}
+              "section_targets", "section_curves", "section_remove", "subsel_picker", "bake_feature", "delete_feature"}
 _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto) if n not in _not_tools}
 _tool_ops = [o_ for o_ in _in_panels if o_ not in ("nproto.add_primitive", "nproto.boolean")] + ["nproto.boolean"]
 _bool_ops = sorted(e["props"].get("operation") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r
@@ -4519,10 +4519,14 @@ _tb = patch("TR_b", (2, 1120, 0), (2, 1124, 0), "Z", 2.0)
 _sel(_ta, _tb); bpy.ops.nproto.join(); _tj = ctx.active_object
 fillet_all(_tj, shape="CIRCULAR", radius=0.3, rail_type="CHORD")
 _log = []
-_hui._node(_FL(_log), _tj, 0, "self", _tj, set(), _tj)
+_hui.draw_tree(_FL(_log), ctx, _tj)
 _steps = [e for e in _log if e[0] == "op" and e[1] == "nproto.tree_step"]
 _labels = [e[1] for e in _log if e[0] == "label"]
+_objrows = [e[2] for e in _log if e[0] == "op" and e[1] == "nproto.history_focus"]
 _ok_rows = len(_steps) == 1 and _steps[0][2].startswith("1. Edge Circular") and any("chord 0.3" in t for t in _labels)
+_order = [o.name for o in _hui.build_order(_tj)]
+_ok_rows = _ok_rows and _objrows[-1] == _tj.name and _order[-1] == _tj.name and len(_objrows) == len(set(_objrows)) \
+    and _order.index("TR_a") < _order.index(_tj.name) and _order.index("TR_b") < _order.index(_tj.name)
 _sel(_ta)
 bpy.ops.nproto.tree_step(name=_tj.name, root=_tj.name, index=0)
 _opened = ctx.view_layer.objects.active == _tj and _tj.nproto_step.index == 0 and _tj.nproto_step.rail_type == "CHORD"
@@ -4530,7 +4534,8 @@ bpy.ops.nproto.history_toggle_hide(name=_ta.name)
 _vis_on = _ta.visible_get()
 bpy.ops.nproto.history_toggle_hide(name=_ta.name)
 _vis_off = not _ta.visible_get() and _ta.name not in ctx.scene.collection.objects
-check("construction tree: a fillet step has its own row (click opens it); the eye shows / hides a kept input",
+check("history list: built order (inputs first, the body last, each once), a fillet step has its own row "
+      "(click opens it); the eye shows / hides a kept input",
       _ok_rows and _opened and _vis_on and _vis_off,
       f"rows={[e[2] for e in _steps]} labels={_labels} opened={_opened} eye={_vis_on}/{_vis_off}")
 
@@ -4560,6 +4565,72 @@ check("step focus: a step picked in the tree reads like a feature (Feature: <ste
       f"{_lab1[:4]} | {_lab2[:4]} | mute {len(_mute_ops)}")
 check("step focus: the fillet step knows its face (highlighted while open; CVs / Hulls shows just its net)",
       _sf_ok and _ssf.step_faces(_tj) == [], f"{_sf} areas {[round(f.area(), 3) for f in _tjf]}")
+
+# --- two surfaces trimmed by each other follow their inputs (the rebuild order does not matter) ---
+from blender_nurbs import history as _hist
+from blender_nurbs.contcheck import edge_kind as _ek_kind
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0); _mca = ctx.active_object
+_mca.location = (0, 2000, 0); ctx.view_layer.update()
+bpy.ops.nproto.extrude(inputs=ins((_mca, "S0")), distance=3.0, direction="Z"); _mA = ctx.active_object; _mA.name = "MT_A"
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=0.4); _mcb = ctx.active_object
+_mcb.location = (0, 2000, 1.5); _mcb.rotation_euler = (0, math.radians(90), 0); ctx.view_layer.update()
+bpy.ops.nproto.extrude(inputs=ins((_mcb, "S0")), distance=2.0, direction="X"); _mB = ctx.active_object; _mB.name = "MT_B"
+r1 = bpy.ops.nproto.trim(target="MT_A", cutters=json.dumps([["MT_B", "SURF"]]), ref_point=(1, 2000, 1.5),
+                         normal=(0, 0, 1), action="DELETE", scope="THROUGH")
+r2 = bpy.ops.nproto.trim(target="MT_B", cutters=json.dumps([["MT_A", "SURF"]]), ref_point=(0.5, 2000, 1.9),
+                         normal=(0, 0, 1), action="DELETE", scope="THROUGH")
+_sel(_mA, _mB); bpy.ops.nproto.join(tolerance=1e-3); _mj = ctx.active_object
+def _open_n(o):
+    return sum(1 for i in range(len(store.get_brep(o).edges())) if _ek_kind(o, f"E{i}") == "open")
+_mj_area0, _mj_open0, _mA_area0 = area(_mj), _open_n(_mj), area(_mA)
+_hp = json.loads(_mcb[features.PROP_HIST]); _hp["params"]["radius"] = 0.55
+_mcb[features.PROP_HIST] = json.dumps(_hp)
+features.rebuild(_mcb, ctx, force=True)
+for _o in (_mA, _mB, _mj):     # the order that broke: A first, while B still has its old shape
+    features.rebuild(_o, ctx)
+_mj_area1, _mj_open1, _mA_area1 = area(_mj), _open_n(_mj), area(_mA)
+# the hole in A is now the radius-0.55 crossing: A lost more area, the body still closes up along it
+check("two surfaces trimmed by each other, joined: changing one circle's radius re-trims BOTH (whichever rebuilds "
+      "first) and the joined body follows, still closed along the crossing",
+      r1 == {'FINISHED'} and r2 == {'FINISHED'} and _mj_open0 == 3 and _mj_open1 == 3
+      and _mA_area1 < _mA_area0 - 0.2 and abs(_mj_area1 - _mj_area0) > 0.05,
+      f"open {_mj_open0}->{_mj_open1} A {_mA_area0:.3f}->{_mA_area1:.3f} body {_mj_area0:.3f}->{_mj_area1:.3f}")
+
+# --- Bake / Delete (Alias' Delete History): a feature stops following its inputs; a step bakes with what is under it ---
+_bk_a = patch("BK_a", (0, 1140, 0), (0, 1144, 0), "X", 2.0)
+_bk_b = patch("BK_b", (2, 1140, 0), (2, 1144, 0), "Z", 2.0)
+_sel(_bk_a, _bk_b); bpy.ops.nproto.join(); _bk = ctx.active_object
+fillet_all(_bk, shape="CIRCULAR", radius=0.3)
+_area_bk = area(_bk)
+_bk2 = _bk.copy(); _bk2.data = _bk.data.copy(); ctx.collection.objects.link(_bk2)
+r1 = bpy.ops.nproto.bake_feature(name=_bk.name, step=-1)          # the Join only: the fillet stays live
+_st1 = features.stack(_bk)
+_live_fillet = features.history(_bk) is None and len(_st1) == 1 and features.PROP_BASE in _bk
+features.rebuild(_bk, ctx, force=True)
+_same1 = abs(area(_bk) - _area_bk) < 1e-6
+r2 = bpy.ops.nproto.bake_feature(name=_bk2.name, step=0)          # up to the fillet: all of it
+_none = not features.has_history(_bk2) and abs(area(_bk2) - _area_bk) < 1e-6
+check("bake: the feature alone (its steps stay live, the result unchanged); up to a step (nothing left, the shape kept)",
+      r1 == {'FINISHED'} and r2 == {'FINISHED'} and _live_fillet and _same1 and _none,
+      f"stack {len(_st1)} same {_same1} none {_none}")
+_dk_a = patch("DK_a", (0, 1150, 0), (0, 1154, 0), "X", 2.0)
+_dk_b = patch("DK_b", (2, 1150, 0), (2, 1154, 0), "Z", 2.0)
+_sel(_dk_a, _dk_b); bpy.ops.nproto.join(); _dk = ctx.active_object
+_dk_name = _dk.name
+bpy.ops.nproto.delete_feature(name=_dk_name, mode="ALL")
+_gone_all = _dk_name not in bpy.data.objects and "DK_a" not in bpy.data.objects and "DK_b" not in bpy.data.objects
+_ek_a = patch("EK_a", (0, 1160, 0), (0, 1164, 0), "X", 2.0)
+_ek_b = patch("EK_b", (2, 1160, 0), (2, 1164, 0), "Z", 2.0)
+_sel(_ek_a, _ek_b); bpy.ops.nproto.join(); _ek = ctx.active_object
+_ek_area = area(_ek)
+_feeds = _hui.from_feeds(_ek_a, ctx.scene)
+bpy.ops.nproto.delete_feature(name="EK_a", mode="BAKE")          # an input: what is built from it is baked
+_kept_shape = _ek.name in bpy.data.objects and not features.has_history(_ek) and abs(area(_ek) - _ek_area) < 1e-6
+check("delete: a body takes its unused hidden inputs with it; deleting an input bakes what was built from it "
+      "(it keeps its shape) and tidies the inputs nothing uses now",
+      _gone_all and _kept_shape and "EK_a" not in bpy.data.objects and "EK_b" not in bpy.data.objects
+      and "Feeds: " in _feeds,
+      f"gone_all {_gone_all} kept {_kept_shape} feeds '{_feeds}' left {[n for n in ('EK_a', 'EK_b') if n in bpy.data.objects]}")
 
 # --- Class-A on a closed rim of two edges (a tilted cap on a round wall): light patches, no kernel fallback ---
 bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0); _cc2 = ctx.active_object
@@ -5021,5 +5092,178 @@ check("Edge mode: picked edges are what Edge Fillet / Continuity Check take; the
       and all(isinstance(j, dict) and j["G2"][1] for j in _jj), f"{_ssel.selected_edges(ctx)} {_nadd} {_jj}")
 _vw.sel_mode = "BODY"
 check("Body mode: the picks go", _ssel.PROP not in _sb and _ssel.get(_sb) == (None, []))
+
+# --- Dome: close an open rim, G1 / G2 (exact revolution on a round rim, the rim's own curve otherwise) ---
+from blender_nurbs import dome as _dome
+from blender_nurbs import contcheck as _ccd
+from blender_nurbs.ops import _pick_candidates as _pcd
+def _top_rim(o):
+    return max(("U0", "U1", "V0", "V1"), key=lambda w: np.mean([q[2] for q in geom.boundary_points(store.get_surfaces(o)[0], w, 8)]))
+def _dome_cont(base, ref):
+    _ccd.clear()
+    cands = [c for c in _pcd(ctx, True) if not c[1].startswith("S")]
+    own = next(c for c in cands if c[0] == base and c[1] == ref)
+    partner = _ccd.find_partner(base, ref, own[2], cands)
+    if partner is None:
+        return None
+    _ccd.add(base, ref, partner)
+    j = _ccd.judge(_ccd.result(_ccd.PAIRS[0]), ctx.window_manager.nproto_view)
+    _ccd.clear()
+    return {k: float(v[0]) for k, v in j.items()}
+_dres = {}
+for _i, (_shape, _cont) in enumerate((("CIRCLE", "G1"), ("CIRCLE", "G2"), ("ELLIPSE", "G2"))):
+    bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0); _dc = ctx.active_object
+    if _shape == "ELLIPSE":
+        _h = json.loads(_dc[features.PROP_HIST]); _h["params"]["elliptic"] = True; _h["params"]["radius2"] = 0.6
+        _dc[features.PROP_HIST] = json.dumps(_h); features.rebuild(_dc, ctx, force=True)
+    _dc.location = (4.0 * _i, 2100, 0); ctx.view_layer.update()
+    bpy.ops.nproto.extrude(inputs=ins((_dc, "S0")), distance=2.0, direction="Z", draft=-8.0); _dbase = ctx.active_object
+    _dref = _top_rim(_dbase)
+    r = bpy.ops.nproto.dome(inputs=ins((_dbase, _dref)), dome_cont=_cont, dome_height=0.75)
+    _dd = ctx.active_object
+    _dcv = ext.surface_cvs(store.get_surfaces(_dd)[0])
+    _dres[_shape + _cont] = {"ok": r == {'FINISHED'} and _dd.name.startswith("Dome"), "deg": (_dcv["degree_u"], _dcv["degree_v"]),
+                             "n": (_dcv["count_u"], _dcv["count_v"]), "j": _dome_cont(_dbase, _dref),
+                             "round": _dome.rim_data(_dbase, _dref)["round"], "obj": _dd, "base": _dbase, "ref": _dref}
+_g1, _g2, _el = _dres["CIRCLEG1"], _dres["CIRCLEG2"], _dres["ELLIPSEG2"]
+check("dome on a round rim (a drafted cone): an exact surface of revolution, 9 rational CVs round; G1 tangent, "
+      "G2 also with the wall's curvature",
+      _g1["ok"] and _g2["ok"] and _g1["round"] and _g1["deg"] == (3, 2) and _g1["n"] == (4, 9) and _g2["deg"] == (5, 2)
+      and _g1["j"] and _g1["j"]["G0"] < 1e-6 and _g1["j"]["G1"] < 0.01
+      and _g2["j"] and _g2["j"]["G0"] < 1e-6 and _g2["j"]["G1"] < 0.01 and _g2["j"]["G2"] < 0.005,
+      str({k: (v["deg"], v["n"], v["j"]) for k, v in _dres.items()}))
+check("dome on a planar rim that is not round (a drafted ellipse): on the rim's own curve, G2 to it",
+      _el["ok"] and not _el["round"] and _el["j"] and _el["j"]["G0"] < 1e-5 and _el["j"]["G1"] < 0.05
+      and _el["j"]["G2"] < 0.02, str(_el["j"]))
+_h = json.loads(_g2["base"][features.PROP_HIST]); _h["params"]["draft"] = -3.0
+_g2["base"][features.PROP_HIST] = json.dumps(_h)
+features.rebuild(_g2["base"], ctx, force=True); features.rebuild(_g2["obj"], ctx)
+_jj = _dome_cont(_g2["base"], _g2["ref"])
+check("dome history: change the surface's draft and the dome follows (still G2)",
+      _jj and _jj["G0"] < 1e-6 and _jj["G1"] < 0.01 and _jj["G2"] < 0.005 and features.history(_g2["obj"])["op"] == "dome",
+      str(_jj))
+
+# a barrel loft through three ellipses, its top rim leaning in (the fit used to stall at the loft's seam)
+_bl = []
+for _z, _r in ((0.0, 1.0), (1.0, 1.25), (2.0, 0.8)):
+    bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=_r); _bc = ctx.active_object
+    _h = json.loads(_bc[features.PROP_HIST]); _h["params"]["elliptic"] = True; _h["params"]["radius2"] = 0.7 * _r
+    _bc[features.PROP_HIST] = json.dumps(_h); features.rebuild(_bc, ctx, force=True)
+    _bc.location = (0, 2120, _z); ctx.view_layer.update()
+    _bl.append(_bc)
+bpy.ops.nproto.loft(inputs=ins(*[(c_, "S0") for c_ in _bl])); _bar = ctx.active_object
+_bref = _top_rim(_bar)
+r = bpy.ops.nproto.dome(inputs=ins((_bar, _bref)), dome_cont="G2")
+_bd = ctx.active_object
+_bj = _dome_cont(_bar, _bref) if r == {'FINISHED'} else None
+check("dome on a barrel loft's top rim (an ellipse leaning in): built, G2 to it",
+      r == {'FINISHED'} and _bd.name.startswith("Dome") and _bj and _bj["G0"] < 1e-5 and _bj["G1"] < 0.05 and _bj["G2"] < 0.02,
+      str(_bj))
+
+# draped: one even four-sided surface over the opening, trimmed to the rim (round, a flat spatula, an ellipse)
+_drp = {}
+for _i, (_nm, _r2, _dr) in enumerate((("round", None, -8.0), ("spatula", 0.25, 0.0), ("ellipse", 0.6, -5.0))):
+    bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0); _dc = ctx.active_object
+    if _r2:
+        _h = json.loads(_dc[features.PROP_HIST]); _h["params"]["elliptic"] = True; _h["params"]["radius2"] = _r2
+        _dc[features.PROP_HIST] = json.dumps(_h); features.rebuild(_dc, ctx, force=True)
+    _dc.location = (4.0 * _i, 2140, 0); ctx.view_layer.update()
+    bpy.ops.nproto.extrude(inputs=ins((_dc, "S0")), distance=2.0, direction="Z", draft=_dr); _db = ctx.active_object
+    _rf = _top_rim(_db)
+    r = bpy.ops.nproto.dome(inputs=ins((_db, _rf)), dome_cont="G2", dome_layout="DRAPED")
+    _do = ctx.active_object
+    _f = store.get_brep(_do).faces()
+    _sd = ext.surface_cvs(_f[0].surface()) if _f else None
+    _drp[_nm] = {"ok": r == {'FINISHED'} and _do.name.startswith("Dome"), "faces": len(_f),
+                 "net": _sd and (_sd["count_u"], _sd["count_v"], _sd["degree_u"]), "j": _dome_cont(_db, _rf)}
+check("draped dome: one even 20 x 20 degree-5 surface trimmed to the rim (no pole), G2 to it -- round, a flat "
+      "spatula (4:1) and a drafted ellipse",
+      all(v["ok"] and v["faces"] == 1 and v["net"] == (20, 20, 5) and v["j"] and v["j"]["G0"] < 1e-5
+          and v["j"]["G1"] < 0.1 and v["j"]["G2"] < 0.05 for v in _drp.values()),
+      str({k: (v["net"], v["j"]) for k, v in _drp.items()}))
+
+# the G2 dome is round at its top (it used to go flat there: its top three CV rows at one height)
+def _apex_k(obj, frac=0.04):
+    s = store.get_surfaces(obj)[0]
+    (u0, u1), (v0, v1) = s.u_domain(), s.v_domain()
+    vs = np.linspace(v0, v1, 16, endpoint=False)
+    def spread(u):
+        return float(np.ptp(np.array([s.evaluate(u, v) for v in vs]), axis=0).max())
+    ue, ui = (u1, u1 - frac * (u1 - u0)) if spread(u1) < spread(u0) else (u0, u0 + frac * (u1 - u0))
+    top = np.array(s.evaluate(ue, v0))
+    ks = []
+    for v in vs:                                   # circles through the top, centred on the axis
+        q = np.array(s.evaluate(ui, v))
+        d, dz = float(np.hypot(*(q - top)[:2])), float(top[2] - q[2])
+        ks.append(2.0 * dz / (d * d + dz * dz))
+    return min(ks), max(ks)
+r = bpy.ops.nproto.dome(inputs=ins((_g2["base"], _g2["ref"])), dome_cont="G1", dome_height=0.75)   # (its draft changed above)
+_ka1, _ka2 = _apex_k(ctx.active_object), _apex_k(_g2["obj"])
+r = bpy.ops.nproto.dome(inputs=ins((_el["base"], _el["ref"])), dome_cont="G1", dome_height=0.75)
+_ke1, _ke2 = _apex_k(ctx.active_object), _apex_k(_el["obj"])
+check("G2 dome: as round at its top as the G1 one (no flat tip) -- round rim and ellipse",
+      _ka2[0] > 0.9 * _ka1[0] and _ka2[0] > 0.5 and _ke2[0] > 0.85 * _ke1[0] and _ke2[0] > 0.3,
+      f"round G1 {_ka1} G2 {_ka2}; ellipse G1 {_ke1} G2 {_ke2}")
+
+# a loft of selected curves goes along them (a selection has no order: bottom, top, middle folded back)
+from blender_nurbs.ops import loft_selection_order as _lso
+_ls = []
+for _z, _r in ((0.0, 1.0), (2.0, 1.0), (1.0, 1.3)):
+    bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=_r); _lc = ctx.active_object
+    _lc.location = (0, 2160, _z); ctx.view_layer.update(); _ls.append(_lc)
+_lo = _lso(_ls, _ls[2])
+bpy.ops.nproto.loft(inputs=ins(*[(c_, "S0") for c_ in _lo])); _lf = ctx.active_object
+_Ml = geom.world_matrix(_lf)
+_lz = sorted(float(np.mean([(_Ml @ Vector(q))[2] for q in geom.boundary_points(store.get_surfaces(_lf)[0], w, 16)]))
+             for w in ("U0", "U1", "V0", "V1"))
+check("loft of a selection: along the sections (bottom, middle, top), not in the selection's order; picks keep "
+      "theirs; two sections keep the active one last",
+      [o.name for o in _lo] == [_ls[0].name, _ls[2].name, _ls[1].name] and abs(_lz[0]) < 1e-3 and abs(_lz[-1] - 2.0) < 1e-3
+      and [o.name for o in _lso(_ls[:2], _ls[0])] == [_ls[1].name, _ls[0].name]
+      and [o.name for o in _lso(_ls, _ls[2], closed=True)][-1] == _ls[2].name,
+      f"{[o.name for o in _lo]} ends {_lz}")
+
+# loft through sections of different layouts (two circles with Bezier knots, a reshaped one with uniform knots
+# that starts elsewhere): the kernel's skin rose past the top section and folded back down to it, and twisted
+def _cyc(name, pts, z, endpoint, s=1.0):
+    cu = bpy.data.curves.new(name, 'CURVE'); cu.dimensions = '3D'
+    sp = cu.splines.new('NURBS'); sp.points.add(len(pts) - 1)
+    for p_, c_ in zip(sp.points, pts): p_.co = (s * c_[0], s * c_[1], 0.0, c_[2])
+    sp.order_u = 3; sp.use_cyclic_u = True; sp.use_endpoint_u = endpoint
+    o_ = bpy.data.objects.new(name, cu); ctx.collection.objects.link(o_); o_.location = (0, 2180, z); return o_
+_ring = [(0, -.161, 1), (-.181, -.161, .707), (-.181, 0, 1), (-.181, .161, .707), (0, .161, 1), (.181, .161, .707), (.181, 0, 1), (.181, -.161, .707)]
+_bent = [(0, -.174, 1), (-.16, -.135, .707), (-.206, 0, 1), (-.081, .135, .707), (0, .167, 1), (.081, .135, .707), (.206, 0, 1), (.16, -.135, .707)]
+_secs = [_cyc("LsA", _ring, 0.0, True), _cyc("LsB", _ring, 0.087, True), _cyc("LsC", _bent, 0.188, False, 0.749)]
+ctx.view_layer.update()
+_lres = {}
+for _aa in (True, False):
+    _g = features._build_loft([(o_, "S0") for o_ in _secs], {"auto_align": _aa, "closed": False})
+    (_u0, _u1), (_v0, _v1) = _g.u_domain(), _g.v_domain()
+    _Z = np.array([[_g.evaluate(u, v)[2] for u in np.linspace(_u0, _u1, 41)] for v in np.linspace(_v0, _v1, 24, endpoint=False)])
+    _st = []
+    for u in np.linspace(_u0, _u1, 9):
+        _P = np.array([_g.evaluate(u, v) for v in np.linspace(_v0, _v1, 12, endpoint=False)]); _c = _P.mean(axis=0)
+        _st.append(float(np.degrees(np.arctan2(_P[0, 1] - _c[1], _P[0, 0] - _c[0]))))
+    _cp = lambda q: features._k()[0].surface_closest_point(_g, tuple(map(float, q)))[0]
+    _sec_err = max(float(np.linalg.norm(np.array([_cp(q).x, _cp(q).y, _cp(q).z]) - q))
+                   for o_ in _secs for q in geom.sample_curve(features.input_curve(o_, "S0"), 30))
+    _lres[_aa] = {"rise": float(np.diff(_Z, axis=1).min()), "top": float(_Z.max()), "twist": max(_st) - min(_st), "err": _sec_err}
+check("loft through sections of different layouts: rises steadily (no overshoot past the top and back), holds "
+      "every section; Auto Align starts the closed sections alike (no twist)",
+      all(v["rise"] > 0 and v["top"] < 0.188 + 1e-6 and v["err"] < 1e-6 for v in _lres.values()) and _lres[True]["twist"] < 1.0
+      and _lres[False]["twist"] > 15.0, str(_lres))
+_whole = features.run("loft", [(o_, "S0") for o_ in _secs], {"auto_align": True, "closed": False})
+check("...and stays one face: between sections of different layouts it turns a degree at the circle's quarter "
+      "knots, which is no fold (at the sections it is smooth)",
+      isinstance(_whole, features._k()[0].Surface), type(_whole).__name__)
+# a closed section reseated: the same curve, starting elsewhere
+_kc = features.input_curve(_secs[2], "S0")
+_t0, _t1 = _kc.parameter_range()
+_rs = geom.reseat_closed(_kc, _t0 + 0.37 * (_t1 - _t0))
+_Pa, _Pb = geom.sample_curve(_kc, 300), geom.sample_curve(_rs, 300)
+check("reseat a closed curve: the same curve, starting at the new point",
+      np.linalg.norm(_Pb[0] - np.array(_kc.evaluate(_t0 + 0.37 * (_t1 - _t0)))) < 1e-9
+      and max(np.min(np.linalg.norm(_Pa - q, axis=1)) for q in _Pb) < 0.01 * 0.2
+      and abs(np.linalg.norm(np.diff(_Pa, axis=0), axis=1).sum() - np.linalg.norm(np.diff(_Pb, axis=0), axis=1).sum()) < 1e-4)
 
 print("ALL OK" if ok else "SOME FAILED")

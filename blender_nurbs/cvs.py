@@ -381,7 +381,7 @@ class NPROTO_OT_edit_cvs(bpy.types.Operator):
                     self.report({'WARNING'}, f"{obj.name}: {why}")
                     return {'CANCELLED'}
                 if features.has_history(obj):
-                    self.report({'INFO'}, f"{obj.name}: moving a CV removes its construction history "
+                    self.report({'INFO'}, f"{obj.name}: moving a CV bakes it -- its construction history goes "
                                           "(Cancel, or leaving without a change, keeps it)")
                 if context.object is not None and context.object.mode != 'OBJECT':
                     bpy.ops.object.mode_set(mode='OBJECT')

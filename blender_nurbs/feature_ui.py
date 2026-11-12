@@ -38,6 +38,7 @@ FIELDS = {
     "sweep": ["samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height", "flip_normal"],
     "pipe": ["radius", "samples"],
     "patch": ["pt_cvs", "pt_cvs_v", "pt_auto_cvs", "pt_degree", "pt_fair", "pt_surface_fair"],
+    "dome": ["dome_layout", "dome_cont", "dome_height", "dome_fullness", "dome_cvs"],
     "boundary": ["bd_exact", "sq_degree_u", "sq_degree_v", "sq_spans_u", "sq_spans_v", "samples", "flip_normal"],
     "square": ["e0", "w0", "e1", "w1", "e2", "w2", "e3", "w3", "sq_match", "sq_degree_u", "sq_degree_v", "sq_spans_u", "sq_spans_v"],
     "iso_curve": ["iso_dir", "param"],
@@ -62,7 +63,7 @@ LABELS = {"tan_a": "Tangent A", "tan_b": "Tangent B", "cur_a": "Curvature A", "c
           "spans_u": "Spans U", "spans_v": "Spans V", "radius2": "Radius 2", "width": "Size X", "depth": "Size Y",
           "e0": "Edge 1", "e1": "Edge 2", "e2": "Edge 3", "e3": "Edge 4", "w0": "Weight 1", "w1": "Weight 2",
           "w2": "Weight 3", "w3": "Weight 4", "sq_spans_u": "Spans U (0 auto)", "sq_spans_v": "Spans V (0 auto)"}
-PRETTY = {"patch": "Patch", "square": "Square", "sweep": "Sweep", "pipe": "Pipe", "boundary": "Boundary", "iso_curve": "Iso Curve",
+PRETTY = {"patch": "Patch", "dome": "Dome", "square": "Square", "sweep": "Sweep", "pipe": "Pipe", "boundary": "Boundary", "iso_curve": "Iso Curve",
           "dup_edge": "Duplicate Edge", "project_curve": "Projected Curve", "intersect": "Intersection",
           "join": "Join", "split_region": "Split", "boolean": "Boolean", "boundary_fill": "Boundary Fill", "join_curves": "Join Curves", "loft_rails": "Loft Rails", "surface_fillet": "Surface Fillet", "loft": "Loft", "blend_curve": "Blend Curve", "extrude": "Extrude", "revolve": "Revolve",
           "offset": "Offset", "thicken": "Thicken", "planar": "Planar", "perp_profile": "Profile"}
@@ -241,6 +242,18 @@ class NprotoPatchEdge(bpy.types.PropertyGroup):
 
 
 class NprotoFeature(bpy.types.PropertyGroup):
+    dome_layout: EnumProperty(name="Layout", items=[("POLAR", "Polar", "Rows from the rim to one top point (a round rim: an exact revolution)"),
+                              ("DRAPED", "Draped", "One even four-sided surface over the opening, trimmed "
+                                                   "to the rim (no pole: easy to edit)")], **_F())
+    dome_cvs: IntProperty(name="CVs", min=8, max=24, description="Draped: CVs in each direction", **_F())
+    dome_cont: EnumProperty(name="Continuity", items=[("G1", "G1", "Tangent to the surface"),
+                                                      ("G2", "G2", "Tangent, with the surface's curvature carried on")],
+                            **_F())
+    dome_height: FloatProperty(name="Height", min=0.05, soft_max=3.0,
+                               description="1: round (the sphere that carries the surface on over the rim); "
+                                           "less: flatter, more: taller", **_F())
+    dome_fullness: FloatProperty(name="Fullness", min=0.3, max=2.0,
+                                 description="How far the rim's direction carries into the dome", **_F())
     cont_a: EnumProperty(name="Continuity A", items=CONT_ITEMS, **_F())
     cont_b: EnumProperty(name="Continuity B", items=CONT_ITEMS, **_F())
     tan_a: FloatProperty(name="Tangent A", min=0.0, soft_max=3.0, **_F())
@@ -436,7 +449,13 @@ def draw_feature(layout, context):
     head.label(text=f"Editing: {obj.name}" + ("  (hidden input)" if obj.hide_get() else ""),
                icon='HIDE_ON' if obj.hide_get() else 'OBJECT_DATA')
     if not hist:
-        layout.label(text="No history of its own (frozen) -- Edit CVs still works", icon='INFO')
+        box = layout.box()
+        row = box.row()
+        row.label(text="Baked: no history of its own", icon='FREEZE')
+        row.operator("nproto.delete_feature", text="", icon='TRASH').name = obj.name
+        ff = history_ui.from_feeds(obj, context.scene)
+        if ff:
+            box.label(text=ff, icon='LINKED')
     pg_s = obj.nproto_step
     if hist and pg_s.focus and pg_s.index >= 0:
         # a step picked in the Construction Tree: only that step, not the feature under it
@@ -451,6 +470,8 @@ def draw_feature(layout, context):
             row = box.row()
             row.label(text=f"Feature: {history_ui.step_label(e).partition(' · ')[0]}",
                       icon=history_ui.STEP_ICON.get(e["op"], 'MODIFIER'))
+            bk = row.operator("nproto.bake_feature", text="", icon='FREEZE')
+            bk.name, bk.step = obj.name, pg_s.index
             row.operator("nproto.remove_step", text="", icon='TRASH').index = pg_s.index
             if e["params"].get("_off"):
                 box.label(text="Off: skipped (switch it on in the Construction Tree)", icon='INFO')
@@ -469,6 +490,12 @@ def draw_feature(layout, context):
             row.label(text=f"Feature: {title}", icon='MODIFIER')
             if op in features.KEEP_OPS:
                 row.operator("nproto.restore_inputs", text="Restore Inputs", icon='LOOP_BACK')
+            bk = row.operator("nproto.bake_feature", text="", icon='FREEZE')
+            bk.name, bk.step = obj.name, -1
+            row.operator("nproto.delete_feature", text="", icon='TRASH').name = obj.name
+            ff = history_ui.from_feeds(obj, context.scene)
+            if ff:
+                box.label(text=ff, icon='LINKED')
             if op == "surface_fillet":       # how it was built (set in the Fillet's redo panel)
                 prm = h["params"]
                 shape = ("Blend G%d" % prm["blend"]) if prm.get("blend") else \
@@ -530,7 +557,10 @@ def draw_feature(layout, context):
                         if name == "width" and shp == "SQUARE":
                             col.prop(pg, name, text="Size")
                             continue
-                    if name in ("degree", "square_degree", "jc_mode", "bool_op", "lr_degree", "lr_mode", "pp_shape"):
+                    if op == "dome" and name == "dome_cvs" and pg.dome_layout != "DRAPED":
+                        continue
+                    if name in ("degree", "square_degree", "jc_mode", "bool_op", "lr_degree", "lr_mode", "pp_shape",
+                                "dome_cont", "dome_layout"):
                         col.row().prop(pg, name, expand=True)
                     elif name in ("jc_degree", "jc_cvs") and pg.jc_mode != "REBUILD":
                         continue

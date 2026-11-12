@@ -184,7 +184,7 @@ def default_ref(obj):
 LOFT_FOLD_DEG = 1.0     # a loft surface folding more than this along a knot line is split there
 
 
-def split_folds(g):
+def split_folds(g, rows=None):
     """A surface with folds (C0 knot lines where its normal jumps, e.g. a loft
     through rectangles) as faces joined along them, like Rhino's polysurface
     from kinked curves: the folds become real edges, which Edge Fillet can
@@ -192,7 +192,7 @@ def split_folds(g):
     sm, _ = _k()
     if not isinstance(g, sm.Surface):
         return g
-    pieces = store._crease_pieces(g, LOFT_FOLD_DEG)
+    pieces = store._crease_pieces(g, LOFT_FOLD_DEG, rows)
     if not pieces:
         return g
     from . import jobs
@@ -211,8 +211,25 @@ def build_loft(inputs, p):
         # through curve sections: sections with corners give folds -> faces.
         # A G1 / G2 blend between two edges is never split (a fold there would
         # be a defect, not hidden as a polysurface)
-        g = split_folds(g)
+        g = split_folds(g, _section_rows(g, inputs))
     return g
+
+
+def _section_rows(g, inputs):
+    """The u values where a loft surface holds its sections (None if not found)."""
+    sm, _ = _k()
+    try:
+        rows = []
+        for o, r in inputs:
+            P = geom.sample_curve(input_curve(o, r), 5)[1:4]
+            us = []
+            for q in P:
+                uv = sm.surface_closest_point(g, tuple(map(float, q)))[1][0]
+                us.append(float(uv.x if hasattr(uv, "x") else uv[0]))
+            rows.append(float(np.median(us)))
+        return rows
+    except Exception:
+        return None
 
 
 def _is_skin(inputs, p):
@@ -240,6 +257,11 @@ def _build_loft(inputs, p):
         if p.get("auto_align", True):
             prev = geom.sample_curve(curves[0], 16)
             for i in range(1, len(curves)):
+                if geom.is_closed_curve(curves[i]) and geom.is_closed_curve(curves[i - 1]):
+                    # closed sections: the same way round, starting in the same direction
+                    curves[i] = geom.align_closed(curves[i - 1], curves[i])
+                    prev = geom.sample_curve(curves[i], 16)
+                    continue
                 cur = geom.sample_curve(curves[i], 16)
                 if geom.should_flip(prev, cur):
                     curves[i] = geom.reverse_curve(curves[i])
@@ -251,7 +273,13 @@ def _build_loft(inputs, p):
             return geom.closed_skin(curves)
         if len(curves) == 2 and p.get("ruled"):
             return sm.create_ruled_surface(curves[0], curves[1])
-        return sm.create_skin_surface(curves)
+        try:
+            # our own skin: the kernel's spaces the sections by its own measure and
+            # can overshoot (sections of different layouts: the loft rose past
+            # the top section and folded back down to it)
+            return geom.open_skin([c for c in curves])
+        except Exception:
+            return sm.create_skin_surface(curves)
 
     # Two inputs with G1/G2 to surfaces: sampled blend surface.
     n = int(p.get("samples", 24))
@@ -723,6 +751,54 @@ def has_history(obj):
     return PROP_HIST in obj or PROP_STACK in obj
 
 
+def bake(obj, step=-1):
+    """Bake (Alias' Delete History): keep obj as it is and drop its history
+    up to `step` -- step -1: just its own feature (it stops following its
+    inputs); step k: the feature and steps 0..k, which become a snapshot the
+    later steps keep building on. Returns the objects it no longer uses."""
+    from . import steps as _steps
+    entries = stack(obj)
+    h = history(obj)
+    freed = [src for src, _ in h["inputs"]] if h is not None else []
+    if step < 0 and not entries or obj.type == 'CURVE':
+        clear_history(obj)                 # nothing builds on top: the geometry is all there is
+        return freed
+    # the geometry the kept steps build on
+    if h is not None:
+        g = run(h["op"], h["inputs"], h["params"])
+        if isinstance(g, tuple) and g and g[0] == "brep_text":
+            text, natural = g[1], False
+        elif isinstance(g, tuple):
+            clear_history(obj)
+            return freed
+        else:
+            sm = _k()[0]
+            text, natural = store.brep_to_text(store.to_brep(g)), not isinstance(g, sm.Brep)
+    else:
+        text = obj.get(PROP_BASE, obj.get(store.PROP_BREP))
+        natural = bool(obj.get(PROP_BASE + "_natural", 0))
+    upto = min(step, len(entries) - 1)
+    for e in entries[:upto + 1]:
+        freed += [src for src, _ in e["inputs"]]
+        if not e["params"].get("_off"):
+            text = _steps.APPLY[e["op"]](obj, text, e["inputs"], e["params"])
+            natural = False
+    keep = entries[upto + 1:]
+    for key in [k for k in obj.keys() if k.startswith("nproto_in_")] + [PROP_HIST]:
+        if key in obj:
+            del obj[key]
+    _write_stack(obj, keep)
+    if keep:
+        obj[PROP_BASE] = text
+        obj[PROP_BASE + "_natural"] = 1 if natural else 0
+    else:
+        for key in (PROP_BASE, PROP_BASE + "_natural"):
+            if key in obj:
+                del obj[key]
+    mark_built(obj)
+    return [o for o in dict.fromkeys(freed) if o is not None]
+
+
 def clear_history(obj):
     for key in [k for k in obj.keys() if k.startswith(("nproto_in_", "nproto_sin_")) or
                 k in (PROP_HIST, PROP_STACK, PROP_BASE, PROP_BASE + "_natural")]:
@@ -733,11 +809,25 @@ def history_inputs(obj):
     return [obj[k] for k in obj.keys() if k.startswith(("nproto_in_", "nproto_sin_")) and obj[k] is not None]
 
 
+def depends_on(obj, other, limit=500):
+    """Is obj built (directly or through other objects) from `other`?"""
+    seen, todo = set(), [obj]
+    while todo:
+        o = todo.pop()
+        for src in history_inputs(o):
+            if src is other:
+                return True
+            if src.name not in seen and len(seen) < limit:
+                seen.add(src.name)
+                todo.append(src)
+    return False
+
+
 # Features whose surface faces whichever way its inputs happen to run: built
 # from edges of other surfaces it is turned to face the same way as they do
 # (matcaps / shading / a later Join agree across the edges); Flip Normal turns
 # it over on top of that. Patch, Square and Loft Rails orient themselves.
-ORIENT_OPS = {"loft", "boundary", "sweep"}
+ORIENT_OPS = {"loft", "boundary", "sweep", "dome"}
 PROP_FLIPPED = "nproto_flipped"   # 1 = the last build reversed u (see _rebuild)
 LAST_FLIP = [None]                # the last run()'s decision for an ORIENT_OPS surface (None: not one)
 

@@ -191,13 +191,17 @@ def _split_knots(P, W, U, p, k, tol):
     return left, right
 
 
-def _crease_pieces(surf, angle_deg):
+def _crease_pieces(surf, angle_deg, v_rows=None):
     """An untrimmed surface with folds -- C0 knot lines where the normal jumps
     by more than angle_deg, like a loft through rectangles -- as smooth pieces
     split exactly at those lines (None when it has none). Tessellated piece by
     piece, the creases stay sharp: one mesh across a fold gets vertex normals
     from one side only (dark streaks), and the refinement keeps splitting the
-    triangles there (normals more than angle_deg apart) into slivers."""
+    triangles there (normals more than angle_deg apart) into slivers.
+    v_rows: the u values of a loft's sections -- a knot line across them
+    (constant v) is a fold only when it is a corner at a section; between
+    sections of different layouts (a rational circle's quarter knots beside a
+    free curve) the surface turns a degree or so there that is no corner."""
     _, ext = _k()
     try:
         d = ext.surface_cvs(surf)
@@ -214,18 +218,18 @@ def _crease_pieces(surf, angle_deg):
         n = np.cross(su, sv)
         return n / (np.linalg.norm(n) or 1.0)
 
-    def folds(U, p, other, along_u):
+    def folds(U, p, other, along_u, at=None):
         lo, hi = U[p], U[-p - 1]
         tol = 1e-9 * (hi - lo or 1.0)
         eps = 1e-6 * (hi - lo or 1.0)
         out = []
         if abs(U[0] - lo) > tol or abs(U[-1] - hi) > tol:
             return out                         # an unclamped (periodic) knot vector: left whole
-        for k in sorted({x for x in U if lo + tol < x < hi - tol}):
+        for k in sorted({x for x in U if lo + 2 * eps < x < hi - 2 * eps}):   # (k +- eps inside the surface)
             if sum(1 for x in U if abs(x - k) <= tol) != p:
                 continue                       # smoother than C0 (or a gap): nothing to split
             o0, o1 = other
-            for t in np.linspace(o0, o1, 7)[1:-1]:
+            for t in (np.linspace(o0, o1, 7)[1:-1] if at is None else at):
                 a = normal(k - eps, t) if along_u else normal(t, k - eps)
                 b = normal(k + eps, t) if along_u else normal(t, k + eps)
                 if float(a @ b) < cos_c:
@@ -233,7 +237,11 @@ def _crease_pieces(surf, angle_deg):
                     break
         return out
     ku = folds(Uu, du, (Uv[dv], Uv[-dv - 1]), True)
-    kv = folds(Uv, dv, (Uu[du], Uu[-du - 1]), False)
+    at = None
+    if v_rows is not None:
+        lo_u, hi_u = Uu[du], Uu[-du - 1]
+        at = [min(max(float(u), lo_u), hi_u) for u in v_rows]
+    kv = folds(Uv, dv, (Uu[du], Uu[-du - 1]), False, at)
     if not ku and not kv or (len(ku) + 1) * (len(kv) + 1) > 64:
         return None
     rows = [(P, W, Uu)]

@@ -450,7 +450,7 @@ class VIEW3D_PT_nproto_active(_SidePanel, bpy.types.Panel):
             box.label(text="G / R / S, proportional editing, snapping...")
             src = bpy.data.objects.get(cage[_cvs.CAGE_OF])
             if src is not None and features.has_history(src):
-                box.label(text="Moving a CV removes its history (Cancel keeps it)", icon='INFO')
+                box.label(text="Moving a CV bakes this surface (Cancel keeps its history)", icon='FREEZE')
             row = box.row(align=True)
             row.scale_y = 1.3
             row.operator("nproto.cvs_done", icon='CHECKMARK')
@@ -466,7 +466,8 @@ class VIEW3D_PT_nproto_active(_SidePanel, bpy.types.Panel):
             box.label(text=f"{obj.name}: {brep.face_count()} face(s), {brep.edge_count()} edge(s)")
             h = features.history(obj)
             if h:
-                op = h["op"].replace("prim_", "").replace("_", " ").title()
+                from .feature_ui import PRETTY
+                op = PRETTY.get(h["op"], h["op"].replace("prim_", "").replace("_", " ").title())
                 box.label(text=f"History: {op}" + (" from " + ", ".join(o.name for o, _ in h["inputs"]) if h["inputs"] else ""))
             elif features.PROP_HIST in obj:
                 box.label(text="History: broken (input deleted)", icon='ERROR')

@@ -316,6 +316,21 @@ class PickMixin:
 # Loft
 # --------------------------------------------------------------------------
 
+def loft_selection_order(sel, active=None, closed=False):
+    """The order to loft selected curves in. A selection has none (Blender's
+    list is not the order they were clicked), so three or more open-loft
+    sections go along the chain through them; two keep the active one last.
+    Picking them one by one keeps your order."""
+    sel = sorted(sel, key=lambda o: o == active)  # active last
+    if len(sel) >= 3 and not closed:
+        try:
+            order = geom.chain_order([features.input_curve(o, "S0") for o in sel])
+            sel = [sel[i] for i in order]
+        except Exception:
+            pass
+    return sel
+
+
 class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
     """Loft a surface between curves or surface edges (G0 / G1 / G2)"""
     bl_idname = "nproto.loft"
@@ -337,7 +352,7 @@ class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
                          description="G2 shape at input A (moves the 3rd CV row along the tangent)")
     cur_b: FloatProperty(name="Curvature B", default=0.0, soft_min=-2.0, soft_max=2.0)
     auto_align: BoolProperty(name="Auto Align", default=True,
-                             description="Flip inputs so the loft does not twist")
+                             description="Flip inputs, and start closed sections in the same direction, so the loft does not twist")
     flip_b: BoolProperty(name="Flip B", default=False)
     ruled: BoolProperty(name="Ruled", default=False, description="Straight (degree 1) loft between 2 curves")
     closed: BoolProperty(name="Closed", default=False,
@@ -351,8 +366,7 @@ class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
             return {'CANCELLED'}
         sel = [o for o in context.selected_objects if o.type == 'CURVE']
         if self.use_selection or (len(sel) >= 2 and not event.alt):
-            act = context.active_object
-            sel.sort(key=lambda o: o == act)  # active last
+            sel = loft_selection_order(sel, context.active_object, self.closed)
             self.inputs = _encode_inputs([(o, "S0") for o in sel])
             return self.execute(context)
         return self.start_picking(context)

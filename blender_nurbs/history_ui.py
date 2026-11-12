@@ -383,7 +383,7 @@ def _summary(obj, steps=True):
     if not steps:            # the tree lists the steps on their own rows
         if not parts and features.PROP_BASE in obj:
             parts.append("snapshot")
-        return parts[0] if parts else ("frozen" if store.is_nurbs(obj) else obj.type.title())
+        return parts[0] if parts else ("baked" if store.is_nurbs(obj) else obj.type.title())
     try:
         parts += [step_label(e).split(" ·")[0] + (" (off)" if e["params"].get("_off") else "")
                   for e in features.stack(obj)]
@@ -412,52 +412,51 @@ def _children(obj):
     return out
 
 
-def _node(col, obj, depth, role, active, seen, root):
-    """One tree line: name (click = make active) | role · summary | eye.
-    Each object is expanded once; later mentions (e.g. two surfaces that trim
-    each other) say so instead of repeating the subtree."""
+def build_order(root, limit=400):
+    """root and everything it is built from, each once, every object after
+    what it is built from (oldest first): the order the model was built in."""
+    out, seen = [], set()
+
+    def visit(o, depth):
+        if o.name in seen or depth > 60 or len(out) >= limit:
+            return
+        seen.add(o.name)
+        for src, _ in _children(o):
+            visit(src, depth + 1)
+        out.append(o)
+    visit(root, 0)
+    return out
+
+
+def _row_object(col, obj, active, root):
+    """One feature that makes an object: name (click = edit it) | what it is | eye."""
     split = col.split(factor=0.5, align=True)
-    left = split.row(align=True)
-    if depth:
-        left.separator(factor=1.2 * depth)
     icon = 'OUTLINER_OB_SURFACE' if store.is_nurbs(obj) else ('OUTLINER_OB_CURVE' if obj.type == 'CURVE' else 'OBJECT_DATA')
-    op = left.operator("nproto.history_focus", text=obj.name, icon=icon, emboss=False, depress=obj == active)
+    op = split.row(align=True).operator("nproto.history_focus", text=obj.name, icon=icon, emboss=False,
+                                        depress=obj == active and not obj.nproto_step.focus)
     op.name, op.root = obj.name, root.name
     right = split.row(align=True)
-    repeat = obj.name in seen
-    info = "see above" if repeat else _summary(obj, steps=False)
-    if role not in ("self", "input"):
-        info = f"{role} · {info}"
-    right.label(text=info)
+    right.label(text=_summary(obj, steps=False))
     right.operator("nproto.history_toggle_hide", text="", icon='HIDE_OFF' if features.is_shown(obj) else 'HIDE_ON',
                    emboss=False).name = obj.name
-    if repeat or depth > 6:
-        return
-    seen.add(obj.name)
-    # the steps applied on top of the feature (fillets, trims, flips ...), in order
-    try:
-        entries = features.stack(obj)
-    except RuntimeError:
-        entries = []
-        col.label(text="a history step lost an input", icon='ERROR')
-    for k, e in enumerate(entries):
-        sp = col.split(factor=0.5, align=True)
-        lft = sp.row(align=True)
-        lft.separator(factor=1.2 * (depth + 1))
-        label = step_label(e)
-        head, _, rest = label.partition(" · ")
-        off = e["params"].get("_off")
-        op = lft.operator("nproto.tree_step", text=f"{k + 1}. {head}", icon=STEP_ICON.get(e["op"], 'MODIFIER'),
-                          emboss=False, depress=obj == active and obj.nproto_step.index == k)
-        op.name, op.root, op.index = obj.name, root.name, k
-        r = sp.row(align=True)
-        r.active = not off
-        r.label(text=(rest or "step") + (" (off)" if off else ""))
-        mo = r.operator("nproto.mute_step", text="", emboss=False,       # on / off, where the eyes are
-                        icon='CHECKBOX_DEHLT' if off else 'CHECKBOX_HLT')
-        mo.index, mo.name = k, obj.name
-    for src, r in _children(obj):
-        _node(col, src, depth + 1, r, active, seen, root)
+
+
+def _row_step(col, obj, k, e, active, root):
+    """One step applied to that object (a fillet, trim ...): name | settings | eye
+    (on / off: the object without it)."""
+    sp = col.split(factor=0.5, align=True)
+    lft = sp.row(align=True)
+    lft.separator(factor=1.2)
+    head, _, rest = step_label(e).partition(" · ")
+    off = e["params"].get("_off")
+    op = lft.operator("nproto.tree_step", text=f"{k + 1}. {head}", icon=STEP_ICON.get(e["op"], 'MODIFIER'),
+                      emboss=False, depress=obj == active and obj.nproto_step.focus and obj.nproto_step.index == k)
+    op.name, op.root, op.index = obj.name, root.name, k
+    r = sp.row(align=True)
+    r.active = not off
+    r.label(text=(rest or "step") + (" (off)" if off else ""))
+    mo = r.operator("nproto.mute_step", text="", emboss=False, icon='HIDE_ON' if off else 'HIDE_OFF')
+    mo.index, mo.name = k, obj.name
 
 
 def dependents(obj, scene):
@@ -488,11 +487,14 @@ def tree_root(context, obj):
 
 
 def draw_tree(layout, context, obj):
+    """The body's history in the order it was built (oldest first): every
+    feature once, each followed by the steps applied to it. The eye shows what
+    a feature made: an object (shown / hidden) or a step (on / off)."""
     s = context.scene.nproto_settings
     root = tree_root(context, obj)
     box = layout.box()
     row = box.row()
-    row.prop(s, "show_tree", text="Construction Tree", emboss=False,
+    row.prop(s, "show_tree", text="History (oldest first)", emboss=False,
              icon='DISCLOSURE_TRI_DOWN' if s.show_tree else 'DISCLOSURE_TRI_RIGHT')
     if root != obj:
         op = row.operator("nproto.history_focus", text=f"Back to {root.name}", icon='BACK')
@@ -500,24 +502,135 @@ def draw_tree(layout, context, obj):
     if not s.show_tree:
         return
     col = box.column(align=True)
-    _node(col, root, 0, "self", obj, set(), root)
-    used = dependents(obj, context.scene)
-    if used:
-        col.separator()
-        col.label(text="Used by (rebuild when this changes):", icon='LINKED')
-        for d in used:
-            sp = col.split(factor=0.5, align=True)
-            op = sp.row().operator("nproto.history_focus", text=d.name, icon='OUTLINER_OB_SURFACE', emboss=False)
-            op.name, op.root = d.name, d.name
-            r = sp.row(align=True)
-            r.label(text=_summary(d))
-            r.operator("nproto.history_toggle_hide", text="", icon='HIDE_OFF' if features.is_shown(d) else 'HIDE_ON',
-                       emboss=False).name = d.name
-    box.label(text="Click a name to edit it (it stays hidden; Shift+click shows it)", icon='INFO')
+    for o in build_order(root):
+        _row_object(col, o, obj, root)
+        try:
+            entries = features.stack(o)
+        except RuntimeError:
+            entries = []
+            col.label(text="a history step lost an input", icon='ERROR')
+        for k, e in enumerate(entries):
+            _row_step(col, o, k, e, obj, root)
+    box.label(text="Click a feature to edit it · Shift+click shows it", icon='INFO')
+
+
+def from_feeds(obj, scene):
+    """'From: a, b · Feeds: c' for a feature's panel ('' when neither)."""
+    src = list(dict.fromkeys(o.name for o in features.history_inputs(obj)))
+    dst = [d.name for d in dependents(obj, scene)]
+    parts = []
+    if src:
+        parts.append("From: " + ", ".join(src[:4]) + (" ..." if len(src) > 4 else ""))
+    if dst:
+        parts.append("Feeds: " + ", ".join(dst[:4]) + (" ..." if len(dst) > 4 else ""))
+    return "  ·  ".join(parts)
+
+
+class NPROTO_OT_bake_feature(bpy.types.Operator):
+    """Bake: keep the result as it is and drop the history under it (Alias' Delete
+    History). A feature stops following its inputs; a step is baked into the body
+    together with what comes before it (later steps stay live). Edit CVs bakes too"""
+    bl_idname = "nproto.bake_feature"
+    bl_label = "Bake"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    name: StringProperty()
+    step: IntProperty(default=-1)
+
+    def execute(self, context):
+        obj = bpy.data.objects.get(self.name)
+        if obj is None or not features.has_history(obj):
+            return {'CANCELLED'}
+        try:
+            freed = features.bake(obj, self.step)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Bake failed: {exc}")
+            return {'CANCELLED'}
+        obj.nproto_step.focus = False
+        obj.nproto_step.index = -1
+        gone = features.purge_inputs(context, freed)
+        what = obj.name if self.step < 0 else f"{obj.name} up to step {self.step + 1}"
+        self.report({'INFO'}, f"Baked {what}" + (f"; deleted {len(gone)} hidden input(s) nothing uses now" if gone else ""))
+        return {'FINISHED'}
+
+
+class NPROTO_OT_delete_feature(bpy.types.Operator):
+    """Delete this feature's object. When other features are built from it, choose:
+    bake them first (they keep their shape) or delete them too"""
+    bl_idname = "nproto.delete_feature"
+    bl_label = "Delete Feature"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    name: StringProperty()
+    mode: EnumProperty(name="Built from it", default="BAKE",
+                       items=[("BAKE", "Bake them (they keep their shape)", ""),
+                              ("ALL", "Delete them too", "")])
+
+    def _users(self, context, obj):
+        out, todo = [], [obj]
+        while todo:
+            o = todo.pop()
+            for d in features.users_of(o):
+                if d not in out and d is not obj:
+                    out.append(d)
+                    todo.append(d)
+        return out
+
+    def invoke(self, context, event):
+        obj = bpy.data.objects.get(self.name)
+        if obj is None:
+            return {'CANCELLED'}
+        if self._users(context, obj):
+            return context.window_manager.invoke_props_dialog(self, width=360)
+        return self.execute(context)
+
+    def draw(self, context):
+        obj = bpy.data.objects.get(self.name)
+        users = self._users(context, obj) if obj else []
+        self.layout.label(text=f"Built from {self.name}: " + ", ".join(u.name for u in users[:5])
+                          + (" ..." if len(users) > 5 else ""))
+        self.layout.prop(self, "mode", expand=True)
+
+    def execute(self, context):
+        obj = bpy.data.objects.get(self.name)
+        if obj is None:
+            return {'CANCELLED'}
+        users = self._users(context, obj)
+        freed = list(features.history_inputs(obj))
+        doomed = [obj]
+        if users and self.mode == "ALL":
+            doomed += users
+        elif users:
+            for d in features.users_of(obj):      # their history stops at this object
+                st = features.stack(d)
+                uses = [k for k, e in enumerate(st) if any(src is obj for src, _ in e["inputs"])]
+                h = features.history(d)
+                if uses:
+                    freed += features.bake(d, max(uses))
+                elif h is not None and any(src is obj for src, _ in h["inputs"]):
+                    freed += features.bake(d, -1)
+        names = [o.name for o in doomed]
+        for o in doomed:
+            freed += features.history_inputs(o)
+        from .ops_trim import _remove_object
+        for o in doomed:
+            _remove_object(o)
+        gone = features.purge_inputs(context, [o for o in dict.fromkeys(freed) if _alive(o)])
+        self.report({'INFO'}, "Deleted " + ", ".join(names) + (f"; and {len(gone)} hidden input(s) nothing uses now"
+                                                              if gone else ""))
+        return {'FINISHED'}
+
+
+def _alive(o):
+    try:
+        return o.name in bpy.data.objects
+    except ReferenceError:
+        return False
 
 
 classes = (NprotoStep, NPROTO_OT_open_step, NPROTO_OT_mute_step, NPROTO_OT_history_focus,
-           NPROTO_OT_history_toggle_hide, NPROTO_OT_tree_step, NPROTO_OT_step_unfocus)
+           NPROTO_OT_history_toggle_hide, NPROTO_OT_tree_step, NPROTO_OT_step_unfocus,
+           NPROTO_OT_bake_feature, NPROTO_OT_delete_feature)
 
 
 def register():
