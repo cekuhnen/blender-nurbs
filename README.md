@@ -375,7 +375,7 @@ gh workflow run kernel.yml --ref <branch> -f release=true
 **Package:** `python3 tools/package_extension.py` zips `blender_nurbs/` into `dist/nurbs_modeling-<version>.zip`. `--split` also writes one zip per platform (`dist/nurbs_modeling-<version>-macos_arm64.zip`, `-windows_x64`, `-linux_x64`), each with only its own module. A zip's manifest lists exactly the platforms whose module it holds (a macOS module is read to tell arm64, Intel or both), so Blender won't install it where it has no kernel. `--check` only lists the modules found. Check a zip with:
 
 ```bash
-/Applications/Blender.app/Contents/MacOS/Blender --factory-startup --command extension validate dist/nurbs_modeling-0.2.0.zip
+/Applications/Blender.app/Contents/MacOS/Blender --factory-startup --command extension validate dist/nurbs_modeling-0.3.0.zip
 ```
 
 Kernel files written by the add-on use `\n` line endings on every platform. Python on Windows would otherwise write `\r\n` into the B-rep text the C++ reader parses.
