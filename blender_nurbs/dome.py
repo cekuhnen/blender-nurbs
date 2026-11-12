@@ -591,7 +591,7 @@ class NPROTO_OT_dome(AskValue, PickMixin, bpy.types.Operator):
         if not self._rims:
             self.report({'WARNING'}, "No open rim (a closed open edge) to dome")
             return {'CANCELLED'}
-        return self.start_picking(context)
+        return self.start_picking(context, event)
 
     def draw(self, context):
         lay = self.layout

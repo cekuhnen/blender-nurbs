@@ -606,6 +606,10 @@ def set_shown(context, obj, show):
     coll = history_collection(context, create=False)
     kept = coll is not None and obj.name in coll.objects
     scol = context.scene.collection
+    if show and kept and not keepers_of(obj):
+        # nothing keeps it any more (its Join was removed): back where it came from, for good
+        release_inputs(context, [obj])
+        return
     if show:
         if kept and obj.name not in scol.objects:
             scol.objects.link(obj)
@@ -654,6 +658,30 @@ def release_inputs(context, objs):
             o.hide_set(False)
         except RuntimeError:
             pass
+
+
+def is_kept(context, obj):
+    """obj is stashed as a kept input (in the NURBS History collection, or
+    hidden there with its old collections remembered)."""
+    coll = history_collection(context, create=False)
+    return (coll is not None and obj.name in coll.objects) or PROP_HOME in obj
+
+
+def keepers_of(obj):
+    """The features that keep obj as a hidden input: a Join, Thicken, Boolean...
+    (KEEP_OPS) built from it. A Loft or Boundary from its edges leaves it shown."""
+    import bpy
+    out = []
+    for d in bpy.data.objects:
+        if d is obj or not any(d.get(k) is obj for k in d.keys() if k.startswith("nproto_in_")):
+            continue
+        try:
+            op = json.loads(d.get(PROP_HIST, "{}")).get("op")
+        except (ValueError, TypeError):
+            op = None
+        if op in KEEP_OPS:
+            out.append(d)
+    return out
 
 
 def users_of(obj):

@@ -189,12 +189,17 @@ class NprotoView(bpy.types.PropertyGroup):
                               description="Points per curve")
     diag_selected_only: BoolProperty(update=_rd, name="Selected Only", default=True,
                                      description="Zebra / comb on the selected objects only (else on all visible)")
-    sel_mode: EnumProperty(name="Select", default="BODY", update=lambda s, c: _subsel_mode(s, c),
-                           items=[("BODY", "Body", "Select whole bodies (Blender's object selection)", 'MESH_CUBE', 0),
+    sel_mode: EnumProperty(name="Select", default={"BODY"}, options={'ENUM_FLAG'},
+                           update=lambda s, c: _subsel_mode(s, c),
+                           items=[("BODY", "Body", "Select whole bodies (Blender's object selection)", 'MESH_CUBE', 1),
                                   ("FACE", "Face", "Pick faces of NURBS bodies: click, Shift+click adds or removes. "
-                                                   "CVs / Hulls then shows only the picked faces' nets", 'FACESEL', 1),
+                                                   "Shift+click Edge too to pick both. CVs / Hulls shows only the picked "
+                                                   "faces' nets; Unjoin splits them off; X / Delete removes them",
+                                   'FACESEL', 2),
                                   ("EDGE", "Edge", "Pick edges of NURBS bodies: click, Shift+click adds or removes. "
-                                                   "Edge Fillet and Continuity Check take the picked edges", 'EDGESEL', 2)])
+                                                   "Shift+click Face too to pick both (an edge near the mouse wins). "
+                                                   "Edge Fillet, Continuity Check, Loft, Square, Planar, Patch... "
+                                                   "take the picked edges", 'EDGESEL', 4)])
     show_edges: BoolProperty(name="Edges", default=True, update=lambda s, c: _redraw_views(c))
     show_cvs: BoolProperty(name="CVs / Hulls", default=False, update=lambda s, c: _redraw_views(c))
     show_cont_labels: BoolProperty(name="Feature Labels", default=True,
@@ -398,6 +403,10 @@ def header_analyze(self, context):
     subsel.draw_mode_buttons(self.layout, context)
     if load_kernel() is not None:
         draw_display_toggles(self.layout, v, icons_only=True)
+        if clip_check(*_view_of(context)) is not None:      # a tiny Clip Start: one click fixes it
+            warn = self.layout.row(align=True)
+            warn.alert = True
+            warn.operator("nproto.fix_clip_start", text="", icon='ERROR')
     on = [n for n, k in (("Zebra", "show_zebra"), ("Draft", "show_draft"), ("Curvature", "show_curvature"),
                          ("Matcap", "show_matcap"), ("Comb", "show_comb"), ("Surface Combs", "show_iso_combs"))
           if getattr(v, k)]
@@ -507,6 +516,99 @@ DISPLAY_TOGGLES = (("show_edges", "Edges", 'MOD_WIREFRAME'), ("show_cvs", "CVs /
                    ("show_cont_labels", "Feature Labels", 'FONT_DATA'))
 
 
+# --------------------------------------------------------------------------
+# Clip Start: a 3D view's depth buffer spreads its precision between Clip
+# Start and Clip End; with a tiny Clip Start (1 um) it can only tell depths
+# about 8 mm apart at 0.37 m -- surfaces, edges and highlights then flicker
+# against each other
+# --------------------------------------------------------------------------
+
+DEPTH_STEP = 6e-8           # the depth buffer's resolution near the far end (24-bit / float32)
+CLIP_WARN = 5e-4            # warn when depth steps exceed this share of the view distance
+
+
+def _nice_down(x):
+    """x rounded down to 1, 2 or 5 times a power of ten."""
+    import math
+    e = math.floor(math.log10(x))
+    m = x / 10 ** e
+    return (5 if m >= 5 else 2 if m >= 2 else 1) * 10 ** e
+
+
+def clip_check(space, rv3d):
+    """None, or {"step": depth step at the view distance (m), "suggest":
+    Clip Start of about a thousandth of the view distance} when this
+    perspective view's Clip Start is too small to tell surfaces apart."""
+    if space is None or rv3d is None or getattr(rv3d, "view_perspective", "PERSP") != 'PERSP':
+        return None
+    n = float(space.clip_start)
+    z = float(rv3d.view_distance)
+    if n <= 0.0 or z <= 0.0:
+        return None
+    step = DEPTH_STEP * z * z / n
+    if step <= CLIP_WARN * z:
+        return None
+    return {"step": step, "suggest": _nice_down(z / 1000.0), "clip": n}
+
+
+def _fmt_len(context, x):
+    us = context.scene.unit_settings
+    try:
+        return bpy.utils.units.to_string(us.system, 'LENGTH', x * (us.scale_length or 1.0), precision=2)
+    except Exception:
+        return f"{x:.3g} m"
+
+
+def _view_of(context):
+    """(space, rv3d) of the 3D view in context (its sidebar or header too)."""
+    sp = getattr(context, "space_data", None)
+    if sp is None or sp.type != 'VIEW_3D':
+        return None, None
+    return sp, sp.region_3d
+
+
+class NPROTO_OT_fix_clip_start(bpy.types.Operator):
+    """This view's Clip Start is so small that its depth buffer can't tell nearby
+    surfaces apart (surfaces, edges and highlights flicker): set it to about a
+    thousandth of the view distance (Sidebar > View > Clip Start)"""
+    bl_idname = "nproto.fix_clip_start"
+    bl_label = "Fix Clip Start"
+    bl_options = {'REGISTER'}
+
+    value: FloatProperty(name="Clip Start", default=0.0, min=0.0, unit='LENGTH',
+                         description="0: about a thousandth of the view distance")
+
+    @classmethod
+    def poll(cls, context):
+        return _view_of(context)[0] is not None
+
+    def execute(self, context):
+        sp, rv3d = _view_of(context)
+        chk = clip_check(sp, rv3d)
+        v = self.value or (chk["suggest"] if chk else _nice_down(rv3d.view_distance / 1000.0))
+        old = sp.clip_start
+        sp.clip_start = v
+        self.report({'INFO'}, f"Clip Start {_fmt_len(context, old)} -> {_fmt_len(context, v)}")
+        return {'FINISHED'}
+
+
+def draw_clip_warning(layout, context):
+    """A warning with the fix, when the view's Clip Start is too small."""
+    chk = clip_check(*_view_of(context))
+    if chk is None:
+        return False
+    box = layout.box()
+    box.alert = True
+    col = box.column(align=True)
+    col.label(text=f"Clip Start {_fmt_len(context, chk['clip'])} is too small", icon='ERROR')
+    col.label(text=f"Depth steps of {_fmt_len(context, chk['step'])} here: surfaces,")
+    col.label(text="edges and highlights flicker against each other.")
+    op = box.operator("nproto.fix_clip_start", text=f"Set Clip Start to {_fmt_len(context, chk['suggest'])}",
+                      icon='VIEW_CAMERA')
+    op.value = chk["suggest"]
+    return True
+
+
 def draw_display_toggles(layout, v, icons_only=False):
     """Edges / CVs / Hulls / Feature Labels: in the Display panel, and as icons
     in the 3D view header (always at hand)."""
@@ -528,6 +630,7 @@ class VIEW3D_PT_nproto_display(_SidePanel, bpy.types.Panel):
     def draw(self, context):
         row = draw_display_toggles(self.layout, context.window_manager.nproto_view)
         row.scale_y = 1.3
+        draw_clip_warning(self.layout, context)
 
 
 class VIEW3D_PT_nproto_tessellation(_SidePanel, bpy.types.Panel):
@@ -571,7 +674,7 @@ class VIEW3D_PT_nproto_history(_SidePanel, bpy.types.Panel):
         col.operator("nproto.rebuild", icon='FILE_REFRESH')
 
 
-classes = (NPROTO_OT_rebuild_waiting, NprotoSettings, NprotoView, VIEW3D_PT_nproto_active, VIEW3D_PT_nproto_analyze,
+classes = (NPROTO_OT_rebuild_waiting, NPROTO_OT_fix_clip_start, NprotoSettings, NprotoView, VIEW3D_PT_nproto_active, VIEW3D_PT_nproto_analyze,
            VIEW3D_PT_nproto_analyze_side, VIEW3D_PT_nproto_display, VIEW3D_PT_nproto_tessellation,
            VIEW3D_PT_nproto_history)
 

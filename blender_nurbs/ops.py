@@ -227,13 +227,39 @@ class PickMixin:
         context.area.tag_redraw()
         return cur
 
-    def start_picking(self, context):
+    accepts_picks = False   # picked edges (Face / Edge mode) that fit become the inputs
+
+    def picked_inputs(self, context):
+        """The edges picked in Edge mode as this tool's inputs ((obj, ref) in
+        pick order, a Planar edge chained to its loop), when every one is
+        something it can take and their number fits; else None."""
+        from . import subsel
+        picked = subsel.selected_edges(context)
+        if not picked:
+            return None
+        byref = {(c[0].name, c[1]): c for c in self._cands}
+        out = []
+        for o, r in picked:
+            cand = byref.get((o.name, r))
+            if cand is None:
+                return None
+            for c in self.expand_pick(cand):
+                if (c[0], c[1]) not in out:
+                    out.append((c[0], c[1]))
+        return out if self.pick_min <= len(out) <= self.pick_max else None
+
+    def start_picking(self, context, event=None):
         self._cands = self.pick_candidates(context)
         if not self._cands:
             self.report({'WARNING'}, "Nothing to pick: add curves or NURBS surfaces first")
             return {'CANCELLED'}
         self._picks = []
         self._groups = []
+        if self.accepts_picks and not (event is not None and event.alt):
+            pre = self.picked_inputs(context)      # (expand_pick may look at self._picks: empty here)
+            if pre:
+                self._picks, self._groups = pre, [1] * len(pre)
+                return self._finish(context)
         self._ties, self._tie_key, self._cycle = [], None, 0
         draw.pick_overlay["picked"] = []
         draw.pick_overlay["hover"] = None
@@ -364,6 +390,7 @@ class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
     bl_label = "Loft"
     bl_options = {'REGISTER', 'UNDO'}
 
+    accepts_picks = True
     pick_min = 2
     pick_max = 32
 
@@ -396,7 +423,7 @@ class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
             sel = loft_selection_order(sel, context.active_object, self.closed)
             self.inputs = _encode_inputs([(o, "S0") for o in sel])
             return self.execute(context)
-        return self.start_picking(context)
+        return self.start_picking(context, event)
 
     def _params(self):
         return {k: getattr(self, k) for k in (
@@ -457,6 +484,7 @@ def _curve_inputs(context):
 
 
 class _CurveTool(PickMixin):
+    accepts_picks = True
     pick_min = 1
     pick_max = 1
     allow_edges = True
@@ -473,7 +501,7 @@ class _CurveTool(PickMixin):
         if ins and not event.alt:
             self.inputs = _encode_inputs(ins)
             return go(context)
-        return self.start_picking(context)
+        return self.start_picking(context, event)
 
     def execute(self, context):
         if not _kernel_ok(self):
@@ -622,6 +650,7 @@ class NPROTO_OT_planar(PickMixin, bpy.types.Operator):
     bl_label = "Planar"
     bl_options = {'REGISTER', 'UNDO'}
 
+    accepts_picks = True
     pick_min = 1
     pick_max = 512
     finish_on_min = False
@@ -637,7 +666,7 @@ class NPROTO_OT_planar(PickMixin, bpy.types.Operator):
         if ins and not event.alt:
             self.inputs = _encode_inputs(ins)
             return self.execute(context)
-        return self.start_picking(context)
+        return self.start_picking(context, event)
 
     def _status(self, context):
         super()._status(context)
@@ -939,7 +968,7 @@ class NPROTO_OT_align_curve(PickMixin, bpy.types.Operator):
     def invoke(self, context, event):
         if not _kernel_ok(self):
             return {'CANCELLED'}
-        return self.start_picking(context)
+        return self.start_picking(context, event)
 
     def execute(self, context):
         from . import align
@@ -1054,7 +1083,7 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
         if not event.alt and self._from_selection(context):
             return self.execute(context)
         self._ends = []
-        return self.start_picking(context)
+        return self.start_picking(context, event)
 
     def _params(self):
         return {"end_a": self.end_a, "end_b": self.end_b, "cont_a": self.cont_a, "cont_b": self.cont_b,

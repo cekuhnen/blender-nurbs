@@ -2131,6 +2131,7 @@ class NPROTO_OT_patch(PickMixin, bpy.types.Operator):
     bl_label = "Patch"
     bl_options = {'REGISTER', 'UNDO'}
 
+    accepts_picks = True
     pick_min = 2
     pick_max = 256
     finish_on_min = False
@@ -2169,7 +2170,7 @@ class NPROTO_OT_patch(PickMixin, bpy.types.Operator):
             return {'CANCELLED'}
         if self.default_cont == "MIXED":
             self.default_cont = "AUTO"
-        return self.start_picking(context)
+        return self.start_picking(context, event)
 
     def closes_loop(self):
         byref = {(c[0].name, c[1]): c[2] for c in self._cands}
@@ -2499,7 +2500,7 @@ class NPROTO_OT_patch_add_guides(PickMixin, bpy.types.Operator):
             self.report({'WARNING'}, "Select a Patch with history first")
             return {'CANCELLED'}
         self.target = obj.name
-        return self.start_picking(context)
+        return self.start_picking(context, event)
 
     def execute(self, context):
         obj = bpy.data.objects.get(self.target)

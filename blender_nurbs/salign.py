@@ -538,7 +538,7 @@ class NPROTO_OT_surface_align(PickMixin, bpy.types.Operator):
     def invoke(self, context, event):
         if not _kernel_ok(self):
             return {'CANCELLED'}
-        return self.start_picking(context)
+        return self.start_picking(context, event)
 
     def _update_hover(self, context, event):
         """Hovering a surface picks its nearest edge, however far the edge is on

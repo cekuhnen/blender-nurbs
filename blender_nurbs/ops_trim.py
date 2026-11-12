@@ -654,10 +654,45 @@ class NPROTO_OT_join(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def keep_faces(obj, idx):
+    """Brep text of obj's faces idx (indices), the others deleted."""
+    _, ext = store._k()
+    b = store.get_brep(obj).copy()
+    keep = set(int(i) for i in idx)
+    ext.delete_faces(b, [f for k, f in enumerate(b.faces()) if k not in keep])
+    return store.brep_to_text(b)
+
+
+def split_faces(context, obj, idx, op):
+    """The faces idx of obj become objects of their own (one each); the rest
+    stays obj. Returns the new objects."""
+    from . import subsel
+    n = store.get_brep(obj).face_count()
+    idx = sorted(set(int(i) for i in idx if 0 <= int(i) < n))
+    rest = [k for k in range(n) if k not in idx]
+    if not idx or not rest:
+        return []
+    M = geom.world_matrix(obj)
+    texts = [keep_faces(obj, [i]) for i in idx]
+    rest_text = keep_faces(obj, rest)
+    _frozen(obj, op)
+    store.set_geometry_text(obj, rest_text, context, keep_untrimmed=False)
+    made = []
+    for i, text in zip(idx, texts):
+        o = store.new_object_text(context, f"{obj.name}_face{i}", text, M)
+        for m in obj.data.materials:
+            o.data.materials.append(m)
+        made.append(o)
+    subsel.set_picks(obj, "FACE", [])
+    return made
+
+
 class NPROTO_OT_unjoin(bpy.types.Operator):
     """Break the selected multi-face surfaces into one object per face, keeping
-    the current shape (fillets and trims included). To go back to the surfaces
-    a Join was made from, use Restore Inputs in the Feature panel"""
+    the current shape (fillets and trims included). With faces picked (Face
+    mode) only those come off, one object each; the rest stays joined. To go
+    back to the surfaces a Join was made from, use Restore Inputs in the
+    Feature panel"""
     bl_idname = "nproto.unjoin"
     bl_label = "Unjoin"
     bl_options = {'REGISTER', 'UNDO'}
@@ -672,6 +707,20 @@ class NPROTO_OT_unjoin(bpy.types.Operator):
         if not objs:
             self.report({'WARNING'}, "Select a joined surface (more than one face)")
             return {'CANCELLED'}
+        from . import subsel
+        picked = {o.name: subsel.picks(o, "FACE") for o in objs}
+        if any(picked.values()):
+            # Face mode: just the picked faces come off
+            made = []
+            for obj in objs:
+                if picked[obj.name]:
+                    made += [obj] + split_faces(context, obj, picked[obj.name], self)
+            if not made:
+                self.report({'WARNING'}, "Pick some faces, not all of a body's faces")
+                return {'CANCELLED'}
+            _select_only(context, made)
+            self.report({'INFO'}, f"Split off {len(made) - sum(1 for o in made if o.name in picked)} face(s)")
+            return {'FINISHED'}
         made = []
         for obj in objs:
             try:
@@ -701,6 +750,38 @@ class NPROTO_OT_unjoin(bpy.types.Operator):
             return {'CANCELLED'}
         _select_only(context, made)
         self.report({'INFO'}, f"Unjoined into {len(made)} surfaces")
+        return {'FINISHED'}
+
+
+class NPROTO_OT_delete_faces(bpy.types.Operator):
+    """Delete the picked faces (Face mode) from their bodies; a body whose faces
+    are all picked is deleted. X / Delete in Face mode does this"""
+    bl_idname = "nproto.delete_faces"
+    bl_label = "Delete Faces"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if not _kernel_ok(self):
+            return {'CANCELLED'}
+        from . import subsel
+        todo = [(o, subsel.picks(o, "FACE")) for o in context.selected_objects if store.is_nurbs(o)]
+        todo = [(o, f) for o, f in todo if f]
+        if not todo:
+            self.report({'WARNING'}, "Pick faces first (Face mode)")
+            return {'CANCELLED'}
+        gone, faces = [], 0
+        for obj, idx in todo:
+            n = store.get_brep(obj).face_count()
+            faces += len(set(idx))
+            if len(set(idx)) >= n:
+                gone.append(obj.name)
+                bpy.data.objects.remove(obj)
+                continue
+            text = keep_faces(obj, [k for k in range(n) if k not in set(idx)])
+            _frozen(obj, self)
+            store.set_geometry_text(obj, text, context, keep_untrimmed=False)
+            subsel.set_picks(obj, "FACE", [])
+        self.report({'INFO'}, f"Deleted {faces} face(s)" + (f"; removed {', '.join(gone)}" if gone else ""))
         return {'FINISHED'}
 
 
@@ -946,7 +1027,7 @@ class NPROTO_OT_edge_fillet(AskValue, PickMixin, bpy.types.Operator):
         if not self.pick_candidates(context):
             self.report({'WARNING'}, "No shared edges: Join surfaces first (only edges between two faces can be filleted)")
             return {'CANCELLED'}
-        return self.start_picking(context)
+        return self.start_picking(context, event)
 
     def prepare_value(self, context):
         try:
@@ -1276,5 +1357,6 @@ class NPROTO_OT_flip_normal(bpy.types.Operator):
         return {'FINISHED'}
 
 
-classes = (NPROTO_OT_trim, NPROTO_OT_untrim, NPROTO_OT_fillet, NPROTO_OT_split, NPROTO_OT_join, NPROTO_OT_unjoin, NPROTO_OT_restore_inputs,
+classes = (NPROTO_OT_trim, NPROTO_OT_untrim, NPROTO_OT_fillet, NPROTO_OT_split, NPROTO_OT_join, NPROTO_OT_unjoin,
+           NPROTO_OT_delete_faces, NPROTO_OT_restore_inputs,
            NPROTO_OT_edge_fillet, NPROTO_OT_boolean, NPROTO_OT_flip_normal, NPROTO_OT_boundary_fill)

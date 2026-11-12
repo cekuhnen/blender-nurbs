@@ -555,8 +555,11 @@ class NPROTO_OT_bake_feature(bpy.types.Operator):
 
 
 class NPROTO_OT_delete_feature(bpy.types.Operator):
-    """Delete this feature's object. When other features are built from it, choose:
-    bake them first (they keep their shape) or delete them too"""
+    """Remove this feature: its object goes and the objects it was built from
+    come back (shown, selected) -- one step back, like undoing the command.
+    Shift+click: delete the hidden objects it was built from too. When other
+    features are built from it, choose: bake them first (they keep their
+    shape) or delete them too"""
     bl_idname = "nproto.delete_feature"
     bl_label = "Delete Feature"
     bl_options = {'REGISTER', 'UNDO'}
@@ -565,6 +568,9 @@ class NPROTO_OT_delete_feature(bpy.types.Operator):
     mode: EnumProperty(name="Built from it", default="BAKE",
                        items=[("BAKE", "Bake them (they keep their shape)", ""),
                               ("ALL", "Delete them too", "")])
+    keep_inputs: BoolProperty(name="Bring Inputs Back", default=True,
+                              description="Show and select the objects the feature was built from (off: delete the "
+                                          "hidden ones nothing else uses)")
 
     def _users(self, context, obj):
         out, todo = [], [obj]
@@ -580,6 +586,7 @@ class NPROTO_OT_delete_feature(bpy.types.Operator):
         obj = bpy.data.objects.get(self.name)
         if obj is None:
             return {'CANCELLED'}
+        self.keep_inputs = not event.shift
         if self._users(context, obj):
             return context.window_manager.invoke_props_dialog(self, width=360)
         return self.execute(context)
@@ -596,7 +603,7 @@ class NPROTO_OT_delete_feature(bpy.types.Operator):
         if obj is None:
             return {'CANCELLED'}
         users = self._users(context, obj)
-        freed = list(features.history_inputs(obj))
+        baked = []                                # inputs freed by baking what is built from obj
         doomed = [obj]
         if users and self.mode == "ALL":
             doomed += users
@@ -606,18 +613,36 @@ class NPROTO_OT_delete_feature(bpy.types.Operator):
                 uses = [k for k, e in enumerate(st) if any(src is obj for src, _ in e["inputs"])]
                 h = features.history(d)
                 if uses:
-                    freed += features.bake(d, max(uses))
+                    baked += features.bake(d, max(uses))
                 elif h is not None and any(src is obj for src, _ in h["inputs"]):
-                    freed += features.bake(d, -1)
+                    baked += features.bake(d, -1)
         names = [o.name for o in doomed]
+        own = []                                  # what the removed features were built from
         for o in doomed:
-            freed += features.history_inputs(o)
+            own += features.history_inputs(o)
         from .ops_trim import _remove_object
         for o in doomed:
             _remove_object(o)
-        gone = features.purge_inputs(context, [o for o in dict.fromkeys(freed) if _alive(o)])
-        self.report({'INFO'}, "Deleted " + ", ".join(names) + (f"; and {len(gone)} hidden input(s) nothing uses now"
-                                                              if gone else ""))
+        back, shown = [], []
+        if self.keep_inputs:
+            # one step back: the inputs the removed features kept hidden come back, unless
+            # another Join / Thicken / ... still keeps them (a Loft or Boundary built from
+            # one leaves it shown, so it doesn't count)
+            alive = [o for o in dict.fromkeys(own) if _alive(o)]
+            back = [o for o in alive if features.is_kept(context, o) and not features.keepers_of(o)]
+            features.release_inputs(context, back)
+            shown = [o for o in alive if features.is_shown(o)]
+            own = []
+        gone = features.purge_inputs(context, [o for o in dict.fromkeys(own + baked) if _alive(o)])
+        if shown:
+            from .ops import _select_only
+            _select_only(context, shown)
+        msg = "Deleted " + ", ".join(names)
+        if back:
+            msg += "; back: " + ", ".join(o.name for o in back[:6]) + (" ..." if len(back) > 6 else "")
+        if gone:
+            msg += f"; and {len(gone)} hidden input(s) nothing uses now"
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 

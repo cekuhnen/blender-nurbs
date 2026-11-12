@@ -66,7 +66,7 @@ class NPROTO_OT_sweep(PickMixin, bpy.types.Operator):
             rails = [o for o in crv if o != act]
             self.inputs = _encode_inputs([(act, "S0")] + [(o, "S0") for o in rails])
             return self.execute(context)
-        return self.start_picking(context)
+        return self.start_picking(context, event)
 
     def _params(self):
         return {k: getattr(self, k) for k in ("samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height")}
@@ -92,6 +92,7 @@ class NPROTO_OT_pipe(AskValue, PickMixin, bpy.types.Operator):
     bl_label = "Pipe"
     bl_options = {'REGISTER', 'UNDO'}
 
+    accepts_picks = True
     pick_min = 1
     pick_max = 1
     inputs: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
@@ -107,7 +108,7 @@ class NPROTO_OT_pipe(AskValue, PickMixin, bpy.types.Operator):
         if crv and not event.alt:
             self.inputs = _encode_inputs([(o, "S0") for o in crv])
             return self.ask(context)
-        return self.start_picking(context)
+        return self.start_picking(context, event)
 
     def execute(self, context):
         if not _kernel_ok(self):
@@ -133,6 +134,7 @@ class NPROTO_OT_boundary(PickMixin, bpy.types.Operator):
     bl_label = "Boundary"
     bl_options = {'REGISTER', 'UNDO'}
 
+    accepts_picks = True
     pick_min = 4
     pick_max = 4
     inputs: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
@@ -158,7 +160,7 @@ class NPROTO_OT_boundary(PickMixin, bpy.types.Operator):
         if len(crv) == 4 and not event.alt:
             self.inputs = _encode_inputs([(o, "S0") for o in crv])
             return self.execute(context)
-        return self.start_picking(context)
+        return self.start_picking(context, event)
 
     def draw(self, context):
         from .sweeps import boundary_info
@@ -218,6 +220,7 @@ class NPROTO_OT_square(PickMixin, bpy.types.Operator):
     bl_label = "Square"
     bl_options = {'REGISTER', 'UNDO'}
 
+    accepts_picks = True
     pick_min = 3
     pick_max = 4
     finish_on_min = False
@@ -253,7 +256,7 @@ class NPROTO_OT_square(PickMixin, bpy.types.Operator):
         if len(crv) == 4 and not event.alt:
             self.inputs = _encode_inputs([(o, "S0") for o in crv])
             return self.execute(context)
-        return self.start_picking(context)
+        return self.start_picking(context, event)
 
     def _params(self):
         p = {f"e{i}": getattr(self, f"e{i}") for i in range(4)}
@@ -369,6 +372,7 @@ class NPROTO_OT_dup_edge(PickMixin, bpy.types.Operator):
     bl_label = "Duplicate Edge"
     bl_options = {'REGISTER', 'UNDO'}
 
+    accepts_picks = True
     pick_min = 1
     pick_max = 256
     finish_on_min = False
@@ -380,7 +384,7 @@ class NPROTO_OT_dup_edge(PickMixin, bpy.types.Operator):
     def invoke(self, context, event):
         if not _kernel_ok(self):
             return {'CANCELLED'}
-        return self.start_picking(context)
+        return self.start_picking(context, event)
 
     def execute(self, context):
         try:
@@ -457,6 +461,7 @@ class NPROTO_OT_extend(AskValue, PickMixin, bpy.types.Operator):
     bl_label = "Extend Surface"
     bl_options = {'REGISTER', 'UNDO'}
 
+    accepts_picks = True
     pick_min = 1
     pick_max = 1
     finish_on_min = True
@@ -474,7 +479,7 @@ class NPROTO_OT_extend(AskValue, PickMixin, bpy.types.Operator):
             return {'CANCELLED'}
         if self.inputs:                     # picked already (see PickMixin._finish)
             return self.ask(context)
-        return self.start_picking(context)
+        return self.start_picking(context, event)
 
     def execute(self, context):
         from . import extend

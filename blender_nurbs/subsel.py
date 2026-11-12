@@ -5,13 +5,19 @@ the viewport picks a face or edge of a NURBS body whatever tool is active (a
 background handler takes the clicks and mouse moves; everything else passes
 through): a click picks one (and selects its body), Shift+click adds or
 removes one, a click on nothing clears the picks; what is under the mouse
-lights up. The picks live on the object (an ID property, so
-undo keeps them), each with a point on it, so they still mean the same face
-or edge after a rebuild renumbers them; they count while their body is
-selected. What follows them:
+lights up. Face and Edge can be on together (Shift+click the second mode
+button): an edge within 10 px of the mouse is picked, else the face under it.
+Clicks on the navigation gizmo and the continuity labels go to them. The
+picks live on the object (an ID property, so undo keeps them), each with a
+point on it, so they still mean the same face or edge after a rebuild
+renumbers them; they count while their body is selected. What follows them:
 
 * CVs / Hulls: a body with picked faces shows only those faces' nets.
-* Edge Fillet and Continuity Check take the picked edges (no picking).
+* Edge Fillet, Continuity Check, Dome take the picked edges (no picking), and
+  so do Loft, Planar, Square, Boundary, Patch, Loft Rails, Duplicate Edge,
+  Extend Surface, Pipe and Revolve when the picks fit them (Alt+click a tool:
+  pick by hand instead).
+* Unjoin splits the picked faces off; X / Delete removes the picked faces.
 """
 
 import json
@@ -38,9 +44,23 @@ _ftris = {}    # (session_uid, rev, face) -> (points, triangles, boundary polyli
 _epts = {}     # session_uid -> (rev, [polyline or None])
 
 
-def mode(context=None):
+def kinds(context=None):
+    """The sub-object kinds being picked: a subset of {"FACE", "EDGE"}
+    (empty in Body mode)."""
     v = getattr((context or bpy.context).window_manager, "nproto_view", None)
-    return v.sel_mode if v is not None else "BODY"
+    if v is None:
+        return frozenset()
+    m = v.sel_mode
+    m = {m} if isinstance(m, str) else set(m)
+    return frozenset(m & {"FACE", "EDGE"})
+
+
+def mode(context=None):
+    """"BODY", "FACE", "EDGE" or "FACE_EDGE" (both on)."""
+    k = kinds(context)
+    if not k:
+        return "BODY"
+    return "FACE_EDGE" if len(k) == 2 else next(iter(k))
 
 
 def _size(obj):
@@ -97,48 +117,90 @@ def _locate(obj, kind, i, anchor, size):
     return k if ds[k] < 0.02 * size else None
 
 
-def get(obj):
-    """(kind, [indices]) picked on obj, checked against its current geometry;
-    (None, []) when nothing is picked or the body is not selected."""
+KINDS = ("FACE", "EDGE")
+
+
+def _raw(obj):
+    """{"FACE": [[i, anchor], ...], "EDGE": [...]} as stored (older files: one
+    kind, {"kind", "items"})."""
+    try:
+        d = json.loads(obj.get(PROP) or "{}")
+    except (ValueError, TypeError):
+        return {}
+    if "kind" in d:
+        return {d["kind"]: d.get("items", [])} if d.get("kind") in KINDS else {}
+    return {k: d.get(k, []) for k in KINDS if d.get(k)}
+
+
+def get_all(obj):
+    """{"FACE": [indices], "EDGE": [indices]} picked on obj, checked against
+    its current geometry; empty lists when nothing is picked or the body is
+    not selected."""
+    empty = {k: [] for k in KINDS}
     if obj is None or not store.is_nurbs(obj) or not obj.select_get():
-        return None, []
+        return empty
     raw = obj.get(PROP)
     if not raw:
-        return None, []
+        return empty
     rev = obj.get(store.PROP_REV, 0)
     hit = _valid.get(obj.session_uid)
     if hit and hit[0] == rev and hit[1] == raw:
-        return hit[2], hit[3]
-    try:
-        d = json.loads(raw)
-    except ValueError:
-        return None, []
-    kind, idx = d.get("kind"), []
+        return hit[2]
+    out = {k: [] for k in KINDS}
     try:
         size = _size(obj)
-        for i, a in d.get("items", []):
-            j = _locate(obj, kind, int(i), a, size)
-            if j is not None and j not in idx:
-                idx.append(j)
+        for kind, items in _raw(obj).items():
+            for i, a in items:
+                j = _locate(obj, kind, int(i), a, size)
+                if j is not None and j not in out[kind]:
+                    out[kind].append(j)
     except Exception as exc:
         print("NURBS select:", obj.name, exc)
-    _valid[obj.session_uid] = (rev, raw, kind, idx)
-    return kind, idx
+    _valid[obj.session_uid] = (rev, raw, out)
+    return out
+
+
+def get(obj):
+    """(kind, [indices]) picked on obj: "FACE" or "EDGE" when one kind is
+    picked, "MIXED" (faces then edges) when both, (None, []) when nothing."""
+    a = get_all(obj)
+    have = [k for k in KINDS if a[k]]
+    if not have:
+        return None, []
+    if len(have) == 2:
+        return "MIXED", a["FACE"] + a["EDGE"]
+    return have[0], a[have[0]]
 
 
 def picks(obj, kind):
-    k, idx = get(obj)
-    return idx if k == kind else []
+    return get_all(obj)[kind]
 
 
 def set_picks(obj, kind, idx):
-    """Store the picked faces / edges of obj (an empty list removes them)."""
+    """Store the picked faces / edges of obj (an empty list removes that kind's)."""
     idx = list(dict.fromkeys(int(i) for i in idx))
-    if not idx:
-        if PROP in obj:
-            del obj[PROP]
-        return
-    obj[PROP] = json.dumps({"kind": kind, "items": [[i, _anchor(obj, kind, i)] for i in idx]})
+    d = _raw(obj)
+    if idx:
+        d[kind] = [[i, _anchor(obj, kind, i)] for i in idx]
+    else:
+        d.pop(kind, None)
+    if any(d.get(k) for k in KINDS):
+        obj[PROP] = json.dumps({k: d[k] for k in KINDS if d.get(k)})
+    elif PROP in obj:
+        del obj[PROP]
+
+
+def drop_kind(scene, kind):
+    """Remove one kind's picks everywhere (that mode was switched off)."""
+    for o in scene.objects:
+        if PROP in o:
+            d = _raw(o)
+            if kind in d:
+                d.pop(kind)
+                if any(d.get(k) for k in KINDS):
+                    o[PROP] = json.dumps({k: d[k] for k in KINDS if d.get(k)})
+                else:
+                    del o[PROP]
 
 
 def clear_all(scene):
@@ -201,13 +263,17 @@ def selected_edges(context):
 
 
 def summary(obj):
-    """'2 faces picked' / '' for the Active Object panel."""
-    k, idx = get(obj)
-    if not idx:
+    """'2 faces, 1 edge picked: F0, F3, E5' / '' for the Active Object panel."""
+    a = get_all(obj)
+    parts, refs = [], []
+    for k, noun, tag in (("FACE", "face", "F"), ("EDGE", "edge", "E")):
+        n = len(a[k])
+        if n:
+            parts.append(f"{n} {noun}{'s' if n > 1 else ''}")
+            refs += [tag + str(i) for i in a[k]]
+    if not parts:
         return ""
-    noun = "face" if k == "FACE" else "edge"
-    return f"{len(idx)} {noun}{'s' if len(idx) > 1 else ''} picked: " + ", ".join(
-        ("F" if k == "FACE" else "E") + str(i) for i in idx[:8]) + (" ..." if len(idx) > 8 else "")
+    return " and ".join(parts) + " picked: " + ", ".join(refs[:8]) + (" ..." if len(refs) > 8 else "")
 
 
 # --------------------------------------------------------------------------
@@ -358,19 +424,58 @@ def _view_region_at(window, x, y):
     return None
 
 
-def _hit(context, kind, xy):
-    return face_under(context, xy) if kind == "FACE" else edge_under(context, xy)
+def _hit(context, ks, xy):
+    """(body, index, kind) under the mouse for the kinds being picked: an edge
+    within 10 px wins, else the face under the mouse; None for nothing."""
+    if isinstance(ks, str):
+        ks = {"FACE", "EDGE"} if ks == "FACE_EDGE" else {ks}
+    if "EDGE" in ks:
+        h = edge_under(context, xy)
+        if h is not None:
+            return h[0], h[1], "EDGE"
+    if "FACE" in ks:
+        h = face_under(context, xy)
+        if h is not None:
+            return h[0], h[1], "FACE"
+    return None
+
+
+def _over_gizmo(context, area, region, x, y):
+    """The mouse (window x, y) is over the navigation gizmo (the axis ball and
+    its buttons) or a continuity label: those clicks go to them, not to picking."""
+    from . import contlabels
+    if contlabels.hover.get("key") is not None:
+        return True
+    sp = area.spaces.active
+    if not getattr(sp, "show_gizmo", True) or not getattr(sp, "show_gizmo_navigate", True):
+        return False
+    prefs = context.preferences
+    v = prefs.view
+    ball = getattr(v, "mini_axis_type", 'GIZMO') == 'GIZMO'
+    buttons = getattr(v, "show_navigate_ui", True)
+    if not ball and not buttons:
+        return False
+    size = float(getattr(v, "gizmo_size_navigate_v3d", 80)) * (getattr(prefs.system, "ui_scale", 1.0) or 1.0)
+    from .hints import _insets
+    right = _insets(area, region)[1]
+    top = region.y + region.height
+    cut = sum(r.height for r in area.regions if r.type in ('HEADER', 'TOOL_HEADER') and r.height > 1
+              and region.y <= r.y and r.y + r.height <= top + 1 and r.y + r.height >= top - 100)
+    x1, y1 = region.x + region.width - right, top - cut
+    h = (1.4 * size if ball else 0.0) + (2.4 * size if buttons else 0.0)
+    return x1 - 1.6 * size <= x <= x1 and y1 - h <= y <= y1
 
 
 def apply_pick(context, kind, hit, extend):
-    """A click in Face / Edge mode: hit = (body, index) or None."""
+    """A click in Face / Edge mode: hit = (body, index[, kind]) or None."""
     if hit is None:
         if not extend:
             clear_all(context.scene)
             for o in context.selected_objects:
                 o.select_set(False)
         return
-    ob, i = hit
+    ob, i = hit[0], hit[1]
+    kind = hit[2] if len(hit) > 2 else kind
     if extend:
         idx = list(picks(ob, kind))
         if i in idx:
@@ -409,22 +514,37 @@ class NPROTO_OT_subsel_picker(bpy.types.Operator):
         return {'FINISHED', 'PASS_THROUGH'}
 
     def modal(self, context, event):
-        kind = mode(context)
-        if kind == "BODY" or not RUN["on"]:
+        ks = kinds(context)
+        if not ks or not RUN["on"]:
             return self._stop(context)
-        if context.mode != 'OBJECT' or event.type not in ('MOUSEMOVE', 'LEFTMOUSE'):
+        if context.mode != 'OBJECT' or event.type not in ('MOUSEMOVE', 'LEFTMOUSE', 'X', 'DEL'):
             return {'PASS_THROUGH'}
         try:
             win = context.window
             where = _view_region_at(win, event.mouse_x, event.mouse_y) if win is not None else None
+            if where is not None and _over_gizmo(context, where[0], where[1], event.mouse_x, event.mouse_y):
+                if HOVER["key"] is not None:
+                    HOVER["key"] = None
+                    _redraw(context)
+                return {'PASS_THROUGH'}             # the navigation gizmo / a label takes it
+            if event.type in ('X', 'DEL'):
+                # X / Delete with faces picked: those faces go, not the whole body
+                if (event.value != 'PRESS' or where is None or event.ctrl or event.alt or event.oskey
+                        or not any(picks(o, "FACE") for o in context.selected_objects)):
+                    return {'PASS_THROUGH'}
+                area, region = where
+                with context.temp_override(window=win, area=area, region=region):
+                    bpy.ops.nproto.delete_faces('EXEC_DEFAULT')
+                _redraw(context)
+                return {'RUNNING_MODAL'}
             if event.type == 'MOUSEMOVE':
                 key = None
                 if where is not None and (event.mouse_x, event.mouse_y) != RUN["last"]:
                     RUN["last"] = (event.mouse_x, event.mouse_y)
                     area, region = where
                     with context.temp_override(window=win, area=area, region=region):
-                        h = _hit(bpy.context, kind, (event.mouse_x - region.x, event.mouse_y - region.y))
-                    key = None if h is None else (h[0].name, kind, h[1])
+                        h = _hit(bpy.context, ks, (event.mouse_x - region.x, event.mouse_y - region.y))
+                    key = None if h is None else (h[0].name, h[2], h[1])
                 elif where is not None:
                     key = HOVER["key"]
                 if key != HOVER["key"]:
@@ -436,9 +556,9 @@ class NPROTO_OT_subsel_picker(bpy.types.Operator):
                 return {'PASS_THROUGH'}
             area, region = where
             with context.temp_override(window=win, area=area, region=region):
-                h = _hit(bpy.context, kind, (event.mouse_x - region.x, event.mouse_y - region.y))
-                apply_pick(bpy.context, kind, h, event.shift)
-            bpy.ops.ed.undo_push(message=f"Pick {kind.title()}")
+                h = _hit(bpy.context, ks, (event.mouse_x - region.x, event.mouse_y - region.y))
+                apply_pick(bpy.context, None, h, event.shift)
+            bpy.ops.ed.undo_push(message="Pick " + (h[2].title() if h else "Nothing"))
             _redraw(context)
             return {'RUNNING_MODAL'}
         except Exception as exc:
@@ -448,7 +568,7 @@ class NPROTO_OT_subsel_picker(bpy.types.Operator):
 
 def _start_picker():
     """Start the background picker in the first window with a 3D viewport."""
-    if RUN["on"] or mode() == "BODY":
+    if RUN["on"] or not kinds():
         return None
     wm = bpy.context.window_manager
     for win in wm.windows:
@@ -468,16 +588,64 @@ def _start_picker():
 def ensure_running():
     """Face / Edge mode on but no picker (a file was loaded, or it was stopped):
     start it again (from a timer: never from inside a draw)."""
-    if mode() != "BODY" and not RUN["on"] and not bpy.app.timers.is_registered(_start_picker):
+    if kinds() and not RUN["on"] and not bpy.app.timers.is_registered(_start_picker):
         bpy.app.timers.register(_start_picker, first_interval=0.05)
 
 
+_MODE = {"prev": {"BODY"}, "busy": False}
+
+
+def _sync_modes():
+    """Remember the mode set as it is now (after loading a file or the add-on),
+    so the next switch knows which picks to keep."""
+    try:
+        v = bpy.context.window_manager.nproto_view
+        m = {v.sel_mode} if isinstance(v.sel_mode, str) else set(v.sel_mode)
+        if not m:                              # none set (an older single-mode value): Body
+            _MODE["busy"] = True
+            try:
+                v.sel_mode = {"BODY"}
+            finally:
+                _MODE["busy"] = False
+            m = {"BODY"}
+        _MODE["prev"] = m
+    except Exception:
+        pass
+    return None
+
+
+def settle_modes(new, prev):
+    """The mode set after a click on the mode buttons: Face and Edge go together
+    (Shift+click adds one), Body stands alone -- added, it is the only one;
+    Face / Edge added beside it replace it; none left means Body."""
+    new = set(new)
+    if "BODY" in new and len(new) > 1:
+        new = {"BODY"} if "BODY" not in prev else new - {"BODY"}
+    return new or {"BODY"}
+
+
 def mode_changed(view, context):
-    """Body / Face / Edge switched: the picks go (a new selection). Face / Edge
-    start the picker; Body ends it."""
-    clear_all(context.scene)
+    """Body / Face / Edge switched. Face / Edge start the picker; Body ends it.
+    Picks of a kind switched off go; Body clears all of them."""
+    if _MODE["busy"]:
+        return
+    cur = {view.sel_mode} if isinstance(view.sel_mode, str) else set(view.sel_mode)
+    prev = _MODE["prev"]
+    new = settle_modes(cur, prev)
+    if new != cur:
+        _MODE["busy"] = True
+        try:
+            view.sel_mode = new
+        finally:
+            _MODE["busy"] = False
+    if "BODY" in new or "BODY" in prev:
+        clear_all(context.scene)
+    else:
+        for k in prev - new:
+            drop_kind(context.scene, k)
+    _MODE["prev"] = set(new)
     HOVER["key"] = None
-    if view.sel_mode != "BODY":
+    if "BODY" not in new:
         ensure_running()
     _redraw(context)
 
@@ -486,6 +654,7 @@ def mode_changed(view, context):
 def _on_load(_):
     RUN["on"] = False                       # loading a file ends every running operator
     HOVER["key"] = None
+    _sync_modes()
     ensure_running()
 
 
@@ -560,15 +729,16 @@ def draw_view(ctx, draw_lines, draw_tris, edge_bias):
     for ob in ctx.selected_objects:
         if not store.is_nurbs(ob) or not ob.visible_get():
             continue
-        kind, idx = get(ob)
-        for i in idx:
-            try:
-                if kind == "FACE":
-                    _draw_face(ctx, ob, i, COL_PICK, COL_PICK_LINE, 2.5, draw_lines, draw_tris, edge_bias)
-                else:
-                    _draw_edge(ctx, ob, i, COL_PICK_LINE, 4.0, draw_lines, edge_bias)
-            except Exception as exc:
-                print("NURBS select: draw", exc)
+        a = get_all(ob)
+        for kind in KINDS:
+            for i in a[kind]:
+                try:
+                    if kind == "FACE":
+                        _draw_face(ctx, ob, i, COL_PICK, COL_PICK_LINE, 2.5, draw_lines, draw_tris, edge_bias)
+                    else:
+                        _draw_edge(ctx, ob, i, COL_PICK_LINE, 4.0, draw_lines, edge_bias)
+                except Exception as exc:
+                    print("NURBS select: draw", exc)
     act = ctx.view_layer.objects.active
     if act is not None and act.visible_get() and not get(act)[1]:
         for i in step_faces(act):
@@ -577,7 +747,7 @@ def draw_view(ctx, draw_lines, draw_tris, edge_bias):
             except Exception as exc:
                 print("NURBS step faces: draw", exc)
     key = HOVER["key"]
-    if key is not None and mode(ctx) == key[1]:
+    if key is not None and key[1] in kinds(ctx):
         ob = bpy.data.objects.get(key[0])
         if ob is not None and store.is_nurbs(ob) and ob.visible_get():
             try:
@@ -595,6 +765,7 @@ classes = (NPROTO_OT_subsel_picker,)
 def register():
     if _on_load not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_on_load)
+    bpy.app.timers.register(_sync_modes, first_interval=0.05)
     ensure_running()
 
 

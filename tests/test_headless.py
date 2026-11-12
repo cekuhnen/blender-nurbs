@@ -3902,7 +3902,7 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "cycle_continuity", "de
               "patch_auto_corners", "patch_corner", "patch_remove_guide", "rebuild", "rebuild_waiting", "remove_step",
               "restore_inputs", "sync_feature", "tab_edit", "continuity", "continuity_clear", "section_add", "section_orient",
               "section_targets", "section_curves", "section_remove", "subsel_picker", "bake_feature", "delete_feature",
-              "curve_degree"}
+              "curve_degree", "fix_clip_start", "delete_faces"}
 _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto) if n not in _not_tools}
 _tool_ops = [o_ for o_ in _in_panels if o_ not in ("nproto.add_primitive", "nproto.boolean")] + ["nproto.boolean"]
 _bool_ops = sorted(e["props"].get("operation") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r
@@ -4630,7 +4630,7 @@ _dk_a = patch("DK_a", (0, 1150, 0), (0, 1154, 0), "X", 2.0)
 _dk_b = patch("DK_b", (2, 1150, 0), (2, 1154, 0), "Z", 2.0)
 _sel(_dk_a, _dk_b); bpy.ops.nproto.join(); _dk = ctx.active_object
 _dk_name = _dk.name
-bpy.ops.nproto.delete_feature(name=_dk_name, mode="ALL")
+bpy.ops.nproto.delete_feature(name=_dk_name, mode="ALL", keep_inputs=False)     # Shift+click: inputs go too
 _gone_all = _dk_name not in bpy.data.objects and "DK_a" not in bpy.data.objects and "DK_b" not in bpy.data.objects
 _ek_a = patch("EK_a", (0, 1160, 0), (0, 1164, 0), "X", 2.0)
 _ek_b = patch("EK_b", (2, 1160, 0), (2, 1164, 0), "Z", 2.0)
@@ -4639,11 +4639,57 @@ _ek_area = area(_ek)
 _feeds = _hui.from_feeds(_ek_a, ctx.scene)
 bpy.ops.nproto.delete_feature(name="EK_a", mode="BAKE")          # an input: what is built from it is baked
 _kept_shape = _ek.name in bpy.data.objects and not features.has_history(_ek) and abs(area(_ek) - _ek_area) < 1e-6
-check("delete: a body takes its unused hidden inputs with it; deleting an input bakes what was built from it "
-      "(it keeps its shape) and tidies the inputs nothing uses now",
+check("delete (Shift+click): a body takes its unused hidden inputs with it; deleting an input bakes what was built "
+      "from it (it keeps its shape) and tidies the inputs nothing uses now",
       _gone_all and _kept_shape and "EK_a" not in bpy.data.objects and "EK_b" not in bpy.data.objects
       and "Feeds: " in _feeds,
       f"gone_all {_gone_all} kept {_kept_shape} feeds '{_feeds}' left {[n for n in ('EK_a', 'EK_b') if n in bpy.data.objects]}")
+
+_rk_a = patch("RK_a", (0, 1170, 0), (0, 1174, 0), "X", 2.0)
+_rk_b = patch("RK_b", (2, 1170, 0), (2, 1174, 0), "Z", 2.0)
+_sel(_rk_a, _rk_b); bpy.ops.nproto.join(); _rk = ctx.active_object
+_rk_name = _rk.name
+_sel(_rk); bpy.ops.nproto.thicken(distance=0.05); _rt = ctx.active_object
+_rt_name = _rt.name
+_hidden0 = _rk.hide_get()
+bpy.ops.nproto.delete_feature(name=_rt_name)
+_step1 = (_rt_name not in bpy.data.objects and _rk_name in bpy.data.objects and not _rk.hide_get()
+          and _rk.select_get() and ctx.view_layer.objects.active == _rk and features.has_history(_rk))
+bpy.ops.nproto.delete_feature(name=_rk_name)
+_step2 = (_rk_name not in bpy.data.objects and all(n_ in bpy.data.objects for n_ in ("RK_a", "RK_b"))
+          and not bpy.data.objects["RK_a"].hide_get() and not bpy.data.objects["RK_b"].hide_get()
+          and bpy.data.objects["RK_a"].select_get() and bpy.data.objects["RK_b"].select_get())
+check("delete (the trash, a plain click): one step back -- removing a Thicken brings back the joined body it was made "
+      "from (shown, selected, its history kept); removing that Join brings back its surfaces",
+      _hidden0 and _step1 and _step2, f"hidden {_hidden0} step1 {_step1} step2 {_step2}")
+
+# a Join of two surfaces and the loft between them: removing the Join brings all three back -- the loft still
+# uses the two, but a loft doesn't keep its inputs hidden (only Join, Thicken, ... do)
+_ja = patch("JL_a", (0, 1180, 0), (0, 1184, 0), "X", 2.0)
+_jb = patch("JL_b", (4, 1180, 0), (4, 1184, 0), "X", 2.0)
+def _edge_at_x(o, x):
+    s_ = store.get_surfaces(o)[0]; M_ = geom.world_matrix(o)
+    return min(("U0", "U1", "V0", "V1"), key=lambda e_: abs(np.mean([(M_ @ Vector(p_)).x for p_ in geom.boundary_points(s_, e_, 5)]) - x))
+bpy.ops.nproto.loft(inputs=json.dumps([[_ja.name, _edge_at_x(_ja, 2.0)], [_jb.name, _edge_at_x(_jb, 4.0)]]),
+                    cont_a="G1", cont_b="G1")
+_jc = ctx.active_object
+_sel(_ja, _jb, _jc); bpy.ops.nproto.join(); _jj = ctx.active_object
+_jj_name, _parts3 = _jj.name, [_ja.name, _jb.name, _jc.name]
+_hid3 = all(bpy.data.objects[n_].hide_get() for n_ in _parts3)
+bpy.ops.nproto.delete_feature(name=_jj_name)
+_hc = features.history_collection(ctx, create=False)
+_back3 = all(not bpy.data.objects[n_].hide_get() and (_hc is None or n_ not in _hc.objects)
+             and bpy.data.objects[n_].select_get() for n_ in _parts3)
+# an input stranded in the History collection (nothing keeps it any more): its eye brings it home, not a peek
+_orph = patch("JL_orphan", (0, 1190, 0), (0, 1194, 0), "X", 2.0)
+features.keep_inputs(ctx, [_orph])
+features.set_shown(ctx, _orph, True)
+_hc = features.history_collection(ctx, create=False)
+_home = (not _orph.hide_get() and _orph.name not in _hc.objects and features.PROP_HOME not in _orph
+         and features.PROP_PEEK not in _orph)
+check("delete: removing a Join brings back every part it hid, also ones a loft is built from (a loft doesn't hide "
+      "them); a hidden input nothing keeps any more goes home when its eye is clicked",
+      _hid3 and _back3 and _home, f"hid {_hid3} back {_back3} home {_home}")
 
 # --- Class-A on a closed rim of two edges (a tilted cap on a round wall): light patches, no kernel fallback ---
 bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0); _cc2 = ctx.active_object
@@ -5070,7 +5116,7 @@ bpy.ops.object.select_all(action='DESELECT'); _sb.select_set(True); ctx.view_lay
 _sbf = store.get_brep(_sb).faces()
 _ri = next(k for k, f in enumerate(_sbf) if _skey(f.surface()) not in _dkeys)        # the ring face
 _sb[_ssel.PROP] = "x"
-_vw.sel_mode = "FACE"
+_vw.sel_mode = {"FACE"}
 _cleared = _ssel.PROP not in _sb
 _ssel.set_picks(_sb, "FACE", [_ri])
 _nets = store.display(_sb).get("nets", [])
@@ -5084,14 +5130,14 @@ check("Face mode: switching mode clears old picks; a picked face is kept on the 
       f"get {_ssel.get(_sb)} nets {len(_nets)} shown {len(_shown)} area {_tri_area:.4f} vs {_sbf[_ri].area():.4f}")
 # a stored pick whose index no longer matches (a rebuild renumbered the faces) is found again by its point
 _d0 = json.loads(_sb[_ssel.PROP]); _wrong = (_ri + 1) % len(_sbf)
-_sb[_ssel.PROP] = json.dumps({"kind": "FACE", "items": [[_wrong, _d0["items"][0][1]]]})
+_sb[_ssel.PROP] = json.dumps({"kind": "FACE", "items": [[_wrong, _d0["FACE"][0][1]]]})   # older files' format
 _remap = _ssel.get(_sb)
 _sb.select_set(False)
 _desel = _ssel.get(_sb)
 _sb.select_set(True)
 check("Face mode: a pick survives renumbering (found again by its point) and only counts while its body is selected",
       _remap == ("FACE", [_ri]) and _desel == (None, []), f"{_remap} {_desel}")
-_vw.sel_mode = "EDGE"
+_vw.sel_mode = {"EDGE"}
 _sh = store.shared_edges(_sb)
 _ssel.set_picks(_sb, "EDGE", _sh)
 _cleared_f = _ssel.faces_shown(_sb) is None
@@ -5103,7 +5149,7 @@ check("Edge mode: picked edges are what Edge Fillet / Continuity Check take; the
       "(the drafted G2 rim: G2 both sides)",
       _cleared_f and _ssel.selected_edges(ctx) == [(_sb, f"E{i}") for i in _sh] and _nadd == len(_sh) == 2
       and all(isinstance(j, dict) and j["G2"][1] for j in _jj), f"{_ssel.selected_edges(ctx)} {_nadd} {_jj}")
-_vw.sel_mode = "BODY"
+_vw.sel_mode = {"BODY"}
 check("Body mode: the picks go", _ssel.PROP not in _sb and _ssel.get(_sb) == (None, []))
 
 # --- Dome: close an open rim, G1 / G2 (exact revolution on a round rim, the rim's own curve otherwise) ---
@@ -5837,5 +5883,132 @@ _ar2 = _types.SimpleNamespace(regions=[_reg2('WINDOW', 0, 21, 1200, 800), _reg2(
 _evc = _types.SimpleNamespace(mouse_x=100.0, mouse_y=100.0)
 check("a click in the view's bottom-left corner reaches the tool when the redo panel is hidden, not when it shows",
       _PM._in_view(_types.SimpleNamespace(area=_ar), _evc) and not _PM._in_view(_types.SimpleNamespace(area=_ar2), _evc))
+
+# --- Clip Start: too small for the view -> a warning with a one-click fix (Display panel, header icon)
+_spc = lambda n: _types.SimpleNamespace(clip_start=n, type='VIEW_3D')
+_rvp = lambda z, p='PERSP': _types.SimpleNamespace(view_distance=z, view_perspective=p)
+_c_bad = _ui.clip_check(_spc(1e-6), _rvp(0.37))
+check("Clip Start: 1 um at 0.37 m warns (depth steps ~8 mm) and suggests 0.2 mm; 1 mm, the default and an "
+      "orthographic view don't", _c_bad is not None and abs(_c_bad["step"] - 6e-8 * 0.37 ** 2 / 1e-6) < 1e-12
+      and abs(_c_bad["suggest"] - 2e-4) < 1e-12 and _ui.clip_check(_spc(1e-3), _rvp(0.37)) is None
+      and _ui.clip_check(_spc(0.01), _rvp(0.37)) is None and _ui.clip_check(_spc(1e-6), _rvp(0.37, 'ORTHO')) is None,
+      str(_c_bad))
+_wrec = []
+_wctx = _types.SimpleNamespace(space_data=_types.SimpleNamespace(type='VIEW_3D', clip_start=1e-6,
+                                                                 region_3d=_rvp(0.37)), scene=ctx.scene)
+_shown_w = _ui.draw_clip_warning(_FakeLay(_wrec), _wctx)
+_fix = [e for e in _wrec if e.get("op") == "nproto.fix_clip_start"]
+check("Clip Start warning: the Display panel shows it with a button that sets the suggested value",
+      _shown_w and len(_fix) == 1 and abs(_fix[0]["props"]["value"] - 2e-4) < 1e-12, str(_wrec))
+
+# --- Face + Edge together, picks feeding tools, gizmo clicks pass through, picked faces split off / deleted
+from blender_nurbs import subsel as _sx2, ops as _opx
+_st = _sx2.settle_modes
+check("selection modes: Face and Edge combine (Shift+click), Body stands alone, none left is Body",
+      _st({"BODY", "FACE"}, {"BODY"}) == {"FACE"} and _st({"FACE", "BODY"}, {"FACE"}) == {"BODY"}
+      and _st({"FACE", "EDGE"}, {"FACE"}) == {"FACE", "EDGE"} and _st(set(), {"EDGE"}) == {"BODY"})
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+_vw.sel_mode = {"BODY"}
+bpy.ops.nproto.add_primitive(kind="BOX")
+_bx = ctx.active_object
+bpy.ops.object.select_all(action='DESELECT'); _bx.select_set(True); ctx.view_layer.objects.active = _bx
+_vw.sel_mode = {"FACE"}
+_sx2.set_picks(_bx, "FACE", [0])
+_vw.sel_mode = {"FACE", "EDGE"}
+_kept = _sx2.picks(_bx, "FACE") == [0]
+_sx2.set_picks(_bx, "EDGE", [3, 5])
+_all = _sx2.get_all(_bx)
+_sum = _sx2.summary(_bx)
+_vw.sel_mode = {"EDGE"}
+check("Face + Edge: switching Edge on keeps the face picks; both kinds are kept per body (summary names both); "
+      "switching Face off drops only the face picks", _kept and _all == {"FACE": [0], "EDGE": [3, 5]}
+      and _sum.startswith("1 face and 2 edges picked") and _sx2.kinds(ctx) == {"EDGE"}
+      and _sx2.get_all(_bx) == {"FACE": [], "EDGE": [3, 5]}, f"{_all} '{_sum}'")
+# the navigation gizmo's corner (and the continuity labels) take their own clicks
+_rgn = lambda t_, x, y, w, h: _types.SimpleNamespace(type=t_, x=x, y=y, width=w, height=h)
+_gw = _rgn('WINDOW', 0, 21, 1200, 800)
+_gar = _types.SimpleNamespace(regions=[_gw, _rgn('HEADER', 0, 795, 1200, 26), _rgn('UI', 900, 21, 300, 800)],
+                              spaces=_types.SimpleNamespace(active=_types.SimpleNamespace(show_gizmo=True,
+                                                                                          show_gizmo_navigate=True)))
+_gctx = _types.SimpleNamespace(preferences=_types.SimpleNamespace(
+    view=_types.SimpleNamespace(gizmo_size_navigate_v3d=80, mini_axis_type='GIZMO', show_navigate_ui=True),
+    system=_types.SimpleNamespace(ui_scale=1.0)))
+from blender_nurbs import contlabels as _clh
+_h0 = _clh.hover.get("key")
+_clh.hover["key"] = None
+_on_ball, _on_view = _sx2._over_gizmo(_gctx, _gar, _gw, 860, 760), _sx2._over_gizmo(_gctx, _gar, _gw, 500, 400)
+_clh.hover["key"] = ("x", 0)
+_on_label = _sx2._over_gizmo(_gctx, _gar, _gw, 500, 400)
+_clh.hover["key"] = _h0
+check("Face / Edge mode: clicks on the navigation gizmo (beside the sidebar, under the header) and on continuity "
+      "labels go to them; the rest of the view picks", _on_ball and not _on_view and _on_label)
+# tools take the picked edges -- through their real invoke (background Blender has no window: bpy.ops would run
+# execute straight away), on a stand-in like the sketch tools'
+def _fake_pick(op_cls, **props):
+    body = {k: v for k, v in op_cls.__dict__.items() if callable(v) and not k.startswith("bl_")
+            and k not in ("__init__", "pick_candidates")}      # (its super() needs the real class)
+    for k in ("accepts_picks", "pick_min", "pick_max", "finish_on_min", "bl_label", "bl_idname"):
+        if hasattr(op_cls, k):
+            body[k] = getattr(op_cls, k)
+    bases = tuple(b for b in op_cls.__mro__[1:] if b not in (bpy.types.Operator, object) and not b.__name__.startswith("bpy"))
+    f = type("FakePick" + op_cls.__name__, bases or (_opx.PickMixin,), body)()
+    f.msgs, f.inputs = [], ""
+    f.report = lambda t_, m: f.msgs.append(m)
+    for k, v in props.items():
+        setattr(f, k, v)
+    return f
+
+
+_ev0 = _types.SimpleNamespace(type='LEFTMOUSE', value='PRESS', alt=False, shift=False, ctrl=False, oskey=False)
+_sx2.set_picks(_bx, "EDGE", [3, 5])
+_n0 = len(bpy.data.objects)
+_fd = _fake_pick(_opx.NPROTO_OT_dup_edge if hasattr(_opx, "NPROTO_OT_dup_edge") else
+                 __import__("blender_nurbs.ops_sweep", fromlist=["x"]).NPROTO_OT_dup_edge)
+r = _fd.invoke(ctx, _ev0)
+_dup_made = len(bpy.data.objects) - _n0
+_dup_in = json.loads(_fd.inputs or "[]")
+bpy.ops.object.select_all(action='DESELECT'); _bx.select_set(True); ctx.view_layer.objects.active = _bx
+_sx2.set_picks(_bx, "EDGE", [3])
+_fp = _fake_pick(_opx.NPROTO_OT_planar, chain=True)
+r2 = _fp.invoke(ctx, _ev0)
+_pl = ctx.active_object
+_pl_in = json.loads(_fp.inputs or "[]")
+check("tools take picked edges: Duplicate Edge makes their two curves at once, Planar fills the picked edge's "
+      "planar loop (4 edges)", r == {'FINISHED'} and [x[1] for x in _dup_in] == ["E3", "E5"] and _dup_made >= 1
+      and r2 == {'FINISHED'} and len(_pl_in) == 4 and _pl is not _bx and store.is_nurbs(_pl)
+      and store.get_brep(_pl).face_count() == 1, f"{r} {_dup_in} {_dup_made} {r2} {_pl_in} {_fp.msgs} {_fd.msgs}")
+_fake_self = _types.SimpleNamespace(pick_min=2, pick_max=32, expand_pick=lambda c: [c],
+                                    _cands=_opx._pick_candidates(ctx, True))
+bpy.ops.object.select_all(action='DESELECT'); _bx.select_set(True); ctx.view_layer.objects.active = _bx
+_sx2.set_picks(_bx, "EDGE", [3])
+_one = _opx.PickMixin.picked_inputs(_fake_self, ctx)
+_sx2.set_picks(_bx, "EDGE", [3, 5])
+_two = _opx.PickMixin.picked_inputs(_fake_self, ctx)
+check("picked edges that don't fit a tool (too few for a Loft) leave it to pick by hand",
+      _one is None and _two == [(_bx, "E3"), (_bx, "E5")], f"{_one} {_two}")
+# faces: Unjoin splits the picked ones off, X / Delete removes them (all of them: the body goes)
+_vw.sel_mode = {"FACE"}
+bpy.ops.object.select_all(action='DESELECT'); _bx.select_set(True); ctx.view_layer.objects.active = _bx
+_nf = store.get_brep(_bx).face_count()
+_sx2.set_picks(_bx, "FACE", [0, 2])
+r = bpy.ops.nproto.unjoin()
+_after = store.get_brep(_bx).face_count()
+_parts = [o for o in ctx.selected_objects if o is not _bx]
+check("Unjoin with picked faces: just those come off (one object each), the rest stays one body",
+      r == {'FINISHED'} and _nf == 6 and _after == 4 and len(_parts) == 2
+      and all(store.get_brep(o).face_count() == 1 for o in _parts), f"{_nf} -> {_after}, {len(_parts)} parts")
+bpy.ops.object.select_all(action='DESELECT'); _bx.select_set(True); ctx.view_layer.objects.active = _bx
+_sx2.set_picks(_bx, "FACE", [1])
+r = bpy.ops.nproto.delete_faces()
+_left = store.get_brep(_bx).face_count()
+_p0 = _parts[0]
+bpy.ops.object.select_all(action='DESELECT'); _p0.select_set(True); ctx.view_layer.objects.active = _p0
+_sx2.set_picks(_p0, "FACE", [0])
+_pname = _p0.name
+r2 = bpy.ops.nproto.delete_faces()
+check("Delete Faces (X / Delete in Face mode): picked faces go; a body whose faces are all picked is deleted",
+      r == {'FINISHED'} and _left == 3 and r2 == {'FINISHED'} and _pname not in bpy.data.objects, f"{_left}")
+_vw.sel_mode = {"BODY"}
 
 print("ALL OK" if ok else "SOME FAILED")

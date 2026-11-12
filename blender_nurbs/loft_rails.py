@@ -567,6 +567,7 @@ class NPROTO_OT_loft_rails(PickMixin, bpy.types.Operator):
     bl_label = "Loft Rails"
     bl_options = {'REGISTER', 'UNDO'}
 
+    accepts_picks = True
     pick_min = 2
     pick_max = 32
     finish_on_min = False
@@ -591,7 +592,7 @@ class NPROTO_OT_loft_rails(PickMixin, bpy.types.Operator):
     def invoke(self, context, event):
         if not _kernel_ok(self):
             return {'CANCELLED'}
-        return self.start_picking(context)
+        return self.start_picking(context, event)
 
     def _params(self):
         p = {f"lr_{n}": getattr(self, f"lr_{n}") for n, _ in SIDES}
