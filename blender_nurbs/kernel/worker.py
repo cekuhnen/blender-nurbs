@@ -24,6 +24,9 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _nproto_kernel as sm  # noqa: E402
+from harden import harden  # noqa: E402
+
+harden(sm)               # end-of-range curve evaluation that every kernel build accepts
 
 ext = sm.blender_ext
 
