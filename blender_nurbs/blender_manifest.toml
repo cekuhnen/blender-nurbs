@@ -2,9 +2,9 @@ schema_version = "1.0.0"
 
 id = "nurbs_modeling"
 version = "0.3.0"
-name = "NURBS Modeling"
-tagline = "Interactive NURBS surface tools on the USD BRep kernel"
-maintainer = "ckbrd"
+name = "NURBS Proto"
+tagline = "NURBS surfaces for concept design, on NVIDIA’s USD BRep kernel"
+maintainer = "ckbrd <info@ckbrd.de>"
 type = "add-on"
 
 blender_version_min = "5.0.0"

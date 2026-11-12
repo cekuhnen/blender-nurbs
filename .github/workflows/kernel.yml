@@ -188,7 +188,7 @@ jobs:
           pre=--prerelease
           if git branch -r --contains "$GITHUB_SHA" | grep -qx '  origin/main'; then pre=; fi
           cat > notes.md <<EOF
-          NURBS Modeling $version for Blender 5.0 or newer (tested on Blender $BLENDER_VERSION), built from \`${GITHUB_SHA::7}\`.
+          NURBS Proto $version for Blender 5.0 or newer (tested on Blender $BLENDER_VERSION), built from \`${GITHUB_SHA::7}\`.
 
           **Download the zip for your system:**
 
@@ -207,6 +207,6 @@ jobs:
             gh release upload "$tag" dist/*.zip --clobber
             gh release edit "$tag" --notes-file notes.md
           else
-            gh release create "$tag" dist/*.zip --target "$GITHUB_SHA" --title "NURBS Modeling $version" \
+            gh release create "$tag" dist/*.zip --target "$GITHUB_SHA" --title "NURBS Proto $version" \
                                                 --notes-file notes.md $pre
           fi

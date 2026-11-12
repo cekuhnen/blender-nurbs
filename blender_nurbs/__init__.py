@@ -1,4 +1,4 @@
-"""NURBS Modeling -- interactive NURBS surface tools for Blender, built on
+"""NURBS Proto -- interactive NURBS surface modeling for Blender, built on
 NVIDIA's USD BRep (SMLib) kernel."""
 
 import bpy

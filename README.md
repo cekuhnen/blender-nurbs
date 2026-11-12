@@ -1,4 +1,4 @@
-# NURBS Prototype for Blender 5.x (USD BRep / SMLib kernel)
+# NURBS Proto for Blender 5.x (USD BRep / SMLib kernel)
 
 Viewport tools that build exact NURBS surfaces with NVIDIA's open-source
 [USD BRep](https://github.com/NVIDIA-Omniverse/usd-brep) kernel (SMLib, Apache-2.0).
@@ -442,7 +442,7 @@ Intel Macs and Windows on ARM have no kernel build yet.
 
 **From the source (development):** symlink or copy `blender_nurbs/` into
 `~/Library/Application Support/Blender/5.2/extensions/user_default/`, then enable
-**NURBS Modeling** in Preferences → Add-ons. It needs the kernel module built for
+**NURBS Proto** in Preferences → Add-ons. It needs the kernel module built for
 your system in `blender_nurbs/kernel/` (see Build the kernel).
 
 ## Known limits (prototype)
