@@ -46,10 +46,33 @@ def equidistribute(s, err, U, p, spans):
         m = (s >= a) & (s <= b)
         e = float(err[m].max()) if m.any() else 0.0
         dens.append((max(e, 1e-300) / (b - a) ** (p + 1)) ** (1.0 / (p + 1)))
-    dens = np.array(dens) + 1e-3 * max(dens)
+    uniform = list(np.linspace(0.0, 1.0, spans + 1)[1:-1])
+    dens = np.array(dens)
+    if not np.isfinite(dens).all() or dens.max() <= 0:
+        return uniform
+    dens = dens + 1e-3 * dens.max()
     cdf = np.r_[0.0, np.cumsum(dens * np.diff(br))]
+    if not np.isfinite(cdf[-1]) or cdf[-1] <= 0:
+        return uniform
     cdf /= cdf[-1]
-    return list(np.interp(np.linspace(0, 1, spans + 1)[1:-1], cdf, br))
+    return safe_inner(np.interp(np.linspace(0, 1, spans + 1)[1:-1], cdf, br), spans)
+
+
+def safe_inner(inner, spans):
+    """Interior knots kept apart and away from the ends (no span shorter than
+    a quarter of an even one): bunched knots make the fit singular."""
+    inner = np.sort(np.asarray(inner, float))
+    if len(inner) == 0:
+        return []
+    gap = 0.25 / spans
+    lo = gap * np.arange(1, len(inner) + 1)                 # room for the spans before
+    hi = 1.0 - gap * np.arange(len(inner), 0, -1)           # and after
+    inner = np.clip(inner, lo, hi)
+    for i in range(1, len(inner)):
+        inner[i] = max(inner[i], inner[i - 1] + gap)
+    for i in range(len(inner) - 2, -1, -1):
+        inner[i] = min(inner[i], inner[i + 1] - gap)
+    return list(inner)
 
 
 def basis(U, p, ts, der=0):
@@ -60,12 +83,9 @@ def basis(U, p, ts, der=0):
     m = len(U) - 1
     last = max(i for i in range(m) if U[i] < U[i + 1])     # last non-empty span
     T0 = np.zeros((len(ts), m))
-    for k, t in enumerate(ts):
-        if t >= U[last + 1]:
-            T0[k, last] = 1.0
-        else:
-            i = np.searchsorted(U, t, side="right") - 1
-            T0[k, min(max(i, 0), last)] = 1.0
+    span = np.clip(np.searchsorted(U, ts, side="right") - 1, 0, last)
+    span[ts >= U[last + 1]] = last
+    T0[np.arange(len(ts)), span] = 1.0
     tables = [T0]
     for q in range(1, p + 1):
         prev = tables[-1]
@@ -168,6 +188,16 @@ def face_layout(face, sm, is_fillet):
         if key in sides:
             return "a side of the fillet face is split into several edges"
         sides[key] = (e, others[0] if others else None)
+    closed = False
+    if len(sides) == 3:
+        # a fillet round a closed edge loop meets itself at a seam: one edge is
+        # both of its ends (no other face on it)
+        for k, (e, other) in list(sides.items()):
+            twin = {"u0": "u1", "u1": "u0", "v0": "v1", "v1": "v0"}[k]
+            if other is None and twin not in sides:
+                sides[twin] = (e, None)
+                closed = True
+                break
     if len(sides) != 4:
         return f"the fillet face has {len(sides)} sides, not 4 (corner blend)"
     rail_u = all(sides[k][1] is not None and not is_fillet(sides[k][1]) for k in ("u0", "u1"))
@@ -177,9 +207,29 @@ def face_layout(face, sm, is_fillet):
     across = "u" if rail_u else "v"
     a, b = ("u0", "u1") if across == "u" else ("v0", "v1")
     e0, e1 = ("v0", "v1") if across == "u" else ("u0", "u1")
+    T_end = (_end_plane(sides[e0][0]), _end_plane(sides[e1][0]))
     return {"surf": surf, "across": across, "dom_a": (u0, u1) if across == "u" else (v0, v1),
             "dom_t": (v0, v1) if across == "u" else (u0, u1),
-            "rails": (sides[a], sides[b]), "ends": (sides[e0], sides[e1])}
+            "rails": (sides[a], sides[b]), "ends": (sides[e0], sides[e1]), "closed": closed,
+            "T_end": T_end}
+
+
+def _end_plane(edge, n=17):
+    """Normal of the plane an end edge lies in (a fillet's end section), or
+    None when it is not planar. Two fillet faces meeting at that edge then use
+    the SAME section plane there: each face's own along-direction differs a
+    little at the shared edge, and their exact sections would not meet."""
+    try:
+        t0, t1 = edge.parameter_range()
+        P = np.array([edge.point_at(t0 + (t1 - t0) * k / (n - 1)) for k in range(n)], float)
+    except Exception:
+        return None
+    c = P.mean(axis=0)
+    _, sv, vt = np.linalg.svd(P - c)
+    ext_ = float(np.linalg.norm(np.ptp(P, axis=0))) or 1.0
+    if sv[0] <= 0 or float(np.abs((P - c) @ vt[2]).max()) > 1e-4 * ext_:
+        return None
+    return vt[2]
 
 
 def _eval(lay, a, t):
@@ -215,9 +265,31 @@ def ball(lay, sm, t, radius, A, B, tA):
         M, T, _ = s.derivatives(t, am)
     M, T = np.array(M), np.array(T)
     T /= np.linalg.norm(T) or 1.0
+    # near an end, turn the section plane into the end edge's own plane
+    T_end = lay.get("T_end", (None, None))
+    t0, t1 = lay["dom_t"]
+    x = (t - t0) / ((t1 - t0) or 1.0)
+    for Te, w in ((T_end[0], 1.0 - x / 0.3), (T_end[1], 1.0 - (1.0 - x) / 0.3)):
+        if Te is None or w <= 0:
+            continue
+        w = min(w, 1.0)
+        w = w * w * (3.0 - 2.0 * w)                     # smooth
+        Te = Te if Te @ T >= 0 else -Te
+        T = (1.0 - w) * T + w * Te
+        T /= np.linalg.norm(T) or 1.0
     n = (B - A) - ((B - A) @ tA) / (tA @ tA) * tA
-    C = A + radius * n / (np.linalg.norm(n) or 1.0)
     S1, S2 = lay["rails"][0][1].surface(), lay["rails"][1][1].surface()
+    if np.linalg.norm(n) > 1e-6 * np.linalg.norm(B - A):
+        C = A + radius * n / np.linalg.norm(n)
+    else:
+        # (a chamfer's across direction runs along its chord: no hint which
+        # side the ball is on) start from the faces' normals, each turned
+        # towards the other rail
+        _, n1, _ = _foot(S1, sm, A)
+        _, n2, _ = _foot(S2, sm, B)
+        n1 = n1 if n1 @ (B - A) >= 0 else -n1
+        n2 = n2 if n2 @ (A - B) >= 0 else -n2
+        C = 0.5 * (A + radius * n1 + B + radius * n2)
     for _ in range(12):
         P1, n1, _ = _foot(S1, sm, C)
         P2, n2, _ = _foot(S2, sm, C)
@@ -267,7 +339,13 @@ def blend_section(lay, sm, t, radius, A, B, tA, m, k):
         cv = [X + j * al * tX for j in range(c + 1)]
         if c >= 2:
             kap = _normal_curvature(face.surface(), sm, X, tX, nX, L)
-            cv[2] = cv[2] + kap * m * al * al / (m - 1) * nX
+            h2 = kap * m * al * al / (m - 1)
+            cv[2] = cv[2] + h2 * nX
+            if c >= 3:
+                # G3 with the face's curvature taken as constant across the rail
+                # (exact for planes / cylinders): the cubic term of the Bernstein
+                # expansion vanishes when h3 = 3 h2
+                cv[3] = cv[3] + 3.0 * h2 * nX
         sides.append(cv)
     cvs = sides[0] + sides[1][::-1]
     return np.array([np.r_[q, 1.0] for q in cvs])
@@ -307,6 +385,10 @@ def section(lay, t, kind, m=3, sm=None, radius=None, blend_k=None):
         if Q is not None:
             return Q
     if kind == "CHAMFER":
+        # the kernel's chamfer runs between the rolling-ball contact points
+        exact = ball(lay, sm, t, radius, A, B, tA) if (radius and sm is not None) else None
+        if exact is not None:
+            A, B = exact[0], exact[1]
         return np.array([np.r_[A, 1.0], np.r_[B, 1.0]])
     if kind == "CIRCULAR":
         exact = ball(lay, sm, t, radius, A, B, tA) if (radius and sm is not None) else None
@@ -365,16 +447,21 @@ def _orient_rows(Q, A_ref):
 # Fitting
 # ---------------------------------------------------------------------------
 
-def _end_data(nlay, shared_edge, kind, m, A_ref, inward_dir, sm, radius, blend_k=None):
+def _end_data(nlay, shared_edge, kind, m, A_ref, inward_dir, sm, radius, blend_k=None, at=None):
     """Section, first and second derivative of a neighbouring fillet face at
     the end it shares with ours, oriented along inward_dir (our first rail
-    moving away from the shared end)."""
+    moving away from the shared end). at=(t, direction): where on the
+    neighbour to read it (a closed fillet is its own neighbour: both of its
+    ends lie on the seam)."""
     t0, t1 = nlay["dom_t"]
-    mid = _edge_mid(shared_edge)
-    am = 0.5 * sum(nlay["dom_a"])
-    q0 = _eval(nlay, am, t0)[0]
-    q1 = _eval(nlay, am, t1)[0]
-    te, sgn = (t0, 1.0) if np.linalg.norm(q0 - mid) < np.linalg.norm(q1 - mid) else (t1, -1.0)
+    if at is not None:
+        te, sgn = at
+    else:
+        mid = _edge_mid(shared_edge)
+        am = 0.5 * sum(nlay["dom_a"])
+        q0 = _eval(nlay, am, t0)[0]
+        q1 = _eval(nlay, am, t1)[0]
+        te, sgn = (t0, 1.0) if np.linalg.norm(q0 - mid) < np.linalg.norm(q1 - mid) else (t1, -1.0)
     h = 1e-3 * (t1 - t0)
     Qs = [_orient_rows(section(nlay, te + sgn * k * h, kind, m, sm, radius, blend_k), A_ref) for k in range(3)]
     D = (-3 * Qs[0] + 4 * Qs[1] - Qs[2]) / (2 * h)     # d/d(tau), tau running into the neighbour
@@ -498,15 +585,28 @@ def _fit_once(s, Q, p, U, ncv, ends, fair, iters, nrows):
                     G[idx[2], sl, si[(side, "lam", r)]] = -b1 * G[idx[1], sl, si[(side, "lam", r)]] / b2
                     h[idx[2], sl] = (lam_fix[side, r] ** 2 * e["D2"][sl] - b0 * e["Q"][sl]
                                      - b1 * h[idx[1], sl]) / b2
-        A = np.einsum("kj,jrz->krz", Bk, G).reshape(N * R, nz)
-        b = (Q - Bk @ h).reshape(N * R)
-        rows, rhs = [A], [b]
-        if fair > 0 and ncv > 2:
-            w = np.sqrt(fair * N)
-            for j in range(1, ncv - 1):
-                rows.append(w * (G[j - 1] - 2 * G[j] + G[j + 1]))
-                rhs.append(-w * (h[j - 1] - 2 * h[j] + h[j + 1]))
-        z = np.linalg.lstsq(np.vstack(rows), np.concatenate(rhs), rcond=None)[0]
+        # The unknowns of one section row (its 4 homogeneous coordinates in every
+        # free CV, plus that row's own G1 / G2 scalars) appear in no other row's
+        # equations: the least-squares problem is block diagonal. Solving it
+        # row by row gives exactly the same answer, ~30x faster than one big solve.
+        z = np.zeros(nz)
+        resid = Q - Bk @ h
+        w = np.sqrt(fair * N) if (fair > 0 and ncv > 2) else 0.0
+        # the free CVs enter every row the same way: basis x identity(4)
+        A_free = np.kron(Bk[:, free], np.eye(4))                            # (N*4, len(free)*4)
+        for r in range(nrows):
+            sl = slice(4 * r, 4 * r + 4)
+            srow = [si[k] for k in scal if k[2] == r]
+            cols = [fi * R + c for fi in range(len(free)) for c in range(4 * r, 4 * r + 4)] + srow
+            Gs = G[:, sl, :][:, :, cols]                                    # (ncv, 4, nzs)
+            A_s = [A_free] + [(Bk @ G[:, sl, c]).reshape(N * 4, 1) for c in srow]
+            rows_ = [np.hstack(A_s) if srow else A_free]
+            rhs_ = [resid[:, sl].reshape(N * 4)]
+            if w:
+                for j in range(1, ncv - 1):
+                    rows_.append(w * (Gs[j - 1] - 2 * Gs[j] + Gs[j + 1]))
+                    rhs_.append(-w * (h[j - 1, sl] - 2 * h[j, sl] + h[j + 1, sl]))
+            z[cols] = np.linalg.lstsq(np.vstack(rows_), np.concatenate(rhs_), rcond=None)[0]
         C = np.einsum("jrz,z->jr", G, z) + h
         new = np.array([[z[si[(sd, "lam", r)]] if (sd, "lam", r) in si else 0.0 for r in range(nrows)]
                         for sd in (0, 1)])
@@ -541,7 +641,18 @@ def _sample_along(lay, kind, m, sm, radius, n=121, blend_k=None):
     ch = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(mid, axis=0), axis=1))]
     ts = np.interp(np.linspace(0.0, 1.0, n) * ch[-1], ch, tt)
     Q0 = section(lay, ts[0], kind, m, sm, radius, blend_k)
-    secs = np.array([_orient_rows(section(lay, t, kind, m, sm, radius, blend_k), Q0[0, :3]) for t in ts])
+
+    def chained(ts_):
+        # each section oriented like its neighbour (they are close): against the
+        # FIRST section's start, a long curved fillet's far sections compare two
+        # far-away ends and flip at random
+        out, ref = [], Q0[0, :3] / Q0[0, 3]
+        for t in ts_:
+            Q = _orient_rows(section(lay, t, kind, m, sm, radius, blend_k), ref)
+            ref = Q[0, :3] / Q[0, 3]
+            out.append(Q)
+        return np.array(out)
+    secs = chained(ts)
     if radius:
         # space the sections evenly along the exact ones (the kernel face's
         # middle line is only approximate): a symmetric fillet then samples
@@ -550,7 +661,7 @@ def _sample_along(lay, kind, m, sm, radius, n=121, blend_k=None):
             X = (secs[..., :3] / secs[..., 3:4]).mean(axis=1)
             ce = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(X, axis=0), axis=1))]
             ts = np.interp(np.linspace(0.0, 1.0, n) * ce[-1], ce, ts)
-            secs = np.array([_orient_rows(section(lay, t, kind, m, sm, radius, blend_k), Q0[0, :3]) for t in ts])
+            secs = chained(ts)
     return secs, ch[-1]
 
 
@@ -606,7 +717,7 @@ def rebuild_face(face, sm, is_fillet, kind="CIRCULAR", cont=2, tol=1e-4, ang_tol
     m = 3
     if kind == "BLEND":
         d = sm.blender_ext.surface_cvs(lay["surf"])
-        m = int(np.clip(d["degree_u"] if lay["across"] == "u" else d["degree_v"], 3, 7))
+        m = int(np.clip(d["degree_u"] if lay["across"] == "u" else d["degree_v"], 3, 9))
     secs, length = _sample_along(lay, kind, m, sm, radius, blend_k=blend_k)
     N, nrows = secs.shape[0], secs.shape[1]
     Q = secs.reshape(N, nrows * 4)
@@ -619,6 +730,17 @@ def rebuild_face(face, sm, is_fillet, kind="CIRCULAR", cont=2, tol=1e-4, ang_tol
         k = 0 if side == 0 else N - 1
         kin = 3 if side == 0 else N - 4
         A_end = secs[k, 0, :3]
+        if lay.get("closed"):
+            # its own neighbour across the seam: this end takes the section and
+            # derivatives the face has just past the seam (its other end)
+            t0_, t1_ = lay["dom_t"]
+            Qe, D, D2 = _end_data(lay, edge, kind, m, A_end, secs[kin, 0, :3] - A_end, sm, radius, blend_k,
+                                  at=(t1_, -1.0) if side == 0 else (t0_, 1.0))
+            if side == 1:
+                D = -D
+            ends.append({"Q": Qe.reshape(-1), "D": D.reshape(-1), "D2": D2.reshape(-1), "cont": cont})
+            end_info.append(f"G{cont} (closed)")
+            continue
         if other is None or not is_fillet(other):
             ends.append(None)
             end_info.append("free")
@@ -659,28 +781,47 @@ def rebuild_face(face, sm, is_fillet, kind="CIRCULAR", cont=2, tol=1e-4, ang_tol
     cands = _param_candidates(secs, lay, sm)
     scores = []
     for s0 in cands:
-        C, U, s1 = fit_rows(s0, Q, p0, 1, ends, sym=sym)
-        scores.append(np.abs(basis(U, p0, s1) @ C - Q).max())
+        try:
+            C, U, s1 = fit_rows(s0, Q, p0, 1, ends, sym=sym)
+            scores.append(float(np.abs(basis(U, p0, s1) @ C - Q).max()))
+        except (np.linalg.LinAlgError, ValueError, FloatingPointError):
+            scores.append(np.inf)
     s_init = cands[int(np.argmin(scores))]
 
     need = sum(0 if e is None else 1 + e["cont"] for e in ends)
     max_c = max([0] + [e["cont"] for e in ends if e is not None])
     best = None
+    tried = []
     for spans in range(1, max_spans + 1):
-        for p in range(max(1, max_c), max_degree + 1):
+        # the highest degree first: if even it misses the tolerance with these
+        # spans, a lower one cannot do better -- skip to more spans. If it
+        # makes it, look for the lowest degree that does too (lighter patch)
+        lo_p = max(1, max_c)
+        order = [max_degree] + [q for q in range(lo_p, max_degree)] if max_degree >= lo_p else []
+        for p in order:
             if p + spans < max(need + 1, 2):
                 continue
             # even patches first (uniform knots); move the knots to where the
             # error is only if even ones miss the tolerance
-            C, U, s = fit_rows(s_init, Q, p, spans, ends, correct=6, sym=sym)
+            try:
+                C, U, s = fit_rows(s_init, Q, p, spans, ends, correct=6, sym=sym)
+            except (np.linalg.LinAlgError, ValueError, FloatingPointError):
+                continue            # this layout cannot be fitted: try the next one
+            if not np.isfinite(C).all():
+                continue
             rep = measure(C, U, p, nrows, secs, s, lay, rail_edges, rail_faces, sm, exact)
             ok = rep["dev"] <= tol and rep["angle"] <= ang_tol and rep["min_w"] > 0
             if spans > 1 and not ok:
                 e = _sample_err(C, U, p, nrows, secs, s)
                 Uc, sc, ec, e0 = U, s, e, e.max()
                 for _ in range(5):
-                    C2, U2, s2 = fit_rows(sc, Q, p, spans, ends, correct=3, sym=sym,
-                                          inner=equidistribute(sc, ec, Uc, p, spans))
+                    try:
+                        C2, U2, s2 = fit_rows(sc, Q, p, spans, ends, correct=3, sym=sym,
+                                              inner=equidistribute(sc, ec, Uc, p, spans))
+                    except (np.linalg.LinAlgError, ValueError, FloatingPointError):
+                        break       # the moved knots do not fit: keep the even ones
+                    if not np.isfinite(C2).all():
+                        break
                     e2 = _sample_err(C2, U2, p, nrows, secs, s2)
                     Uc, sc, ec = U2, s2, e2
                     if e2.max() < e0:
@@ -692,13 +833,29 @@ def rebuild_face(face, sm, is_fillet, kind="CIRCULAR", cont=2, tol=1e-4, ang_tol
                             break
             rep.update(spans=spans, degree=p, symmetric=sym)
             score = (not ok, spans * p if ok else rep["dev"])
+            tried.append((rep["dev"], max(rep["edge_gap"], 0.0), rep["angle"], spans * p, C, U, p, spans, rep))
             if best is None or score < best[0]:
                 best = (score, C, U, p, spans, rep)
-            if ok:
-                break
+            if p == max_degree and not ok:
+                break               # these spans cannot make it at any degree
+            if p != max_degree and ok:
+                break               # the lowest degree that makes it
         if best is not None and not best[0][0]:
             break
+    if best is not None and best[0][0] and tried:
+        # nothing inside the tolerance (the kernel's own fillet is only that
+        # accurate, or two neighbours disagree a little): more spans then only
+        # chase that floor -- take the lightest layout within 25% of the best
+        dev0 = min(t[0] for t in tried)
+        ang0 = min(t[2] for t in tried)
+        near = [t for t in tried if t[0] <= 1.25 * dev0 + 1e-15 and t[2] <= max(1.25 * ang0, ang_tol)
+                and t[8].get("min_w", 1.0) > 0]
+        if near:
+            t = min(near, key=lambda t: (t[3], t[0]))
+            best = ((True, t[0]), t[4], t[5], t[6], t[7], t[8])
     _, C, U, p, spans, rep = best
+    rep = dict(rep)
+    rep["tried"] = [(t[7], t[6], float(t[0]), float(t[2])) for t in tried]     # spans, degree, dev, angle
     pieces = bezier_pieces(C, U, p)
     rep["ends"] = end_info
     rep["rows"] = nrows
@@ -749,16 +906,22 @@ def measure(C, U, p, nrows, secs, s, lay, rail_edges, rail_faces, sm, exact=True
         # parametric comparison above also counts where along the section a point sits)
         surf = lay["surf"]
         G = eval_sections(eval_rows(C, U, p, nrows, np.linspace(0, 1, 41)), us)
-        dev = max(sm.surface_closest_point(surf, tuple(float(c) for c in q))[2] for q in G.reshape(-1, 3))
+        try:
+            dev = max(sm.surface_closest_point(surf, tuple(float(c) for c in q))[2] for q in G.reshape(-1, 3))
+        except Exception:          # a wild candidate (far off / not finite): reject it
+            dev = float("inf")
     vs = np.linspace(0, 1, 41)
     gap, ang = 0.0, 0.0
     for edge, face, u in zip(rail_edges, rail_faces, (0.0, 1.0)):
         fs = face.surface()
         P, Su, Sv = patch_derivs(C, U, p, nrows, u, vs)
         for j in range(len(vs)):
-            gap = max(gap, edge.closest_point(tuple(P[j]))[2])
+            try:
+                gap = max(gap, edge.closest_point(tuple(float(x) for x in P[j]))[2])
+                _, n2, _ = _foot(fs, sm, P[j])
+            except Exception:      # a wild candidate (far off / not finite): reject it
+                return {"dev": float("inf"), "edge_gap": float("inf"), "angle": 180.0, "min_w": 0.0}
             n1 = np.cross(Su[j], Sv[j])
-            _, n2, _ = _foot(fs, sm, P[j])
             c = abs(n1 @ n2) / (np.linalg.norm(n1) * np.linalg.norm(n2) + 1e-300)
             ang = max(ang, float(np.degrees(np.arccos(np.clip(c, -1, 1)))))
     w = eval_rows(C, U, p, nrows, vs)[..., 3]
@@ -818,7 +981,7 @@ def rebuild_body(b, sm, fillet_ids, kind="CIRCULAR", cont=2, tol=1e-4, ang_tol=0
             if not isinstance(lay, str):
                 d = ext.surface_cvs(lay["surf"])
                 m = d["degree_u"] if lay["across"] == "u" else d["degree_v"]
-                if 3 <= m <= 7 and m % 2 == 1:
+                if 3 <= m <= 9 and m % 2 == 1:
                     ratios += blend_fullness(lay, sm, m)
         blend_k = float(np.median(ratios)) if ratios else None
     todo = [i for i, f in enumerate(fil) if not (is_light(f.surface(), ext) and kind != "BLEND")]

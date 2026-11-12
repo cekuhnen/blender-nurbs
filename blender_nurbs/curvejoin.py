@@ -511,9 +511,7 @@ class NPROTO_OT_join_curves(bpy.types.Operator):
         write_spline_object(out, g[1])
         if features.history_enabled(context):
             features.record(out, "join_curves", inputs, params)
-            for o in objs:
-                o.hide_set(True)
-                o.hide_render = True
+            features.keep_inputs(context, objs)
             tail = " (sources kept hidden: history; Restore Inputs brings them back)"
         else:
             for o in objs:

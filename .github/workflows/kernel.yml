@@ -1,5 +1,5 @@
 # Builds the kernel module (USD BRep / SMLib + bindings + our extension) for
-# macOS (arm64 + Intel), Windows x64 and Linux x64, runs the headless tests in
+# macOS (Apple Silicon), Windows x64 and Linux x64, runs the headless tests in
 # Blender on each, and packages one extension zip with all three.
 #
 # Not yet run: written on macOS, where only the macOS build was tried. Expect to
@@ -34,11 +34,11 @@ jobs:
           git -C third_party/usd-brep fetch -q --depth 1 origin "$USD_BREP_COMMIT"
           git -C third_party/usd-brep checkout -q FETCH_HEAD
           python -m pip install --target third_party/pybind11_pkg "pybind11==$PYBIND11_VERSION"
-      - name: Build (universal arm64 + x86_64)
+      - name: Build (arm64; Intel Macs are not supported)
         run: |
           cmake -S kernel_build -B kernel_build/build -DCMAKE_BUILD_TYPE=Release \
                 -DPython3_EXECUTABLE="${{ steps.py.outputs.python-path }}" \
-                -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.2
+                -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.2
           cmake --build kernel_build/build -j4
           file blender_nurbs/kernel/_nproto_kernel.*
       - uses: actions/upload-artifact@v4

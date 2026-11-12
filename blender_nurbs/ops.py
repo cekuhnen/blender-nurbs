@@ -32,7 +32,10 @@ def _kernel_ok(op):
 
 def _make_result(context, name, op, inputs, params, matrix=None, keep_history=True):
     g = features.run(op, inputs, params)
-    obj = store.new_object(context, name, g, matrix)
+    if isinstance(g, tuple) and g and g[0] == "brep_text":     # built in the worker
+        obj = store.new_object_text(context, name, g[1], matrix)
+    else:
+        obj = store.new_object(context, name, g, matrix)
     if keep_history and context.scene.nproto_settings.construction_history:
         features.record(obj, op, inputs, params)
     return obj
@@ -140,6 +143,23 @@ def _near_candidates(context, event, cands, max_px=18.0, tie_px=4.0):
 def _nearest(context, event, cands, max_px=18.0):
     ties = _near_candidates(context, event, cands, max_px)
     return ties[0] if ties else None
+
+
+class AskValue:
+    """Commands with a size (distance, radius, thickness): started from the UI
+    they first ask for it in a small dialog -- prefilled with the last value
+    used (prepare_value may size it to the part) -- and compute on OK. The
+    redo panel still adjusts it afterwards. Scripts (EXEC) never ask."""
+
+    def prepare_value(self, context):
+        pass
+
+    def ask(self, context):
+        self.prepare_value(context)
+        if bpy.app.background:
+            return self.execute(context)
+        return context.window_manager.invoke_props_dialog(self, width=320, title=self.bl_label,
+                                                          confirm_text=self.bl_label)
 
 
 class PickMixin:
@@ -280,6 +300,15 @@ class PickMixin:
     def _finish(self, context):
         self._end(context)
         self.inputs = _encode_inputs(self._picks)
+        if isinstance(self, AskValue) and not bpy.app.background:
+            # a dialog cannot open from this pick loop (the loop would keep
+            # running behind it): start the command again with the picks
+            # given -- its invoke asks for the value
+            # a running operator reports "NPROTO_OT_edge_fillet", its class "nproto.edge_fillet"
+            idn = self.bl_idname
+            mod, name = idn.split("_OT_", 1) if "_OT_" in idn else idn.split(".", 1)
+            getattr(getattr(bpy.ops, mod.lower()), name)('INVOKE_DEFAULT', inputs=self.inputs)
+            return {'CANCELLED'}
         return self.execute(context)
 
 
@@ -396,10 +425,13 @@ class _CurveTool(PickMixin):
     def invoke(self, context, event):
         if not _kernel_ok(self):
             return {'CANCELLED'}
+        go = self.ask if isinstance(self, AskValue) else self.execute
+        if self.inputs:                     # picked already (see PickMixin._finish)
+            return go(context)
         ins = _curve_inputs(context)
         if ins and not event.alt:
             self.inputs = _encode_inputs(ins)
-            return self.execute(context)
+            return go(context)
         return self.start_picking(context)
 
     def execute(self, context):
@@ -416,7 +448,7 @@ class _CurveTool(PickMixin):
         return {'FINISHED'}
 
 
-class NPROTO_OT_extrude(_CurveTool, bpy.types.Operator):
+class NPROTO_OT_extrude(AskValue, _CurveTool, bpy.types.Operator):
     """Extrude curves (or surface edges) into surfaces"""
     bl_idname = "nproto.extrude"
     bl_label = "Extrude"
@@ -636,13 +668,20 @@ class NPROTO_OT_planar(PickMixin, bpy.types.Operator):
         return {'FINISHED'}
 
 
-class NPROTO_OT_offset(bpy.types.Operator):
+class NPROTO_OT_offset(AskValue, bpy.types.Operator):
     """Offset NURBS surfaces along their normal"""
     bl_idname = "nproto.offset"
     bl_label = "Offset"
     bl_options = {'REGISTER', 'UNDO'}
 
-    distance: FloatProperty(name="Distance", default=0.1, unit='LENGTH')
+    distance: FloatProperty(name="Distance", default=0.1, unit='LENGTH',
+                            description="Along the normals (negative: the other side)")
+
+    def invoke(self, context, event):
+        if not any(store.is_nurbs(o) for o in context.selected_objects):
+            self.report({'WARNING'}, "Select NURBS surfaces")
+            return {'CANCELLED'}
+        return self.ask(context)
 
     def execute(self, context):
         if not _kernel_ok(self):
@@ -658,6 +697,47 @@ class NPROTO_OT_offset(bpy.types.Operator):
         if not made:
             self.report({'WARNING'}, "Select NURBS surfaces")
             return {'CANCELLED'}
+        _select_only(context, made)
+        return {'FINISHED'}
+
+
+class NPROTO_OT_thicken(AskValue, bpy.types.Operator):
+    """Thicken surfaces (single or joined) into closed solids"""
+    bl_idname = "nproto.thicken"
+    bl_label = "Thicken"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    distance: FloatProperty(name="Thickness", default=0.01, unit='LENGTH',
+                            description="Wall thickness along the normals (negative: the other side)")
+    symmetric: BoolProperty(name="Symmetric", default=False, description="Half the thickness on each side")
+
+    def invoke(self, context, event):
+        if not any(store.is_nurbs(o) for o in context.selected_objects):
+            self.report({'WARNING'}, "Select NURBS surfaces")
+            return {'CANCELLED'}
+        return self.ask(context)
+
+    def execute(self, context):
+        if not _kernel_ok(self):
+            return {'CANCELLED'}
+        made = []
+        for o in [o for o in context.selected_objects if store.is_nurbs(o)]:
+            try:
+                made.append(_make_result(context, o.name + "_thick", "thicken", [(o, "SURF")],
+                                         {"distance": self.distance, "symmetric": self.symmetric},
+                                         geom.world_matrix(o)))
+            except Exception as exc:
+                self.report({'ERROR'}, f"Thicken {o.name} failed: {exc}")
+        if not made:
+            if not any(store.is_nurbs(o) for o in context.selected_objects):
+                self.report({'WARNING'}, "Select NURBS surfaces")
+            return {'CANCELLED'}
+        srcs = [o for o in context.selected_objects if store.is_nurbs(o) and o not in made]
+        if features.history_enabled(context):
+            features.keep_inputs(context, srcs)          # Restore Inputs brings the sheets back
+        else:
+            for o in srcs:
+                bpy.data.objects.remove(o)               # the solid replaces its sheet
         _select_only(context, made)
         return {'FINISHED'}
 
@@ -710,13 +790,41 @@ class NPROTO_OT_delete_history(bpy.types.Operator):
     scope: EnumProperty(items=[("SELECTED", "Selected", ""), ("ALL", "All", "")], default="SELECTED")
 
     def execute(self, context):
-        objs = context.selected_objects if self.scope == "SELECTED" else context.scene.objects
-        n = 0
+        objs = list(context.selected_objects if self.scope == "SELECTED" else context.scene.objects)
+        n, freed = 0, []
         for o in objs:
             if features.has_history(o):
+                freed += features.history_inputs(o)
                 features.clear_history(o)
                 n += 1
-        self.report({'INFO'}, f"History removed from {n} object(s)")
+        # the inputs those results kept (hidden) are not needed any more
+        gone = features.purge_inputs(context, list(dict.fromkeys(freed)))
+        msg = f"History removed from {n} object(s)"
+        if gone:
+            msg += f"; deleted {len(gone)} kept input(s) nothing uses now: " + ", ".join(gone)
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
+class NPROTO_OT_collect_inputs(bpy.types.Operator):
+    """Move the surfaces / curves that Join, Boolean, Boundary Fill and Thicken
+    results keep for their history into the hidden NURBS History collection
+    (tidies scenes made before it existed, or after Unhide All)"""
+    bl_idname = "nproto.collect_inputs"
+    bl_label = "Collect Inputs"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        kept = []
+        for o in context.scene.objects:
+            h = features.history(o) if (store.is_nurbs(o) or o.type == 'CURVE') else None
+            if h and h["op"] in features.KEEP_OPS:
+                kept += [src for src, _ in h["inputs"] if src not in kept]
+        if not kept:
+            self.report({'INFO'}, "No kept inputs in this scene")
+            return {'CANCELLED'}
+        features.keep_inputs(context, kept)
+        self.report({'INFO'}, f"{len(kept)} kept input(s) in the hidden '{features.HISTORY_COLL}' collection")
         return {'FINISHED'}
 
 
@@ -951,6 +1059,6 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
 
 classes = (NPROTO_OT_align_curve, 
     NPROTO_OT_blend_curve,
-    NPROTO_OT_loft, NPROTO_OT_extrude, NPROTO_OT_revolve, NPROTO_OT_planar, NPROTO_OT_offset,
-    NPROTO_OT_from_surface, NPROTO_OT_delete_history, NPROTO_OT_rebuild,
+    NPROTO_OT_loft, NPROTO_OT_extrude, NPROTO_OT_revolve, NPROTO_OT_planar, NPROTO_OT_offset, NPROTO_OT_thicken,
+    NPROTO_OT_from_surface, NPROTO_OT_delete_history, NPROTO_OT_collect_inputs, NPROTO_OT_rebuild,
 )

@@ -8,7 +8,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import blender_nurbs
 blender_nurbs.register()
-from blender_nurbs import features, store, geom, history, jobs
+from blender_nurbs import features, store, geom, history, jobs, steps
 from blender_nurbs.kernel import load as _kl
 ext = _kl().blender_ext
 
@@ -428,8 +428,9 @@ check("surface cutter: tube trimmed back to the vase", r == {'FINISHED'} and 0.5
       f"tube {tube_area0:.3f} -> {t_after:.3f}, faces={store.get_brep(tube).face_count()}")
 
 # --- Split ---------------------------------------------------------------
-def pieces(prefix):
-    return sorted((o for o in bpy.data.objects if o.name.startswith(prefix) and store.is_nurbs(o)), key=lambda o: o.name)
+def pieces(prefix):     # (with history the split surface stays as a hidden input: not a piece)
+    return sorted((o for o in bpy.data.objects if o.name.startswith(prefix) and store.is_nurbs(o) and not o.hide_get()),
+                  key=lambda o: o.name)
 sf = make_floor("SpF", loc=(0, 80, 0))
 swl = poly("SpW_ln", [(2, 78, -1), (2, 82, -1)])
 bpy.ops.nproto.extrude(inputs=ins((swl, "S0")), distance=3.0, direction="Z"); sw = ctx.active_object; sw.name = "SpW"
@@ -460,6 +461,26 @@ vp_, tp_ = pieces("VaseT"), pieces("TubeT")
 check("split: vase and tube split each other", r == {'FINISHED'} and len(vp_) == 3 and len(tp_) >= 2
       and abs(sum(store.get_brep(o).area(1e-7) for o in vp_) - vase_area) < 2e-3,
       f"vase pieces={[round(area(o), 3) for o in vp_]} tube pieces={[round(area(o), 3) for o in tp_]}")
+
+# split keeps history: the regions follow the split surface and what cut it
+_sl = poly("SpH_ln", [(0, 120, 0), (0, 124, 0)])
+bpy.ops.nproto.extrude(inputs=ins((_sl, "S0")), distance=4.0, direction="X"); _shf = ctx.active_object; _shf.name = "SpH"
+_scl = poly("SpHW_ln", [(2, 119, -1), (2, 125, -1)])
+bpy.ops.nproto.extrude(inputs=ins((_scl, "S0")), distance=3.0, direction="Z"); _shw = ctx.active_object; _shw.name = "SpHW"
+bpy.ops.object.select_all(action='DESELECT'); _shf.select_set(True); _shw.select_set(True); ctx.view_layer.objects.active = _shf
+r = bpy.ops.nproto.split()
+_hp = pieces("SpH_")
+_hp_hist = [features.history(o) for o in _hp]
+_kept = _shf.hide_get() and not _shw.hide_get()       # (the wall is not split by the floor: it stays, as the cutter)
+_a0 = sorted(round(area(o), 4) for o in _hp)
+_shw.location.x += 1.0; ctx.view_layer.update()          # move the cutting wall: the regions follow
+for o in _hp:
+    features.rebuild(o, ctx, force=True)
+_a1 = sorted(round(area(o), 4) for o in _hp)
+check("split with history: the split surface is kept as a hidden input, every region is its own object with a Split "
+      "feature, and moving the cutter re-splits them (8 + 8 -> 12 + 4)",
+      r == {'FINISHED'} and len(_hp) == 2 and all(h is not None and h["op"] == "split_region" for h in _hp_hist)
+      and _kept and _a0 == [8.0, 8.0] and _a1 == [4.0, 12.0], f"{[o.name for o in _hp]} {_a0} -> {_a1} kept {_kept}")
 
 # --- Join / Unjoin ---------------------------------------------------------
 def patch(name, p0, p1, d, dist):
@@ -1274,6 +1295,8 @@ for cont in ("G1", "G2"):
     def _nrm(u, v):
         _, su, sv = sl.derivatives(u, v); n = np.cross(su, sv); n = Ml[:3, :3] @ n; return n / np.linalg.norm(n)
     (u0, u1), (v0, v1) = sl.u_domain(), sl.v_domain()
+    if (Ml @ np.append(sl.evaluate(u0, 0.5 * (v0 + v1)), 1))[2] > 0.5:   # u may run either way (orientation)
+        u0, u1 = u1, u0
     angA = max(np.degrees(np.arccos(min(1, abs(_nrm(u0, v) @ np.array([0, 0, 1]))))) for v in np.linspace(v0, v1, 9))
     angB = max(np.degrees(np.arccos(min(1, abs(_nrm(u1, v) @ np.array([1, 0, 0]))))) for v in np.linspace(v0, v1, 9))
     check(f"loft {cont} between two trimmed edges: tangent to both faces, light net", r == {'FINISHED'} and ea and eb
@@ -1473,6 +1496,35 @@ _rad = np.linalg.norm(_pts[:, :2] - np.array([20, 0]), axis=1).reshape(3, -1)
 check("symmetric draft: both ends open away from the parting circle (r 1 -> 1+tan10 at z -1 and +1)", r == {'FINISHED'}
       and np.abs(_rad[1] - 1).max() < 1e-4 and np.abs(_rad[0] - _r2).max() < 1e-4 and np.abs(_rad[2] - _r2).max() < 1e-4
       and abs(_pts[:, 2].max() - _pts[:, 2].min() - 2) < 1e-6, f"{_rad.min(axis=1)} {_rad.max(axis=1)}")
+# a drafted exact circle stays exact: the wall is a true cone on the circle's own 9 rational CVs
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0); _ec = ctx.active_object
+_ec.location = (30, 0, -190); ctx.view_layer.update()
+r = bpy.ops.nproto.extrude(inputs=ins((_ec, "S0")), distance=1.0, direction="Z", draft=10.0)
+for _sym in (False, True):
+    if _sym:
+        r = bpy.ops.nproto.extrude(inputs=ins((_ec, "S0")), distance=1.0, direction="Z", draft=10.0, symmetric=True)
+    _cs_ = store.get_surfaces(ctx.active_object)[0]
+    _cd = ext.surface_cvs(_cs_)
+    _M = np.array(geom.world_matrix(ctx.active_object))
+    (_u0, _u1), (_v0, _v1) = _cs_.u_domain(), _cs_.v_domain()
+    _rows = [np.array([_M[:3, :3] @ np.array(_cs_.evaluate(_u, _v)) + _M[:3, 3] for _v in np.linspace(_v0, _v1, 721)])
+             for _u in (_u0, _u1)]
+    _rr = [np.linalg.norm(_q[:, :2] - np.array([30, 0]), axis=1) for _q in _rows]
+    check(f"drafted circle{' (symmetric)' if _sym else ''}: an exact cone on the circle's own rational CVs "
+          "(9 round, radius constant to 1e-6 at both ends, 1 -> 1 + tan 10)", r == {'FINISHED'} and bool(_cd["weights"])
+          and _cd["count_v"] == 9 and _cd["count_u"] == (3 if _sym else 2) and max(np.ptp(_x) for _x in _rr) < 1e-6
+          and abs(_rr[0].mean() - (1 + _t if _sym else 1.0)) < 1e-6 and abs(_rr[1].mean() - (1 + _t)) < 1e-6,
+          f"cvs {_cd['count_u']}x{_cd['count_v']} rational {bool(_cd['weights'])} radii "
+          f"{[(round(float(_x.mean()), 7), float(np.ptp(_x))) for _x in _rr]}")
+# a smooth profile with a sharp corner still drafts (sampled, mitred path)
+_bzc = bezier("EX_bz", [(40, 0), (42, 0), (42, 2), (40, 2)], -190.0)
+_bzc.data.splines[0].use_cyclic_u = True
+for _bp in _bzc.data.splines[0].bezier_points:
+    _bp.handle_left_type = _bp.handle_right_type = 'VECTOR'
+r = bpy.ops.nproto.extrude(inputs=ins((_bzc, "S0")), distance=1.0, direction="Z", draft=10.0)
+_bb = store.get_brep(ctx.active_object).bounding_box()
+check("drafted smooth profile with sharp corners: still drafts with mitred corners",
+      r == {'FINISHED'} and abs((_bb[1][0] - _bb[0][0]) - (2 + 2 * _t)) < 1e-3, str(_bb))
 
 # sharp shading at B-rep creases (cap rim of a capped cylinder)
 bpy.ops.nproto.add_primitive(kind="CYLINDER", radius=1.0, height=2.0, degree="0", caps=True); _cc = ctx.active_object
@@ -3844,10 +3896,11 @@ for _op in set(_in_panels):
         getattr(bpy.ops.nproto, _op.split(".")[1]).get_rna_type()
     except Exception:
         _missing.append(_op)
-_not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "cycle_continuity", "delete_history", "export_step",
-              "import_step", "open_step", "history_focus", "history_toggle_hide", "mute_step", "patch_add_guides",
+_not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "cycle_continuity", "delete_history", "collect_inputs", "export_step",
+              "import_step", "open_step", "history_focus", "history_toggle_hide", "tree_step", "step_unfocus", "mute_step", "patch_add_guides",
               "patch_auto_corners", "patch_corner", "patch_remove_guide", "rebuild", "rebuild_waiting", "remove_step",
-              "restore_inputs", "sync_feature", "tab_edit", "continuity"}
+              "restore_inputs", "sync_feature", "tab_edit", "continuity", "continuity_clear", "section_add", "section_orient",
+              "section_targets", "section_curves", "section_remove", "subsel_picker"}
 _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto) if n not in _not_tools}
 _tool_ops = [o_ for o_ in _in_panels if o_ not in ("nproto.add_primitive", "nproto.boolean")] + ["nproto.boolean"]
 _bool_ops = sorted(e["props"].get("operation") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r
@@ -4062,7 +4115,8 @@ try:
         _vw.env_coat = True
         _on = [e["prop"] for e in _draw(_ui.VIEW3D_PT_nproto_analyze_side) if "prop" in e]
         _hdr = []
-        _ui.header_analyze(_NS(layout=_NS(popover=lambda *a, **k: _hdr.append(k.get("text")))), ctx)
+        _ui.header_analyze(_NS(layout=_NS(popover=lambda *a, **k: _hdr.append(k.get("text")),
+                                         row=lambda *a, **k: _NS(prop=lambda *a, **k: None))), ctx)
         _coat[_nm] = ("env_coat" in _off, "env_source" in _off, "env_source" in _on, "env_roughness" in _on,
                       "env_paint" in _on or "env_metallic" in _on, _hdr[0])
         for _k in ("show_draft", "show_curvature", "show_matcap", "show_zebra"):
@@ -4192,5 +4246,780 @@ check("boolean: union 12 / difference 4 / intersection 4 of two overlapping 2-cu
       and _nohist == ({'FINISHED'}, True, True, 4.0)
       and "not a closed solid" in str(_bad),
       f"{_bv} edit={_hv} restore={_rst_ok} nohist={_nohist} bad={str(_bad)[:120]}")
+
+# --- surfaces built from other surfaces' edges face the same way; Flip Normal ---
+from blender_nurbs.square import sample_side as _ss, grid_starts as _gs, _foot as _ft
+def _seam_dot(obj, src, ref):
+    sd = _ss(src, ref, 10)
+    s_ = store.get_surfaces(obj)[0]
+    M_ = np.array(geom.world_matrix(obj), float); Mi_ = np.linalg.inv(M_)
+    d_ = []
+    for k in range(1, 9):
+        q = (Mi_ @ np.append(sd.P[k], 1))[:3]
+        _, su, sv = s_.derivatives(*_ft(s_, q, _gs(s_, [q])[0]))
+        n_ = M_[:3, :3] @ np.cross(su, sv)
+        d_.append(float(n_ @ sd.Nout[k]) / np.linalg.norm(n_))
+    return round(float(np.mean(d_)), 3)
+_o1 = nurbs("OR_c1", [(90, 0, 0), (90, 0.7, 0), (90, 1.4, 0), (90, 2, 0)])
+_o2 = nurbs("OR_c2", [(92, 0, 0), (92, 0.7, 0), (92, 1.4, 0), (92, 2, 0)])
+_o3 = nurbs("OR_c3", [(94, 2, 0.5), (94, 1.4, 0.5), (94, 0.7, 0.5), (94, 0, 0.5)])
+bpy.ops.nproto.loft(inputs=ins((_o1, "S0"), (_o2, "S0"))); _oA = ctx.active_object
+_sA = store.get_surfaces(_oA)[0]
+_eA = min(("U0", "U1", "V0", "V1"), key=lambda r: abs(np.mean([p[0] for p in geom.boundary_points(_sA, r, 5)]) - 92))
+_votes = {}
+for _flipB in (False, True):        # whichever way the curve runs, B comes out facing like A
+    bpy.ops.nproto.loft(inputs=ins((_oA, _eA), (_o3, "S0")), flip_b=_flipB); _oB = ctx.active_object
+    _votes[_flipB] = _seam_dot(_oB, _oA, _eA)
+_fl_before = (_oA.get(features.PROP_FLIPPED), json.loads(_oB[features.PROP_HIST])["refs"][0])
+_oA.nproto_feature.flip_normal = True           # Feature panel: Flip Normal on A
+features.rebuild(_oA, ctx, force=True)
+_ref_after = json.loads(_oB[features.PROP_HIST])["refs"][0]
+features.rebuild(_oB, ctx)
+_sB = store.get_surfaces(_oB)[0]
+_gapB = max(float(np.linalg.norm(np.array(_sB.evaluate(*_ft(_sB, np.array(p), _gs(_sB, [p])[0]))) - np.array(p)))
+            for p in geom.boundary_points(store.get_surfaces(_oA)[0], _ref_after, 9))
+check("orientation: a loft from a surface edge faces like that surface (either curve direction); Flip Normal on the "
+      "source turns it over, renames the edge the loft uses, and the loft follows",
+      min(_votes.values()) > 0.9 and _fl_before[0] == 0 and _oA.get(features.PROP_FLIPPED) == 1
+      and _ref_after == {"U0": "U1", "U1": "U0"}.get(_fl_before[1], _fl_before[1])
+      and _seam_dot(_oB, _oA, _ref_after) > 0.9 and _gapB < 1e-6,
+      f"votes={_votes} before={_fl_before} after={_ref_after} flipped={_oA.get(features.PROP_FLIPPED)} "
+      f"dot={_seam_dot(_oB, _oA, _ref_after)} gap={_gapB:.1e}")
+
+# --- feature batch: CV selection, Flip Normal, G2 check, Offset / Thicken, chord + blend fillets ---
+from blender_nurbs import cvs as _cvs
+from blender_nurbs.ops_sweep import continuity_report as _cr
+def _floor(name, y, x0=0.0):
+    ln = poly(name + "_ln", [(x0, y - 2, 0), (x0, y + 2, 0)])
+    bpy.ops.nproto.extrude(inputs=ins((ln, "S0")), distance=4.0, direction="X")
+    o = ctx.active_object; o.name = name; return o
+def _wall(name, y, x=2.0):
+    ln = poly(name + "_ln", [(x, y - 2, -1), (x, y + 2, -1)])
+    bpy.ops.nproto.extrude(inputs=ins((ln, "S0")), distance=3.0, direction="Z")
+    o = ctx.active_object; o.name = name; return o
+def _sel(*objs):
+    bpy.ops.object.select_all(action='DESELECT')
+    for o in objs: o.select_set(True)
+    ctx.view_layer.objects.active = objs[0]
+def _face_normals(o):
+    b = store.get_brep(o); R = np.array(geom.world_matrix(o).to_3x3())
+    out = []
+    for f in b.faces():
+        c = f.centroid()
+        _, uvs, _ = _kl().surface_closest_point(f.surface(), tuple(c))
+        uv = uvs[0]; n = R @ np.array(f.outward_normal_at_uv(uv.x, uv.y)); out.append(n / np.linalg.norm(n))
+    return out
+def _bbz(o):
+    b = store.get_brep(o); M = geom.world_matrix(o)
+    lo, hi = b.bounding_box(); return round((M @ Vector(lo)).z, 4), round((M @ Vector(hi)).z, 4)
+
+# 1. a new CV cage starts with nothing selected
+_fc = _floor("FB_cage", 900)
+_cage = _cvs.make_cage(ctx, _fc)
+_nsel = sum(1 for v in _cage.data.vertices if v.select)
+_me = _cage.data; bpy.data.objects.remove(_cage); bpy.data.meshes.remove(_me)
+check("CV cage: no CV selected when it opens", _nsel == 0, f"{_nsel} selected")
+
+# 2. Flip Normal: plain surface with history -> step, flip again -> step gone
+_f1 = _floor("FB_flip", 910)
+_n0 = _face_normals(_f1)[0]
+_sel(_f1); _r1 = bpy.ops.nproto.flip_normal()
+_n1 = _face_normals(_f1)[0]; _st1 = [e["op"] for e in features.stack(_f1)]
+_sel(_f1); _r2 = bpy.ops.nproto.flip_normal()
+_n2 = _face_normals(_f1)[0]; _st2 = [e["op"] for e in features.stack(_f1)]
+check("flip normal: a plain surface turns over (history step), flipping again removes the step",
+      _r1 == _r2 == {'FINISHED'} and _n0 @ _n1 < -0.999 and _n0 @ _n2 > 0.999 and _st1 == ["flip_normal"]
+      and _st2 == [] and store.is_natural(_f1), f"{_n0} {_n1} {_n2} {_st1} {_st2}")
+# trimmed: trims kept, still trimmed, history edit (input moved) keeps it flipped
+_f2 = _floor("FB_flipT", 920)
+bpy.ops.curve.primitive_bezier_circle_add(radius=0.5, location=(1, 920, 1)); _cc = ctx.active_object
+bpy.ops.nproto.trim(action="KEEP", target=_f2.name, cutters=ins((_cc, "S0")), ref_point=(1, 920, 0), normal=(0, 0, 1),
+                    view_dir=(0, 0, -1))
+_a0, _m0 = area(_f2), _face_normals(_f2)[0]
+_sel(_f2); _r3 = bpy.ops.nproto.flip_normal()
+_a1, _m1 = area(_f2), _face_normals(_f2)[0]
+check("flip normal: a trimmed surface turns over, trim kept", _r3 == {'FINISHED'} and abs(_a1 - _a0) < 1e-4 * _a0
+      and _m0 @ _m1 < -0.999 and not store.is_natural(_f2), f"area {_a0:.5f} -> {_a1:.5f} n {_m0} -> {_m1}")
+# joined L: both faces turn over, still joined
+_L = make_L("FB_L", loc=(0, 790, 0))
+_ln0 = _face_normals(_L); _sh0 = len(store.shared_edges(_L))
+_sel(_L); _r4 = bpy.ops.nproto.flip_normal()
+_ln1 = _face_normals(_L)
+check("flip normal: a joined sheet turns over, still joined",
+      _r4 == {'FINISHED'} and len(_ln1) == 2 and all(a @ b < -0.999 for a, b in zip(_ln0, _ln1))
+      and len(store.shared_edges(_L)) == _sh0 == 1, f"{_ln0} -> {_ln1}")
+# without construction history: geometry replaced, no stack
+_prev = ctx.scene.nproto_settings.construction_history
+ctx.scene.nproto_settings.construction_history = False
+try:
+    _f3 = _floor("FB_flipN", 930)
+    _k0 = _face_normals(_f3)[0]
+    _sel(_f3); _r5 = bpy.ops.nproto.flip_normal()
+    _k1 = _face_normals(_f3)[0]
+finally:
+    ctx.scene.nproto_settings.construction_history = _prev
+check("flip normal without history", _r5 == {'FINISHED'} and _k0 @ _k1 < -0.999 and not features.stack(_f3))
+
+# 3. Continuity Check reports G2: a G2 loft to a flat floor matches its curvature, a G1 loft does not
+_gf = _floor("G2_floor", 980)
+_gwl = poly("G2_wall_ln", [(6, 978, 1), (6, 982, 1)])
+bpy.ops.nproto.extrude(inputs=ins((_gwl, "S0")), distance=2.0, direction="Z"); _gw = ctx.active_object
+def _iso_at(o, key, val):
+    s_ = store.get_surfaces(o)[0]
+    return min(("U0", "U1", "V0", "V1"), key=lambda r: abs(np.mean([p[key] for p in geom.boundary_points(s_, r, 5)]) - val))
+_ge_f, _ge_w = _iso_at(_gf, 0, 4.0), _iso_at(_gw, 2, 1.0)
+_rep = {}
+for _cont in ("G1", "G2"):
+    bpy.ops.nproto.loft(inputs=json.dumps([[_gf.name, _ge_f], [_gw.name, _ge_w]]), cont_a=_cont, cont_b=_cont)
+    _lo = ctx.active_object
+    _rep[_cont] = _cr(_lo, _gf) or _cr(_gf, _lo)
+check("continuity check: G2 measured (curvature across the edge), G2 loft passes, G1 loft does not",
+      _rep["G2"] and _rep["G1"] and _rep["G2"]["curv_diff"] < 0.02 and _rep["G1"]["curv_diff"] > 0.1,
+      f"G1 {_rep['G1'] and round(_rep['G1']['curv_diff'], 4)} G2 {_rep['G2'] and round(_rep['G2']['curv_diff'], 5)}")
+
+# 4. Offset of a joined sheet and of a trimmed surface; Thicken single / joined / symmetric
+_L2 = make_L("OF_L", loc=(0, 810, 0))
+_sel(_L2); _r6 = bpy.ops.nproto.offset(distance=0.1); _of = ctx.active_object
+_sel(_f2); _r7 = bpy.ops.nproto.offset(distance=0.1); _ot = ctx.active_object
+check("offset: joined sheet (2 faces, corner closed) and trimmed surface (trim kept, moved 0.1)",
+      _r6 == _r7 == {'FINISHED'} and store.get_brep(_of).face_count() == 2 and len(store.shared_edges(_of)) == 1
+      and abs(area(_ot) - area(_f2)) < 1e-3 * area(_f2) and abs(abs(_bbz(_ot)[0]) - 0.1) < 1e-6
+      and features.history(_of)["op"] == "offset",
+      f"faces {store.get_brep(_of).face_count()} shared {len(store.shared_edges(_of))} area {area(_ot):.5f}/{area(_f2):.5f} z {_bbz(_ot)}")
+_t1 = _floor("TK_single", 940)
+_sel(_t1); _r8 = bpy.ops.nproto.thicken(distance=0.1); _tk = ctx.active_object
+_v1 = Vol(_tk)
+_tk.nproto_feature.distance = 0.2; features.rebuild(_tk, ctx)
+_v2 = Vol(_tk)
+_t2 = _floor("TK_sym", 950)
+_sel(_t2); bpy.ops.nproto.thicken(distance=0.1, symmetric=True); _ts = ctx.active_object
+_L3 = make_L("TK_L", loc=(0, 830, 0))
+_sel(_L3); bpy.ops.nproto.thicken(distance=0.1); _tl = ctx.active_object
+check("thicken: 4x4 sheet -> closed solid 1.6, feature edit 0.2 -> 3.2, symmetric centred, sheet hidden, joined L -> solid",
+      _r8 == {'FINISHED'} and abs(_v1 - 1.6) < 1e-3 and abs(_v2 - 3.2) < 1e-3 and _t1.hide_get()
+      and _bbz(_ts) == (-0.05, 0.05) and abs(Vol(_ts) - 1.6) < 1e-3 and Vol(_tl) > 0,
+      f"v {_v1:.4f} {_v2:.4f} sym {_bbz(_ts)} {Vol(_ts):.4f} L {Vol(_tl):.4f}")
+
+# 5. Fillets: chord (distance between the rails) and the G2 blend between two surfaces
+def _chord_of(o):
+    s_ = store.get_surfaces(o)[0]; (u0, u1), (v0, v1) = s_.u_domain(), s_.v_domain()
+    du = np.mean([np.linalg.norm(np.array(s_.evaluate(u0, v)) - np.array(s_.evaluate(u1, v))) for v in np.linspace(v0, v1, 9)])
+    dv = np.mean([np.linalg.norm(np.array(s_.evaluate(u, v0)) - np.array(s_.evaluate(u, v1))) for u in np.linspace(u0, u1, 9)])
+    return float(min(du, dv))
+_cf, _cw = _floor("CH_floor", 960), _wall("CH_wall", 960)
+_r9 = bpy.ops.nproto.fillet(surf_a=_cf.name, surf_b=_cw.name, radius=0.4, rail_type="CHORD", shape="CIRCULAR",
+                            trim_bases=True)
+_cfil = ctx.active_object
+_rr = 0.4 / math.sqrt(2.0)
+check("surface fillet by chord: rails 0.4 apart, ball radius 0.4 / sqrt 2 at 90 deg",
+      _r9 == {'FINISHED'} and abs(_chord_of(_cfil) - 0.4) < 1e-4 and abs(area(_cfil) - 0.5 * math.pi * _rr * 4) < 2e-3,
+      f"chord {_chord_of(_cfil):.6f} area {area(_cfil):.4f} vs {0.5 * math.pi * _rr * 4:.4f}")
+_bf, _bw = _floor("BL_floor", 970), _wall("BL_wall", 970)
+_r10 = bpy.ops.nproto.fillet(surf_a=_bf.name, surf_b=_bw.name, radius=0.3, shape="BLEND", continuity="2",
+                             trim_bases=True)
+_bfil = ctx.active_object
+_c1, _c2 = _cr(_bfil, _bf) or _cr(_bf, _bfil), _cr(_bfil, _bw) or _cr(_bw, _bfil)
+_rb = features.rebuild(_bfil, ctx, force=True)
+_c3 = _cr(_bfil, _bf) or _cr(_bf, _bfil)
+check("surface fillet G2 blend: G2 to both surfaces, history rebuild keeps it",
+      _r10 == {'FINISHED'} and _c1 and _c2 and _c1["gap"] < 1e-5 and _c2["gap"] < 1e-5 and _c1["angle"] < 0.05
+      and _c2["angle"] < 0.05 and _c1["curv_diff"] < 0.02 and _c2["curv_diff"] < 0.02 and _c3 and _c3["curv_diff"] < 0.02
+      and features.history(_bfil)["params"].get("blend") == 2,
+      f"{_c1} {_c2} after rebuild {_c3}")
+_L4 = make_L("CH_L", loc=(0, 850, 0))
+_ea0 = A(_L4)
+_r11 = fillet_all(_L4, shape="CIRCULAR", radius=0.3, rail_type="CHORD")
+_re = 0.3 / math.sqrt(2.0)
+check("edge fillet by chord: ball radius chord / sqrt 2 on a 90 deg edge (area change r L (2 - pi/2))",
+      _r11 == {'FINISHED'} and abs((_ea0 - A(_L4)) - _re * 4 * (2 - math.pi / 2)) < 2e-3,
+      f"dA {_ea0 - A(_L4):.5f} vs {_re * 4 * (2 - math.pi / 2):.5f}")
+
+from blender_nurbs import history_ui as _hui
+_hui.sync_step(_L4, 0)
+_pg = _L4.nproto_step
+_shown = (_pg.rail_type, round(_pg.radius, 6), _hui.STEP_FIELDS["edge_fillet"][1])
+_lbl = steps.LABEL["edge_fillet"](features.stack(_L4)[0]["params"])
+_pg.rail_type = "RADIUS"                      # step editor: back to a rolling ball of 0.3
+_dA_r = _ea0 - A(_L4)
+check("edge fillet step shows Rail = Chord (label 'chord'); switching it to Rolling Ball rebuilds with radius 0.3",
+      _shown == ("CHORD", 0.3, "rail_type") and "chord 0.3" in _lbl
+      and abs(_dA_r - 0.3 * 4 * (2 - math.pi / 2)) < 2e-3 and not features.stack(_L4)[0]["params"].get("chord"),
+      f"{_shown} {_lbl} dA {_dA_r:.5f}")
+
+# --- Boundary Fill: the solid a wall and two sheets enclose ---
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0); _bc = ctx.active_object
+_bc.location = (0, 1000, -1); ctx.view_layer.update()
+bpy.ops.nproto.extrude(inputs=ins((_bc, "S0")), distance=2.0, direction="Z"); _bw = ctx.active_object
+_bl = poly("BF_lo_ln", [(-2, 998, -0.5), (-2, 1002, -0.5)])
+bpy.ops.nproto.extrude(inputs=ins((_bl, "S0")), distance=4.0, direction="X"); _blo = ctx.active_object
+_bh = poly("BF_hi_ln", [(-2, 998, 0.5), (-2, 1002, 0.5)])
+bpy.ops.nproto.extrude(inputs=ins((_bh, "S0")), distance=4.0, direction="X"); _bhi = ctx.active_object
+_sel(_bw, _blo, _bhi)
+_rf = bpy.ops.nproto.boundary_fill(); _sol = ctx.active_object
+_v0 = Vol(_sol)
+_bh.location.z += 0.5; ctx.view_layer.update()
+features.rebuild(_bhi, ctx); features.rebuild(_sol, ctx)
+_v1 = Vol(_sol)
+features.release_inputs(ctx, [_blo, _bhi])
+_sel(_blo, _bhi)
+try:
+    _bad = bpy.ops.nproto.boundary_fill()
+except RuntimeError as _e:
+    _bad = str(_e)
+check("boundary fill: wall + two sheets -> closed solid pi r^2 h, inputs hidden, follows a moved sheet; "
+      "surfaces that enclose nothing are refused",
+      _rf == {'FINISHED'} and abs(_v0 - math.pi) < 0.01 * math.pi and abs(_v1 - 1.5 * math.pi) < 0.015 * math.pi
+      and _bw.hide_get() and features.history(_sol)["op"] == "boundary_fill"
+      and ("enclose" in str(_bad) or "does not cross" in str(_bad)),
+      f"v {_v0:.4f} -> {_v1:.4f} bad={str(_bad)[:100]}")
+
+# --- kept inputs live in the hidden NURBS History collection; Delete History removes freed ones ---
+_ka = patch("KI_a", (0, 1100, 0), (0, 1104, 0), "X", 2.0)
+_kb = patch("KI_b", (2, 1100, 0), (2, 1104, 0), "Z", 2.0)
+_home = _ka.users_collection[0].name
+_sel(_ka, _kb); bpy.ops.nproto.join(); _kj = ctx.active_object
+_hc = features.history_collection(ctx, create=False)
+_in_coll = _hc is not None and all(o.name in _hc.objects and len(o.users_collection) == 1 for o in (_ka, _kb))
+for _o in ctx.view_layer.objects: _o.hide_set(False)  # what Unhide All does
+_still_hidden = not _ka.visible_get() and not _kb.visible_get() and _kj.visible_get()
+_sel(_kj); bpy.ops.nproto.restore_inputs()
+_back = (_ka.users_collection[0].name == _home and _ka.visible_get() and _kb.visible_get()
+         and _ka.name not in _hc.objects and "KI_a_joined" not in [o.name for o in bpy.data.objects])
+_sel(_ka, _kb); bpy.ops.nproto.join(); _kj = ctx.active_object
+_names = (_ka.name, _kb.name)
+_sel(_kj); bpy.ops.nproto.delete_history(scope='SELECTED')
+_purged = all(n not in bpy.data.objects for n in _names) and not features.has_history(_kj) and _kj.name in bpy.data.objects
+# an older scene: the inputs sit hidden in the main collection -> Collect Inputs tidies them
+_kc = patch("KI_c", (0, 1110, 0), (0, 1114, 0), "X", 2.0)
+_kd = patch("KI_d", (2, 1110, 0), (2, 1114, 0), "Z", 2.0)
+_sel(_kc, _kd); bpy.ops.nproto.join(); _kj2 = ctx.active_object
+features.release_inputs(ctx, [_kc, _kd])              # as if made before the collection existed
+_rc = bpy.ops.nproto.collect_inputs()
+_collected = _kc.name in _hc.objects and _kd.name in _hc.objects and not _kc.visible_get()
+check("kept inputs: Join puts them in the hidden NURBS History collection (stay hidden after Unhide All), "
+      "Restore Inputs puts them back, Delete History deletes the ones nothing uses, Collect Inputs tidies old scenes",
+      _in_coll and _still_hidden and _back and _purged and _rc == {'FINISHED'} and _collected,
+      f"coll={_in_coll} hidden={_still_hidden} back={_back} purged={_purged} collected={_collected}")
+
+# --- Construction Tree lists history steps (fillets ...) on their own rows; eye works on kept inputs ---
+import types as _types
+class _FL:
+    def __init__(self, log): self.log, self.active = log, True
+    def split(self, **k): return _FL(self.log)
+    def row(self, **k): return _FL(self.log)
+    def column(self, **k): return _FL(self.log)
+    def box(self): return _FL(self.log)
+    def separator(self, **k): pass
+    def prop(self, *a, **k): pass
+    def label(self, text="", **k): self.log.append(("label", text))
+    def operator(self, idname, text="", **k):
+        o = _types.SimpleNamespace(); self.log.append(("op", idname, text, o)); return o
+_ta = patch("TR_a", (0, 1120, 0), (0, 1124, 0), "X", 2.0)
+_tb = patch("TR_b", (2, 1120, 0), (2, 1124, 0), "Z", 2.0)
+_sel(_ta, _tb); bpy.ops.nproto.join(); _tj = ctx.active_object
+fillet_all(_tj, shape="CIRCULAR", radius=0.3, rail_type="CHORD")
+_log = []
+_hui._node(_FL(_log), _tj, 0, "self", _tj, set(), _tj)
+_steps = [e for e in _log if e[0] == "op" and e[1] == "nproto.tree_step"]
+_labels = [e[1] for e in _log if e[0] == "label"]
+_ok_rows = len(_steps) == 1 and _steps[0][2].startswith("1. Edge Circular") and any("chord 0.3" in t for t in _labels)
+_sel(_ta)
+bpy.ops.nproto.tree_step(name=_tj.name, root=_tj.name, index=0)
+_opened = ctx.view_layer.objects.active == _tj and _tj.nproto_step.index == 0 and _tj.nproto_step.rail_type == "CHORD"
+bpy.ops.nproto.history_toggle_hide(name=_ta.name)
+_vis_on = _ta.visible_get()
+bpy.ops.nproto.history_toggle_hide(name=_ta.name)
+_vis_off = not _ta.visible_get() and _ta.name not in ctx.scene.collection.objects
+check("construction tree: a fillet step has its own row (click opens it); the eye shows / hides a kept input",
+      _ok_rows and _opened and _vis_on and _vis_off,
+      f"rows={[e[2] for e in _steps]} labels={_labels} opened={_opened} eye={_vis_on}/{_vis_off}")
+
+# --- step focus: a step opened from the tree shows only that step; the object row shows the feature again ---
+_log = []
+features.mark_built(_tj)
+_ctx_feat = _types.SimpleNamespace(view_layer=ctx.view_layer, scene=ctx.scene, window_manager=ctx.window_manager)
+from blender_nurbs import feature_ui as _fui
+bpy.ops.nproto.tree_step(name=_tj.name, root=_tj.name, index=0)
+_fui.draw_feature(_FL(_log), ctx)
+_lab1 = [e[1] for e in _log if e[0] == "label"]
+from blender_nurbs import subsel as _ssf
+_sf = _ssf.step_faces(_tj)
+_tjf = store.get_brep(_tj).faces()
+_sf_ok = len(_sf) == 1 and _ssf.faces_shown(_tj) == set(_sf) and _tjf[_sf[0]].area() < min(f.area() for k, f in enumerate(_tjf) if k != _sf[0])
+_mute_ops = [e for e in _log if e[0] == "op" and e[1] == "nproto.mute_step"]
+bpy.ops.nproto.history_focus(name=_tj.name, root=_tj.name)
+_log = []
+_fui.draw_feature(_FL(_log), ctx)
+_lab2 = [e[1] for e in _log if e[0] == "label"]
+check("step focus: a step picked in the tree reads like a feature (Feature: <step>, its own settings); "
+      "the object shows only its own feature (its steps are tree rows, each with its on / off switch)",
+      any(t.startswith("Feature: Edge") for t in _lab1) and not any(t.startswith("Feature: Join") for t in _lab1)
+      and not any(t.startswith("Step 1 of") for t in _lab1)
+      and any(t.startswith("Feature: Join") for t in _lab2) and not any("History steps" in t for t in _lab2)
+      and not _tj.nproto_step.focus and len(_mute_ops) == 1 and _mute_ops[0][3].name == _tj.name,
+      f"{_lab1[:4]} | {_lab2[:4]} | mute {len(_mute_ops)}")
+check("step focus: the fillet step knows its face (highlighted while open; CVs / Hulls shows just its net)",
+      _sf_ok and _ssf.step_faces(_tj) == [], f"{_sf} areas {[round(f.area(), 3) for f in _tjf]}")
+
+# --- Class-A on a closed rim of two edges (a tilted cap on a round wall): light patches, no kernel fallback ---
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0); _cc2 = ctx.active_object
+_cc2.location = (0, 1200, -1); ctx.view_layer.update()
+bpy.ops.nproto.extrude(inputs=ins((_cc2, "S0")), distance=2.0, direction="Z"); _cw2 = ctx.active_object
+_cl = poly("CA_lo_ln", [(-2, 1198, -0.5), (-2, 1202, -0.5)])
+bpy.ops.nproto.extrude(inputs=ins((_cl, "S0")), distance=4.0, direction="X"); _clo = ctx.active_object
+_ch = poly("CA_hi_ln", [(-2.5, 1198, 0.2), (-2.5, 1202, 0.2)])
+bpy.ops.nproto.extrude(inputs=ins((_ch, "S0")), distance=5.0, direction="VECTOR", dir_vec=(1.0, 0.0, 0.15)); _chi = ctx.active_object
+_sel(_cw2, _clo, _chi); bpy.ops.nproto.boundary_fill(); _cs = ctx.active_object
+_bb = store.get_brep(_cs)
+_top = [i for i in store.shared_edges(_cs)
+        if (lambda e: (lambda t: e.point_at(0.5 * (t[0] + t[1]))[2])(e.parameter_range()))(_bb.edges()[i]) > -0.2
+        and _bb.edges()[i].length() > 0.5]
+_cs_plain = _cs.copy(); _cs_plain.data = _cs.data.copy(); ctx.collection.objects.link(_cs_plain)
+_rca = bpy.ops.nproto.edge_fillet(inputs=json.dumps([[_cs.name, f"E{i}"] for i in _top]), shape="BLEND",
+                                  continuity="3", radius=0.15, rail_type="CHORD", class_a=True, ca_tolerance=1e-3)
+_rep = json.loads(_cs.get("nproto_class_a", "{}"))
+_bf2 = store.get_brep(_cs)
+_dense = [f for f in _bf2.faces() if max(ext.surface_cvs(f.surface())["count_u"], ext.surface_cvs(f.surface())["count_v"]) > 69]
+from blender_nurbs.ops_trim import class_a_summary as _cas
+_rings_ca = _rep.get("rings") or []
+check("class-A on a closed (not round) rim, blend G3, chord: the rim is ONE even periodic ring (as without Class-A), "
+      "no patches, no kernel fallback, and the report says so",
+      _rca == {'FINISHED'} and len(_top) >= 1 and "error" not in _rep and _rep.get("patches", 1) == 0
+      and len(_rings_ca) == 1 and _rings_ca[0]["ring"] == "periodic" and _rings_ca[0]["round"] <= 69 and not _dense
+      and "one even ring" in _cas(_rep)[0] and _cas(_rep)[1],
+      f"edges {_top} report {str(_rep)[:300]} dense {len(_dense)} · {_cas(_rep)[0]}")
+
+# --- Blend / chamfer on a closed rim (cap on a round wall): the kernel's face has no seam and
+#     covers a sliver; it must come back as the full ring, joined to cap and wall ---
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0); _rc = ctx.active_object
+_rc.location = (0, 1300, 0); ctx.view_layer.update()
+bpy.ops.nproto.extrude(inputs=ins((_rc, "S0")), distance=2.0, direction="Z"); _rw = ctx.active_object
+_rtop = max(("U0", "U1", "V0", "V1"), key=lambda w: np.mean([q[2] for q in geom.boundary_points(store.get_surfaces(_rw)[0], w, 8)]))
+bpy.ops.nproto.planar(inputs=ins((_rw, _rtop))); _rcap = ctx.active_object
+_sel(_rw, _rcap); bpy.ops.nproto.join(tolerance=1e-3); _rj = ctx.active_object
+_ring_area = {}
+for _shape, _cont in (("CIRCULAR", "1"), ("BLEND", "2"), ("BLEND", "3"), ("CHAMFER", "1")):
+    _o = _rj.copy(); _o.data = _rj.data.copy(); ctx.collection.objects.link(_o)
+    r = bpy.ops.nproto.edge_fillet(inputs=json.dumps([[_o.name, f"E{i}"] for i in store.shared_edges(_o)]),
+                                   shape=_shape, continuity=_cont, radius=0.2)
+    _b = store.get_brep(_o)
+    _ring_area[_shape + _cont] = (r == {'FINISHED'}, _b.face_count(), round(min(f.area() for f in _b.faces()), 4),
+                                  sum(1 for e in _b.edges() if len(e.faces()) == 1))
+_ca_ref = _ring_area["CIRCULAR1"][2]
+check("blend / chamfer of a closed rim: full ring face (not a sliver), joined like the circular fillet",
+      all(v[0] and v[1] == 3 and v[2] > 0.7 * _ca_ref and v[3] == _ring_area["CIRCULAR1"][3] for v in _ring_area.values()),
+      str(_ring_area))
+
+# --- A fillet round a closed rim is ONE smooth face: on a round part (a drafted wall) the exact surface of
+#     revolution of its section (9 rational CVs round, like the wall); otherwise an even periodic degree-5 ring ---
+def _skey(s_):
+    d_ = ext.surface_cvs(s_)
+    return (d_["count_u"], d_["count_v"], tuple(round(c_, 7) for p_ in d_["points"] for c_ in p_))
+def _new_faces(o_, before_keys):
+    return [f for f in store.get_brep(o_).faces() if _skey(f.surface()) not in before_keys]
+def _ring_iso(s_, along, at, n=721):
+    (u0_, u1_), (v0_, v1_) = s_.u_domain(), s_.v_domain()
+    ts_ = np.linspace(0, 1, n)
+    if along == "u":
+        return np.array([s_.evaluate(u0_ + (u1_ - u0_) * t_, v0_ + (v1_ - v0_) * at) for t_ in ts_])
+    return np.array([s_.evaluate(u0_ + (u1_ - u0_) * at, v0_ + (v1_ - v0_) * t_) for t_ in ts_])
+def _round_dir(s_):
+    """The parameter direction that runs round the ring (its iso closes on itself)."""
+    for along in ("u", "v"):
+        q_ = _ring_iso(s_, along, 0.5, 41)
+        if np.linalg.norm(q_[0] - q_[-1]) < 1e-6 and np.ptp(q_, axis=0).max() > 1e-3:
+            return along
+    return None
+from blender_nurbs.contcheck import edge_kind as _cc_kind
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0); _dc = ctx.active_object
+_dc.location = (0, 1350, 0); ctx.view_layer.update()
+bpy.ops.nproto.extrude(inputs=ins((_dc, "S0")), distance=2.0, direction="Z", draft=-2.0); _dw = ctx.active_object
+_dtop = max(("U0", "U1", "V0", "V1"), key=lambda w: np.mean([q[2] for q in geom.boundary_points(store.get_surfaces(_dw)[0], w, 8)]))
+bpy.ops.nproto.planar(inputs=ins((_dw, _dtop))); _dcap = ctx.active_object
+_sel(_dw, _dcap); bpy.ops.nproto.join(tolerance=1e-3); _dj = ctx.active_object
+_dkeys = {_skey(f.surface()) for f in store.get_brep(_dj).faces()}
+_revs = {}
+for _shape, _cont in (("BLEND", "2"), ("BLEND", "3"), ("CIRCULAR", "1"), ("CHAMFER", "1")):
+    _o = _dj.copy(); _o.data = _dj.data.copy(); ctx.collection.objects.link(_o)
+    r = bpy.ops.nproto.edge_fillet(inputs=json.dumps([[_o.name, f"E{i}"] for i in store.shared_edges(_o)]),
+                                   shape=_shape, continuity=_cont, radius=0.3)
+    _nf = _new_faces(_o, _dkeys)
+    _info = {"ok": r == {'FINISHED'}, "new": len(_nf)}
+    if len(_nf) == 1:
+        _s = _nf[0].surface(); _d = ext.surface_cvs(_s); _rd = _round_dir(_s)
+        _info["round"] = _rd
+        if _rd:
+            _n_round = _d["count_u"] if _rd == "u" else _d["count_v"]
+            _deg_round = _d["degree_u"] if _rd == "u" else _d["degree_v"]
+            _sp = []
+            for _at in (0.0, 0.25, 0.5, 0.75, 1.0):
+                _q = _ring_iso(_s, _rd, _at)
+                _sp.append(max(float(np.ptp(np.linalg.norm(_q[:, :2] - np.array([0, 1350]), axis=1))), float(np.ptp(_q[:, 2]))))
+            _info.update(cvs=_n_round, deg=_deg_round, rational=bool(_d["weights"]), spread=max(_sp))
+    _info["open"] = sum(1 for i in range(len(store.get_brep(_o).edges())) if _cc_kind(_o, f"E{i}") == "open")
+    _revs[_shape + _cont] = (_info, _o)
+check("drafted rim, every fillet shape: ONE ring face, an exact surface of revolution (9 rational CVs round, "
+      "degree 2, every iso round it a true circle to 1e-6), stitched in with no new open edge",
+      all(v[0]["ok"] and v[0]["new"] == 1 and v[0].get("cvs") == 9 and v[0].get("deg") == 2 and v[0].get("rational")
+          and v[0].get("spread", 1) < 1e-6 and v[0]["open"] == 1 for v in _revs.values()),
+      str({k: v[0] for k, v in _revs.items()}))
+_oca = _dj.copy(); _oca.data = _dj.data.copy(); ctx.collection.objects.link(_oca)
+r = bpy.ops.nproto.edge_fillet(inputs=json.dumps([[_oca.name, f"E{i}"] for i in store.shared_edges(_oca)]),
+                               shape="BLEND", continuity="2", radius=0.3, class_a=True)
+_nfa = _new_faces(_oca, _dkeys)
+_repa = json.loads(_oca.get("nproto_class_a", "{}"))
+_da = ext.surface_cvs(_nfa[0].surface()) if len(_nfa) == 1 else None
+check("drafted rim with Class-A Patches on: the same exact revolution (9 CVs round), reported as such",
+      r == {'FINISHED'} and len(_nfa) == 1 and _da is not None and 9 in (_da["count_u"], _da["count_v"])
+      and [g["ring"] for g in _repa.get("rings", [])] == ["revolution"] and "exact revolution" in _cas(_repa)[0],
+      f"{len(_nfa)} new faces, {_da and (_da['count_u'], _da['count_v'])} · {_cas(_repa)[0]}")
+_st_ca = features.stack(_oca)
+_rims_ca = steps.rims_of(_oca, _st_ca[-1]["params"]["mids_local"]) if _st_ca else None
+check("the fillet step records what its rim became (its panel shows it, and hides the Class-A settings: "
+      "every fillet face is the ring)", _rims_ca is not None and _rims_ca["only"]
+      and [g["ring"] for g in _rims_ca["rings"]] == ["revolution"], str(_rims_ca))
+from blender_nurbs import contcheck as _cc0
+_cc0.clear()
+_bo = _revs["BLEND2"][1]
+for i in store.shared_edges(_bo):
+    _cc0.add(_bo, f"E{i}")
+_dj2 = [_cc0.judge(_cc0.result(p_), ctx.window_manager.nproto_view) for p_ in _cc0.PAIRS]
+_cc0.clear()
+check("drafted rim, G2 blend ring: G2 to wall and cap all round (gap < 1e-6, < 0.01 deg, curvature within 0.5%)",
+      len(_dj2) == 2 and all(isinstance(j, dict) and j["G0"][0] < 1e-6 and j["G1"][0] < 0.01 and j["G2"][0] < 0.005
+                             for j in _dj2), str(_dj2))
+# the tilted rim of the Class-A test without Class-A: not round, so one even periodic degree-5 ring
+_pkeys = {_skey(f.surface()) for f in store.get_brep(_cs_plain).faces()}
+r = bpy.ops.nproto.edge_fillet(inputs=json.dumps([[_cs_plain.name, f"E{i}"] for i in _top]), shape="BLEND",
+                               continuity="2", radius=0.15)
+_pf = _new_faces(_cs_plain, _pkeys)
+_pinfo = {"ok": r == {'FINISHED'}, "new": len(_pf)}
+if len(_pf) == 1:
+    _s = _pf[0].surface(); _d = ext.surface_cvs(_s); _rd = _round_dir(_s)
+    _kr = np.array(_d["knots_u"] if _rd == "u" else _d["knots_v"]) if _rd else np.zeros(0)
+    _inner = _kr[(_kr > _kr[0]) & (_kr < _kr[-1])] if len(_kr) else _kr
+    _pinfo.update(round=_rd, deg=(_d["degree_u"] if _rd == "u" else _d["degree_v"]) if _rd else None,
+                  cvs=(_d["count_u"] if _rd == "u" else _d["count_v"]) if _rd else None,
+                  even=bool(len(_inner) and len(np.unique(np.round(_inner, 12))) == len(_inner)
+                            and np.ptp(np.diff(np.r_[_kr[0], _inner, _kr[-1]])) < 1e-9))
+_cc0.clear()
+_pk = _skey(_pf[0].surface()) if len(_pf) == 1 else None
+for i, e_ in enumerate(store.get_brep(_cs_plain).edges()):      # the ring's rails and its seam
+    if any(_skey(f_.surface()) == _pk for f_ in e_.faces()) and _cc_kind(_cs_plain, f"E{i}") in ("shared", "seam"):
+        _cc0.add(_cs_plain, f"E{i}")
+_pj = [_cc0.judge(_cc0.result(p_), ctx.window_manager.nproto_view) for p_ in _cc0.PAIRS]
+_cc0.clear()
+_pinfo["cont"] = [{k_: round(v_[0], 6) for k_, v_ in j_.items()} if isinstance(j_, dict) else j_ for j_ in _pj]
+check("tilted (not round) rim, G2 blend: ONE even periodic ring (degree 5, uniform simple knots, <= 69 CVs round), "
+      "G2 across its seam and to both faces",
+      _pinfo["ok"] and _pinfo["new"] == 1 and _pinfo.get("deg") == 5 and _pinfo.get("even") and _pinfo.get("cvs", 999) <= 69
+      and len(_pj) >= 3 and all(isinstance(j_, dict) and j_["G0"][0] < 1e-5 and j_["G1"][0] < 0.05 and j_["G2"][0] < 0.01
+                                for j_ in _pj),
+      str(_pinfo))
+
+# --- Continuity Check on picked edges: one stitched edge of a joined body, or two surfaces' edges ---
+from blender_nurbs import contcheck as _cc
+from blender_nurbs.ops import _pick_candidates as _pc
+_vw = ctx.window_manager.nproto_view
+_ccres = {}
+for _shape, _cont in (("CIRCULAR", "1"), ("BLEND", "2")):
+    _o = _rj.copy(); _o.data = _rj.data.copy(); ctx.collection.objects.link(_o)
+    bpy.ops.nproto.edge_fillet(inputs=json.dumps([[_o.name, f"E{i}"] for i in store.shared_edges(_o)]),
+                               shape=_shape, continuity=_cont, radius=0.2)
+    _cc.clear()
+    for i in store.shared_edges(_o):
+        _cc.add(_o, f"E{i}")
+    _rs = [_cc.result(p_) for p_ in _cc.PAIRS]
+    _ccres[_shape] = [r_ if isinstance(r_, str) else {lv: (round(v_[0], 6), v_[1]) for lv, v_ in _cc.judge(r_, _vw).items()}
+                      for r_ in _rs]
+_rim = [_cc.result(p_) for p_ in _cc.PAIRS]
+from blender_nurbs.kernel import load as _kl2
+_cvmax = max(max(_kl2().blender_ext.surface_cvs(f.surface())["count_u"], _kl2().blender_ext.surface_cvs(f.surface())["count_v"])
+             for f in store.get_brep(_o).faces())
+check("continuity check: a closed rim is sampled all the way round (seam included), with exactly the Samples set, "
+      "and the samples a true comb needs are recommended (4 per CV)",
+      all(not isinstance(r_, str) and r_["closed"] and len(r_["ang"]) == _vw.cont_samples
+          and r_["recommended"] == min(4 * _cvmax, 1200) for r_ in _rim),
+      f"{[(r_['closed'], len(r_['ang']), r_['recommended']) for r_ in _rim if not isinstance(r_, str)]} cvs {_cvmax}")
+_s0 = _vw.cont_samples
+_vw.cont_samples = 40
+_rim40 = [_cc.result(p_) for p_ in _cc.PAIRS]
+_vw.cont_samples = _s0
+check("continuity check: changing Samples changes the measurement (and so the comb)",
+      all(not isinstance(r_, str) and len(r_["ang"]) == 40 for r_ in _rim40))
+_g2 = [j for j in _ccres["BLEND"] if isinstance(j, dict)]
+check("continuity check, stitched edges: circular fillet holds G1 but not G2; the G2 blend's curvature matches "
+      "(within 1%) and it sits within 0.1 mm / 0.3 deg of wall and cap",
+      all(isinstance(j, dict) and j["G1"][1] and not j["G2"][1] for j in _ccres["CIRCULAR"]) and len(_g2) == 2
+      and all(j["G2"][0] < 0.01 and j["G0"][0] < 1e-4 and j["G1"][0] < 0.3 for j in _g2), str(_ccres))
+_cc.clear()
+_k1 = patch("CK_floor", (0, 1400, 0), (0, 1404, 0), "X", 2.0)
+_k2 = patch("CK_wall", (2, 1400, 0), (2, 1404, 0), "Z", 2.0)
+_cands = [c for c in _pc(ctx, True) if not c[1].startswith("S") and store.is_nurbs(c[0])]
+_ea = [c for c in _cands if c[0] == _k1 and all(abs(p_[0] - 2.0) < 1e-4 for p_ in c[2])]
+_pa = _cc.find_partner(_k1, _ea[0][1], _ea[0][2], _cands) if _ea else None
+if _pa:
+    _cc.add(_k1, _ea[0][1], _pa)
+_r90 = _cc.result(_cc.PAIRS[-1]) if _cc.PAIRS else "no pair"
+_j90 = _cc.judge(_r90, _vw) if not isinstance(_r90, str) else {}
+check("continuity check, two surfaces: the partner edge is found; G0 holds, G1 fails at the 90 deg crease",
+      _pa is not None and _pa[0] == _k2 and _j90 and _j90["G0"][1] and not _j90["G1"][1] and abs(_j90["G1"][0] - 90) < 1,
+      f"{_pa} {_j90 or _r90}")
+_seams = [f"E{i}" for i in range(len(store.get_brep(_o).edges())) if _cc.edge_kind(_o, f"E{i}") == "seam"]
+_cc.clear()
+for _r in _seams:
+    _cc.add(_o, _r)
+_sr = [_cc.result(p_) for p_ in _cc.PAIRS]
+_sj = [_cc.judge(r_, _vw) if not isinstance(r_, str) else r_ for r_ in _sr]
+check("continuity check, seams: a joined body's seam edges (a closed face meeting itself) are measured with one click, "
+      "between the face's two ends", len(_seams) >= 2 and all(isinstance(j, dict) and j["G0"][0] < 1e-4 and j["G1"][0] < 0.5
+                                                            for j in _sj),
+      f"{_seams} {[j if isinstance(j, str) else {k: round(x[0], 6) for k, x in j.items()} for j in _sj]}")
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0); _sc = ctx.active_object
+_sc.location = (0, 1500, 0); ctx.view_layer.update()
+bpy.ops.nproto.extrude(inputs=ins((_sc, "S0")), distance=2.0, direction="Z"); _sw = ctx.active_object
+_cands = [c for c in _pc(ctx, True) if not c[1].startswith("S") and store.is_nurbs(c[0])]
+_own = [c for c in _cands if c[0] == _sw]
+_hit = None
+for c in _own:
+    _pp = _cc.find_partner(_sw, c[1], c[2], _cands)
+    if _pp is not None and _pp[0] == _sw:
+        _hit = (c[1], _pp[1]); break
+_cc.clear()
+if _hit:
+    _cc.add(_sw, _hit[0], (_sw, _hit[1]))
+_ns = _cc.result(_cc.PAIRS[-1]) if _cc.PAIRS else "no pair"
+_nj = _cc.judge(_ns, _vw) if not isinstance(_ns, str) else _ns
+check("continuity check, untrimmed closed surface: its two ends are paired and measured end against end",
+      _hit is not None and isinstance(_nj, dict) and _nj["G0"][0] < 1e-6 and _nj["G1"][0] < 1.0, f"{_hit} {_nj}")
+# STEP export of that blended rim: every edge loop must close (a closed trim curve that ends ~1e-6 from
+# its start is still ONE vertex), or other programs drop the face -- Plasticity lost the fillet
+from blender_nurbs import step_export as _se2, step_import as _si2
+_rim_step = os.path.join(tempfile.mkdtemp(), "rim.step")
+_rst = _se2.export_step(_rim_step, [_o], unit="MM")
+with open(_rim_step) as _fh:
+    _rtxt = _fh.read()
+_rres, _rrep = _si2.read_step(_rim_step, 1.0)
+_bo = store.get_brep(_o)
+check("step export: the blended rim's loops all close, one vertex per kernel vertex, and it reads back with every face",
+      _rst["open_loops"] == [] and _rtxt.count("VERTEX_POINT") == len(list(_bo.vertices()))
+      and _rrep["failed"] == 0 and _rres and _rres[0][1].face_count() == _bo.face_count(),
+      f"open {_rst.get('open_loops')} verts {_rtxt.count('VERTEX_POINT')}/{len(list(_bo.vertices()))} {_rrep}")
+_cc.clear(); _cc.add(_k1, _ea[0][1], _pa) if _ea and _pa else None
+_vw.cont_show_checks = True
+_a1 = _cc.active(ctx)
+_cc.stop(ctx)
+_a2 = _cc.active(ctx)
+check("continuity check: its button toggles it like Zebra -- off hides the checks (kept for when it is on again)",
+      _a1 and not _a2 and len(_cc.PAIRS) == 1 and not _vw.cont_show_checks)
+_vw.cont_show_checks = True
+_n_before = len(_cc.PAIRS)
+bpy.ops.nproto.continuity_clear(index=-1)
+check("continuity check: Clear All empties the list", _n_before == 1 and not _cc.PAIRS)
+
+# --- Dynamic Section: exact plane sections with exact curvature combs ---
+from blender_nurbs import sections as _sx
+bpy.ops.object.select_all(action='DESELECT')
+bpy.ops.nproto.add_primitive(kind="SPHERE", radius=1.0, degree="0"); _sph2 = ctx.active_object
+_sph2.location = (0, 1600, 0); ctx.view_layer.update()
+bpy.ops.object.select_all(action='DESELECT'); _sph2.select_set(True); ctx.view_layer.objects.active = _sph2
+r = bpy.ops.nproto.section_add()
+_sec = ctx.active_object
+_sec.nproto_section.count = 3; _sec.nproto_section.step = 0.4
+_sec.location = (0, 1600, 0)
+def _sect_err(sec, ctr):
+    errs, n_c = [], 0
+    for sd in _sx.compute(sec):
+        p0, nn = sd["plane"]
+        d = float((p0 - ctr) @ nn)
+        rho = math.sqrt(max(1.0 - d * d, 1e-12))
+        cc = ctr + d * nn                       # the circle's centre
+        for c in sd["curves"]:
+            n_c += 1
+            if c["K"] is None:
+                return None, n_c
+            for P_, K_ in zip(c["P"], c["K"]):
+                k = np.linalg.norm(K_)
+                inward = (cc - P_) / (np.linalg.norm(cc - P_) or 1.0)
+                errs.append(max(abs(k * rho - 1.0), 1.0 - float(K_ @ inward) / (k or 1.0)))
+    return (max(errs) if errs else None), n_c
+_ctr = np.array([0.0, 1600.0, 0.0])
+for _ax, _rot in (("Z", (0, 0, 0)), ("tilted 35 deg", (math.radians(35), math.radians(20), 0))):
+    _sec.rotation_euler = _rot; ctx.view_layer.update()
+    _e, _nc = _sect_err(_sec, _ctr)
+    check(f"dynamic section ({_ax}): 3 planes cut a sphere in 3 circles; every comb hair has the circle's exact curvature "
+          "1/sqrt(R^2-d^2) and points to its centre", r == {'FINISHED'} and _sx.is_section(_sec) and _nc == 3
+          and _e is not None and _e < 1e-3, f"circles {_nc} worst rel. error {_e}")
+_sec.rotation_euler = (0, 0, 0); ctx.view_layer.update()
+_k0 = _sx._cache.get(_sec.name, (None,))[0]
+_f0 = _sx.comb_factor(_sec.nproto_section, _sx.targets(_sec), _sx._size(_sx.targets(_sec))[1])
+_sec.location.z += 0.1; ctx.view_layer.update(); _sx.compute(_sec)
+_f1 = _sx.comb_factor(_sec.nproto_section, _sx.targets(_sec), _sx._size(_sx.targets(_sec))[1])
+check("dynamic section: Scale works like the other combs (a sphere's curvature 1/R at Scale 1 makes a hair a fifth of "
+      "its size) and stays the same while the section moves", abs(_f0 - _f1) < 1e-12
+      and abs(_f0 * 1.0 - 0.2 * _sx._size(_sx.targets(_sec))[1]) < 1e-3 * _sx._size(_sx.targets(_sec))[1], f"{_f0} {_f1}")
+_mid = _sx.planes(_sec)[1][0]
+check("dynamic section: moving the section moves its planes (centred on it) and recomputes the sections",
+      _sx._cache[_sec.name][0] != _k0 and abs(_mid.z - 0.1) < 1e-6)
+_sec.location.z = 0.0; ctx.view_layer.update()
+_n_sec = len([o for o in ctx.scene.objects if _sx.is_section(o)])
+bpy.ops.object.select_all(action='DESELECT'); _sph2.select_set(True); ctx.view_layer.objects.active = _sph2
+_on0 = _sx.section_active(ctx)
+r2 = bpy.ops.nproto.section_add()
+_off1 = not _sx.section_active(ctx) and _sec.hide_get()
+r3 = bpy.ops.nproto.section_add()
+check("dynamic section: the button toggles it like Zebra -- off hides the section, on brings the same one back "
+      "selected (one per scene, never a second)",
+      r2 == r3 == {'FINISHED'} and _on0 and _off1 and _sx.section_active(ctx) and not _sec.hide_get()
+      and len([o for o in ctx.scene.objects if _sx.is_section(o)]) == _n_sec == 1
+      and ctx.view_layer.objects.active == _sec and _sec.select_get())
+r = bpy.ops.nproto.section_curves()
+_scv = ctx.scene.objects.get("Section Curves")
+check("dynamic section: Create Curves makes the sections real curves", r == {'FINISHED'} and _scv is not None
+      and _scv.type == 'CURVE' and len(_scv.data.splines) == 3, str(_scv and len(_scv.data.splines)))
+
+# --- Visual Clip: a Geometry Nodes modifier drops the faces past the middle plane ---
+_sec.rotation_euler = (0, 0, 0); _sec.location = (0, 1600, 0); _sec.nproto_section.offset = 0.0
+ctx.view_layer.update()
+def _kept(o):
+    dg = ctx.evaluated_depsgraph_get()
+    me = o.evaluated_get(dg).to_mesh()
+    M = o.matrix_world
+    zs = [(M @ pl.center).z for pl in me.polygons]
+    vz = [(M @ vv.co).z for vv in me.vertices]
+    n = len(me.polygons)
+    o.evaluated_get(dg).to_mesh_clear()
+    _kept.verts = (min(vz) if vz else None, max(vz) if vz else None)
+    return n, (min(zs) if zs else None), (max(zs) if zs else None)
+_n_all = len(_sph2.data.polygons)
+_sec.nproto_section.clip = True; ctx.view_layer.update()
+_c1 = _kept(_sph2)
+_sec.nproto_section.flip = True; ctx.view_layer.update()
+_c2 = _kept(_sph2)
+_sec.nproto_section.flip = False; _sec.nproto_section.slab = True; _sec.nproto_section.slab_width = 0.3
+ctx.view_layer.update()
+_c3 = _kept(_sph2)
+_v3 = _kept.verts
+_planes = _sx.clip_planes(_sph2)
+_sec.nproto_section.slab = False; ctx.view_layer.update()
+_kept(_sph2); _v1 = _kept.verts
+_sec.nproto_section.slab = True; ctx.view_layer.update()
+check("visual clip cuts cleanly: every vertex left is on the kept side and the cut reaches the plane exactly "
+      "(no sawtooth of whole triangles); Clip Offset the same at its second plane",
+      abs(_v1[1]) < 1e-5 and abs(_v3[1]) < 1e-5 and abs(_v3[0] + 0.3) < 1e-5, f"behind {_v1} slab {_v3}")
+from mathutils import Vector as _V
+_seg = _sx.keep_segments([_V((0, 0, -1)), _V((0, 0, 1)), _V((1, 0, 2)), _V((1, 0, 3))],
+                         [(_V((0, 0, 0)), _V((0, 0, 1)), None)])
+check("visual clip: B-rep edge lines are cut exactly at the plane", len(_seg) == 2 and abs(_seg[1].z) < 1e-12
+      and abs(_seg[0].z + 1) < 1e-12, str(_seg))
+check("visual clip: only the faces behind the middle plane stay (Flip: the other side; Clip Offset: a slab)",
+      _sph2.modifiers.get(_sx.CLIP) is not None and 0 < _c1[0] < _n_all and _c1[2] <= 1e-6
+      and _c2[1] >= -1e-6 and 0 < _c3[0] < _c1[0] and _c3[1] >= -0.3 - 1e-6 and _planes,
+      f"all {_n_all} behind {_c1} flip {_c2} slab {_c3}")
+_sec.nproto_section.slab = False; ctx.view_layer.update()
+_c4 = _kept(_sph2)
+bpy.ops.nproto.section_add(); ctx.view_layer.update()          # switched off: the clip pauses
+_c5 = _kept(_sph2)
+bpy.ops.nproto.section_add(); ctx.view_layer.update()          # on again: it clips as before
+_c6 = _kept(_sph2)
+check("visual clip pauses while the section is switched off and comes back with it",
+      _c5[0] == _n_all and _c6[0] == _c4[0] < _n_all, f"{_c4[0]} -> off {_c5[0]} -> on {_c6[0]}")
+_sec.nproto_section.clip = False; ctx.view_layer.update()
+_off = _sph2.modifiers.get(_sx.CLIP) is None
+_sec.nproto_section.clip = True; ctx.view_layer.update()
+ctx.view_layer.objects.active = _sph2
+bpy.ops.nproto.section_remove(name=_sec.name); ctx.view_layer.update(); _sx._clip_cleanup(ctx.scene)
+check("visual clip: turning it off, or removing the section (Remove), removes the modifier and the section",
+      _off and _sph2.modifiers.get(_sx.CLIP) is None and not any(_sx.is_section(o) for o in ctx.scene.objects) and len(_sph2.evaluated_get(ctx.evaluated_depsgraph_get()).data.polygons) == _n_all)
+
+# --- Surface Combs: exact curvature combs on iso-curves ---
+from blender_nurbs import isocombs as _ic
+bpy.ops.object.select_all(action='DESELECT')
+bpy.ops.nproto.add_primitive(kind="CYLINDER", radius=0.5, height=1.0, caps=False); _icy = ctx.active_object
+_icy.location = (0, 1700, 0); ctx.view_layer.update()
+_vw.iso_count_u = 3; _vw.iso_count_v = 3; _vw.iso_samples = 40
+_runs, _k95, _isz = _ic.compute(_icy, _vw)
+_round, _flat, _bad = 0, 0, []
+for _P, _K in _runs:
+    _k = np.linalg.norm(_K, axis=1)
+    if _k.max() < 1e-6:
+        _flat += 1
+        continue
+    _round += 1
+    _ax = np.array([0.0, 1700.0])
+    for _p, _kv in zip(_P, _K):
+        _in = np.array([_ax[0] - _p[0], _ax[1] - _p[1], 0.0]); _in /= np.linalg.norm(_in)
+        _bad.append(max(abs(np.linalg.norm(_kv) * 0.5 - 1.0), 1.0 - float(_kv @ _in) / np.linalg.norm(_kv)))
+check("surface combs: on a cylinder the iso-curves around it have curvature exactly 1/r pointing to the axis, "
+      "those along it none", _round == 3 and _flat == 3 and max(_bad) < 1e-4, f"round {_round} flat {_flat} err {max(_bad) if _bad else None}")
+
+# --- Visual Clip on a straight wall (long triangles) cut by a tilted plane: the cut stays ON the surface ---
+bpy.ops.object.select_all(action='DESELECT')
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0); _tc = ctx.active_object
+_tc.location = (0, 1800, 0); ctx.view_layer.update()
+bpy.ops.nproto.extrude(inputs=ins((_tc, "S0")), distance=2.0, direction="Z"); _tw = ctx.active_object
+bpy.ops.object.select_all(action='DESELECT'); _tw.select_set(True); ctx.view_layer.objects.active = _tw
+bpy.ops.nproto.section_add(); _ts = ctx.active_object
+_ts.location = (0, 1800, 1.0); _ts.rotation_euler = (math.radians(35), 0, 0)
+_ts.nproto_section.clip = True; ctx.view_layer.update()
+_dg = ctx.evaluated_depsgraph_get()
+_me = _tw.evaluated_get(_dg).to_mesh()
+_Mw = _tw.matrix_world
+_vs = [(_Mw @ vv.co) for vv in _me.vertices]
+_tw.evaluated_get(_dg).to_mesh_clear()
+_nrm_t = (_ts.matrix_world.to_3x3() @ Vector((0, 0, 1))).normalized()
+_rad = max(abs(math.hypot(p_.x, p_.y - 1800) - 1.0) for p_ in _vs)
+_sd = max((p_ - _ts.matrix_world.translation).dot(_nrm_t) for p_ in _vs)
+_edge = max((_Mw @ _tw.data.vertices[e.vertices[0]].co - _Mw @ _tw.data.vertices[e.vertices[1]].co).length
+            for e in _tw.data.edges)
+check("visual clip, tilted plane through a straight wall: the cut edge lies on the plane AND on the surface "
+      "(corners move along the surface, not off it; float32 mesh at y = 1800)", _sd < 2e-4 and _rad < 2e-3,
+      f"off the cylinder {_rad:.2e}, past the plane {_sd:.2e}, longest mesh edge {_edge:.3f}")
+bpy.ops.nproto.section_remove(name=_ts.name)
+
+# --- Face / Edge selection modes (picks on a body; CVs / Hulls and Continuity Check follow them) ---
+from blender_nurbs import subsel as _ssel
+from blender_nurbs import contcheck as _ccs
+_vw = ctx.window_manager.nproto_view
+_sb = _revs["BLEND2"][1]
+bpy.ops.object.select_all(action='DESELECT'); _sb.select_set(True); ctx.view_layer.objects.active = _sb
+_sbf = store.get_brep(_sb).faces()
+_ri = next(k for k, f in enumerate(_sbf) if _skey(f.surface()) not in _dkeys)        # the ring face
+_sb[_ssel.PROP] = "x"
+_vw.sel_mode = "FACE"
+_cleared = _ssel.PROP not in _sb
+_ssel.set_picks(_sb, "FACE", [_ri])
+_nets = store.display(_sb).get("nets", [])
+_shown = [n for k, n in enumerate(_nets) if n.get("f", k) in (_ssel.faces_shown(_sb) or set())]
+_pts, _tris, _polys = _ssel.face_tris(_sb, _ri)
+_tri_area = float(sum(np.linalg.norm(np.cross(_pts[b] - _pts[a], _pts[c] - _pts[a])) / 2 for a, b, c in _tris))
+check("Face mode: switching mode clears old picks; a picked face is kept on the body, CVs / Hulls shows only its net, "
+      "and its own tessellation covers it (area within 2%)",
+      _cleared and _ssel.get(_sb) == ("FACE", [_ri]) and len(_nets) == 3 and len(_shown) == 1
+      and _shown[0]["f"] == _ri and abs(_tri_area - _sbf[_ri].area()) < 0.02 * _sbf[_ri].area() and len(_polys) >= 2,
+      f"get {_ssel.get(_sb)} nets {len(_nets)} shown {len(_shown)} area {_tri_area:.4f} vs {_sbf[_ri].area():.4f}")
+# a stored pick whose index no longer matches (a rebuild renumbered the faces) is found again by its point
+_d0 = json.loads(_sb[_ssel.PROP]); _wrong = (_ri + 1) % len(_sbf)
+_sb[_ssel.PROP] = json.dumps({"kind": "FACE", "items": [[_wrong, _d0["items"][0][1]]]})
+_remap = _ssel.get(_sb)
+_sb.select_set(False)
+_desel = _ssel.get(_sb)
+_sb.select_set(True)
+check("Face mode: a pick survives renumbering (found again by its point) and only counts while its body is selected",
+      _remap == ("FACE", [_ri]) and _desel == (None, []), f"{_remap} {_desel}")
+_vw.sel_mode = "EDGE"
+_sh = store.shared_edges(_sb)
+_ssel.set_picks(_sb, "EDGE", _sh)
+_cleared_f = _ssel.faces_shown(_sb) is None
+_ccs.clear()
+_nadd = _ccs.add_selected(ctx)
+_jj = [_ccs.judge(_ccs.result(p_), _vw) for p_ in _ccs.PAIRS]
+_ccs.clear()
+check("Edge mode: picked edges are what Edge Fillet / Continuity Check take; the check measures them at once "
+      "(the drafted G2 rim: G2 both sides)",
+      _cleared_f and _ssel.selected_edges(ctx) == [(_sb, f"E{i}") for i in _sh] and _nadd == len(_sh) == 2
+      and all(isinstance(j, dict) and j["G2"][1] for j in _jj), f"{_ssel.selected_edges(ctx)} {_nadd} {_jj}")
+_vw.sel_mode = "BODY"
+check("Body mode: the picks go", _ssel.PROP not in _sb and _ssel.get(_sb) == (None, []))
 
 print("ALL OK" if ok else "SOME FAILED")

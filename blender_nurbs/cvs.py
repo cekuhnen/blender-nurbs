@@ -94,6 +94,10 @@ def make_cage(context, obj):
     me = bpy.data.meshes.new(obj.name + "_CVs")
     me.from_pydata(verts, edges, [])
     me.update()
+    # start with nothing selected: picking the CVs to move is the first step
+    for elems in (me.vertices, me.edges):
+        for e in elems:
+            e.select = False
     cage = bpy.data.objects.new(obj.name + "_CVs", me)
     for coll in obj.users_collection:
         coll.objects.link(cage)

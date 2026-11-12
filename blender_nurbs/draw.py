@@ -81,6 +81,14 @@ def _draw_lines(coords, color, width):
     batch_for_shader(sh, 'LINES', {"pos": coords}).draw(sh)
 
 
+def _draw_tris(coords, color):
+    if coords is None or len(coords) == 0:
+        return
+    sh = gpu.shader.from_builtin('UNIFORM_COLOR')
+    sh.uniform_float("color", color)
+    batch_for_shader(sh, 'TRIS', {"pos": coords}).draw(sh)
+
+
 def _draw_points(coords, color, size):
     if not coords:
         return
@@ -221,11 +229,19 @@ def _draw():
         M = obj.matrix_world
         sel = obj.select_get()
         if show_edges:
-            _draw_lines(_lines_from_polylines(d.get("edges", []), M, _edge_bias(ctx, obj, chord)),
-                        COL_EDGE_SEL if sel else COL_EDGE, 2.0 if sel else 1.5)
+            from . import sections as _sx
+            from . import subsel as _ss
+            hot = sel and not _ss.get(obj)[1]      # a body with picked faces / edges: only those light up
+            _draw_lines(_sx.keep_segments(_lines_from_polylines(d.get("edges", []), M, _edge_bias(ctx, obj, chord)),
+                                          _sx.clip_planes(obj)),
+                        COL_EDGE_SEL if hot else COL_EDGE, 2.0 if sel else 1.5)
         if show_cvs and sel:
             gpu.state.depth_test_set('NONE')
-            for net in d.get("nets", []):
+            from . import subsel as _ss
+            only = _ss.faces_shown(obj)          # picked faces (Face mode): only their nets
+            for k, net in enumerate(d.get("nets", [])):
+                if only is not None and net.get("f", k) not in only:
+                    continue
                 nu, nv, P = net["nu"], net["nv"], net["p"]
                 W = [M @ Vector(p) for p in P]
                 hull = []
@@ -241,8 +257,30 @@ def _draw():
 
     _draw_cage(ctx)
 
+    from . import subsel
+    try:
+        subsel.draw_view(ctx, _draw_lines, _draw_tris, _edge_bias)
+    except Exception as exc:
+        print("NURBS select:", exc)
+    gpu.state.depth_test_set('LESS_EQUAL')
+
     if v is not None:
         diagnostics.draw_combs(ctx, _draw_lines)
+        from . import contcheck
+        try:
+            contcheck.draw_view(ctx, _draw_lines)
+        except Exception as exc:
+            print("NURBS continuity check:", exc)
+        from . import sections
+        try:
+            sections.draw_view(ctx, _draw_lines)
+        except Exception as exc:
+            print("NURBS section:", exc)
+        from . import isocombs
+        try:
+            isocombs.draw_view(ctx, _draw_lines)
+        except Exception as exc:
+            print("NURBS surface combs:", exc)
 
     # Rebuild Surface: while its F9 panel is up, show the new topology
     # (span isoparms + CV hull) of the rebuilt surfaces
@@ -344,6 +382,11 @@ def _draw_px():
         return
     _draw_paused(ctx, region)
     _draw_snap_label(region, rv3d)
+    from . import contcheck
+    try:
+        contcheck.draw_px(ctx, region, rv3d, _box)
+    except Exception as exc:
+        print("NURBS continuity labels:", exc)
     font = 0
     blf.size(font, 11)
     cols = {"FREE": (0.62, 0.62, 0.62, 1), "G0": (0.9, 0.9, 0.9, 1), "G1": (0.35, 0.8, 1.0, 1),
@@ -431,6 +474,14 @@ def _draw_snap_label(region, rv3d):
     blf.color(font, *COL_SNAP)
     blf.position(font, x, y, 0)
     blf.draw(font, txt)
+
+
+def _box(x, y, w, h, color):
+    sh = gpu.shader.from_builtin('UNIFORM_COLOR')
+    gpu.state.blend_set('ALPHA')
+    sh.uniform_float("color", color)
+    a, b, c_, d_ = (x, y), (x + w, y), (x + w, y + h), (x, y + h)
+    batch_for_shader(sh, 'TRIS', {"pos": [a, b, c_, a, c_, d_]}).draw(sh)
 
 
 def _square(c, h, color):

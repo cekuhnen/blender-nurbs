@@ -183,16 +183,52 @@ class NprotoView(bpy.types.PropertyGroup):
     matcap_width: FloatProperty(update=_rd, name="Width", default=0.06, min=0.005, max=0.5)
     matcap_lines: FloatProperty(update=_rd, name="Lines", default=6.0, min=1.0, soft_max=40.0)
     matcap_line_px: FloatProperty(update=_rd, name="Line Px", default=0.6, min=0.0, max=6.0, description="Line thickness in pixels")
-    comb_scale: FloatProperty(update=_rd, name="Comb Scale", default=1.0, min=0.01, soft_max=10.0)
-    comb_samples: IntProperty(update=_rd, name="Comb Samples", default=200, min=8, max=2000)
+    comb_scale: FloatProperty(update=_rd, name="Scale", default=1.0, min=0.01, soft_max=10.0,
+                              description="Comb length: at 1 the longest hair is a fifth of the curve's size")
+    comb_samples: IntProperty(update=_rd, name="Samples", default=200, min=8, max=2000,
+                              description="Points per curve")
     diag_selected_only: BoolProperty(update=_rd, name="Selected Only", default=True,
                                      description="Zebra / comb on the selected objects only (else on all visible)")
+    sel_mode: EnumProperty(name="Select", default="BODY", update=lambda s, c: _subsel_mode(s, c),
+                           items=[("BODY", "Body", "Select whole bodies (Blender's object selection)", 'MESH_CUBE', 0),
+                                  ("FACE", "Face", "Pick faces of NURBS bodies: click, Shift+click adds or removes. "
+                                                   "CVs / Hulls then shows only the picked faces' nets", 'FACESEL', 1),
+                                  ("EDGE", "Edge", "Pick edges of NURBS bodies: click, Shift+click adds or removes. "
+                                                   "Edge Fillet and Continuity Check take the picked edges", 'EDGESEL', 2)])
     show_edges: BoolProperty(name="Edges", default=True, update=lambda s, c: _redraw_views(c))
     show_cvs: BoolProperty(name="CVs / Hulls", default=False, update=lambda s, c: _redraw_views(c))
-    show_cont_labels: BoolProperty(name="Continuity Labels", default=True,
-                                   description="Clickable Free / G0 / G1 / G2 labels on the edges of selected Square, Loft, Loft Rails "
-                                               "and Blend Curve features: click steps the edge's continuity, "
-                                               "Ctrl+click steps back (the feature rebuilds)", update=lambda s, c: _redraw_views(c))
+    show_cont_labels: BoolProperty(name="Feature Labels", default=True,
+                                   description="The continuity each feature was BUILT with: Free / G0 / G1 / G2 labels on the "
+                                               "edges of selected Square, Loft, Loft Rails, Blend Curve, Patch and Surface Align "
+                                               "features. Click a label to change the setting (Ctrl+click steps back; the feature "
+                                               "rebuilds); a red ring means the result misses it. To MEASURE any edge, use "
+                                               "Analyze > Continuity Check", update=lambda s, c: _redraw_views(c))
+    cont_show_checks: BoolProperty(name="Show Checks", default=True, update=lambda s, c: _redraw_views(c),
+                                   description="Show the labels and combs of the edges picked with Continuity Check")
+    cont_level: EnumProperty(name="Show", update=lambda s, c: _redraw_views(c), default='G2',
+                             items=[('G0', "G0", "Position: the gap between the two sides (comb = gap, magnified)"),
+                                    ('G1', "G1", "Tangency: the angle between the two sides' normals (comb = angle)"),
+                                    ('G2', "G2", "Curvature: the difference of the two sides' curvature across the edge "
+                                                 "(comb = difference, magnified; Curvature Combs: each side's own too)")])
+    cont_scale: FloatProperty(name="Scale", default=1.0, min=0.02, soft_max=10.0, max=50.0,
+                              update=lambda s, c: _redraw_views(c), description="Comb length: at 1 the longest hair is a fifth of the edge's length (+ / - in the tool)")
+    cont_kcombs: BoolProperty(name="Curvature Combs", default=False, update=lambda s, c: _redraw_views(c),
+                              description="G2: also draw each side's own curvature across the edge (white / magenta); "
+                                          "where the edge is G2 the two lie on each other")
+    cont_samples: IntProperty(name="Samples", default=160, min=16, max=2000, update=lambda s, c: _redraw_views(c),
+                              description="Points measured along each checked edge. A dense surface needs about 4 per CV "
+                                          "for its true comb (the panel says how many). More: smoother, slower")
+    cont_gap_tol: FloatProperty(name="Gap", default=1e-5, min=0.0, precision=6, unit='LENGTH',
+                                update=lambda s, c: _redraw_views(c),
+                                description="G0 holds while the two sides are no farther apart than this")
+    cont_angle_tol: FloatProperty(name="Angle °", default=0.1, min=0.0, soft_max=5.0, precision=3,
+                                  update=lambda s, c: _redraw_views(c),
+                                  description="G1 holds while the normals of the two sides differ by no more than this "
+                                              "(also used by the feature labels' red ring)")
+    cont_curv_tol: FloatProperty(name="Curvature %", default=5.0, min=0.0, soft_max=50.0,
+                                 update=lambda s, c: _redraw_views(c),
+                                 description="G2 holds while the curvature across the edge differs by no more than this, "
+                                             "in percent of the largest along the edge (also used by the feature labels)")
     show_zebra: BoolProperty(name="Zebra", default=False, update=lambda s, c: _one_map(s, "show_zebra"),
                              description="Reflection stripes on NURBS surfaces")
     show_draft: BoolProperty(name="Draft Angle", default=False, update=lambda s, c: _one_map(s, "show_draft"),
@@ -201,6 +237,20 @@ class NprotoView(bpy.types.PropertyGroup):
                                  description="Colour surfaces by exact curvature")
     show_matcap: BoolProperty(name="Matcap", default=False, update=lambda s, c: _one_map(s, "show_matcap"),
                               description="Highlight, grey-lines or environment shading on NURBS surfaces (exact normals)")
+    show_iso_combs: BoolProperty(name="Surface Combs", default=False, update=lambda s, c: _redraw_views(c),
+                                 description="Curvature combs on iso-curves of the NURBS surfaces (Alias Curvature U / V)")
+    iso_along_u: BoolProperty(name="Along U", default=True, update=lambda s, c: _redraw_views(c),
+                              description="Combs on the iso-curves running along U")
+    iso_along_v: BoolProperty(name="Along V", default=True, update=lambda s, c: _redraw_views(c),
+                              description="Combs on the iso-curves running along V")
+    iso_count_u: IntProperty(name="Number U", default=8, min=1, max=100, update=lambda s, c: _redraw_views(c),
+                             description="How many iso-curves along U, evenly through the face")
+    iso_count_v: IntProperty(name="Number V", default=6, min=1, max=100, update=lambda s, c: _redraw_views(c),
+                             description="How many iso-curves along V, evenly through the face")
+    iso_samples: IntProperty(name="Samples", default=100, min=8, max=2000, update=lambda s, c: _redraw_views(c),
+                             description="Points per iso-curve")
+    iso_scale: FloatProperty(name="Scale", default=1.0, min=0.0, soft_max=10.0, update=lambda s, c: _redraw_views(c),
+                             description="1: the longest combs are about a fifth of the object's size")
     show_comb: BoolProperty(name="Curvature Comb", default=False, description="Curvature comb on curves", update=lambda s, c: _redraw_views(c))
 
 
@@ -244,7 +294,18 @@ def draw_analyze(col, context):
     row = col.row(align=True)
     row.prop(v, "show_curvature", toggle=True, icon='COLOR')
     row.prop(v, "show_comb", toggle=True, icon='IPO_ELASTIC')
-    col.prop(v, "show_matcap", toggle=True, icon='MATSPHERE')
+    row = col.row(align=True)
+    row.prop(v, "show_iso_combs", toggle=True, icon='MOD_LATTICE')
+    row.prop(v, "show_matcap", toggle=True, icon='MATSPHERE')
+    if v.show_iso_combs:
+        row = col.row(align=True)
+        row.prop(v, "iso_along_u", toggle=True)
+        row.prop(v, "iso_count_u", text="")
+        row.prop(v, "iso_along_v", toggle=True)
+        row.prop(v, "iso_count_v", text="")
+        row = col.row(align=True)
+        row.prop(v, "iso_scale")
+        row.prop(v, "iso_samples")
     if v.show_matcap:
         col.row(align=True).prop(v, "matcap_style", expand=True)
         if v.matcap_style == 'ENVIRONMENT':
@@ -301,7 +362,7 @@ def draw_analyze(col, context):
         sp = context.space_data
         if sp is not None and sp.type == 'VIEW_3D':
             row.prop(sp.shading, "show_xray", text="See-Through", toggle=True, icon='XRAY')
-    if v.show_zebra or v.show_comb or v.show_draft or v.show_curvature or v.show_matcap:
+    if v.show_zebra or v.show_comb or v.show_iso_combs or v.show_draft or v.show_curvature or v.show_matcap:
         col.prop(v, "diag_selected_only")
 
 
@@ -314,16 +375,30 @@ class VIEW3D_PT_nproto_analyze(bpy.types.Panel):
     bl_ui_units_x = 12
 
     def draw(self, context):
+        from . import contcheck, sections
         self.layout.label(text="NURBS Analyze")
-        draw_analyze(self.layout.column(align=True), context)
+        col = self.layout.column(align=True)
+        contcheck.draw_panel(col, context)
+        col.separator()
+        sections.draw_panel(col, context)
+        col.separator()
+        draw_analyze(col, context)
+
+
+def _subsel_mode(view, context):
+    from . import subsel
+    subsel.mode_changed(view, context)
 
 
 def header_analyze(self, context):
     v = getattr(context.window_manager, "nproto_view", None)
     if v is None:
         return
+    from . import subsel
+    subsel.draw_mode_buttons(self.layout, context)
     on = [n for n, k in (("Zebra", "show_zebra"), ("Draft", "show_draft"), ("Curvature", "show_curvature"),
-                         ("Matcap", "show_matcap"), ("Comb", "show_comb")) if getattr(v, k)]
+                         ("Matcap", "show_matcap"), ("Comb", "show_comb"), ("Surface Combs", "show_iso_combs"))
+          if getattr(v, k)]
     if v.env_coat and coat_applies(v):
         on.append("Coat")
     self.layout.popover("VIEW3D_PT_nproto_analyze", text=" · ".join(on) if on else "", icon='MOD_WAVE')
@@ -395,6 +470,10 @@ class VIEW3D_PT_nproto_active(_SidePanel, bpy.types.Panel):
                 box.label(text=f"History: {op}" + (" from " + ", ".join(o.name for o, _ in h["inputs"]) if h["inputs"] else ""))
             elif features.PROP_HIST in obj:
                 box.label(text="History: broken (input deleted)", icon='ERROR')
+            from . import subsel
+            picked = subsel.summary(obj)
+            if picked:
+                box.label(text=picked, icon='FACESEL' if subsel.get(obj)[0] == "FACE" else 'EDGESEL')
 
 
 class VIEW3D_PT_nproto_analyze_side(_SidePanel, bpy.types.Panel):
@@ -408,8 +487,12 @@ class VIEW3D_PT_nproto_analyze_side(_SidePanel, bpy.types.Panel):
         return load_kernel() is not None
 
     def draw(self, context):
+        from . import contcheck, sections
         col = self.layout.column(align=True)
-        col.operator("nproto.continuity", icon='DRIVER_DISTANCE')
+        contcheck.draw_panel(col, context)
+        col.separator()
+        sections.draw_panel(col, context)
+        col.separator()
         draw_analyze(col, context)
 
 
@@ -437,6 +520,7 @@ class VIEW3D_PT_nproto_settings(_SidePanel, bpy.types.Panel):
         row = col.row(align=True)
         row.operator("nproto.delete_history", text="Delete History").scope = 'SELECTED'
         row.operator("nproto.delete_history", text="All").scope = 'ALL'
+        col.operator("nproto.collect_inputs", icon='OUTLINER_COLLECTION')
         col.operator("nproto.rebuild", icon='FILE_REFRESH')
 
         col = lay.column(align=True)
@@ -444,7 +528,7 @@ class VIEW3D_PT_nproto_settings(_SidePanel, bpy.types.Panel):
         row = col.row(align=True)
         row.prop(v, "show_edges", toggle=True)
         row.prop(v, "show_cvs", toggle=True)
-        row.prop(v, "show_cont_labels", text="Continuity", toggle=True)
+        row.prop(v, "show_cont_labels", text="Feature Labels", toggle=True)
         col.prop(s, "chord_tolerance")
         col.prop(s, "angle_tolerance")
         col.prop(s, "edge_angle_tolerance")
@@ -459,9 +543,13 @@ def register():
     bpy.types.Scene.nproto_settings = PointerProperty(type=NprotoSettings)
     bpy.types.WindowManager.nproto_view = PointerProperty(type=NprotoView)
     bpy.types.VIEW3D_HT_header.append(header_analyze)
+    from . import subsel
+    bpy.types.VIEW3D_HT_tool_header.prepend(subsel.draw_tool_header)
 
 
 def unregister():
+    from . import subsel
+    bpy.types.VIEW3D_HT_tool_header.remove(subsel.draw_tool_header)
     bpy.types.VIEW3D_HT_header.remove(header_analyze)
     del bpy.types.Scene.nproto_settings
     del bpy.types.WindowManager.nproto_view

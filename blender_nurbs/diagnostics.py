@@ -19,8 +19,17 @@ from mathutils import Vector
 
 from . import geom, store
 
-COL_COMB = (0.1, 0.85, 1.0, 0.85)
-COL_ENVELOPE = (1.0, 0.35, 0.2, 1.0)
+# One look for every comb (curve comb, Continuity Check, Dynamic Section,
+# Surface Combs), Alias-style: green hairs, magenta envelope; red marks hairs
+# past a tolerance. Scale 1 = the longest hairs about a fifth of the size of
+# what they belong to (the object, or a checked edge).
+COMB_HAIR = (0.3, 1.0, 0.6, 0.6)
+COMB_ENVELOPE = (1.0, 0.3, 0.85, 1.0)
+COMB_BAD = (1.0, 0.2, 0.2, 1.0)
+COMB_HAIR_W = 1.0
+COMB_ENV_W = 1.5
+COMB_SPAN = 0.2
+COL_COMB, COL_ENVELOPE = COMB_HAIR, COMB_ENVELOPE
 
 
 # --------------------------------------------------------------------------
@@ -101,12 +110,12 @@ def draw_combs(ctx, draw_lines):
             data = comb_data(obj, int(v.comb_samples))
         except Exception:
             continue
-        # scale: comb_scale x (object size / max curvature) keeps the comb readable
+        # Scale 1: the longest hair is a fifth of the curve's size
         for P, Kv in data:
             kap = np.linalg.norm(Kv, axis=1)
             size = float(np.linalg.norm(np.ptp(P, axis=0))) or 1.0
             ref = float(kap.max()) or 1.0
-            L = v.comb_scale * 0.3 * size / ref
+            L = v.comb_scale * COMB_SPAN * size / ref
             tips = P - L * Kv                     # hairs point away from the centre of curvature
             hairs = []
             for a, b in zip(P, tips):
@@ -114,8 +123,8 @@ def draw_combs(ctx, draw_lines):
             env = []
             for a, b in zip(tips[:-1], tips[1:]):
                 env += [Vector(a), Vector(b)]
-            draw_lines(hairs, COL_COMB, 1.0)
-            draw_lines(env, COL_ENVELOPE, 2.0)
+            draw_lines(hairs, COMB_HAIR, COMB_HAIR_W)
+            draw_lines(env, COMB_ENVELOPE, COMB_ENV_W)
     gpu.state.depth_test_set('LESS_EQUAL')
 
 

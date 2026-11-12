@@ -988,12 +988,12 @@ def _display_data(brep):
         except Exception:
             pass
     nets = []
-    for f in brep.faces():
+    for k, f in enumerate(brep.faces()):
         try:
             d = ext.surface_cvs(f.surface())
         except Exception:
             continue
-        nets.append({"nu": d["count_u"], "nv": d["count_v"],
+        nets.append({"nu": d["count_u"], "nv": d["count_v"], "f": k,      # f: the face (Face mode picks)
                      "p": [list(p) for p in d["points"]]})
     return {"edges": edges, "nets": nets, "shared": shared}
 

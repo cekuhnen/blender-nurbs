@@ -13,7 +13,7 @@ from bpy_extras import view3d_utils
 from mathutils import Vector
 
 from . import draw, features, geom, jobs, steps, store
-from .ops import PickMixin, _kernel_ok, _near_candidates, _pick_candidates, _select_only
+from .ops import AskValue, PickMixin, _kernel_ok, _near_candidates, _pick_candidates, _select_only
 
 
 def _ray_nurbs(context, event):
@@ -315,7 +315,7 @@ def fit_radius(op, objs, names):
                         f"using {getattr(op, names[0]):g} m")
 
 
-class NPROTO_OT_fillet(bpy.types.Operator):
+class NPROTO_OT_fillet(AskValue, bpy.types.Operator):
     """Fillet or chamfer between two surfaces (select both)"""
     bl_idname = "nproto.fillet"
     bl_label = "Fillet / Chamfer"
@@ -327,7 +327,15 @@ class NPROTO_OT_fillet(bpy.types.Operator):
     shape: EnumProperty(name="Shape", items=[
         ("CIRCULAR", "Circular", "Exact circular cross-section"),
         ("CHAMFER", "Chamfer", "Straight (linear) cross-section"),
+        ("BLEND", "Blend", "Free-form blend, G1 or G2 to both surfaces"),
     ], default="CIRCULAR")
+    continuity: EnumProperty(name="Continuity", items=[("1", "G1", "Tangent to both surfaces"),
+                                                       ("2", "G2", "Curvature continuous to both surfaces")],
+                             default="2")
+    rail_type: EnumProperty(name="Rail", items=[
+        ("RADIUS", "Rolling Ball", "The size is the radius of a ball rolling between the faces"),
+        ("CHORD", "Chord", "The size is the distance between the two rails (where the fillet meets the faces)"),
+    ], default="RADIUS")
     radius: FloatProperty(name="Radius A", default=0.25, min=1e-5, soft_max=10.0, unit='LENGTH',
                           description="Distance from surface A to its rail")
     radius_b: FloatProperty(name="Radius B", default=0.25, min=1e-5, soft_max=10.0, unit='LENGTH')
@@ -348,17 +356,27 @@ class NPROTO_OT_fillet(bpy.types.Operator):
         sel.sort(key=lambda o: o == act)  # active = B
         self.surf_a, self.surf_b = sel[0].name, sel[1].name
         self.fit_pending = True
-        return self.execute(context)
+        return self.ask(context)
+
+    def prepare_value(self, context):
+        a, b = bpy.data.objects.get(self.surf_a), bpy.data.objects.get(self.surf_b)
+        if a is not None and b is not None:
+            fit_radius(self, [a, b], ["radius", "radius_b"])     # a size that fits, shown in the dialog
+
+    def _chord(self):
+        return self.radius if self.rail_type == "CHORD" else None
 
     def _try(self, a, b, fa, fb):
-        rb = self.radius if self.same_radius else self.radius_b
+        chord = self._chord()
+        rb = self.radius if (self.same_radius or chord) else self.radius_b
         self._used = {"radius_a": -self.radius if fa else self.radius, "radius_b": -rb if fb else rb,
-                      "xsect": 0 if self.shape == "CHAMFER" else 2}
+                      "xsect": 0 if self.shape == "CHAMFER" else 2, "chord": chord,
+                      "blend": int(self.continuity) if self.shape == "BLEND" else 0}
         return jobs.run("fillet", {"a": a, "b": b}, ["fillet", "a", "b"],
                         radius_a=-self.radius if fa else self.radius,
                         radius_b=-rb if fb else rb,
-                        xsect=0 if self.shape == "CHAMFER" else 2,
-                        tolerance=1e-4, trim_bases=self.trim_bases)
+                        xsect=0 if self.shape == "CHAMFER" else 2, chord=chord,
+                        tolerance=1e-4, trim_bases=self.trim_bases or self.shape == "BLEND")
 
     def execute(self, context):
         if not _kernel_ok(self):
@@ -395,8 +413,6 @@ class NPROTO_OT_fillet(bpy.types.Operator):
         fil = store.new_object_text(context, "Chamfer" if self.shape == "CHAMFER" else "Fillet", breps["fillet"])
         keep_history = features.history_enabled(context)
         u = self._used
-        if keep_history:
-            features.record(fil, "surface_fillet", [(a, "SURF"), (b, "SURF")], dict(u))
         for key, obj in (("a", a), ("b", b)):
             if key in breps:
                 pre = obj[store.PROP_BREP]
@@ -408,6 +424,20 @@ class NPROTO_OT_fillet(bpy.types.Operator):
                     features.push_step(obj, "fillet_trim", [(partner, "SURF")], dict(u, role=key), base_text=pre)
         for key, err in res.get("trim_errors", {}).items():
             self.report({'WARNING'}, f"Could not trim {(a if key == 'a' else b).name}: {err}")
+        if u["blend"]:
+            # the circular fillet trimmed both surfaces back to its rails: the
+            # blend is a G1 / G2 loft between those two new edges
+            try:
+                store.set_geometry(fil, steps.blend_between(a, b, breps["fillet"], u["blend"]), context)
+            except Exception as exc:
+                self.report({'WARNING'}, f"Blend failed ({exc}): kept the circular fillet")
+                u["blend"] = 0
+        if keep_history:
+            features.record(fil, "surface_fillet", [(a, "SURF"), (b, "SURF")], dict(u))
+        if res.get("chord"):
+            lo, mean, hi = res["chord"]
+            spread = (f"{lo:.4g}..{hi:.4g}" if hi - lo > 1e-3 * mean else f"{mean:.4g}")
+            self.report({'INFO'}, f"Chord {spread} m (ball radius {res['radius']:.4g} m)")
         if keep_history:          # all three are final now: no history re-run needed
             features.mark_built(fil, a, b)
         _select_only(context, [fil])
@@ -416,12 +446,18 @@ class NPROTO_OT_fillet(bpy.types.Operator):
     def draw(self, context):
         lay = self.layout
         lay.prop(self, "shape", expand=True)
+        if self.shape == "BLEND":
+            lay.row(align=True).prop(self, "continuity", expand=True)
+        lay.row(align=True).prop(self, "rail_type", expand=True)
         col = lay.column(align=True)
-        col.prop(self, "radius", text="Distance A" if self.shape == "CHAMFER" else "Radius A")
-        col.prop(self, "same_radius")
-        sub = col.row()
-        sub.enabled = not self.same_radius
-        sub.prop(self, "radius_b", text="Distance B" if self.shape == "CHAMFER" else "Radius B")
+        if self.rail_type == "CHORD":
+            col.prop(self, "radius", text="Chord")
+        else:
+            col.prop(self, "radius", text="Distance A" if self.shape == "CHAMFER" else "Radius A")
+            col.prop(self, "same_radius")
+            sub = col.row()
+            sub.enabled = not self.same_radius
+            sub.prop(self, "radius_b", text="Distance B" if self.shape == "CHAMFER" else "Radius B")
         row = lay.row(align=True)
         row.prop(self, "flip_a", toggle=True)
         row.prop(self, "flip_b", toggle=True)
@@ -435,7 +471,9 @@ class NPROTO_OT_fillet(bpy.types.Operator):
 
 class NPROTO_OT_split(bpy.types.Operator):
     """Split the selected surfaces along each other and/or along the selected
-    curves. Every region becomes its own object; nothing is removed"""
+    curves. Every region becomes its own object; nothing is removed. With
+    history the split surfaces are kept as hidden inputs and each region
+    follows them (and what cut them)"""
     bl_idname = "nproto.split"
     bl_label = "Split"
     bl_options = {'REGISTER', 'UNDO'}
@@ -473,55 +511,46 @@ class NPROTO_OT_split(bpy.types.Operator):
         if not surfs or (len(surfs) < 2 and not curve_refs):
             self.report({'WARNING'}, "Select two or more surfaces, or surfaces and curves")
             return {'CANCELLED'}
-        try:
-            curves = []
-            for name, ref in curve_refs:
-                kc = features.input_curve(bpy.data.objects[name], ref)
-                cj = jobs.curve_json(kc)
-                if self.projection == "CURVE":
-                    cj["dir"] = list(_curve_direction(kc, Vector(self.view_dir)))
-                curves.append(cj)
-        except Exception as exc:
-            self.report({'ERROR'}, f"Split: bad curve ({exc})")
-            return {'CANCELLED'}
-        if self.projection == "VIEW" or self.projection == "CURVE":
-            d = Vector(self.view_dir)
-        else:
-            d = Vector({"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}[self.projection])
-        if d.length < 1e-9:
-            d = Vector((0, 0, -1))
+        params = {"surfaces_cut": bool(self.surfaces_cut), "projection": self.projection,
+                  "view_dir": [float(x) for x in self.view_dir]}
+        crv_inputs = [(bpy.data.objects[n], r) for n, r in curve_refs if n in bpy.data.objects]
 
         # compute every split from the ORIGINAL geometry first, then apply
         results, skipped = {}, []
         for tgt in surfs:
-            others = {f"c{i}": o for i, o in enumerate(s for s in surfs if s != tgt)} if self.surfaces_cut else {}
+            inputs = [(tgt, "SURF")] + ([(s, "SURF") for s in surfs if s != tgt] if self.surfaces_cut else []) \
+                + crv_inputs
+            if len(inputs) < 2:
+                continue
             try:
-                info, breps = jobs.run("split", {"target": tgt, **others}, [], curves=curves,
-                                       cutter_breps=list(others), direction=list(d.normalized()))
+                results[tgt.name] = (inputs, steps.split_regions(inputs, params))
             except jobs.JobError as exc:
                 skipped.append(f"{tgt.name}: {exc}")
-                continue
-            parts = sorted(((int(k[6:]), t) for k, t in breps.items() if k.startswith("region")))
-            areas = info.get("areas", [])
-            order = sorted(range(len(parts)), key=lambda i: -(areas[i] if i < len(areas) else 0))
-            results[tgt.name] = [parts[i][1] for i in order]
+            except Exception as exc:
+                skipped.append(f"{tgt.name}: bad curve ({exc})")
         if not results:
             self.report({'ERROR'}, "Split: nothing was split. " + "; ".join(skipped))
             return {'CANCELLED'}
         made = []
-        for name, texts in results.items():
+        keep = features.history_enabled(context)
+        for name, (inputs, texts) in results.items():
             tgt = bpy.data.objects[name]
-            _frozen(tgt, self)
             original = tgt.get(store.PROP_UNTRIM, tgt[store.PROP_BREP])
-            store.set_geometry_text(tgt, texts[0], context)
-            made.append(tgt)
-            for i, text in enumerate(texts[1:], 1):
+            if not keep:                  # no history: the largest region stays in the surface itself
+                _frozen(tgt, self)
+                store.set_geometry_text(tgt, texts[0], context)
+                made.append(tgt)
+            for i, text in enumerate(texts if keep else texts[1:], 1):
                 o = store.new_object_text(context, f"{name}_split{i}", text, geom.world_matrix(tgt))
                 o[store.PROP_UNTRIM] = original
                 if tgt.data.materials:
                     for m in tgt.data.materials:
                         o.data.materials.append(m)
+                if keep:              # each region follows the split surface and what cut it
+                    features.record(o, "split_region", inputs, {**params, "at": steps.region_point(text)})
                 made.append(o)
+        if keep:
+            features.keep_inputs(context, [bpy.data.objects[n] for n in results])
         for msg in skipped:
             self.report({'WARNING'}, msg)
         _select_only(context, made)
@@ -586,9 +615,7 @@ class NPROTO_OT_join(bpy.types.Operator):
                 return {'CANCELLED'}
             joined = store.new_object_text(context, into.name + "_joined", g[1])
             features.record(joined, "join", [(o, "SURF") for o in objs], {"tolerance": self.tolerance})
-            for o in objs:
-                o.hide_set(True)
-                o.hide_render = True
+            features.keep_inputs(context, objs)
             _select_only(context, [joined])
             b = store.get_brep(joined)
             self.report({'INFO'}, f"Joined {len(objs)} surfaces into {b.face_count()} faces "
@@ -677,12 +704,12 @@ class NPROTO_OT_restore_inputs(bpy.types.Operator):
         out = []
         for o in context.selected_objects or [context.active_object]:
             h = features.history(o) if o is not None and (store.is_nurbs(o) or o.type == 'CURVE') else None
-            if h and h["op"] in ("join", "join_curves", "boolean"):
+            if h and h["op"] in features.KEEP_OPS:
                 out.append(o)
         act = context.active_object
         if act is not None and act not in out:
             h = features.history(act) if (store.is_nurbs(act) or act.type == 'CURVE') else None
-            if h and h["op"] in ("join", "join_curves", "boolean"):
+            if h and h["op"] in features.KEEP_OPS:
                 out.append(act)
         return out
 
@@ -714,10 +741,8 @@ class NPROTO_OT_restore_inputs(bpy.types.Operator):
         restored = []
         for o in objs:
             srcs = list(dict.fromkeys(src for src, _ in features.history(o)["inputs"]))
-            for src in srcs:
-                src.hide_set(False)
-                src.hide_render = False
             _remove_object(o)
+            features.release_inputs(context, srcs)
             restored += srcs
         _select_only(context, restored)
         self.report({'INFO'}, f"Restored {len(restored)} source objects")
@@ -805,7 +830,7 @@ def tangent_chain(cand, cands, max_deg=10.0):
     return chain
 
 
-class NPROTO_OT_edge_fillet(PickMixin, bpy.types.Operator):
+class NPROTO_OT_edge_fillet(AskValue, PickMixin, bpy.types.Operator):
     """Fillet, chamfer or blend shared edges of joined surfaces and solids.
     Click the edges to fillet (click again to un-pick, A = all), Enter to finish.
     Alt+click the button: all shared edges of the selected objects at once"""
@@ -826,6 +851,10 @@ class NPROTO_OT_edge_fillet(PickMixin, bpy.types.Operator):
         ("CHAMFER", "Chamfer", "Straight cross-section"),
         ("BLEND", "Blend", "Free-form blend with G1/G2/G3 continuity to both faces"),
     ], default="CIRCULAR")
+    rail_type: EnumProperty(name="Rail", items=[
+        ("RADIUS", "Rolling Ball", "The size is the radius of a ball rolling between the faces"),
+        ("CHORD", "Chord", "The size is the distance between the two rails (where the fillet meets the faces)"),
+    ], default="RADIUS")
     radius: FloatProperty(name="Radius", default=0.1, min=1e-4, soft_max=5.0, unit='LENGTH')
     variable: BoolProperty(name="Variable Radius", default=False)
     end_radius: FloatProperty(name="End Radius", default=0.2, min=1e-4, soft_max=5.0, unit='LENGTH')
@@ -882,15 +911,38 @@ class NPROTO_OT_edge_fillet(PickMixin, bpy.types.Operator):
         if not _kernel_ok(self):
             return {'CANCELLED'}
         self.fit_pending = True
+        if self.inputs:                     # picked already (see PickMixin._finish)
+            return self.ask(context)
+        from . import subsel
+        picked = subsel.selected_edges(context)     # Edge mode: the picked edges, no picking
+        if picked:
+            ok = [(o, r) for o, r in picked if int(r[1:]) in self._shared(o)]
+            if not ok:
+                self.report({'WARNING'}, "None of the picked edges lies between two faces: Join the surfaces first")
+                return {'CANCELLED'}
+            if len(ok) < len(picked):
+                self.report({'WARNING'}, f"{len(picked) - len(ok)} picked edge(s) skipped (open: only edges "
+                                         "between two faces can be filleted)")
+            self.inputs = json.dumps([[o.name, r] for o, r in ok])
+            return self.ask(context)
         if event.alt:   # all shared edges of the selection at once
             sel = [o for o in context.selected_objects if store.is_nurbs(o) and store.shared_edges(o)]
             if sel:
                 self.inputs = json.dumps([[o.name, f"E{i}"] for o in sel for i in store.shared_edges(o)])
-                return self.execute(context)
+                return self.ask(context)
         if not self.pick_candidates(context):
             self.report({'WARNING'}, "No shared edges: Join surfaces first (only edges between two faces can be filleted)")
             return {'CANCELLED'}
         return self.start_picking(context)
+
+    def prepare_value(self, context):
+        try:
+            names = {n for n, _ in json.loads(self.inputs or "[]")}
+        except ValueError:
+            names = set()
+        objs = [bpy.data.objects[n] for n in names if n in bpy.data.objects]
+        if objs:
+            fit_radius(self, objs, ["radius", "end_radius"])     # a size that fits, shown in the dialog
 
     def modal(self, context, event):
         if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
@@ -922,6 +974,7 @@ class NPROTO_OT_edge_fillet(PickMixin, bpy.types.Operator):
             self.report({'WARNING'}, "Pick shared edges of a joined surface")
             return {'CANCELLED'}
         fit_radius(self, [bpy.data.objects[n] for n in by_obj], ["radius", "end_radius"])
+        chord = self.radius if self.rail_type == "CHORD" else None
         done = []
         for name, idxs in by_obj.items():
             obj = bpy.data.objects[name]
@@ -929,7 +982,8 @@ class NPROTO_OT_edge_fillet(PickMixin, bpy.types.Operator):
                 mids = [_edge_mid_world(obj, i) for i in idxs]
                 info, breps = jobs.run("edge_fillet", {"target": obj}, ["result"], edge_mids=mids,
                                        shape=self.shape, radius=self.radius,
-                                       end_radius=self.end_radius if self.variable else None,
+                                       end_radius=self.end_radius if self.variable and not chord else None,
+                                       chord=chord,
                                        continuity=int(self.continuity), thumbweight=self.thumbweight,
                                        **steps.class_a_params(self._ca_params()))
             except (jobs.JobError, IndexError) as exc:
@@ -946,14 +1000,21 @@ class NPROTO_OT_edge_fillet(PickMixin, bpy.types.Operator):
             store.set_geometry_text(obj, breps["result"], context, keep_untrimmed=False)
             if keep_history:
                 Mi = geom.world_matrix(obj).inverted()
+                steps.store_rims(obj, [list(Mi @ Vector(m)) for m in mids], info, Mi)
                 features.push_step(obj, "edge_fillet", [], {
                     "mids_local": [list(Mi @ Vector(m)) for m in mids], "shape": self.shape, "radius": self.radius,
-                    "end_radius": self.end_radius if self.variable else None,
+                    "end_radius": self.end_radius if self.variable and not chord else None, "chord": chord,
                     "continuity": int(self.continuity), "thumbweight": self.thumbweight,
                     **self._ca_params()}, base_text=pre)
             done.append(obj)
             msg = f"{name}: {info['edges']} edge(s) filleted" + (" (solid)" if info.get("solid") else "")
+            if info.get("chord"):
+                lo, mean, hi = info["chord"]
+                msg += (f" · chord {lo:.4g}..{hi:.4g} m" if hi - lo > 1e-3 * mean else f" · chord {mean:.4g} m") \
+                    + f" (ball radius {info['radius']:.4g} m)"
             level = 'INFO'
+            if info.get("rings") and "class_a" not in info:
+                msg += " · " + ring_summary(info["rings"])
             if "class_a" in info:
                 ca_msg, ok = class_a_summary(info["class_a"])
                 msg += " · " + ca_msg
@@ -974,12 +1035,16 @@ class NPROTO_OT_edge_fillet(PickMixin, bpy.types.Operator):
     def draw(self, context):
         lay = self.layout
         lay.prop(self, "shape", expand=True)
+        lay.row(align=True).prop(self, "rail_type", expand=True)
         col = lay.column(align=True)
-        col.prop(self, "radius", text="Distance" if self.shape == "CHAMFER" else "Radius")
-        col.prop(self, "variable")
-        sub = col.row()
-        sub.enabled = self.variable
-        sub.prop(self, "end_radius")
+        if self.rail_type == "CHORD":
+            col.prop(self, "radius", text="Chord")
+        else:
+            col.prop(self, "radius", text="Distance" if self.shape == "CHAMFER" else "Radius")
+            col.prop(self, "variable")
+            sub = col.row()
+            sub.enabled = self.variable
+            sub.prop(self, "end_radius")
         if self.shape == "BLEND":
             row = lay.row(align=True)
             row.prop(self, "continuity", expand=True)
@@ -993,13 +1058,27 @@ class NPROTO_OT_edge_fillet(PickMixin, bpy.types.Operator):
             box.row(align=True).prop(self, "ca_continuity", expand=True)
 
 
+def ring_summary(rings):
+    """What became of the fillet faces round closed edges (rims)."""
+    out = []
+    for g in rings or []:
+        k = g.get("kernel_cvs", [0, 0])
+        out.append(f"rim {k[0]}x{k[1]} CVs -> " + ("exact revolution, 9 CVs round" if g.get("ring") == "revolution"
+                                                  else f"one even ring, {g.get('round')} CVs round "
+                                                       f"(degree {g.get('degree', 5)})"))
+    return "; ".join(out)
+
+
 def class_a_summary(rep):
     """One line for the Class-A rebuild report; (text, all within tolerance)."""
+    rings = ring_summary(rep.get("rings"))
     if rep.get("error"):
-        return rep["error"], False
+        return rep["error"] + (f" · {rings}" if rings else ""), False
     faces = [f for f in rep.get("faces", []) if "skipped" not in f]
     skipped = [f["skipped"] for f in rep.get("faces", []) if "skipped" in f]
     if not faces:
+        if rings:
+            return "Class-A: " + rings + (" · kept: " + "; ".join(skipped) if skipped else ""), not skipped
         return "Class-A: " + (rep.get("note") or ("; ".join(skipped) or "nothing to rebuild")), not skipped
     parts = []
     for f in faces:
@@ -1009,7 +1088,7 @@ def class_a_summary(rep):
                      f"{f.get('rows', 3)}x{f['degree'] + 1} (dev {f['dev']:.2g}, {f['angle']:.2g} deg, "
                      f"ends {'/'.join(f['ends'])})")
     ok = all(f["within"] for f in faces) and not skipped
-    txt = "Class-A: " + "; ".join(parts)
+    txt = "Class-A: " + "; ".join(parts + ([rings] if rings else []))
     if not all(f["within"] for f in faces):
         txt += " -- outside tolerance (raise Tolerance or Max Degree)"
     if skipped:
@@ -1062,9 +1141,7 @@ class NPROTO_OT_boolean(bpy.types.Operator):
                 return {'CANCELLED'}
             res = store.new_object_text(context, name, g[1])
             features.record(res, "boolean", [(o, "SURF") for o in objs], {"bool_op": self.operation})
-            for o in objs:
-                o.hide_set(True)
-                o.hide_render = True
+            features.keep_inputs(context, objs)
             features.mark_built(res)
             _select_only(context, [res])
             self.report({'INFO'}, f"Boolean {self.operation.lower()} of {len(objs)} solids "
@@ -1089,5 +1166,102 @@ class NPROTO_OT_boolean(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class NPROTO_OT_boundary_fill(bpy.types.Operator):
+    """Boundary fill: the closed solid that the selected surfaces enclose. Each
+    surface is trimmed by the others and the pieces around the enclosed volume
+    are joined into a solid (everything outside is discarded). With history
+    the surfaces are hidden and the solid follows them"""
+    bl_idname = "nproto.boundary_fill"
+    bl_label = "Boundary Fill"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if not _kernel_ok(self):
+            return {'CANCELLED'}
+        from .cvs import is_cage
+        objs = [o for o in context.selected_objects if store.is_nurbs(o) and not is_cage(o)]
+        if len(objs) < 2:
+            self.report({'WARNING'}, "Select the surfaces around the volume (two or more)")
+            return {'CANCELLED'}
+        objs.sort(key=lambda o: o.name)
+        ins_ = [(o, "SURF") for o in objs]
+        try:
+            g = features.run("boundary_fill", ins_, {})
+        except jobs.JobError as exc:
+            self.report({'ERROR'}, f"Boundary Fill failed: {exc}")
+            return {'CANCELLED'}
+        res = store.new_object_text(context, "Solid", g[1])
+        if features.history_enabled(context):
+            features.record(res, "boundary_fill", ins_, {})
+            features.mark_built(res)
+            features.keep_inputs(context, objs)        # Restore Inputs brings them back
+        else:
+            for o in objs:
+                _remove_object(o)                       # the solid replaces them
+        _select_only(context, [res])
+        b = store.get_brep(res)
+        try:
+            vol = abs(b.volume(1e-6)) if b.is_manifold_solid() else 0.0
+        except Exception:
+            vol = 0.0
+        self.report({'INFO'}, f"Boundary Fill: solid of {b.face_count()} faces, volume {vol:.4g}")
+        return {'FINISHED'}
+
+
+class NPROTO_OT_flip_normal(bpy.types.Operator):
+    """Turn the selected surfaces over: their normals (shading, matcaps, offset
+    direction) point the other way. Works on trimmed faces and joined sheets;
+    closed solids always face outward"""
+    bl_idname = "nproto.flip_normal"
+    bl_label = "Flip Normal"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if not _kernel_ok(self):
+            return {'CANCELLED'}
+        from .cvs import is_cage
+        objs = [o for o in context.selected_objects if store.is_nurbs(o) and not is_cage(o)]
+        if not objs:
+            self.report({'WARNING'}, "Select NURBS surfaces")
+            return {'CANCELLED'}
+        done = []
+        for o in objs:
+            old = features._edge_marks(o)
+            try:
+                if features.history_enabled(context):
+                    entries = features.stack(o)
+                    if entries and entries[-1]["op"] == "flip_normal":
+                        features.remove_step(o, len(entries) - 1)      # flipping back: drop the step
+                        if features.history(o) is None and not features.stack(o) and features.PROP_BASE in o:
+                            # nothing left but the snapshot: it is the geometry again
+                            nat = bool(o.get(features.PROP_BASE + "_natural", 0))
+                            store.set_geometry_text(o, o[features.PROP_BASE], context, keep_untrimmed=False)
+                            o[store.PROP_NATURAL] = 1 if nat else 0
+                            for k in (features.PROP_BASE, features.PROP_BASE + "_natural"):
+                                if k in o:
+                                    del o[k]
+                        else:
+                            features.rebuild(o, context, force=True)
+                    else:
+                        features.push_step(o, "flip_normal", [], {})
+                        features.rebuild(o, context, force=True)
+                else:
+                    nat = store.is_natural(o)
+                    untrim = o.get(store.PROP_UNTRIM)
+                    store.set_geometry_text(o, steps.flip_text(o[store.PROP_BREP]), context, keep_untrimmed=False)
+                    o[store.PROP_NATURAL] = 1 if nat else 0
+                    if untrim and not nat:
+                        o[store.PROP_UNTRIM] = steps.flip_text(untrim)
+                features._remap_dependents(o, old)
+                done.append(o)
+            except Exception as exc:
+                self.report({'ERROR'}, f"{o.name}: {exc}")
+        if not done:
+            return {'CANCELLED'}
+        features.mark_built(*done)
+        self.report({'INFO'}, "Flipped " + ", ".join(o.name for o in done))
+        return {'FINISHED'}
+
+
 classes = (NPROTO_OT_trim, NPROTO_OT_untrim, NPROTO_OT_fillet, NPROTO_OT_split, NPROTO_OT_join, NPROTO_OT_unjoin, NPROTO_OT_restore_inputs,
-           NPROTO_OT_edge_fillet, NPROTO_OT_boolean)
+           NPROTO_OT_edge_fillet, NPROTO_OT_boolean, NPROTO_OT_flip_normal, NPROTO_OT_boundary_fill)

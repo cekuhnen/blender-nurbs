@@ -737,16 +737,170 @@ def _draft_normals(P, d, closed, flip):
     return sgn * out
 
 
+def _exact_draft(cv, d, h, off, flip, symmetric):
+    """Draft rows on the profile's own basis: the base row IS the profile (its
+    CVs, knots and weights unchanged), the far row(s) are fitted on the same
+    knots and weights -- exact for lines, circles and arcs (a cone), with knots
+    added to every row (exactly) only where an offset needs them. At a sharp
+    corner (a knot of full multiplicity where the tangents disagree) the
+    smooth pieces are drafted one by one and the far rows mitred: each
+    piece's end is moved along its tangent to where the two pieces' far edges
+    meet (exact for straight pieces). Returns (rows, knots, degree, weights),
+    or None when the profile is not clamped or cannot be drafted this way."""
+    from .kernel.classa import basis, insert_knot
+    p = int(cv["degree"])
+    U = [float(k) for k in cv["knots"]]
+    P = np.array(cv["points"], float)
+    w = np.array(cv["weights"], float) if cv.get("weights") else np.ones(len(P))
+    if p < 2 or len(U) != len(P) + p + 1 or len(w) != len(P) or (w <= 0).any():
+        return None
+    if any(abs(U[i] - U[0]) > 1e-12 or abs(U[-1 - i] - U[-1]) > 1e-12 for i in range(p + 1)):
+        return None
+    size = float(np.linalg.norm(np.ptp(P, axis=0))) or 1.0
+    closed = np.linalg.norm(P[0] - P[-1]) < 1e-9 * size
+    tol = 1e-5 * size
+    Pw = np.c_[P * w[:, None], w]
+    # the offset's parameter speed kinks wherever the profile's curvature
+    # jumps (at its knots): one more multiplicity there lets the far row
+    # follow (inserting a knot leaves the profile itself unchanged)
+    for k in sorted(set(U[p + 1:-p - 1])):
+        if U.count(k) < p:
+            Pw, U = insert_knot(Pw, U, p, k)
+            Pw = np.asarray(Pw, float)
+    P = Pw[:, :3] / Pw[:, 3:]
+
+    def frame(Pw_, U_, ts):
+        H, H1 = basis(U_, p, ts) @ Pw_, basis(U_, p, ts, 1) @ Pw_
+        C = H[:, :3] / H[:, 3:]
+        return C, (H1[:, :3] - C * H1[:, 3:]) / H[:, 3:]
+
+    def unit_n(T):
+        nrm = np.cross(T, d)
+        nn = np.linalg.norm(nrm, axis=1)
+        if (nn < 1e-9 * (np.linalg.norm(T, axis=1) + 1e-300)).any():
+            return None                       # the profile runs along the direction
+        return nrm / nn[:, None]
+
+    def bends(T):
+        return T[0] @ T[1] < (1.0 - 1e-9) * np.linalg.norm(T[0]) * np.linalg.norm(T[1])
+
+    br = sorted(set(U))
+    e = 1e-7 * (br[-1] - br[0])
+    corners = []
+    for k in br[1:-1]:
+        if bends(frame(Pw, U, [k - e, k + e])[1]):
+            if U.count(k) != p:
+                return None
+            corners.append(k)
+    seam_corner = closed and bends(np.vstack([frame(Pw, U, [U[-1] - e])[1], frame(Pw, U, [U[0] + e])[1]]))
+    # outward = away from the curve's centre, as _draft_normals (whole curve)
+    ts = np.concatenate([np.linspace(a, b, 18)[1:-1] for a, b in zip(br[:-1], br[1:])])
+    C, T = frame(Pw, U, ts)
+    nrm = unit_n(T)
+    if nrm is None:
+        return None
+    rel = C - C.mean(axis=0)
+    rel -= np.outer(rel @ d, d)
+    sgn = 1.0 if np.sum(nrm * rel) >= 0 else -1.0
+    if flip:
+        sgn = -sgn
+    heights = [h] + ([-h] if symmetric else [])          # far rows: top (and bottom)
+
+    def fit_piece(Pw_, U_):
+        """The far rows of one smooth piece on its own basis (ends exact)."""
+        n0 = len(Pw_)
+        for _ in range(16):
+            w_ = Pw_[:, 3]
+            br_ = sorted(set(U_))
+            ts_ = np.concatenate([np.linspace(a, b, 16, endpoint=False) for a, b in zip(br_[:-1], br_[1:])]
+                                 + [[br_[-1]]])
+            C_, T_ = frame(Pw_, U_, ts_)
+            n_ = unit_n(T_)
+            if n_ is None:
+                return None
+            B = basis(U_, p, ts_)
+            R = B * w_[None, :] / (B @ w_)[:, None]           # the rational basis
+            rows, worst = [], np.zeros(len(ts_))
+            for hh in heights:
+                tg = C_ + hh * d + off * sgn * n_
+                X = np.zeros((len(Pw_), 3))
+                X[0], X[-1] = tg[0], tg[-1]
+                if len(Pw_) > 2:
+                    rhs = tg - np.outer(R[:, 0], X[0]) - np.outer(R[:, -1], X[-1])
+                    X[1:-1] = np.linalg.lstsq(R[:, 1:-1], rhs, rcond=None)[0]
+                rows.append(X)
+                worst = np.maximum(worst, np.linalg.norm(R @ X - tg, axis=1))
+            if worst.max() <= tol:
+                return Pw_, U_, rows
+            spans = sorted({max(i for i, k in enumerate(br_) if k <= t and i < len(br_) - 1)
+                            for t, err in zip(ts_, worst) if err > tol})
+            for i in spans:
+                Pw_, U_ = insert_knot(Pw_, U_, p, 0.5 * (br_[i] + br_[i + 1]))
+            Pw_ = np.asarray(Pw_, float)
+            if len(Pw_) > 8 * n0 + 200:
+                return None
+        return None
+
+    cuts = [U[0]] + corners + [U[-1]]
+    pieces = []
+    for a, b in zip(cuts[:-1], cuts[1:]):
+        ka = 0 if a == U[0] else U.index(a) - 1
+        kb = len(P) - 1 if b == U[-1] else U.index(b) - 1
+        res = fit_piece(Pw[ka:kb + 1], [a] * (p + 1) + [u for u in U if a < u < b] + [b] * (p + 1))
+        if res is None:
+            return None
+        pieces.append(res)
+
+    def mitre(Xa, Xb):
+        """Move Xa's last and Xb's first CV to where their end tangents meet."""
+        p0, ta, q0, tb = Xa[-1], Xa[-1] - Xa[-2], Xb[0], Xb[1] - Xb[0]
+        M = np.array([[ta @ ta, -(ta @ tb)], [ta @ tb, -(tb @ tb)]])
+        m = 0.5 * (p0 + q0)
+        if abs(np.linalg.det(M)) > 1e-12 * (ta @ ta) * (tb @ tb):
+            s_, u_ = np.linalg.solve(M, np.array([(q0 - p0) @ ta, (q0 - p0) @ tb]))
+            mm = 0.5 * (p0 + s_ * ta + q0 + u_ * tb)
+            if np.linalg.norm(mm - m) < 20.0 * abs(off) + tol:    # (a hairpin: no sane mitre)
+                m = mm
+        Xa[-1] = Xb[0] = m
+
+    for i in range(len(pieces) - 1 + (1 if seam_corner else 0)):
+        j = (i + 1) % len(pieces)
+        for r in range(len(heights)):
+            mitre(pieces[i][2][r], pieces[j][2][r])
+    base, far, Ut = [], [[] for _ in heights], [U[0]] * (p + 1)
+    for i, (Pw_, U_, rows) in enumerate(pieces):
+        k0 = 0 if i == 0 else 1                               # a corner CV is shared
+        base.append(Pw_[k0:])
+        for r, X in enumerate(rows):
+            far[r].append(X[k0:])
+        Ut += [u for u in U_ if U_[0] < u < U_[-1]] + ([U_[-1]] * p if i < len(pieces) - 1 else [])
+    Ut += [U[-1]] * (p + 1)
+    Pw = np.vstack(base)
+    w = Pw[:, 3]
+    P = Pw[:, :3] / w[:, None]
+    far = [np.vstack(f) for f in far]
+    if closed:                                                # the seam: one point
+        for f in far:
+            f[-1] = f[0]
+    rows = [P, far[0]] if not symmetric else [far[1], P, far[0]]
+    return rows, Ut, p, w
+
+
 def draft_extrude(kcurve, d, h, draft_deg, flip=False, symmetric=False):
     """Ruled draft surface: height h along d, outward offset h*tan(draft).
-    Degree-1 profiles (polylines) are exact with mitred corners; smooth
-    profiles: the base row is the exact curve sampled and fitted with the far
-    row on one parameterization (tolerance 1e-5 of the size)."""
+    Degree-1 profiles (polylines) are exact with mitred corners. Smooth
+    profiles keep their own CVs, knots and weights for the base row, and the
+    far row is fitted on that basis (a drafted circle is an exact cone, CVs
+    as even as the circle's; sharp corners are mitred). Only a profile that
+    cannot be drafted so is sampled and both rows fitted on one
+    parameterization (tolerance 1e-5 of the size)."""
     _, ext = _k()
     d = np.asarray(d, float) / np.linalg.norm(d)
     off = h * np.tan(np.radians(draft_deg))
     cv = ext.curve_cvs(kcurve)
     closed = False
+    wts = None
+    exact = None if cv["degree"] == 1 else _exact_draft(cv, d, h, off, flip, symmetric)
     if cv["degree"] == 1 and not cv.get("weights"):
         P = np.array(cv["points"], float)
         closed = np.linalg.norm(P[0] - P[-1]) < 1e-9 * (np.ptp(P, axis=0).max() or 1.0)
@@ -757,6 +911,10 @@ def draft_extrude(kcurve, d, h, draft_deg, flip=False, symmetric=False):
         knots_c = list(cv["knots"])
         deg_c = 1
         X = rows
+    elif exact is not None:
+        X, knots_c, deg_c, w = exact
+        if np.abs(w - 1.0).max() > 1e-12:
+            wts = [float(x) for _ in X for x in w]
     else:
         t0, t1 = kcurve.parameter_range()
         P = np.array([kcurve.evaluate(t0 + (t1 - t0) * i / 199) for i in range(200)], float)
@@ -775,7 +933,7 @@ def draft_extrude(kcurve, d, h, draft_deg, flip=False, symmetric=False):
     for r in X:
         pts.extend(tuple(map(float, p)) for p in r)
     # u = across the extrusion (degree 1), v = along the curve
-    return ext.surface_from_cvs(1, deg_c, pts, knots_e, [float(k) for k in knots_c])
+    return ext.surface_from_cvs(1, deg_c, pts, knots_e, [float(k) for k in knots_c], wts)
 
 
 def _draft_rows(P, nrm, d, h, off, symmetric):

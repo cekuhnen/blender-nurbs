@@ -511,11 +511,64 @@ def _orient_fillet(f, bases):
         return f
 
 
+def _fillet_chord(f, A, B, n=15):
+    """(min, mean, max) distance between the fillet's two rails, section by
+    section (the fillet face's own across parameter), or None."""
+    np = _np()
+    try:
+        face = f.faces()[0]
+        s = face.surface()
+        (u0, v0), (u1, v1) = face.uv_domain()
+    except Exception:
+        return None
+    on = lambda base, p: dist_to_brep(tuple(p), base)
+    um, vm = 0.5 * (u0 + u1), 0.5 * (v0 + v1)
+    ea = min(on(A, s.evaluate(u0, vm)) + on(B, s.evaluate(u1, vm)), on(B, s.evaluate(u0, vm)) + on(A, s.evaluate(u1, vm)))
+    ev = min(on(A, s.evaluate(um, v0)) + on(B, s.evaluate(um, v1)), on(B, s.evaluate(um, v0)) + on(A, s.evaluate(um, v1)))
+    if ea <= ev:
+        ch = [np.linalg.norm(np.array(s.evaluate(u0, v)) - np.array(s.evaluate(u1, v))) for v in np.linspace(v0, v1, n)]
+    else:
+        ch = [np.linalg.norm(np.array(s.evaluate(u, v0)) - np.array(s.evaluate(u, v1))) for u in np.linspace(u0, u1, n)]
+    return float(min(ch)), float(np.mean(ch)), float(max(ch))
+
+
 def job_fillet(job):
-    # optional *_base breps: surfaces to compute the fillet from (untrimmed);
-    # "a" / "b" are what gets trimmed
+    """Surface fillet. With job['chord']: the rolling-ball radius is found so
+    that the distance between the two rails (the chord) is that length --
+    exact where the angle between the surfaces stays the same, the average
+    chord otherwise (reported)."""
     A = world_brep(job, "a_base" if "a_base" in job["breps"] else "a")
     B = world_brep(job, "b_base" if "b_base" in job["breps"] else "b")
+    chord = job.get("chord")
+    if chord:
+        np = _np()
+        c = float(chord)
+        sa = 1.0 if float(job["radius_a"]) >= 0 else -1.0
+        sb = 1.0 if float(job["radius_b"]) >= 0 else -1.0
+        r = c / np.sqrt(2.0)                 # exact for surfaces at 90 deg
+        f = None
+        for _ in range(4):
+            job["radius_a"], job["radius_b"] = sa * r, sb * r
+            f = _surface_fillet(job, A, B)
+            ch = _fillet_chord(f, A, B)
+            if ch is None or ch[1] <= 0:
+                break
+            if abs(ch[1] - c) <= 1e-6 * c:
+                break
+            r *= c / ch[1]
+        job["radius_a"], job["radius_b"] = sa * r, sb * r
+        f = _surface_fillet(job, A, B)
+        res = _fillet_finish(job, f, A, B)
+        res["radius"] = r
+        res["chord"] = _fillet_chord(f, A, B)
+        return res
+    return _fillet_finish(job, _surface_fillet(job, A, B), A, B)
+
+
+def _surface_fillet(job, A, B):
+    """The kernel fillet face between the bases (world space)."""
+    # optional *_base breps: surfaces to compute the fillet from (untrimmed);
+    # "a" / "b" are what gets trimmed
     f, last = None, None
     key_a = "a_base" if "a_base" in job["breps"] else "a"
     key_b = "b_base" if "b_base" in job["breps"] else "b"
@@ -543,7 +596,11 @@ def job_fillet(job):
         if last is not None:
             raise last
         raise RuntimeError("no fillet found on these sides (try Flip A / Flip B)")
-    f = _orient_fillet(f, (A, B))
+    return _orient_fillet(f, (A, B))
+
+
+def _fillet_finish(job, f, A, B):
+    """Write the fillet; trim the bases back to its rails (trim_bases)."""
     save(f, job["out"]["fillet"])
     out = {"fillet": {"faces": f.face_count(), "area": f.area()}, "trim_errors": {}}
 
@@ -705,6 +762,146 @@ def job_boolean(job):
     return {"faces": res.face_count(), "volume": volume}
 
 
+def _seg_dist(P, pts):
+    """Distance of each point of pts to the polyline P."""
+    np = _np()
+    if len(P) < 2:
+        return np.full(len(pts), np.inf)
+    A, S = P[:-1], P[1:] - P[:-1]
+    ss = np.maximum(np.einsum("ij,ij->i", S, S), 1e-300)
+    out = []
+    for q in pts:
+        t = np.clip(np.einsum("ij,ij->i", q - A, S) / ss, 0.0, 1.0)
+        out.append(float(np.min(np.linalg.norm(A + S * t[:, None] - q, axis=1))))
+    return np.array(out)
+
+
+def job_boundary_fill(job):
+    """Boundary fill (Rhino's CreateSolid): the closed solid the selected
+    surfaces enclose. Every surface is split along the others; pieces with an
+    edge that no piece of another surface shares (overhangs, the parts outside
+    the enclosure) are dropped until none is left; the rest is stitched into a
+    solid. World space in; local space of job['into'] out."""
+    np = _np()
+    keys = job["order"]
+    names = job.get("names", {})
+    worlds = {k: world_brep(job, k) for k in keys}
+    lo = np.min([np.array(worlds[k].bounding_box()[0], float) for k in keys], axis=0)
+    hi = np.max([np.array(worlds[k].bounding_box()[1], float) for k in keys], axis=0)
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    tol = 1e-4 * size
+
+    pieces = []                                   # (source index, brep)
+    for i, k in enumerate(keys):
+        sub = {"breps": dict(job["breps"], target=job["breps"][k]),
+               "xforms": dict(job.get("xforms", {}), target=job.get("xforms", {}).get(k)),
+               "ref_point": [float(x) for x in worlds[k].bounding_box()[0]]}
+        cutters = []
+        for j, other in enumerate(keys):
+            if j == i:
+                continue
+            c = SurfaceCutter(sub, other)
+            try:              # keep only surfaces that really cut this one
+                n0 = worlds[k].face_count()
+                cut = c.split(world_brep(job, k), None)
+                if cut is not None and cut.face_count() > n0:
+                    cutters.append(c)
+            except Exception:
+                pass
+        if not cutters:
+            raise RuntimeError(f"{names.get(k, k)} does not cross any other selected surface")
+        b, faces, groups, _, _ = _regions(sub, cutters)
+        for g in groups:
+            part = b.copy()
+            drop = [f for fi, f in enumerate(part.faces()) if fi not in set(g)]
+            if drop:
+                ext.delete_faces(part, drop)
+            pieces.append((i, part))
+
+    # each piece's open edges, as polylines
+    def key(e):
+        m = _edge_mid(e)
+        return None if m is None else tuple(round(float(v) / tol) for v in m)
+
+    def open_edges(part):
+        # a seam (a closed face meeting itself) is used twice by its face's loop
+        seams = set()
+        for f in part.faces():
+            seen = set()
+            for loop in f.boundary_loops():
+                for e, _ in loop:
+                    kk = key(e)
+                    if kk in seen:
+                        seams.add(kk)
+                    seen.add(kk)
+        out = []
+        for e in part.edges():
+            if len(e.faces()) < 2 and key(e) not in seams:
+                P = np.array(_edge_poly(e, 24), float)
+                if len(P) >= 2:
+                    out.append(P)
+        return out
+    edges = [open_edges(part) for _, part in pieces]
+    alive = set(range(len(pieces)))
+    while True:
+        drop = set()
+        for a in alive:
+            src = pieces[a][0]
+            for ei, P in enumerate(edges[a]):
+                probe = P[1:-1:3] if len(P) > 4 else P
+                covered = False
+                # a seam: another open edge of the same piece lies on it
+                for ej, Q in enumerate(edges[a]):
+                    if ej != ei and (_seg_dist(Q, probe) <= tol).all():
+                        covered = True
+                        break
+                if not covered:
+                    for b_ in alive:
+                        if b_ == a or pieces[b_][0] == src:
+                            continue
+                        if any((_seg_dist(Q, probe) <= tol).all() for Q in edges[b_]):
+                            covered = True
+                            break
+                if not covered:
+                    drop.add(a)
+                    break
+        if not drop:
+            break
+        alive -= drop
+    if len({pieces[a][0] for a in alive}) < 2:
+        raise RuntimeError("the surfaces do not enclose a volume (every piece has an open edge) -- "
+                           "extend them so that they cross each other all round")
+    parts = [pieces[a][1] for a in sorted(alive)]
+    merged = sm.merge_breps(parts, operation=sm.BooleanOp.MERGE) if len(parts) > 1 else parts[0]
+    res = sm.stitch_advanced(merged, tol, squeeze_small_edges=False, making_manifold_solid=True)
+    b = res[0]
+    try:
+        solid = bool(b.is_manifold_solid())
+    except Exception:
+        solid = False
+    if not solid:
+        n_open = sum(1 for e in b.edges() if len(e.faces()) < 2)
+        n_multi = sum(1 for e in b.edges() if len(e.faces()) > 2)
+        if n_multi:
+            raise RuntimeError("the surfaces enclose more than one volume -- select only the surfaces "
+                               "around the one you want")
+        raise RuntimeError(f"the pieces do not close up ({n_open} open edges)")
+    try:
+        sm.unify_normals(b, max(b.faces(), key=lambda f: f.area()), 100)
+    except Exception:
+        pass
+    volume = 0.0
+    try:
+        h = sm.heal_brep(b)
+        v = h.volume(1e-6) if h is not None else 0.0
+        if h is not None and abs(v) > 0:
+            b, volume = h, abs(v)
+    except Exception:
+        pass
+    save(to_local(b, job.get("xforms", {}).get(job.get("into"))), job["out"]["result"])
+    return {"faces": b.face_count(), "volume": volume, "pieces": len(pieces), "kept": len(alive)}
+
+
 def job_unjoin(job):
     """One brep per face (local space of the source object)."""
     b = load(job["breps"]["target"])
@@ -727,6 +924,7 @@ def job_edge_fillet(job):
     np = _np()
     b = world_brep(job, "target")
     b_orig = b.copy() if job.get("class_a") else None
+    b_ring = b.copy()
     edges = b.edges()
     mids = []
     for e in edges:
@@ -754,6 +952,23 @@ def job_edge_fillet(job):
     xsect = {"CHAMFER": 0, "CIRCULAR": 1, "BLEND": 2}[job.get("shape", "CIRCULAR")]
     r0 = float(job["radius"])
     r1 = job.get("end_radius")
+    chord_info = None
+    if job.get("chord"):
+        # chord = distance between the rails = 2 r sin(theta / 2), theta = the
+        # angle between the two faces' normals across the edge
+        c = float(job["chord"])
+        th = []
+        for e in sel:
+            t0, t1 = e.parameter_range()
+            for t in np.linspace(t0, t1, 9)[1:-1]:
+                p = np.array(e.point_at(t), float)
+                n0, n1 = (_face_normal(fc, p) for fc in e.faces()[:2])
+                th.append(float(np.arccos(np.clip(n0 @ n1, -1.0, 1.0))))
+        th = np.maximum(np.array(th), np.radians(1.0))       # (a smooth edge needs no fillet)
+        rs = c / (2.0 * np.sin(0.5 * th))
+        r0, r1 = float(np.mean(rs)), None
+        ch = 2.0 * r0 * np.sin(0.5 * th)
+        chord_info = (float(ch.min()), float(ch.mean()), float(ch.max()))
     if r1 is not None and abs(float(r1) - r0) > 1e-12:
         r = sm.variable_radius_fillet(b, sel, start_radius=r0, end_radius=float(r1), xsect_type=xsect,
                                       continuity=int(job.get("continuity", 1)))
@@ -762,18 +977,341 @@ def job_edge_fillet(job):
                             thumbweight=float(job.get("thumbweight", 1.0)))
     if r is None or r.face_count() == 0:
         raise RuntimeError("the kernel returned no result (radius too large for the neighbouring faces?)")
+    r = _fix_ring_faces(b_ring, r)
+    rings = []
+    if r1 is None or abs(float(r1) - r0) <= 1e-12:
+        # rims (Class-A or not): one smooth ring each; Class-A leaves them be
+        r, rings = _smooth_rings(b_ring, r, xsect, r0)
+    rims_only = False
+    if rings:            # every fillet face is a rebuilt ring: Class-A has nothing left to do
+        on_in = _input_test(b_ring)
+        rims_only = sum(1 for f in r.faces() if not on_in(f)) == len(rings)
     class_a = None
     if job.get("class_a"):
-        r, class_a = _class_a(b_orig, r, job, xsect, r0 if r1 is None or abs(float(r1) - r0) <= 1e-12 else None)
+        r, class_a = _class_a(b_orig, r, job, xsect, r0 if r1 is None or abs(float(r1) - r0) <= 1e-12 else None,
+                              skip=[g["at"] for g in rings])
+        if rings:
+            class_a["rings"] = [{k: v for k, v in g.items() if k != "at"} for g in rings]
     try:
         solid = bool(r.is_manifold_solid())
     except Exception:
         solid = False
+    new_faces = []                        # a point inside each face the fillet made (world): its panel highlights them
+    try:
+        on_in = _input_test(b_ring)
+        for f in r.faces():
+            if not on_in(f):
+                q = f.interior_point()
+                new_faces.append([float(q.x), float(q.y), float(q.z)] if hasattr(q, "x") else [float(x) for x in q])
+    except Exception:
+        new_faces = []
     save(to_local(r, job.get("xforms", {}).get("target")), job["out"]["result"])
-    out = {"edges": len(sel), "faces": r.face_count(), "solid": solid}
+    out = {"edges": len(sel), "faces": r.face_count(), "solid": solid, "new_faces": new_faces,
+           "rings": [{k: v for k, v in g.items() if k != "at"} for g in rings], "rims_only": rims_only}
+    if chord_info is not None:
+        out["radius"], out["chord"] = r0, chord_info
     if class_a is not None:
         out["class_a"] = class_a
     return out
+
+
+def _open_edge_count(b):
+    """Open (one-face) edges of b, not counting seams (an edge a face's own
+    loop uses twice)."""
+    n = 0
+    seams = set()
+    for f in b.faces():
+        seen = set()
+        for loop in f.boundary_loops():
+            for e, _ in loop:
+                k = id(e) if _edge_mid(e) is None else tuple(round(float(v), 7) for v in _edge_mid(e))
+                if k in seen:
+                    seams.add(k)
+                seen.add(k)
+    for e in b.edges():
+        m = _edge_mid(e)
+        k = id(e) if m is None else tuple(round(float(v), 7) for v in m)
+        if len(e.faces()) < 2 and k not in seams:
+            n += 1
+    return n
+
+
+def _fix_ring_faces(before, r):
+    """The kernel's chamfer and blend fillets of a CLOSED edge (the rim of a
+    cylinder) come back with a broken trim: the face is bounded by the two
+    closed rails but has no seam, so it covers a sliver of its surface and the
+    fillet shows as a gap. The surface itself spans exactly rail to rail all
+    the way round, so such a face is replaced by its untrimmed surface and
+    stitched back in. Keeps r when that does not stitch as well."""
+    np = _np()
+    orig = {_surface_key(f.surface()) for f in before.faces()}
+    bad = []
+    for f in r.faces():
+        loops = f.boundary_loops()
+        if len(loops) < 2 or any(len(lp) != 1 for lp in loops):
+            continue                       # only rings bounded by closed rails alone
+        try:
+            if _surface_key(f.surface()) in orig:
+                continue                   # an input face (a tube with two rims)
+            nat = ext.brep_from_surface(f.surface())
+            if f.area() < 0.5 * nat.faces()[0].area():
+                bad.append((f, nat))
+        except Exception:
+            continue
+    if not bad:
+        return r
+    lo, hi = (np.array(v) for v in r.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    out = r.copy()
+    try:
+        drop = [f for f in out.faces() for g, _ in bad if _surface_key(f.surface()) == _surface_key(g.surface())]
+        ext.delete_faces(out, drop)
+        for _, nat in bad:
+            ext.append_brep(out, nat)
+        before_open = _open_edge_count(r)
+        for tol in (1e-6 * size, 1e-5 * size, 1e-4 * size):
+            st = sm.stitch_advanced(out.copy(), tol, squeeze_small_edges=False, making_manifold_solid=False)[0]
+            if _open_edge_count(st) <= before_open and st.face_count() == r.face_count():
+                try:
+                    sm.unify_normals(st, max(st.faces(), key=lambda f: f.area()), 100)
+                except Exception:
+                    pass
+                return st
+    except Exception:
+        pass
+    return r
+
+
+def _input_test(before):
+    """on_input(face): face is one of `before`'s faces (maybe trimmed or
+    merged), not a new fillet face."""
+    np = _np()
+    orig = {_surface_key(f.surface()) for f in before.faces()}
+    lo, hi = (np.array(v) for v in before.bounding_box())
+    tol = 1e-6 * (float(np.linalg.norm(hi - lo)) or 1.0)
+
+    def on_input(f):
+        if _surface_key(f.surface()) in orig:
+            return True
+        try:
+            p = f.interior_point()
+        except Exception:
+            return False
+        p = (p.x, p.y, p.z) if hasattr(p, "x") else tuple(p)
+        return dist_to_brep(p, before) < tol
+    return on_input
+
+
+def _periodic_basis(n, p, ts, der=0):
+    """Uniform periodic B-spline basis (n functions, n spans on [0, 1))."""
+    import classa
+    np = _np()
+    B = classa.basis(np.arange(-p, n + p + 1) / n, p, np.asarray(ts, float) % 1.0, der)
+    out = np.zeros((B.shape[0], n))
+    for j in range(B.shape[1]):
+        out[:, j % n] += B[:, j]
+    return out
+
+
+RING_DEGREE = 5          # along a rebuilt ring: curvature ripple ~1e-5 with 12-16 spans (cubic: ~1e-2)
+
+
+def _ring_surface(face, is_fillet, kind, radius, size):
+    """One smooth closed surface for a kernel fillet face that runs all round a
+    closed edge, or None. Sections are exact (rolling ball; the Blend profile
+    with the kernel's own fullness), at even arc length all round. When they
+    are all one section turned about an axis, the ring is that section's exact
+    surface of revolution (_revolved_ring); otherwise they are fitted along the
+    ring with a uniform periodic degree-5 B-spline (C4 across the seam, evenly
+    spaced CVs), the fewest spans within 1e-6 of the size. Returns (surface,
+    description for the report) or None."""
+    import classa
+    np = _np()
+    lay = classa.face_layout(face, sm, is_fillet)
+    if isinstance(lay, str) or not lay.get("closed"):
+        return None
+    # a ring has no ends: its seam is just one of its sections (classa turns
+    # the sections near an end into the end's plane, over 30% of the length
+    # each way -- on a ring that tilts a third of them, by up to ~7 deg)
+    lay["T_end"] = (None, None)
+    d = ext.surface_cvs(lay["surf"])
+    m = d["degree_u"] if lay["across"] == "u" else d["degree_v"]
+    kcv = [d["count_v"], d["count_u"]] if lay["across"] == "u" else [d["count_u"], d["count_v"]]   # along x across
+    blend_k = None
+    if kind == "BLEND":
+        if not (3 <= m <= 9 and m % 2 == 1):
+            return None
+        ks = classa.blend_fullness(lay, sm, m)
+        if not ks:
+            return None
+        blend_k = float(np.median(ks))
+    secs, _ = classa._sample_along(lay, kind, m, sm, radius, n=385, blend_k=blend_k)
+    X = (secs[..., :3] / secs[..., 3:4]).mean(axis=1)
+    gaps = np.linalg.norm(np.diff(X, axis=0), axis=1)
+    h = float(np.median(gaps))
+    # the kernel's ring face may stop a little short of its start or run a
+    # little past it: drop the last sections that lie at (or past) the first
+    t0 = (X[1] - X[0]) / (np.linalg.norm(X[1] - X[0]) or 1.0)
+    keep = len(X)
+    while keep > len(X) // 2 and (X[0] - X[keep - 1]) @ t0 < 0.5 * h:
+        keep -= 1
+    secs, X = secs[:keep], X[:keep]
+    seg = np.r_[np.linalg.norm(np.diff(X, axis=0), axis=1), np.linalg.norm(X[0] - X[-1])]
+    if seg.max() > 3.0 * h:
+        return None                               # not one even loop of sections
+    nrows = secs.shape[1]
+    rev = _revolved_ring(secs, 1e-6 * size)
+    if rev is not None:
+        return rev, {"ring": "revolution", "round": 9, "kernel_cvs": kcv}
+    s = np.r_[0.0, np.cumsum(seg[:-1])] / seg.sum()
+    Q = secs.reshape(keep, -1)
+    us = np.linspace(0.0, 1.0, 9)
+    Xs = classa.eval_sections(secs, us)
+    p, tol = RING_DEGREE, 1e-6 * size
+    fit = None
+    for n in (8, 12, 16, 24, 32, 48, 64):
+        if 5 * n > keep:
+            break
+        C = np.linalg.lstsq(_periodic_basis(n, p, s), Q, rcond=None)[0]
+        F = (_periodic_basis(n, p, s) @ C).reshape(secs.shape)
+        if (F[..., 3] <= 0).any():
+            continue
+        if float(np.linalg.norm(classa.eval_sections(F, us) - Xs, axis=2).max()) <= tol:
+            fit = (n, C)
+            break
+    if fit is None:
+        return None
+    n, C = fit
+    # the same spline on a clamped knot vector (a periodic spline restricted to
+    # [0, 1] lies in that space: the change of basis is exact)
+    Uc = [0.0] * (p + 1) + [k / n for k in range(1, n)] + [1.0] * (p + 1)
+    ss = np.linspace(0.0, 1.0, 20 * n + 1)
+    Bc = classa.basis(Uc, p, ss)
+    P = (np.linalg.lstsq(Bc, _periodic_basis(n, p, ss), rcond=None)[0] @ C).reshape(n + p, nrows, 4)
+    pts, wts = [], []
+    for i in range(nrows):                        # u = across (Bezier), v = along the ring
+        for j in range(n + p):
+            hj = P[j, i]
+            pts.append(tuple(float(x) for x in hj[:3] / hj[3]))
+            wts.append(float(hj[3]))
+    rational = any(abs(w - 1.0) > 1e-12 for w in wts)
+    return (ext.surface_from_cvs(nrows - 1, p, pts, [0.0] * nrows + [1.0] * nrows, Uc, wts if rational else None),
+            {"ring": "periodic", "round": n + p, "degree": p, "kernel_cvs": kcv})
+
+
+def _revolved_ring(secs, tol):
+    """When every section is the same one turned about an axis (the rim of a
+    cylinder, cone or any revolved part), the exact surface of revolution of
+    that section: rational, 9 CVs round (the circle's own), its seam where
+    the kernel's was. None when the sections differ by more than tol."""
+    np = _np()
+    X = secs[..., :3] / secs[..., 3:4]                    # (N, rows, 3)
+    R0 = X[:, 0]
+    m0 = R0.mean(axis=0)
+    _, _, vt = np.linalg.svd(R0 - m0)
+    a = vt[2]
+    if np.abs((R0 - m0) @ a).max() > tol:
+        return None                                       # the rail is not planar
+    e1, e2 = vt[0], vt[1]
+    if np.cross(a, R0[0] - m0) @ (R0[1] - R0[0]) < 0:
+        a = -a                                            # turn the way the sections run (as the kernel face)
+    xy = np.c_[(R0 - m0) @ e1, (R0 - m0) @ e2]
+    A = np.c_[2.0 * xy, np.ones(len(xy))]
+    cx, cy, _ = np.linalg.lstsq(A, (xy ** 2).sum(axis=1), rcond=None)[0]
+    c = m0 + cx * e1 + cy * e2
+    D = X - c
+    z = D @ a                                              # (N, rows)
+    rad = D - z[..., None] * a
+    r = np.linalg.norm(rad, axis=2)
+    if r.min() < tol:
+        return None                                       # a row on the axis
+    x0 = rad[:, :1] / r[:, :1, None]                       # each section's own radial direction
+    y0 = np.cross(a, x0)
+    phi = np.arctan2((rad * y0).sum(axis=2), (rad * x0).sum(axis=2))
+    w = secs[..., 3]
+    if (np.ptp(r, axis=0).max() > tol or np.ptp(z, axis=0).max() > tol
+            or (np.ptp(phi, axis=0) * r.max(axis=0)).max() > tol or np.ptp(w, axis=0).max() > 1e-6):
+        return None
+    rm, zm, pm, wm = r.mean(axis=0), z.mean(axis=0), phi.mean(axis=0), w.mean(axis=0)
+    xs = x0[0, 0]
+    ys = np.cross(a, xs)
+    s2 = np.sqrt(0.5)
+    pts, wts = [], []
+    for i in range(secs.shape[1]):                         # u = across (the section), v = round
+        for k in range(9):
+            ang = pm[i] + k * np.pi / 4.0
+            rr = rm[i] if k % 2 == 0 else rm[i] / s2
+            q = c + zm[i] * a + rr * (np.cos(ang) * xs + np.sin(ang) * ys)
+            pts.append(tuple(float(x) for x in q))
+            wts.append(float(wm[i] * (1.0 if k % 2 == 0 else s2)))
+    nr = secs.shape[1]
+    return ext.surface_from_cvs(nr - 1, 2, pts, [0.0] * nr + [1.0] * nr,
+                                [0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0], wts)
+
+
+def _smooth_rings(before, r, xsect, radius):
+    """The kernel's fillet round a CLOSED edge (a cylinder's rim) is one dense
+    face (150-200 CVs along it, knots of multiplicity 3: only C0 inside) whose
+    section shape follows the base surfaces' parametrisation, so it differs a
+    little all the way round: on a round part the curvature map shows blobs
+    and the CVs bunch up unevenly, most of all at the seam. Each such face is
+    rebuilt as one smooth closed surface (_ring_surface) and stitched back in.
+    Keeps r (and that face) when anything misses. Returns (brep, rings): one
+    description per rebuilt ring, with "at" = a point inside it (to find the
+    face again after the stitch)."""
+    np = _np()
+    kind = {0: "CHAMFER", 1: "CIRCULAR", 2: "BLEND"}[xsect]
+    lo, hi = (np.array(v) for v in r.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    on_input = _input_test(before)
+    fil = [f for f in r.faces() if not on_input(f)]
+    if not fil:
+        return r, []
+    import classa
+
+    def is_fillet(f):
+        return any(classa._same_face(f, g) for g in fil)
+    new = []
+    for f in fil:
+        try:
+            res = _ring_surface(f, is_fillet, kind, radius, size)
+        except Exception:
+            res = None
+        if res is not None:
+            surf, desc = res
+            (u0, u1), (v0, v1) = surf.u_domain(), surf.v_domain()
+            desc["at"] = [float(x) for x in surf.evaluate(0.5 * (u0 + u1), 0.5 * (v0 + v1))]
+            new.append((_surface_key(f.surface()), surf, desc))
+    if not new:
+        return r, []
+    try:
+        out = r.copy()
+        keys = {k for k, _, _ in new}
+        ext.delete_faces(out, [f for f in out.faces() if _surface_key(f.surface()) in keys])
+        for _, surf, _ in new:
+            ext.append_brep(out, ext.brep_from_surface(surf))
+        open0 = _open_edge_count(r)
+        for tol in (1e-6 * size, 1e-5 * size):
+            st = sm.stitch_advanced(out.copy(), tol, squeeze_small_edges=False, making_manifold_solid=False)[0]
+            if _open_edge_count(st) <= open0 and st.face_count() == r.face_count():
+                try:      # agree with the original faces (the new one may face either way)
+                    base = [f for f in st.faces() if on_input(f)] or st.faces()
+                    sm.unify_normals(st, max(base, key=lambda f: f.area()), 100)
+                except Exception:
+                    pass
+                return st, [desc for _, _, desc in new]
+    except Exception:
+        pass
+    return r, []
+
+
+def _face_normal(face, p):
+    """Unit outward normal of face at (near) the point p."""
+    np = _np()
+    _, uvs, _ = sm.surface_closest_point(face.surface(), tuple(float(x) for x in p))
+    uv = uvs[0]
+    n = np.array(face.outward_normal_at_uv(*((uv.x, uv.y) if hasattr(uv, "x") else uv)), float)
+    return n / (np.linalg.norm(n) or 1.0)
 
 
 def _surface_key(surf):  # noqa: E302
@@ -782,9 +1320,11 @@ def _surface_key(surf):  # noqa: E302
             tuple(round(c, 9) for p in d["points"] for c in p))
 
 
-def _class_a(before, r, job, xsect, radius):
+def _class_a(before, r, job, xsect, radius, skip=()):
     """Rebuild the kernel's dense fillet faces as single-span patches
-    (kernel/classa.py). Keeps the kernel result if anything goes wrong."""
+    (kernel/classa.py). Keeps the kernel result if anything goes wrong.
+    Faces through a point of `skip` (rims already rebuilt as one smooth
+    ring, _smooth_rings) are left as they are."""
     import classa
     np = _np()
     orig = {_surface_key(f.surface()) for f in before.faces()}
@@ -800,7 +1340,11 @@ def _class_a(before, r, job, xsect, radius):
             return False
         p = (p.x, p.y, p.z) if hasattr(p, "x") else tuple(p)
         return dist_to_brep(p, before) < tol
-    fil = [i for i, f in enumerate(r.faces()) if not on_input(f)]
+    def is_ring(f):
+        return any(f.closest_point(tuple(q))[1] < tol for q in skip)
+    fil = [i for i, f in enumerate(r.faces()) if not on_input(f) and not is_ring(f)]
+    if not fil and skip:
+        return r, {"faces": [], "patches": 0}
     kind = {0: "CHAMFER", 1: "CIRCULAR", 2: "BLEND"}[xsect]
     keep = r.copy()
     try:
@@ -855,7 +1399,142 @@ def job_retarget(job):
     return {"faces": b.face_count()}
 
 
-JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean}
+def _reverse_v(s):
+    """The same surface with v reversed (its normal turns over)."""
+    np = _np()
+    d = ext.surface_cvs(s)
+    nu, nv = d["count_u"], d["count_v"]
+    P = np.array(d["points"], float).reshape(nu, nv, 3)[:, ::-1]
+    w = np.array(d["weights"], float).reshape(nu, nv)[:, ::-1] if d.get("weights") else None
+    K = list(d["knots_v"])
+    Kv = [K[0] + K[-1] - k for k in reversed(K)]
+    pts = [tuple(map(float, P[i, j])) for i in range(nu) for j in range(nv)]
+    return ext.surface_from_cvs(d["degree_u"], d["degree_v"], pts, list(d["knots_u"]), Kv,
+                                [float(x) for x in w.reshape(-1)] if w is not None else None)
+
+
+def _uvxy(uv):
+    return (uv.x, uv.y) if hasattr(uv, "x") else (uv[0], uv[1])
+
+
+def _normal_near(b, p):
+    """Outward normal of b's face nearest the point p."""
+    np = _np()
+    f = min(b.faces(), key=lambda f: f.closest_point(tuple(p))[1])
+    _, uvs, _ = sm.surface_closest_point(f.surface(), tuple(p))
+    return np.array(f.outward_normal_at_uv(*_uvxy(uvs[0])), float)
+
+
+def flip_brep(b):
+    """Every face of an open sheet / shell turned over, trims kept. The kernel
+    only turns faces over to agree with a neighbour (unify_normals), so a
+    small helper strip is stitched to one open edge facing the other way,
+    the faces are unified to the strip, and the strip is removed again."""
+    np = _np()
+    try:
+        solid = bool(b.is_manifold_solid())
+    except Exception:
+        solid = False
+    if solid:
+        raise RuntimeError("a closed solid always faces outward -- nothing to flip")
+    n0 = b.face_count()
+    lo, hi = (np.array(v, float) for v in b.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    bnd = [e for e in b.edges() if len(e.faces()) == 1]
+    if not bnd:
+        raise RuntimeError("no open edge (the faces are not joined into one sheet?)")
+    e = max(bnd, key=lambda e: e.length())
+    t0, t1 = e.parameter_range()
+    P = np.array([e.point_at(t) for t in np.linspace(t0, t1, 41)], float)
+    m = P[20]
+    nrm = _normal_near(b, m)
+    nrm /= np.linalg.norm(nrm) or 1.0
+    h = 0.05 * (e.length() or size)
+    # the strip leaves the edge at 45 deg between the normal and the outward
+    # direction: straight along the normal its side edges could lie on a
+    # neighbouring face's edge (a wall at a corner) and get stitched to it
+    T = P[21] - P[19]
+    out = np.cross(nrm, T)
+    out /= np.linalg.norm(out) or 1.0
+    f0 = e.faces()[0]
+    if f0.closest_point(tuple(m + 1e-3 * h * out))[1] < f0.closest_point(tuple(m - 1e-3 * h * out))[1]:
+        out = -out
+    w = (nrm + out) / np.sqrt(2.0)
+    c1 = sm.create_curve_interp_points([tuple(map(float, p)) for p in P])
+    c2 = sm.create_curve_interp_points([tuple(map(float, p + h * w)) for p in P])
+    strip = sm.create_ruled_surface(c1, c2)
+    probe = m + 0.5 * h * w
+    # the interpolated edge strays from the real one by ~(edge / 40)^4 x curvature:
+    # stitch tight first, a little looser if that does not connect
+    for tol in (1e-6 * size, 1e-5 * size, 1e-4 * size):
+        for helper in (strip, _reverse_v(strip)):
+            merged = sm.merge_breps([b.copy(), ext.brep_from_surface(helper)], operation=sm.BooleanOp.MERGE)
+            st = sm.stitch_advanced(merged, tol, squeeze_small_edges=False, making_manifold_solid=False)[0]
+            hf = min(st.faces(), key=lambda f: f.closest_point(tuple(probe))[1])
+            try:
+                sm.unify_normals(st, hf, 100)
+            except Exception:
+                continue
+            ext.delete_faces(st, [hf])
+            if st.face_count() != n0:
+                continue
+            if float(_normal_near(st, m) @ nrm) < 0:
+                return st
+    raise RuntimeError("the kernel could not turn these faces over")
+
+
+def job_flip(job):
+    """Flip Normal of a trimmed face / joined sheet (local space)."""
+    b = load(job["breps"]["target"])
+    save(flip_brep(b), job["out"]["result"])
+    return {"faces": b.face_count()}
+
+
+def job_offset(job):
+    """Offset every face of a (joined) sheet or solid by `distance` along its
+    normals; corners between faces extended until they meet. World space in,
+    local space of the target out (the distance is a world distance)."""
+    b = world_brep(job, "target")
+    d = float(job["distance"])
+    if abs(d) <= 0:
+        raise RuntimeError("the distance is zero")
+    r = sm.offset_brep(b, d, extended_offset=True, self_intersection=True)
+    if r is None or r.face_count() == 0:
+        raise RuntimeError("no offset (the distance may be bigger than a concave radius)")
+    save(to_local(r, job.get("xforms", {}).get("target")), job["out"]["result"])
+    return {"faces": r.face_count()}
+
+
+def job_thicken(job):
+    """A closed solid from a (joined) sheet: the sheet, its offset by
+    `distance` and the side walls between them. symmetric: half each way."""
+    b = world_brep(job, "target")
+    d = float(job["distance"])
+    if abs(d) <= 0:
+        raise RuntimeError("the thickness is zero")
+    try:
+        solid = bool(b.is_manifold_solid())
+    except Exception:
+        solid = False
+    if solid:
+        raise RuntimeError("this is already a closed solid -- Thicken works on open surfaces (use Offset)")
+    if job.get("symmetric"):
+        b = sm.offset_brep(b, -0.5 * d, extended_offset=True, self_intersection=True)
+    r = sm.shell_brep(b, d, extended_offset=True, self_intersection=True, create_solid=True)
+    if r is None or r.face_count() == 0:
+        raise RuntimeError("no solid (the thickness may be bigger than a concave radius)")
+    volume = 0.0
+    try:
+        if r.is_manifold_solid():
+            volume = abs(r.volume(1e-6))
+    except Exception:
+        pass
+    save(to_local(r, job.get("xforms", {}).get("target")), job["out"]["result"])
+    return {"faces": r.face_count(), "volume": volume}
+
+
+JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean,
+        "flip": job_flip, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken}
 
 
 def main():

@@ -25,7 +25,23 @@ CORNER_DEG = 25.0
 
 def _edge_polyline(edge, n=64):
     t0, t1 = edge.parameter_range()
-    return np.array([edge.point_at(t0 + (t1 - t0) * i / (n - 1)) for i in range(n)], float)
+    return np.array([_point_at(edge, t, t0, t1) for t in np.linspace(t0, t1, n)], float)
+
+
+def _point_at(edge, t, t0, t1):
+    """edge.point_at(t), stepping a hair inside the range if the kernel calls
+    an end parameter out of range (its float rounding differs between the
+    Windows / Linux / macOS builds)."""
+    try:
+        return edge.point_at(t)
+    except Exception:
+        h = (t1 - t0) or 1.0
+        for k in (1e-12, 1e-10, 1e-8):
+            try:
+                return edge.point_at(min(max(t, t0 + k * h), t1 - k * h))
+            except Exception:
+                continue
+        raise
 
 
 def _chain(polys, tol):

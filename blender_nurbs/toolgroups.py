@@ -56,7 +56,7 @@ GROUPS = (
              _t("nproto.patch", icon='MOD_TRIANGULATE')),
         )),
         ("From Surfaces", (
-            (_t("nproto.offset", icon='MOD_OFFSET'),),
+            (_t("nproto.offset", icon='MOD_OFFSET'), _t("nproto.thicken", icon='MOD_SOLIDIFY')),
             (_t("nproto.from_blender_surface", icon='SURFACE_NSURFACE'),),
         )),
     )),
@@ -74,7 +74,7 @@ GROUPS = (
     )),
     ("SURFACE_EDIT", "Surface Edit", (
         ("Shape", (
-            (_t("nproto.edit_cvs", icon='EDITMODE_HLT'),),
+            (_t("nproto.edit_cvs", icon='EDITMODE_HLT'), _t("nproto.flip_normal", icon='NORMALS_FACE')),
             (_t("nproto.rebuild_surface", icon='MOD_REMESH'), _t("nproto.extend", icon='FULLSCREEN_ENTER')),
             (_t("nproto.surface_align", icon='SNAP_EDGE'), _t("nproto.refit_trim", icon='MOD_LATTICE')),
         )),
@@ -90,6 +90,7 @@ GROUPS = (
             (("nproto.boolean", "Union", 'SELECT_EXTEND', {"operation": "UNION"}),
              ("nproto.boolean", "Difference", 'SELECT_SUBTRACT', {"operation": "DIFFERENCE"}),
              ("nproto.boolean", "Intersection", 'SELECT_INTERSECT', {"operation": "INTERSECTION"})),
+            (_t("nproto.boundary_fill", icon='MESH_CUBE'),),
         )),
     )),
 )
@@ -224,6 +225,7 @@ class VIEW3D_MT_nproto_tools(bpy.types.Menu):
         lay.menu("VIEW3D_MT_nproto_surface_edit", icon='SURFACE_DATA')
         lay.separator()
         lay.operator("nproto.continuity", icon='DRIVER_DISTANCE')
+        lay.operator("nproto.section_add", icon='MOD_EDGESPLIT')
 
 
 def menu_header(self, context):

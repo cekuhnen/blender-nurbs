@@ -22,21 +22,23 @@ DIR_ITEMS = [("NORMAL", "Curve Normal", "")] + AXIS_ITEMS + [("VECTOR", "Vector"
 
 # which settings each feature shows (in this order)
 FIELDS = {
-    "loft": ["closed", "cont_a", "tan_a", "cur_a", "cont_b", "tan_b", "cur_b", "auto_align", "flip_b", "ruled", "samples"],
+    "loft": ["closed", "cont_a", "tan_a", "cur_a", "cont_b", "tan_b", "cur_b", "auto_align", "flip_b", "ruled", "samples", "flip_normal"],
     "blend_curve": ["cont_a", "w_a", "c_a", "flip_a", "cont_b", "w_b", "c_b", "flip_b"],
     "extrude": ["distance", "direction", "dir_vec", "tilt", "tilt_azimuth", "draft", "draft_flip", "symmetric"],
     "revolve": ["angle", "axis", "pivot", "seam_angle"],
     "offset": ["distance"],
+    "thicken": ["distance", "symmetric"],
     "planar": [],
     "join": ["tolerance"],
     "boolean": ["bool_op"],
+    "boundary_fill": [],
     "loft_rails": ["lr_mode", "lr_start", "lw_start", "lr_end", "lw_end", "lr_ra", "lw_ra", "lr_rb", "lw_rb",
                    "lr_degree", "lr_spans_u", "lr_spans_v"],
     "join_curves": ["jc_mode", "tolerance", "jc_degree", "jc_cvs"],
-    "sweep": ["samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height"],
+    "sweep": ["samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height", "flip_normal"],
     "pipe": ["radius", "samples"],
     "patch": ["pt_cvs", "pt_cvs_v", "pt_auto_cvs", "pt_degree", "pt_fair", "pt_surface_fair"],
-    "boundary": ["bd_exact", "sq_degree_u", "sq_degree_v", "sq_spans_u", "sq_spans_v", "samples"],
+    "boundary": ["bd_exact", "sq_degree_u", "sq_degree_v", "sq_spans_u", "sq_spans_v", "samples", "flip_normal"],
     "square": ["e0", "w0", "e1", "w1", "e2", "w2", "e3", "w3", "sq_match", "sq_degree_u", "sq_degree_v", "sq_spans_u", "sq_spans_v"],
     "iso_curve": ["iso_dir", "param"],
     "surface_fillet": ["radius_a", "radius_b"],
@@ -62,8 +64,8 @@ LABELS = {"tan_a": "Tangent A", "tan_b": "Tangent B", "cur_a": "Curvature A", "c
           "w2": "Weight 3", "w3": "Weight 4", "sq_spans_u": "Spans U (0 auto)", "sq_spans_v": "Spans V (0 auto)"}
 PRETTY = {"patch": "Patch", "square": "Square", "sweep": "Sweep", "pipe": "Pipe", "boundary": "Boundary", "iso_curve": "Iso Curve",
           "dup_edge": "Duplicate Edge", "project_curve": "Projected Curve", "intersect": "Intersection",
-          "join": "Join", "boolean": "Boolean", "join_curves": "Join Curves", "loft_rails": "Loft Rails", "surface_fillet": "Surface Fillet", "loft": "Loft", "blend_curve": "Blend Curve", "extrude": "Extrude", "revolve": "Revolve",
-          "offset": "Offset", "planar": "Planar", "perp_profile": "Profile"}
+          "join": "Join", "split_region": "Split", "boolean": "Boolean", "boundary_fill": "Boundary Fill", "join_curves": "Join Curves", "loft_rails": "Loft Rails", "surface_fillet": "Surface Fillet", "loft": "Loft", "blend_curve": "Blend Curve", "extrude": "Extrude", "revolve": "Revolve",
+          "offset": "Offset", "thicken": "Thicken", "planar": "Planar", "perp_profile": "Profile"}
 
 
 def _on_change(self, context):
@@ -290,6 +292,7 @@ class NprotoFeature(bpy.types.PropertyGroup):
     pl_degree_v: IntProperty(name="Degree V", min=1, max=7, description="Degree along Y", **_F())
     tangent: BoolProperty(name="Tangent to Surface", **_F())
     flip_tangent: BoolProperty(name="Flip Tangent", **_F())
+    flip_normal: BoolProperty(name="Flip Normal", description="Turn the surface over (it faces like the surfaces it is built from; this reverses that)", **_F())
     scale_end: FloatProperty(name="End Scale", min=0.01, soft_max=5.0, **_F())
     twist: FloatProperty(name="Twist", soft_min=-720.0, soft_max=720.0, **_F())
     keep_height: BoolProperty(name="Keep Height (2 rails)", **_F())
@@ -363,6 +366,8 @@ def sync_from_history(obj):
         if h["op"] == "boundary":                                  # older boundaries: fitted, auto layout
             for k_, v_ in (("bd_exact", False), ("sq_degree_u", 0), ("sq_degree_v", 0), ("sq_spans_u", 0), ("sq_spans_v", 0)):
                 params.setdefault(k_, v_)
+        if h["op"] in features.ORIENT_OPS:
+            params.setdefault("flip_normal", False)
         if h["op"] == "patch":                                     # older patches: square nets, fixed size
             params.setdefault("pt_cvs_v", params.get("pt_cvs", 20))
             params.setdefault("pt_auto_cvs", False)
@@ -432,6 +437,28 @@ def draw_feature(layout, context):
                icon='HIDE_ON' if obj.hide_get() else 'OBJECT_DATA')
     if not hist:
         layout.label(text="No history of its own (frozen) -- Edit CVs still works", icon='INFO')
+    pg_s = obj.nproto_step
+    if hist and pg_s.focus and pg_s.index >= 0:
+        # a step picked in the Construction Tree: only that step, not the feature under it
+        try:
+            entries = features.stack(obj)
+        except RuntimeError:
+            entries = []
+        if pg_s.index < len(entries):
+            # laid out like any feature: its name, Pause Rebuild, its settings
+            e = entries[pg_s.index]
+            box = layout.box()
+            row = box.row()
+            row.label(text=f"Feature: {history_ui.step_label(e).partition(' · ')[0]}",
+                      icon=history_ui.STEP_ICON.get(e["op"], 'MODIFIER'))
+            row.operator("nproto.remove_step", text="", icon='TRASH').index = pg_s.index
+            if e["params"].get("_off"):
+                box.label(text="Off: skipped (switch it on in the Construction Tree)", icon='INFO')
+            from .ui import draw_pause
+            draw_pause(box, context)
+            history_ui.draw_steps(box, obj, only=pg_s.index, bare=True)
+            history_ui.draw_tree(layout, context, obj)
+            return
     if hist:
         h = features.history(obj)
         box = layout.box()
@@ -440,8 +467,14 @@ def draw_feature(layout, context):
             title = PRETTY.get(op, op.replace("prim_", "").title())
             row = box.row()
             row.label(text=f"Feature: {title}", icon='MODIFIER')
-            if op in ("join", "join_curves", "boolean"):
+            if op in features.KEEP_OPS:
                 row.operator("nproto.restore_inputs", text="Restore Inputs", icon='LOOP_BACK')
+            if op == "surface_fillet":       # how it was built (set in the Fillet's redo panel)
+                prm = h["params"]
+                shape = ("Blend G%d" % prm["blend"]) if prm.get("blend") else \
+                    ("Chamfer" if prm.get("xsect") == 0 else "Circular")
+                box.label(text=f"Shape: {shape} · Rail: {'Chord' if prm.get('chord') else 'Rolling Ball'}",
+                          icon='MOD_BEVEL')
             from .ui import draw_pause
             draw_pause(box, context)
             if obj.get("nproto_feature_synced") != obj.get(features.PROP_HIST):
@@ -525,7 +558,7 @@ def draw_feature(layout, context):
                             box.label(text=note, icon='ERROR')
         elif features.PROP_HIST in obj:
             box.label(text="Feature: an input was deleted (history broken)", icon='ERROR')
-        history_ui.draw_steps(box, obj)
+        # (its steps -- fillets, trims ... -- are rows of the Construction Tree: click one to edit it)
     history_ui.draw_tree(layout, context, obj)
 
 

@@ -222,7 +222,7 @@ def _base_brep(obj):
 def labels(obj):
     """[{pos, param, value, values, name}] of an object's continuity labels (cached per build)."""
     key = (obj.get("nproto_build_key"), obj.get(features.PROP_HIST), obj.get(features.PROP_STACK),
-           tuple(obj.matrix_world.translation) if obj.type == 'CURVE' else None, features.pending(obj))
+           tuple(obj.matrix_world.translation) if obj.type == 'CURVE' else None, features.pending(obj), _tols())
     hit = _cache.get(obj.session_uid)
     if hit and hit[0] == key:
         return hit[1]
@@ -264,6 +264,15 @@ TOL_ANGLE = 0.1         # degrees between the normals
 TOL_CURV = 0.05         # normal curvature across the edge, relative to the neighbour's largest
 
 
+def _tols():
+    """Angle / curvature tolerances: the Continuity Check's (Analyze panel), so
+    a feature label's red ring and the check agree."""
+    v = getattr(bpy.context.window_manager, "nproto_view", None)
+    if v is None:
+        return TOL_ANGLE, TOL_CURV
+    return float(v.cont_angle_tol), float(v.cont_curv_tol) / 100.0
+
+
 def guide_skip(obj, ref_pts=None):
     """(loop points, distance, loop size): a Patch's guide curves are checked
     only farther than distance from its loop (near an edge the edge's own
@@ -291,6 +300,7 @@ def measure(obj, src, ref, cont, n=33, ease=None, skip_near=None, brep=None):
     feature's result before its history steps)."""
     from .square import _foot, _second, sample_side
     from . import geom, store
+    TOL_ANGLE, TOL_CURV = _tols()
     sd = sample_side(src, ref, n + 4)
     M = np.array(geom.world_matrix(obj), float)
     R, T = M[:3, :3], M[:3, 3]

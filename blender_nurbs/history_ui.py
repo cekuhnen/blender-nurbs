@@ -19,7 +19,7 @@ _syncing = [False]
 # settings each step type exposes (in this order)
 STEP_FIELDS = {
     "trim": ["action", "scope", "projection"],
-    "edge_fillet": ["shape", "radius", "variable", "end_radius", "continuity", "thumbweight",
+    "edge_fillet": ["shape", "rail_type", "radius", "variable", "end_radius", "continuity", "thumbweight",
                     "class_a", "ca_tolerance", "ca_angle", "ca_degree", "ca_continuity"],
     "rebuild_surface": ["degree_u", "degree_v", "spans_u", "spans_v"],
     "extend_surface": ["distance"],
@@ -57,8 +57,11 @@ def _on_step_change(self, context):
         v = getattr(self, name)
         if name == "variable":
             continue
+        if name == "rail_type":                 # chord: the size is the distance between the rails
+            p["chord"] = self.radius if v == "CHORD" else None
+            continue
         if name == "end_radius":
-            p["end_radius"] = v if self.variable else None
+            p["end_radius"] = v if self.variable and self.rail_type != "CHORD" else None
         elif name in ("continuity", "ca_continuity", "ca_degree"):
             p[name] = int(v)
         else:
@@ -75,6 +78,7 @@ def _S(**kw):
 
 class NprotoStep(bpy.types.PropertyGroup):
     index: IntProperty(default=-1)          # the step open for editing (-1: none)
+    focus: BoolProperty(default=False)      # opened from the Construction Tree: the panel shows only this step
     error: StringProperty()
     action: EnumProperty(name="Action", items=[("KEEP", "Keep", "Keep the picked side"),
                                                ("DELETE", "Discard", "Remove the picked side")], **_S())
@@ -85,6 +89,9 @@ class NprotoStep(bpy.types.PropertyGroup):
         ("X", "World X", ""), ("Y", "World Y", ""), ("Z", "World Z", "")], **_S())
     shape: EnumProperty(name="Shape", items=[("CIRCULAR", "Circular", ""), ("CHAMFER", "Chamfer", ""),
                                              ("BLEND", "Blend", "")], **_S())
+    rail_type: EnumProperty(name="Rail", items=[
+        ("RADIUS", "Rolling Ball", "The size is the radius of a ball rolling between the faces"),
+        ("CHORD", "Chord", "The size is the distance between the two rails")], **_S())
     radius: FloatProperty(name="Radius", min=1e-4, soft_max=5.0, unit='LENGTH', **_S())
     variable: BoolProperty(name="Variable Radius", **_S())
     end_radius: FloatProperty(name="End Radius", min=1e-4, soft_max=5.0, unit='LENGTH', **_S())
@@ -118,7 +125,9 @@ def sync_step(obj, k):
         p = raw[k]["params"]
         for name in STEP_FIELDS.get(raw[k]["op"], []):
             try:
-                if name == "variable":
+                if name == "rail_type":
+                    pg.rail_type = "CHORD" if p.get("chord") else "RADIUS"
+                elif name == "variable":
                     pg.variable = p.get("end_radius") is not None
                 elif name == "end_radius":
                     pg.end_radius = p["end_radius"] if p.get("end_radius") is not None else 2 * p.get("radius", 0.1)
@@ -150,10 +159,24 @@ class NPROTO_OT_open_step(bpy.types.Operator):
         obj = context.view_layer.objects.active
         if obj is None:
             return {'CANCELLED'}
+        obj.nproto_step.focus = False
         if obj.nproto_step.index == self.index:
             obj.nproto_step.index = -1
         else:
             sync_step(obj, self.index)
+        return {'FINISHED'}
+
+
+class NPROTO_OT_step_unfocus(bpy.types.Operator):
+    """Back to the whole feature: its settings and all its history steps"""
+    bl_idname = "nproto.step_unfocus"
+    bl_label = "Show Feature"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if obj is not None:
+            obj.nproto_step.focus = False
         return {'FINISHED'}
 
 
@@ -164,9 +187,10 @@ class NPROTO_OT_mute_step(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     index: IntProperty()
+    name: StringProperty(options={'SKIP_SAVE'})    # the step's object (default: the active one)
 
     def execute(self, context):
-        obj = context.view_layer.objects.active
+        obj = bpy.data.objects.get(self.name) if self.name else context.view_layer.objects.active
         raw = _raw_stack(obj) if obj else []
         if not 0 <= self.index < len(raw):
             return {'CANCELLED'}
@@ -198,20 +222,48 @@ class NPROTO_OT_history_focus(bpy.types.Operator):
         obj = bpy.data.objects.get(self.name)
         if obj is None:
             return {'CANCELLED'}
-        if self.reveal:
-            obj.hide_set(False)
-        for o in context.selected_objects:
-            o.select_set(False)
-        try:
-            obj.select_set(True)
-        except RuntimeError:
-            pass
-        context.view_layer.objects.active = obj
-        from . import draw
-        draw.ghost["name"] = obj.name if obj.hide_get() else None
-        context.scene["nproto_tree_root"] = self.root or obj.name
-        for area in context.screen.areas if context.screen else []:
-            area.tag_redraw()
+        _focus(context, obj, self.root, self.reveal)
+        obj.nproto_step.focus = False          # the object itself: its feature and all steps
+        return {'FINISHED'}
+
+
+def _focus(context, obj, root, reveal=False):
+    """Make obj active (a hidden input stays hidden: its edges are drawn as a
+    ghost) and keep root's tree shown."""
+    if reveal:
+        features.set_shown(context, obj, True)
+    for o in context.selected_objects:
+        o.select_set(False)
+    try:
+        obj.select_set(True)
+    except RuntimeError:
+        pass
+    context.view_layer.objects.active = obj
+    from . import draw
+    draw.ghost["name"] = obj.name if not features.is_shown(obj) else None
+    context.scene["nproto_tree_root"] = root or obj.name
+    for area in context.screen.areas if context.screen else []:
+        area.tag_redraw()
+
+
+class NPROTO_OT_tree_step(bpy.types.Operator):
+    """Open this history step: its object becomes active with the step's
+    settings shown for editing"""
+    bl_idname = "nproto.tree_step"
+    bl_label = "Edit History Step"
+    bl_options = {'UNDO'}
+
+    name: StringProperty()
+    root: StringProperty()
+    index: IntProperty()
+
+    def execute(self, context):
+        obj = bpy.data.objects.get(self.name)
+        if obj is None:
+            return {'CANCELLED'}
+        _focus(context, obj, self.root)
+        sync_step(obj, self.index)
+        obj.nproto_step.focus = True           # the panel shows just this step
         return {'FINISHED'}
 
 
@@ -227,7 +279,7 @@ class NPROTO_OT_history_toggle_hide(bpy.types.Operator):
         obj = bpy.data.objects.get(self.name)
         if obj is None:
             return {'CANCELLED'}
-        obj.hide_set(not obj.hide_get())
+        features.set_shown(context, obj, not features.is_shown(obj))
         return {'FINISHED'}
 
 
@@ -240,7 +292,9 @@ def step_label(e):
     return steps.LABEL.get(e["op"], lambda p: e["op"].replace("_", " ").title())(e["params"])
 
 
-def draw_steps(box, obj):
+def draw_steps(box, obj, only=None, bare=False):
+    """The object's history steps; only=k: just step k, open (step focus);
+    bare: only its settings, no row of its own (the step view)."""
     try:
         entries = features.stack(obj)
     except RuntimeError as exc:
@@ -250,25 +304,39 @@ def draw_steps(box, obj):
         return
     pg = obj.nproto_step
     col = box.column(align=True)
-    col.label(text="History steps (applied in order)", icon='SORTSIZE')
+    if only is None:
+        col.label(text="History steps (applied in order)", icon='SORTSIZE')
     for k, e in enumerate(entries):
+        if only is not None and k != only:
+            continue
         off = e["params"].get("_off", False)
-        is_open = pg.index == k
-        row = col.row(align=True)
-        row.operator("nproto.mute_step", text="", icon='CHECKBOX_DEHLT' if off else 'CHECKBOX_HLT',
-                     emboss=False).index = k
-        sub = row.row(align=True)
-        sub.active = not off
-        ins = ", ".join(o.name for o, _ in e["inputs"])
-        sub.operator("nproto.open_step", text=f"{k + 1}. {step_label(e)}" + (f"  ({ins})" if ins else ""),
-                     icon='DISCLOSURE_TRI_DOWN' if is_open else 'DISCLOSURE_TRI_RIGHT', emboss=False).index = k
-        row.operator("nproto.remove_step", text="", icon='X').index = k
+        is_open = pg.index == k or only == k
+        if not bare:
+            row = col.row(align=True)
+            row.operator("nproto.mute_step", text="", icon='CHECKBOX_DEHLT' if off else 'CHECKBOX_HLT',
+                         emboss=False).index = k
+            sub = row.row(align=True)
+            sub.active = not off
+            ins = ", ".join(o.name for o, _ in e["inputs"])
+            sub.operator("nproto.open_step", text=f"{k + 1}. {step_label(e)}" + (f"  ({ins})" if ins else ""),
+                         icon='DISCLOSURE_TRI_DOWN' if is_open else 'DISCLOSURE_TRI_RIGHT', emboss=False).index = k
+            row.operator("nproto.remove_step", text="", icon='X').index = k
         if is_open:
-            inner = col.box().column(align=True)
+            inner = col.column(align=True) if bare else col.box().column(align=True)
             fields = STEP_FIELDS.get(e["op"])
+            rims = None
+            if e["op"] == "edge_fillet":
+                from . import steps as _steps
+                rims = _steps.rims_of(obj, e["params"].get("mids_local", []))
             if fields:
                 for name in fields:
-                    if name == "end_radius" and not pg.variable:
+                    if name == "end_radius" and (not pg.variable or pg.rail_type == "CHORD"):
+                        continue
+                    if name == "variable" and pg.rail_type == "CHORD":
+                        continue
+                    if name == "radius":
+                        inner.prop(pg, name, text="Chord" if pg.rail_type == "CHORD" else
+                                   ("Distance" if pg.shape == "CHAMFER" else "Radius"))
                         continue
                     if name == "thumbweight" and pg.shape != 'BLEND':
                         continue
@@ -276,12 +344,20 @@ def draw_steps(box, obj):
                         continue
                     if name.startswith("ca_") and not pg.class_a:
                         continue
-                    if name in ("action", "continuity", "ca_continuity"):
+                    if name.startswith("ca_") and rims and rims.get("only"):
+                        continue                  # (see the note below: nothing for them to do)
+                    if name in ("action", "continuity", "ca_continuity", "rail_type"):
                         inner.row(align=True).prop(pg, name, expand=True)
                     else:
                         inner.prop(pg, name)
             else:
                 inner.label(text=STEP_NOTE.get(e["op"], "No settings"), icon='INFO')
+            if rims and rims.get("rings"):
+                from .ops_trim import ring_summary
+                note = inner.column(align=True)
+                note.label(text=ring_summary(rims["rings"]).replace("rim ", "Rim: ", 1), icon='MESH_CIRCLE')
+                if pg.class_a and rims.get("only"):
+                    note.label(text="Class-A settings don't apply to it", icon='INFO')
             if e["op"] == "trim":
                 inner.label(text="Keep / Discard flips the trimmed side", icon='INFO')
             if e["op"] == "rebuild_surface":
@@ -291,7 +367,12 @@ def draw_steps(box, obj):
                 inner.label(text=pg.error, icon='ERROR')
 
 
-def _summary(obj):
+STEP_ICON = {"edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
+             "flip_normal": 'NORMALS_FACE', "surface_align": 'SNAP_EDGE', "extend_surface": 'FULLSCREEN_ENTER',
+             "rebuild_surface": 'MOD_REMESH', "refit_trim": 'MOD_LATTICE'}
+
+
+def _summary(obj, steps=True):
     from .feature_ui import PRETTY
     parts = []
     h = features.history(obj)
@@ -299,6 +380,10 @@ def _summary(obj):
         parts.append(PRETTY.get(h["op"], h["op"].replace("prim_", "").replace("_", " ").title()))
     elif features.PROP_HIST in obj:
         parts.append("broken")
+    if not steps:            # the tree lists the steps on their own rows
+        if not parts and features.PROP_BASE in obj:
+            parts.append("snapshot")
+        return parts[0] if parts else ("frozen" if store.is_nurbs(obj) else obj.type.title())
     try:
         parts += [step_label(e).split(" ·")[0] + (" (off)" if e["params"].get("_off") else "")
                   for e in features.stack(obj)]
@@ -340,15 +425,37 @@ def _node(col, obj, depth, role, active, seen, root):
     op.name, op.root = obj.name, root.name
     right = split.row(align=True)
     repeat = obj.name in seen
-    info = "see above" if repeat else _summary(obj)
+    info = "see above" if repeat else _summary(obj, steps=False)
     if role not in ("self", "input"):
         info = f"{role} · {info}"
     right.label(text=info)
-    right.operator("nproto.history_toggle_hide", text="", icon='HIDE_ON' if obj.hide_get() else 'HIDE_OFF',
+    right.operator("nproto.history_toggle_hide", text="", icon='HIDE_OFF' if features.is_shown(obj) else 'HIDE_ON',
                    emboss=False).name = obj.name
     if repeat or depth > 6:
         return
     seen.add(obj.name)
+    # the steps applied on top of the feature (fillets, trims, flips ...), in order
+    try:
+        entries = features.stack(obj)
+    except RuntimeError:
+        entries = []
+        col.label(text="a history step lost an input", icon='ERROR')
+    for k, e in enumerate(entries):
+        sp = col.split(factor=0.5, align=True)
+        lft = sp.row(align=True)
+        lft.separator(factor=1.2 * (depth + 1))
+        label = step_label(e)
+        head, _, rest = label.partition(" · ")
+        off = e["params"].get("_off")
+        op = lft.operator("nproto.tree_step", text=f"{k + 1}. {head}", icon=STEP_ICON.get(e["op"], 'MODIFIER'),
+                          emboss=False, depress=obj == active and obj.nproto_step.index == k)
+        op.name, op.root, op.index = obj.name, root.name, k
+        r = sp.row(align=True)
+        r.active = not off
+        r.label(text=(rest or "step") + (" (off)" if off else ""))
+        mo = r.operator("nproto.mute_step", text="", emboss=False,       # on / off, where the eyes are
+                        icon='CHECKBOX_DEHLT' if off else 'CHECKBOX_HLT')
+        mo.index, mo.name = k, obj.name
     for src, r in _children(obj):
         _node(col, src, depth + 1, r, active, seen, root)
 
@@ -404,13 +511,13 @@ def draw_tree(layout, context, obj):
             op.name, op.root = d.name, d.name
             r = sp.row(align=True)
             r.label(text=_summary(d))
-            r.operator("nproto.history_toggle_hide", text="", icon='HIDE_ON' if d.hide_get() else 'HIDE_OFF',
+            r.operator("nproto.history_toggle_hide", text="", icon='HIDE_OFF' if features.is_shown(d) else 'HIDE_ON',
                        emboss=False).name = d.name
     box.label(text="Click a name to edit it (it stays hidden; Shift+click shows it)", icon='INFO')
 
 
 classes = (NprotoStep, NPROTO_OT_open_step, NPROTO_OT_mute_step, NPROTO_OT_history_focus,
-           NPROTO_OT_history_toggle_hide)
+           NPROTO_OT_history_toggle_hide, NPROTO_OT_tree_step, NPROTO_OT_step_unfocus)
 
 
 def register():

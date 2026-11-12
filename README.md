@@ -282,7 +282,7 @@ module, without OpenUSD. The module is per platform; all can sit side by side in
 
 | Platform | Module |
 |---|---|
-| macOS (arm64, or universal arm64 + Intel) | `_nproto_kernel.cpython-313-darwin.so` |
+| macOS arm64 (Apple Silicon) | `_nproto_kernel.cpython-313-darwin.so` |
 | Windows x64 | `_nproto_kernel.cp313-win_amd64.pyd` |
 | Linux x64 | `_nproto_kernel.cpython-313-x86_64-linux-gnu.so` |
 
@@ -311,7 +311,7 @@ cmake -S kernel_build -B kernel_build/build -DCMAKE_BUILD_TYPE=Release -DPython3
 cmake --build kernel_build/build -j10
 ```
 
-Add `-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"` for one universal module that also runs on Intel Macs. A build tree configured before this change keeps Homebrew's include path in its cache and still works.
+The module is built for Apple Silicon only; Intel Macs are not supported. A build tree configured before this change keeps Homebrew's include path in its cache and still works.
 
 **Linux** (GCC 9+ and `python3.13-dev`, or the manylinux_2_28 container the workflow uses, so the module also loads on older distributions):
 
@@ -335,9 +335,9 @@ The Windows module uses the static C runtime, so it needs no Visual C++ redistri
 
 The build copies the module into `blender_nurbs/kernel/` under a temporary name and renames it over the old one, so a running Blender keeps the module it loaded (writing into a loaded library can crash it on macOS); restart Blender to use the new build. On Windows a loaded `.pyd` can't be replaced at all, so close Blender before building. Worker jobs start a fresh process and use the new module at once.
 
-**Status:** only macOS has been built and tested. This script's arm64 build is byte-identical to the one before, and all headless tests pass with it. The universal build compiles and loads in Blender on Apple Silicon; its Intel half has not been run. The Windows and Linux builds are prepared but not yet compiled; their first run will likely need small fixes.
+**Status:** only macOS has been built and tested. This script's arm64 build is byte-identical to the one before, and all headless tests pass with it. The Windows and Linux builds are prepared but not yet compiled; their first run will likely need small fixes.
 
-**All three at once (GitHub Actions):** `.github/workflows/kernel.yml` builds the module on macOS (universal), Windows x64 and Linux x64 (manylinux_2_28). It then runs the headless test suite in Blender 5.2.1 on each and packages one extension zip with all three modules. It runs on a push that touches the add-on, the kernel build or the tests, or by hand (workflow_dispatch). The project has to be a GitHub repository for this; `.gitignore` keeps `third_party/`, build trees and the built modules out of it.
+**All three at once (GitHub Actions):** `.github/workflows/kernel.yml` builds the module on macOS (arm64), Windows x64 and Linux x64 (manylinux_2_28). It then runs the headless test suite in Blender 5.2.1 on each and packages one extension zip with all three modules. It runs on a push that touches the add-on, the kernel build or the tests, or by hand (workflow_dispatch). The project has to be a GitHub repository for this; `.gitignore` keeps `third_party/`, build trees and the built modules out of it.
 
 **Package:** `python3 tools/package_extension.py` zips `blender_nurbs/` into `dist/nurbs_modeling-<version>.zip`. Its manifest lists exactly the platforms whose module is present (a macOS module is read to tell arm64, Intel or both), so Blender won't install it where it has no kernel. `--check` only lists the modules found. Check a zip with:
 

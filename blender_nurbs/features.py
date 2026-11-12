@@ -375,11 +375,29 @@ def build_revolve(inputs, p):
 
 @builder("offset")
 def build_offset(inputs, p):
+    """Result in the source object's local space (same matrix). One plain
+    surface: the kernel's exact offset surface. Trimmed faces / joined sheets /
+    solids: every face offset, trims kept, corners extended until they meet."""
     sm, _ = _k()
     obj, _ = inputs[0]
-    surf = store.fresh_surfaces(obj)[0]  # fresh: the offset keeps a pointer to its base
-    # Result lives in the source object's local space (same matrix).
-    return sm.create_offset_surface(surf, p.get("distance", 0.1))
+    d = p.get("distance", 0.1)
+    if store.is_natural(obj) and store.get_brep(obj).face_count() == 1:
+        surf = store.fresh_surfaces(obj)[0]  # fresh: the offset keeps a pointer to its base
+        return sm.create_offset_surface(surf, d)
+    from . import jobs
+    _, breps = jobs.run("offset", {"target": obj}, ["result"], distance=d)
+    return ("brep_text", breps["result"])
+
+
+@builder("thicken")
+def build_thicken(inputs, p):
+    """A closed solid from a (joined) sheet: the sheet, its offset and the walls
+    between them (in the source object's local space)."""
+    obj, _ = inputs[0]
+    from . import jobs
+    _, breps = jobs.run("thicken", {"target": obj}, ["result"], distance=p.get("distance", 0.1),
+                        symmetric=bool(p.get("symmetric", False)))
+    return ("brep_text", breps["result"])
 
 
 @builder("planar")
@@ -417,12 +435,177 @@ def record(obj, op, inputs, params):
     for i, (src, _) in enumerate(inputs):
         obj[f"nproto_in_{i}"] = src
     obj[PROP_HIST] = json.dumps({"op": op, "refs": [r for _, r in inputs], "params": params})
+    if op in ORIENT_OPS:     # the caller just built it with run(): how it came out
+        obj[PROP_FLIPPED] = int(LAST_FLIP[0] or 0)
     mark_built(obj)          # the caller just built it from exactly these inputs
     try:  # show it in the Feature panel right away
         from .feature_ui import sync_from_history
         sync_from_history(obj)
     except Exception:
         pass
+
+
+# --------------------------------------------------------------------------
+# Kept inputs: Join / Boolean / Boundary Fill / Thicken keep what they were
+# built from (their history rebuilds from it) in one hidden collection
+# --------------------------------------------------------------------------
+
+HISTORY_COLL = "NURBS History"
+PROP_HOME = "nproto_home"      # JSON list: the collections an input was in before it was kept
+KEEP_OPS = ("join", "join_curves", "boolean", "thicken", "boundary_fill", "split_region")   # results that keep their inputs
+
+
+def history_collection(context, create=True):
+    """The scene's hidden NURBS History collection (made on first use)."""
+    import bpy
+    scene = context.scene
+    coll = next((c for c in scene.collection.children_recursive if c.name.startswith(HISTORY_COLL)
+                 and c.get("nproto_history_coll")), None)
+    if coll is None and create:
+        coll = bpy.data.collections.new(HISTORY_COLL)
+        coll["nproto_history_coll"] = 1
+        scene.collection.children.link(coll)
+    if coll is not None:
+        coll.hide_render = True
+        for vl in scene.view_layers:
+            lc = _layer_coll(vl.layer_collection, coll)
+            if lc is not None and not lc.hide_viewport:
+                lc.hide_viewport = True          # its eye off: Unhide All leaves the inputs hidden
+    return coll
+
+
+def _layer_coll(lc, coll):
+    if lc.collection is coll:
+        return lc
+    for ch in lc.children:
+        r = _layer_coll(ch, coll)
+        if r is not None:
+            return r
+    return None
+
+
+def keep_inputs(context, objs):
+    """Hide the inputs a result was built from in the NURBS History collection
+    (their old collections are remembered for Restore Inputs)."""
+    coll = history_collection(context)
+    for o in objs:
+        homes = [c.name for c in o.users_collection if c is not coll]
+        if homes:
+            o[PROP_HOME] = json.dumps(homes)
+        if coll not in o.users_collection:
+            coll.objects.link(o)
+        for c in list(o.users_collection):
+            if c is not coll:
+                c.objects.unlink(o)
+        o.hide_render = True
+        if PROP_PEEK in o:
+            del o[PROP_PEEK]
+        try:
+            o.hide_set(True)
+        except RuntimeError:
+            pass
+
+
+PROP_PEEK = "nproto_peek"      # a kept input shown for a look (also linked to the scene collection)
+
+
+def set_shown(context, obj, show):
+    """Show / hide an object from the Construction Tree. A kept input lives in
+    the hidden History collection, so showing it also links it to the scene
+    collection for the moment; hiding it again takes that link away."""
+    coll = history_collection(context, create=False)
+    kept = coll is not None and obj.name in coll.objects
+    scol = context.scene.collection
+    if show:
+        if kept and obj.name not in scol.objects:
+            scol.objects.link(obj)
+            obj[PROP_PEEK] = 1
+        try:
+            obj.hide_set(False)
+        except RuntimeError:
+            pass
+    else:
+        try:
+            obj.hide_set(True)
+        except RuntimeError:
+            pass
+        if obj.get(PROP_PEEK):
+            if kept and obj.name in scol.objects:
+                scol.objects.unlink(obj)
+            del obj[PROP_PEEK]
+
+
+def is_shown(obj):
+    try:
+        return obj.visible_get()
+    except RuntimeError:
+        return False
+
+
+def release_inputs(context, objs):
+    """Back from the History collection to where they came from, shown."""
+    import bpy
+    coll = history_collection(context, create=False)
+    for o in objs:
+        homes = [bpy.data.collections.get(n) if n != context.scene.collection.name else context.scene.collection
+                 for n in json.loads(o.get(PROP_HOME, "[]"))]
+        homes = [c for c in homes if c is not None] or [context.collection or context.scene.collection]
+        for c in homes:
+            if o.name not in c.objects:
+                c.objects.link(o)
+        if coll is not None and o.name in coll.objects:
+            coll.objects.unlink(o)
+        if PROP_HOME in o:
+            del o[PROP_HOME]
+        if PROP_PEEK in o:
+            del o[PROP_PEEK]
+        o.hide_render = False
+        try:
+            o.hide_set(False)
+        except RuntimeError:
+            pass
+
+
+def users_of(obj):
+    """Objects whose history (feature or steps) takes obj as an input."""
+    import bpy
+    return [d for d in bpy.data.objects if d is not obj
+            and any(d.get(k) is obj for k in d.keys() if k.startswith(("nproto_in_", "nproto_sin_")))]
+
+
+def purge_inputs(context, candidates):
+    """Delete the kept inputs among candidates (hidden, or in the History
+    collection) that no history uses any more -- and, in turn, the kept
+    inputs they were built from. Visible objects (curves you work with)
+    stay. Returns the deleted names."""
+    import bpy
+    coll = history_collection(context, create=False)
+    todo, gone = list(candidates), []
+    while todo:
+        o = todo.pop()
+        try:
+            name = o.name
+        except ReferenceError:
+            continue
+        if name not in bpy.data.objects or users_of(o):
+            continue
+        try:
+            hidden = o.hide_get()
+        except RuntimeError:            # not in this view layer
+            hidden = True
+        kept = (coll is not None and name in coll.objects) or hidden
+        if not kept:
+            continue
+        todo += history_inputs(o)
+        data = o.data
+        bpy.data.objects.remove(o)
+        if data is not None and getattr(data, "users", 1) == 0:
+            try:
+                (bpy.data.meshes if isinstance(data, bpy.types.Mesh) else bpy.data.curves).remove(data)
+            except Exception:
+                pass
+        gone.append(name)
+    return gone
 
 
 def history(obj):
@@ -440,6 +623,7 @@ def history(obj):
 
 
 NATURAL_STEPS = {"refit_trim", "rebuild_surface", "extend_surface"}   # result is an untrimmed surface
+KEEP_STEPS = {"flip_normal"}     # result is plain / trimmed exactly when its input was
 PROP_STACK = "nproto_stack"   # JSON list of in-place steps: {"op", "refs", "params"}
 PROP_BASE = "nproto_base"     # brep text the stack starts from when there is no base feature
 
@@ -549,10 +733,141 @@ def history_inputs(obj):
     return [obj[k] for k in obj.keys() if k.startswith(("nproto_in_", "nproto_sin_")) and obj[k] is not None]
 
 
+# Features whose surface faces whichever way its inputs happen to run: built
+# from edges of other surfaces it is turned to face the same way as they do
+# (matcaps / shading / a later Join agree across the edges); Flip Normal turns
+# it over on top of that. Patch, Square and Loft Rails orient themselves.
+ORIENT_OPS = {"loft", "boundary", "sweep"}
+PROP_FLIPPED = "nproto_flipped"   # 1 = the last build reversed u (see _rebuild)
+LAST_FLIP = [None]                # the last run()'s decision for an ORIENT_OPS surface (None: not one)
+
+
 def run(op, inputs, params):
     if op not in BUILDERS:
         raise RuntimeError(f"no builder for feature '{op}' (reload the add-on)")
-    return BUILDERS[op](inputs, params)
+    g = BUILDERS[op](inputs, params)
+    LAST_FLIP[0] = None
+    if op in ORIENT_OPS:
+        sm, _ = _k()
+        if isinstance(g, sm.Surface):
+            flip = edge_vote(g, inputs) < 0
+            if params.get("flip_normal"):
+                flip = not flip
+            if flip:
+                from .square import reverse_u
+                g = reverse_u(g)
+            LAST_FLIP[0] = int(flip)
+    return g
+
+
+def edge_vote(surf, inputs, m=12):
+    """> 0: surf faces the same way as the surfaces whose edges are among the
+    inputs, < 0: the other way, 0: no surface edges (or nothing to compare)."""
+    from .square import sample_side, grid_starts, _foot
+    vote = 0.0
+    for obj, ref in inputs:
+        if not is_surface_edge(ref) or not store.is_nurbs(obj):
+            continue
+        try:
+            sd = sample_side(obj, ref, m)
+        except Exception:
+            continue
+        if sd.Nout is None:
+            continue
+        ks = list(range(1, len(sd.P) - 1))
+        starts = grid_starts(surf, [sd.P[k] for k in ks])
+        for k, uv0 in zip(ks, starts):
+            try:
+                _, su, sv = surf.derivatives(*_foot(surf, np.asarray(sd.P[k], float), uv0))
+            except Exception:
+                continue
+            n = np.cross(su, sv)
+            vote += float(n @ sd.Nout[k]) / (np.linalg.norm(n) or 1.0)
+    return vote
+
+
+_U_SWAP = {"U0": "U1", "U1": "U0"}
+
+
+def _swap_u(ref):
+    return _U_SWAP.get(ref, ref) if isinstance(ref, str) else ref
+
+
+def _dependents(obj):
+    """Objects with history that take obj as an input."""
+    import bpy
+    out = []
+    for o in bpy.data.objects:
+        if o is obj:
+            continue
+        if any(o.get(k) is obj for k in o.keys() if k.startswith(("nproto_in_", "nproto_sin_"))):
+            out.append(o)
+    return out
+
+
+def _edge_marks(obj):
+    """Each display edge of obj as (start, mid, end) in local space."""
+    try:
+        polys = store.display(obj).get("edges", [])
+    except Exception:
+        return []
+    out = []
+    for pl in polys:
+        P = np.asarray(pl, float)
+        if len(P):
+            out.append(np.array([P[0], P[len(P) // 2], P[-1]]))
+    return out
+
+
+def _swap_own(obj, entries):
+    """obj's base surface turned over (u reversed): its iso edges U0 / U1
+    swapped. Its stack steps that name them (Match, Extend) follow."""
+    for e in entries:
+        prm = e["params"]
+        if isinstance(prm.get("edges"), list):
+            prm["edges"] = [_swap_u(x) for x in prm["edges"]]
+        if "edge" in prm:
+            prm["edge"] = _swap_u(prm["edge"])
+    if entries:
+        _write_stack(obj, entries)
+
+
+def _remap_dependents(obj, old_marks):
+    """obj turned over: its iso edges U0 / U1 swapped and its B-rep edges may
+    be numbered differently. Every feature built from its edges is renamed to
+    keep the same edges (old_marks: obj's edges before, from _edge_marks)."""
+    new_marks = _edge_marks(obj)
+
+    def e_map(ref):
+        try:
+            i = int(ref[1:])
+            a = old_marks[i]
+        except (ValueError, IndexError):
+            return ref
+        best = None
+        for j, b in enumerate(new_marks):
+            d = min(np.abs(a - b).max(), np.abs(a - b[::-1]).max())
+            if best is None or d < best[0]:
+                best = (d, j)
+        return f"E{best[1]}" if best is not None else ref
+
+    def remap(ref):
+        if is_edge_ref(ref):
+            return _swap_u(ref)
+        if is_brep_edge_ref(ref):
+            return e_map(ref)
+        return ref
+
+    for o in _dependents(obj):
+        if PROP_HIST in o:
+            h = json.loads(o[PROP_HIST])
+            h["refs"] = [remap(r) if o.get(f"nproto_in_{i}") is obj else r for i, r in enumerate(h["refs"])]
+            o[PROP_HIST] = json.dumps(h)
+        if PROP_STACK in o:
+            raw = json.loads(o[PROP_STACK])
+            for k, e in enumerate(raw):
+                e["refs"] = [remap(r) if o.get(f"nproto_sin_{k}_{i}") is obj else r for i, r in enumerate(e["refs"])]
+            o[PROP_STACK] = json.dumps(raw)
 
 
 PROP_KEY = "nproto_build_key"
@@ -649,9 +964,23 @@ def rebuild(obj, context=None, force=False):
 
 
 def _rebuild(obj, context, h, entries, steps):
+    turned = [None]
+    result = _rebuild_inner(obj, context, h, entries, steps, turned)
+    if turned[0] is not None:
+        _remap_dependents(obj, turned[0])
+    return result
+
+
+def _rebuild_inner(obj, context, h, entries, steps, turned):
     natural = False
     if h is not None:
         g = run(h["op"], h["inputs"], h["params"])
+        if h["op"] in ORIENT_OPS and LAST_FLIP[0] is not None and LAST_FLIP[0] != int(obj.get(PROP_FLIPPED, 0)):
+            # it came out turned the other way than last time: the stack's
+            # steps name the base's edges -- swap U0 / U1 before they run
+            turned[0] = _edge_marks(obj)
+            obj[PROP_FLIPPED] = LAST_FLIP[0]
+            _swap_own(obj, entries)
         if h["op"] == "square":
             from .square import store_info
             store_info(obj)
@@ -689,11 +1018,20 @@ def _rebuild(obj, context, h, entries, steps):
         text = steps.APPLY[e["op"]](obj, text, e["inputs"], e["params"])
     store.set_geometry_text(obj, text, context, keep_untrimmed=False)
     active = [e for e in entries if not e["params"].get("_off")]
-    if active and active[-1]["op"] in NATURAL_STEPS:
-        obj[store.PROP_NATURAL] = 1          # the last step made a plain surface again
+    # Flip Normal keeps a surface as it is (plain or trimmed): look past it
+    core = [e for e in active if e["op"] not in KEEP_STEPS]
+    flips = sum(1 for e in active if e["op"] == "flip_normal") % 2
+    if (core and core[-1]["op"] in NATURAL_STEPS) or (not core and natural):
+        obj[store.PROP_NATURAL] = 1          # a plain surface (again)
         if store.PROP_UNTRIM in obj:
             del obj[store.PROP_UNTRIM]
     elif entries:
+        if flips and natural:                # Untrim gives the surface facing the same way
+            try:
+                base_text = steps.flip_text(base_text)
+            except Exception:
+                pass
+        obj[store.PROP_NATURAL] = 0
         obj[store.PROP_UNTRIM] = base_text
         obj[store.PROP_UNTRIM + "_natural"] = 1 if natural else 0
     else:

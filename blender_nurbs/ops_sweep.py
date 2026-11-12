@@ -10,7 +10,7 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, St
 from mathutils import Vector
 
 from . import features, geom, store, sweeps
-from .ops import PickMixin, _decode_inputs, _encode_inputs, _kernel_ok, _select_only
+from .ops import AskValue, PickMixin, _decode_inputs, _encode_inputs, _kernel_ok, _select_only
 
 
 def _new_surface(context, name, op, inputs, params):
@@ -86,7 +86,7 @@ class NPROTO_OT_sweep(PickMixin, bpy.types.Operator):
         return {'FINISHED'}
 
 
-class NPROTO_OT_pipe(PickMixin, bpy.types.Operator):
+class NPROTO_OT_pipe(AskValue, PickMixin, bpy.types.Operator):
     """Sweep an exact circle along curves (selected, or pick one)"""
     bl_idname = "nproto.pipe"
     bl_label = "Pipe"
@@ -101,10 +101,12 @@ class NPROTO_OT_pipe(PickMixin, bpy.types.Operator):
     def invoke(self, context, event):
         if not _kernel_ok(self):
             return {'CANCELLED'}
+        if self.inputs:                     # picked already (see PickMixin._finish)
+            return self.ask(context)
         crv = [o for o in context.selected_objects if o.type == 'CURVE']
         if crv and not event.alt:
             self.inputs = _encode_inputs([(o, "S0") for o in crv])
-            return self.execute(context)
+            return self.ask(context)
         return self.start_picking(context)
 
     def execute(self, context):
@@ -448,7 +450,7 @@ class NPROTO_OT_intersect(bpy.types.Operator):
 # Rebuild Surface, Continuity Check
 # --------------------------------------------------------------------------
 
-class NPROTO_OT_extend(PickMixin, bpy.types.Operator):
+class NPROTO_OT_extend(AskValue, PickMixin, bpy.types.Operator):
     """Extend (or with a negative distance shrink) a surface at one boundary edge,
     continuing its own shape exactly (Alias "Natural" extend). Pick the edge"""
     bl_idname = "nproto.extend"
@@ -470,6 +472,8 @@ class NPROTO_OT_extend(PickMixin, bpy.types.Operator):
     def invoke(self, context, event):
         if not _kernel_ok(self):
             return {'CANCELLED'}
+        if self.inputs:                     # picked already (see PickMixin._finish)
+            return self.ask(context)
         return self.start_picking(context)
 
     def execute(self, context):
@@ -650,7 +654,8 @@ def continuity_report(a, b, samples=60):
         return None
     Mai = Ma.inverted()
     gap, ang = 0.0, 0.0
-    for p, d, fb, q in near:
+    curv = []                 # (relative difference, k_a, k_b) of the curvature across the edge
+    for idx, (p, d, fb, q) in enumerate(near):
         pa = np.array(Mai @ Vector(p))
         fa = min(ba.faces(), key=lambda f: f.closest_point(tuple(pa))[1])
         na = Ra @ _normal_near(fa.surface(), np.array(fa.closest_point(tuple(pa))[0]))
@@ -658,33 +663,43 @@ def continuity_report(a, b, samples=60):
         c = abs(float(na @ nb) / ((np.linalg.norm(na) * np.linalg.norm(nb)) or 1.0))
         gap = max(gap, d)
         ang = max(ang, math.degrees(math.acos(min(1.0, c))))
-    return {"points": len(near), "gap": gap, "angle": ang}
+        # G2: normal curvature of both faces in the direction across the edge
+        prev, nxt = near[max(idx - 1, 0)][0], near[min(idx + 1, len(near) - 1)][0]
+        T = np.asarray(nxt, float) - np.asarray(prev, float)
+        if np.linalg.norm(T) == 0:
+            continue
+        try:
+            ka, nwa = _cross_curvature(fa.surface(), np.array(fa.closest_point(tuple(pa))[0]), Ra, T)
+            kb, nwb = _cross_curvature(fb.surface(), q, Rb, T)
+        except Exception:
+            continue
+        if nwa @ nwb < 0:
+            kb = -kb
+        floor = 1.0 / span            # curvatures below "flat over the whole part" count as equal
+        curv.append((abs(ka - kb) / max(abs(ka), abs(kb), floor), ka, kb))
+    out = {"points": len(near), "gap": gap, "angle": ang}
+    if curv:
+        worst = max(curv, key=lambda x: x[0])
+        out.update(curv_diff=worst[0], k_a=worst[1], k_b=worst[2])
+    return out
 
 
-class NPROTO_OT_continuity(bpy.types.Operator):
-    """Check G0 (gap) and G1 (normal angle) where two selected surfaces meet"""
-    bl_idname = "nproto.continuity"
-    bl_label = "Continuity Check"
-
-    gap_tol: FloatProperty(name="Gap Tolerance", default=1e-3, min=0.0, unit='LENGTH')
-    angle_tol: FloatProperty(name="Angle Tolerance", default=1.0, min=0.0)
-
-    def execute(self, context):
-        sel = [o for o in context.selected_objects if store.is_nurbs(o)]
-        if len(sel) != 2:
-            self.report({'WARNING'}, "Select two NURBS surfaces")
-            return {'CANCELLED'}
-        r = continuity_report(sel[0], sel[1]) or continuity_report(sel[1], sel[0])
-        if r is None:
-            self.report({'WARNING'}, "The surfaces don't meet")
-            return {'CANCELLED'}
-        g0 = "G0 ok" if r["gap"] <= self.gap_tol else "G0 FAIL"
-        g1 = "G1 ok" if r["angle"] <= self.angle_tol else "G1 FAIL"
-        self.report({'INFO'}, f"{g0} (max gap {r['gap']:.2e}) · {g1} (max normal angle {r['angle']:.3f}° "
-                              f") · {r['points']} points")
-        context.scene["nproto_last_continuity"] = json.dumps(r)
-        return {'FINISHED'}
+def _cross_curvature(surf, q, R, T):
+    """Normal curvature (world space) of surf at its point q (local) in the
+    direction across the edge running along T (world). Returns (k, normal):
+    k > 0 when the surface bends towards that normal."""
+    from .square import _foot, _second
+    u, v = _foot(surf, np.asarray(q, float), None)
+    su, sv, suu, suv, svv = (R @ x for x in _second(surf, u, v))
+    n = np.cross(su, sv)
+    n /= np.linalg.norm(n) or 1.0
+    w = np.cross(n, T)
+    w /= np.linalg.norm(w) or 1.0
+    a, b = np.linalg.lstsq(np.array([su, sv]).T, w, rcond=None)[0]
+    du = a * su + b * sv
+    k = (a * a * (suu @ n) + 2 * a * b * (suv @ n) + b * b * (svv @ n)) / max(du @ du, 1e-300)
+    return float(k), n
 
 
 classes = (NPROTO_OT_extend, NPROTO_OT_refit_trim, NPROTO_OT_square, NPROTO_OT_sweep, NPROTO_OT_pipe, NPROTO_OT_boundary, NPROTO_OT_iso_curve, NPROTO_OT_dup_edge,
-           NPROTO_OT_project_curve, NPROTO_OT_intersect, NPROTO_OT_rebuild_surface, NPROTO_OT_continuity)
+           NPROTO_OT_project_curve, NPROTO_OT_intersect, NPROTO_OT_rebuild_surface)

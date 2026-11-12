@@ -1310,11 +1310,18 @@ def _orient_like_neighbours(surf, sides):
             vote += float(n @ sd.Nout[i]) / (np.linalg.norm(n) or 1.0)
     if vote >= 0:
         return surf
+    return reverse_u(surf)
+
+
+def reverse_u(surf):
+    """The same surface with u reversed: the normal turns over; U0 and U1 swap."""
+    _, ext = _k()
     d = ext.surface_cvs(surf)
     nu, nv = d["count_u"], d["count_v"]
     P = np.array(d["points"], float).reshape(nu, nv, 3)[::-1]
     W = np.array(d["weights"], float).reshape(nu, nv)[::-1] if d.get("weights") else None
-    Ku = [1.0 - k for k in reversed(d["knots_u"])]
+    K = list(d["knots_u"])
+    Ku = [K[0] + K[-1] - k for k in reversed(K)]
     pts = [tuple(map(float, P[i, j])) for i in range(nu) for j in range(nv)]
     return ext.surface_from_cvs(d["degree_u"], d["degree_v"], pts, Ku, list(d["knots_v"]),
                                 [float(x) for x in W.reshape(-1)] if W is not None else None)

@@ -8,7 +8,7 @@
 #
 #   macOS    cmake -S kernel_build -B kernel_build/build -DCMAKE_BUILD_TYPE=Release \
 #                  -DPython3_EXECUTABLE=/opt/homebrew/bin/python3.13          (brew install python@3.13)
-#            (universal arm64 + Intel: add -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64")
+#            (Apple Silicon only: Intel Macs are not supported)
 #   Linux    cmake -S kernel_build -B kernel_build/build -DCMAKE_BUILD_TYPE=Release \
 #                  -DPython3_EXECUTABLE=/usr/bin/python3.13                   (python3.13-dev)
 #   Windows  cmake -S kernel_build -B kernel_build/build -A x64 -DPython3_EXECUTABLE=<python.org 3.13>\python.exe
@@ -18,7 +18,7 @@
 #   cmake --build kernel_build/build -j
 #
 # Output, copied into the add-on's kernel/ folder (Python picks the one for its platform):
-#   _nproto_kernel.cpython-313-darwin.so            macOS
+#   _nproto_kernel.cpython-313-darwin.so            macOS arm64
 #   _nproto_kernel.cp313-win_amd64.pyd              Windows x64
 #   _nproto_kernel.cpython-313-x86_64-linux-gnu.so  Linux x64
 
@@ -89,7 +89,9 @@ message(STATUS "Kernel module: _nproto_kernel${PY_SUFFIX}  (Python headers: ${BL
 
 # --- compiler flags (the kernel's own warnings are not ours to fix: silenced)
 if(MSVC)
-  set(KERNEL_OPTS /O2 /W0 /bigobj /utf-8 /EHsc)
+  # /MP: compile a target's files in parallel (MSBuild's -j / /m only runs
+  # whole projects in parallel, and ours depend on each other in a chain)
+  set(KERNEL_OPTS /O2 /W0 /bigobj /utf-8 /EHsc /MP)
   set(MODULE_OPTS ${KERNEL_OPTS})
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS _SCL_SECURE_NO_WARNINGS)
   set(PYBIND_TAG "_msvc_nproto")
