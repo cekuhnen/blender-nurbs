@@ -103,6 +103,11 @@ GROUPS = (
             (_t("nproto.boundary_fill", icon='MESH_CUBE'),),
         )),
     )),
+    ("CONVERT", "Convert", (
+        ("To Mesh", (
+            (_t("nproto.brep_to_mesh", "BREP to Mesh", 'MESH_DATA'),),
+        )),
+    )),
 )
 
 GROUP = {g[0]: g for g in GROUPS}
@@ -199,6 +204,13 @@ class VIEW3D_PT_nproto_surface_edit(_ToolPanel, bpy.types.Panel):
     hint = True
 
 
+class VIEW3D_PT_nproto_convert(_ToolPanel, bpy.types.Panel):
+    bl_label = "Convert"
+    bl_order = 5
+    group = "CONVERT"
+    bl_options = {'DEFAULT_CLOSED'}
+
+
 # ---------------------------------------------------------------- menus
 
 class _ToolMenu:
@@ -228,6 +240,11 @@ class VIEW3D_MT_nproto_surface_edit(_ToolMenu, bpy.types.Menu):
     group = "SURFACE_EDIT"
 
 
+class VIEW3D_MT_nproto_convert(_ToolMenu, bpy.types.Menu):
+    bl_label = "Convert"
+    group = "CONVERT"
+
+
 class VIEW3D_MT_nproto_tools(bpy.types.Menu):
     """All NURBS tools; F3 search finds them by name through this menu"""
     bl_label = "NURBS Proto"
@@ -239,6 +256,7 @@ class VIEW3D_MT_nproto_tools(bpy.types.Menu):
         lay.separator()
         lay.menu("VIEW3D_MT_nproto_curve_edit", icon='CURVE_DATA')
         lay.menu("VIEW3D_MT_nproto_surface_edit", icon='SURFACE_DATA')
+        lay.menu("VIEW3D_MT_nproto_convert", icon='MESH_DATA')
         lay.separator()
         lay.operator("nproto.continuity", icon='DRIVER_DISTANCE')
         lay.operator("nproto.section_add", icon='MOD_EDGESPLIT')
@@ -257,8 +275,9 @@ def menu_add(self, context):
 
 
 classes = (VIEW3D_PT_nproto_curves, VIEW3D_PT_nproto_surfaces, VIEW3D_PT_nproto_curve_edit,
-           VIEW3D_PT_nproto_surface_edit, VIEW3D_MT_nproto_curves, VIEW3D_MT_nproto_surfaces,
-           VIEW3D_MT_nproto_curve_edit, VIEW3D_MT_nproto_surface_edit, VIEW3D_MT_nproto_tools)
+           VIEW3D_PT_nproto_surface_edit, VIEW3D_PT_nproto_convert, VIEW3D_MT_nproto_curves,
+           VIEW3D_MT_nproto_surfaces, VIEW3D_MT_nproto_curve_edit, VIEW3D_MT_nproto_surface_edit,
+           VIEW3D_MT_nproto_convert, VIEW3D_MT_nproto_tools)
 
 
 def register():

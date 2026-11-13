@@ -369,8 +369,14 @@ class _ShapeTool(SketchMixin):
             self.report({'WARNING'}, f"{self.TITLE}: click a straight line or edge")
             return
         if self._plane is None:
-            P = self._mouse_on(context, event, ln[0], self._view_plane(context, ln[0])[1])
-            self.fix_plane(context, P if P is not None else ln[0])
+            W = np.asarray(ln[2], float)
+            f = self._face_under(context, self._mouse(context, event), getattr(event, "alt", False))
+            if f is not None and self.on_face(f, W[0]) and self.on_face(f, W[-1]):
+                self.fix_plane(context, ln[0], on=(W[0], W[-1]))     # a line drawn on a flat face: its plane
+            else:
+                self._face_hover = None
+                P = self._mouse_on(context, event, ln[0], self._view_plane(context, ln[0])[1])
+                self.fix_plane(context, P if P is not None else ln[0])
         self._lines_picked.append(ln)
         self._reset_typing()
 

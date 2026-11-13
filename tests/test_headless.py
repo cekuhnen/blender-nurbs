@@ -3920,18 +3920,19 @@ _menu_ops = sorted(e["op"] for n, r in _drawn.items() if n.startswith("VIEW3D_MT
 _subs = [e["menu"] for e in _drawn["VIEW3D_MT_nproto_tools"] if "menu" in e]
 _menu_kinds = sorted(e["props"].get("kind") for n, r in _drawn.items() if n.startswith("VIEW3D_MT")
                      and n != "VIEW3D_MT_nproto_tools" for e in r if e.get("op") == "nproto.add_primitive")
-check("UI: header menu holds the four groups, the same tools as the panels, and every shape (the curve shapes "
+check("UI: header menu holds the five groups, the same tools as the panels, and every shape (the curve shapes "
       "only there: the panel draws them)",
       sorted(set(_menu_ops)) == sorted(set(_in_panels))
       and _menu_kinds == sorted(list(_prims.CURVE_KINDS) + list(_prims.SURFACE_KINDS))
       and _subs == ["VIEW3D_MT_nproto_curves", "VIEW3D_MT_nproto_surfaces",
-                    "VIEW3D_MT_nproto_curve_edit", "VIEW3D_MT_nproto_surface_edit"], f"{_subs} {_menu_kinds}")
+                    "VIEW3D_MT_nproto_curve_edit", "VIEW3D_MT_nproto_surface_edit",
+                    "VIEW3D_MT_nproto_convert"], f"{_subs} {_menu_kinds}")
 _act = ctx.view_layer.objects.active
 try:
     _shown = _ui.VIEW3D_PT_nproto_active.poll(ctx)
     _top = _draw(_ui.VIEW3D_PT_nproto_active)
     _rest = [_draw(_ui.VIEW3D_PT_nproto_analyze_side), _draw(_ui.VIEW3D_PT_nproto_display),
-             _draw(_ui.VIEW3D_PT_nproto_tessellation), _draw(_ui.VIEW3D_PT_nproto_history)]
+             _draw(_ui.VIEW3D_PT_nproto_history)]
     _hrec = []
     _ui.header_analyze(_NS(layout=_FakeLay(_hrec)), ctx)
     ctx.view_layer.objects.active = None
@@ -3944,14 +3945,14 @@ finally:
     ctx.view_layer.objects.active = _act
 check("UI: Active Object panel shows for a NURBS object, hides with nothing active; Analyze and Settings draw",
       _side_err is None and _shown and _hidden and store.is_nurbs(_act), f"{_side_err} active={_act and _act.name}")
-_tog = ["show_edges", "show_cvs", "show_cont_labels"]
-check("UI: Settings split -- Display (the three toggles), Tessellation (closed, its four values), History; the "
-      "toggles also sit as icons in the 3D view header",
-      _side_err is None and [e["prop"] for e in _rest[1] if "prop" in e] == _tog
-      and len([e for e in _rest[2] if "prop" in e]) == 4
-      and "construction_history" in [e.get("prop") for e in _rest[3]]
+_tog = ["show_edges", "show_cvs", "show_cont_labels", "show_fine_grid"]
+check("UI: Settings split -- Display (the four toggles, then the four tessellation values right under them, "
+      "no sub-panel), History; the toggles also sit as icons in the 3D view header",
+      _side_err is None and [e["prop"] for e in _rest[1] if "prop" in e] == _tog + [
+          "chord_tolerance", "angle_tolerance", "edge_angle_tolerance", "max_edge_rel"]
+      and "construction_history" in [e.get("prop") for e in _rest[2]]
       and [e["prop"] for e in _hrec if e.get("prop") in _tog] == _tog
-      and 'DEFAULT_CLOSED' in _ui.VIEW3D_PT_nproto_tessellation.bl_options, str(_hrec))
+      and not hasattr(_ui, "VIEW3D_PT_nproto_tessellation"), str(_hrec))
 
 # --- Edit CVs on a Patch: trims fitted tightly (re-lifting the edges keeps them in place),
 #     history and the exact B-rep kept unless a CV moves
@@ -6977,5 +6978,518 @@ check("Center snap: a circle's and an arc's centre (curves), a cylinder rim's ce
       and (_he is None or _he[1] != "center")
       and _hr is not None and _hr[1] == "center" and np.allclose(_hr[0][:2], (0, 2), atol=1e-9) and _hr[0][2] > 0.1,
       f"{_hc} | {_ha} | {_he} | {_hr}")
+
+
+# --- Drawing on a flat face: the first point on a flat face (plain mesh or NURBS) draws on its plane,
+#     axes along its edges; a facet of a curved surface (cylinder side, sphere) does not
+import bmesh as _bm
+def _ff_clear():
+    for o_ in list(bpy.data.objects):
+        bpy.data.objects.remove(o_)
+def _ff(obj, view, xy):
+    return _sn.collect([obj]).flat_face(view, np.asarray(xy, float))
+def _prism(name="Chamfer"):
+    """A box (+-1) with its top front edge (y = -1, z = 1, along X) chamfered at 45 degrees."""
+    pent = [(-1, -1), (1, -1), (1, 1), (-0.2, 1), (-1, 0.2)]
+    V = [(x, y, z) for x in (-1.0, 1.0) for (y, z) in pent]
+    F = [(0, 1, 2, 3, 4), (9, 8, 7, 6, 5)] + [(i, (i + 1) % 5, 5 + (i + 1) % 5, 5 + i) for i in range(5)]
+    me = bpy.data.meshes.new(name)
+    me.from_pydata(V, [], F)
+    me.update()
+    o_ = bpy.data.objects.new(name, me)
+    ctx.scene.collection.objects.link(o_)
+    ctx.view_layer.update()
+    return o_
+top, front = _snap_view(), _snap_view(True)
+_ffr = {}
+_ff_clear()
+bpy.ops.mesh.primitive_cube_add(size=2)
+_c = ctx.active_object
+_f = _ff(_c, top, _px(0.3, 0.2))
+_ffr["cube"] = _f is not None and np.allclose(_f["P"], (0.3, 0.2, 1), atol=1e-6) and np.allclose(_f["n"], (0, 0, 1), atol=1e-9) \
+    and np.allclose(_f["u"], (1, 0, 0), atol=1e-9) and np.allclose(_f["v"], (0, 1, 0), atol=1e-9) and len(_f["seg"]) == 4
+_c.rotation_euler = (0, 0, math.radians(30))
+ctx.view_layer.update()
+_f = _ff(_c, top, _px(0.1, 0.1))
+_ffr["rotated"] = _f is not None and np.allclose(_f["u"], (math.cos(math.radians(30)), math.sin(math.radians(30)), 0), atol=1e-6)
+_ff_clear()
+bpy.ops.mesh.primitive_cylinder_add(vertices=32, radius=1, depth=2)
+_c = ctx.active_object
+_ffr["cyl side"] = _ff(_c, front, _px(0.1, 0.2)) is None
+_f = _ff(_c, top, _px(0.2, 0.1))
+_ffr["cyl cap"] = _f is not None and np.allclose(_f["n"], (0, 0, 1), atol=1e-9) and np.allclose(_f["u"], (1, 0, 0), atol=1e-9)
+_ff_clear()
+bpy.ops.mesh.primitive_cylinder_add(vertices=32, radius=1, depth=2, end_fill_type='TRIFAN')
+_c = ctx.active_object
+_f = _ff(_c, top, _px(0.2, 0.1))
+_ffr["fan cap"] = _f is not None and len(_f["seg"]) == 32 and abs(_f["P"][2] - 1) < 1e-6
+_bmc = _bm.new()
+_bmc.from_mesh(_c.data)
+_vert_e = [e_ for e_ in _bmc.edges if abs(e_.verts[0].co.z - e_.verts[1].co.z) > 1.0]
+_bm.ops.subdivide_edges(_bmc, edges=_vert_e, cuts=3, use_grid_fill=True)
+_bmc.to_mesh(_c.data)
+_bmc.free()
+_c.data.update()
+ctx.view_layer.update()
+_sn.forget_meshes()
+_ffr["cut side"] = _ff(_c, front, _px(0.1, 0.2)) is None and len(_c.data.polygons) > 100
+_ff_clear()
+bpy.ops.mesh.primitive_cylinder_add(vertices=8, radius=1, depth=2)
+_ffr["octagon side"] = _ff(ctx.active_object, front, _px(0.05, 0.2)) is not None
+_ff_clear()
+bpy.ops.mesh.primitive_uv_sphere_add(radius=1)
+_ffr["sphere"] = _ff(ctx.active_object, top, _px(0.1, 0.1)) is None
+_ff_clear()
+bpy.ops.mesh.primitive_cube_add(size=2)
+_c = ctx.active_object
+_bv = _c.modifiers.new("Bevel", 'BEVEL')
+_bv.width, _bv.segments = 0.1, 4
+ctx.view_layer.update()
+_f = _ff(_c, top, _px(0.2, 0.1))
+_ffr["bevelled"] = _f is not None and np.allclose(_f["n"], (0, 0, 1), atol=1e-9) and np.allclose(_f["u"], (1, 0, 0), atol=1e-9)
+_c.modifiers.remove(_bv)
+_c.modifiers.new("Tri", 'TRIANGULATE')
+ctx.view_layer.update()
+_sn.forget_meshes()
+_f = _ff(_c, top, _px(0.2, 0.1))
+_ffr["triangulated"] = _f is not None and len(_f["seg"]) == 4 and np.allclose(_f["u"], (1, 0, 0), atol=1e-9)
+_ff_clear()
+bpy.ops.mesh.primitive_grid_add(x_subdivisions=200, y_subdivisions=200, size=2)
+_c = ctx.active_object
+_t0 = _time.perf_counter()
+_f = _ff(_c, top, _px(0.3, -0.4))
+_tgrid = _time.perf_counter() - _t0
+_ffr["grid"] = _f is not None and np.allclose(np.ptp(_f["seg"].reshape(-1, 3), axis=0), (2, 2, 0), atol=1e-6) \
+    and len(_f["seg"]) == 4 * (round(math.sqrt(len(_c.data.polygons))))
+_ffr_grid = (None if _f is None else (len(_f["seg"]), len(_c.data.polygons), np.ptp(_f["seg"].reshape(-1, 3), axis=0)))
+_ff_clear()
+_ch = _prism()
+_f = _ff(_ch, top, _px(0.1, -0.6))
+_n45 = np.array([0, -1, 1]) / math.sqrt(2)
+_ffr["chamfer"] = _f is not None and np.allclose(_f["n"], _n45, atol=1e-9) and np.allclose(_f["u"], (1, 0, 0), atol=1e-9) \
+    and abs(float(_f["P"] @ _n45) - 1.2 / math.sqrt(2)) < 1e-6 and np.allclose(_f["P"][:2], (0.1, -0.6), atol=1e-6)
+_f = _ff(_ch, top, _px(0.1, 0.4))
+_ffr["chamfer top"] = _f is not None and np.allclose(_f["n"], (0, 0, 1), atol=1e-9)
+_m0 = _sn.FLAT_MAX_LOOPS
+_sn.FLAT_MAX_LOOPS = 10
+_sn.forget_meshes()
+_ffr["dense"] = _ff(_ch, top, _px(0.1, 0.4)) is None
+_sn.FLAT_MAX_LOOPS = _m0
+_sn.forget_meshes()
+_ff_clear()
+bpy.ops.nproto.add_primitive(kind="BOX", width=2, depth=2, height=2, degree="0")
+_nb = ctx.active_object
+_ztop = max((_nb.matrix_world @ Vector(c_)).z for c_ in _nb.bound_box)
+_f = _ff(_nb, top, _px(0.3, 0.2))
+_ffr["nurbs box"] = _f is not None and np.allclose(_f["n"], (0, 0, 1), atol=1e-9) and abs(_f["P"][2] - _ztop) < 1e-6 \
+    and np.allclose(_f["u"], (1, 0, 0), atol=1e-6)
+_ff_clear()
+bpy.ops.nproto.add_primitive(kind="CYLINDER", radius=1.0, height=2.0, caps=True)
+_ffr["nurbs cylinder side"] = _ff(ctx.active_object, front, _px(0.1, 0.0)) is None
+check("flat faces: box, rotated box (axes along its edges), cylinder cap (n-gon / fan), octagon side, bevelled and "
+      "triangulated box, subdivided grid, chamfer, NURBS box; not a cylinder side (cut or not), sphere, dense mesh",
+      all(_ffr.values()), str({k_: v_ for k_, v_ in _ffr.items() if not v_}) + f" grid {_ffr_grid}")
+check("flat faces: a 40,000-face grid's flat face is found fast", _tgrid < 0.5, f"{_tgrid:.3f} s")
+
+# ...and the sketch tools draw on it (fake top view over the chamfered box)
+_ff_clear()
+_ch = _prism()
+ctx.scene.cursor.location = (0, 0, 0)
+def _eva(type_, q, value='PRESS', alt=False):
+    e_ = _ev(type_, _wpx(q[0], q[1]), value)
+    e_.alt = alt
+    return e_
+f = _fake_shape(_ds.NPROTO_OT_draw_rectangle, mode="CORNERS", width=1.0, depth=0.5, corner=0.0)
+_at(f, (0.0, -0.6, 0))
+_outl = [np.asarray(s_) for s_ in _drw.sketch_overlay["face"]]
+_b = set(bpy.data.objects)
+_click(f, (-0.5, -0.8, 0))
+_click(f, (0.5, -0.4, 0))
+_o = _newest_curve(_b)
+_pts = _ends(_o)[3] if _o is not None else []
+_off = max(abs(float(q @ _n45) - 1.2 / math.sqrt(2)) for q in _pts) if len(_pts) else 1
+_xr = (min(q[0] for q in _pts), max(q[0] for q in _pts)) if len(_pts) else None
+check("Rectangle on a flat face: the face outlined before the click, the rectangle lies on the chamfer, sides along its edges",
+      len(_outl) == 4 and all(abs(float(s_[k_] @ _n45) - 1.2 / math.sqrt(2)) < 1e-6 for s_ in _outl for k_ in (0, 1))
+      and _off < 1e-6 and _xr is not None and abs(_xr[0] + 0.5) < 1e-6 and abs(_xr[1] - 0.5) < 1e-6,
+      f"{len(_outl)} off {_off:.1e} x {_xr}")
+f = _fake_shape(_ds.NPROTO_OT_draw_rectangle, mode="CORNERS", width=1.0, depth=0.5, corner=0.0)
+_b = set(bpy.data.objects)
+for q_ in ((-0.5, -0.8), (0.5, -0.4)):
+    f.modal(fc, _eva('MOUSEMOVE', q_, 'NOTHING', alt=True))
+    f.modal(fc, _eva('LEFTMOUSE', q_, alt=True))
+_o = _newest_curve(_b)
+_pts = _ends(_o)[3] if _o is not None else []
+check("Rectangle with Alt: the view (grid) plane, as before", len(_pts) and max(abs(q[2]) for q in _pts) < 1e-9,
+      f"{[round(q[2], 3) for q in _pts[:3]]}")
+f = _ln_tool()
+_click(f, (0.0, 0.3))
+_click(f, (0.6, 0.6))
+_click(f, (-0.5, -0.6))
+_click(f, (0.4, -0.5))
+_L = f._lines
+check("Line: each new line starts on the flat face under it (the top, then the chamfer), its free end on that face",
+      len(_L) == 2 and all(abs(q[2] - 1) < 1e-6 for q in _L[0])
+      and all(abs(float(np.asarray(q) @ _n45) - 1.2 / math.sqrt(2)) < 1e-6 for q in _L[1]), f"{_L}")
+f.modal(fc, _ev('ESC'))
+_ff_clear()
+
+# the face's corners and edge middles: drawn as small squares, and on a mesh they snap (a run of collinear edges too)
+_fm = {}
+bpy.ops.mesh.primitive_cube_add(size=2)
+_f = _ff(ctx.active_object, top, _px(0.3, 0.2))
+_mk = lambda P: sorted(tuple(round(float(x), 6) for x in q) for q in P)
+_fm["cube"] = _f is not None and _mk(_f["corners"]) == _mk([(x, y, 1) for x in (-1, 1) for y in (-1, 1)]) \
+    and _mk(_f["mids"]) == _mk([(0, -1, 1), (0, 1, 1), (-1, 0, 1), (1, 0, 1)]) and len(_f["snap"]) == 8
+_ff_clear()
+bpy.ops.mesh.primitive_cylinder_add(vertices=32, radius=1, depth=2)
+_f = _ff(ctx.active_object, top, _px(0.2, 0.1))
+_fm["32-gon"] = _f is not None and len(_f["corners"]) == 0 and len(_f["mids"]) == 0
+_ff_clear()
+bpy.ops.mesh.primitive_cylinder_add(vertices=16, radius=1, depth=2)
+_f = _ff(ctx.active_object, top, _px(0.2, 0.1))
+_fm["16-gon"] = _f is not None and len(_f["corners"]) == 16 and len(_f["mids"]) == 16
+_ff_clear()
+bpy.ops.mesh.primitive_grid_add(x_subdivisions=7, y_subdivisions=7, size=2)
+_f = _ff(ctx.active_object, top, _px(0.3, -0.4))
+_fm["grid"] = _f is not None and len(_f["corners"]) == 4 and _mk(_f["mids"]) == _mk([(0, -1, 0), (0, 1, 0), (-1, 0, 0), (1, 0, 0)])
+_ff_clear()
+_ch = _prism()
+_f = _ff(_ch, top, _px(0.1, -0.6))
+_fm["chamfer"] = _f is not None and len(_f["corners"]) == 4 and len(_f["mids"]) == 4 \
+    and _mk(_f["mids"]) == _mk([(0, -1, 0.2), (0, -0.2, 1), (-1, -0.6, 0.6), (1, -0.6, 0.6)])
+_ff_clear()
+bpy.ops.nproto.add_primitive(kind="BOX", width=2, depth=2, height=2, degree="0")
+_nb = ctx.active_object
+_f = _ff(_nb, top, _px(0.3, 0.2))
+_ztop = max((_nb.matrix_world @ Vector(c_)).z for c_ in _nb.bound_box)
+_fm["nurbs box"] = _f is not None and len(_f["corners"]) == 4 and len(_f["mids"]) == 4 and not _f["snap"] \
+    and any(np.allclose(q, (0, 1, _ztop), atol=1e-6) for q in _f["mids"])
+_ff_clear()
+_me = bpy.data.meshes.new("Split")
+_me.from_pydata([(-1, -1, 0), (-0.4, -1, 0), (1, -1, 0), (1, 1, 0), (-1, 1, 0)], [], [(0, 1, 2, 3, 4)])
+_me.update()
+_so = bpy.data.objects.new("Split", _me)
+ctx.scene.collection.objects.link(_so)
+ctx.view_layer.update()
+f = _ln_tool()
+_at(f, (0.0, -0.98))
+_sq = list(_drw.sketch_overlay["face_pts"])
+_fm["run middle snaps"] = _drw.sketch_overlay["snap_label"] == "Mid" and _drw.sketch_overlay["snap"] is not None \
+    and np.allclose(np.asarray(_drw.sketch_overlay["snap"]), (0, -1, 0), atol=1e-6) and len(_sq) == 8
+f.modal(fc, _ev('ESC'))
+check("face squares: corners and edge middles (box, grid, chamfer, 16-gon, NURBS box; none on a 32-gon); "
+      "a mesh face's snap, even the middle of a side split unevenly",
+      all(_fm.values()), str({k_: v_ for k_, v_ in _fm.items() if not v_}) + f" {_drw.sketch_overlay['snap_label']} {_drw.sketch_overlay['snap']}")
+_ff_clear()
+
+
+# --- BREP to Mesh: plain meshes meshed afresh (Light: n-gons on flat faces, quads on curved ones), welded,
+#     exact corner normals, UVs, seams, sharp creases, the brep_face attribute; the operator
+import bmesh as _bmx
+from blender_nurbs import brep_mesh as _bmm
+def _bm_clear():
+    for o_ in list(bpy.data.objects):
+        bpy.data.objects.remove(o_)
+def _bm_stats(me):
+    b_ = _bmx.new()
+    b_.from_mesh(me)
+    open_ = sum(1 for e_ in b_.edges if len(e_.link_faces) != 2)
+    area_ = sum(f_.calc_area() for f_ in b_.faces)
+    vol_ = b_.calc_volume(signed=True)
+    b_.free()
+    return open_, area_, vol_
+def _bm_of(o, **kw):
+    me_, m_ = _bmm.mesh_from_brep(store.get_brep(o), "T_" + o.name, **kw)
+    return me_, m_, _bmm.counts(me_), _bm_stats(me_)
+_bmr = {}
+_bm_clear()
+bpy.ops.nproto.add_primitive(kind="BOX", width=2, depth=2, height=2, degree="0")
+_bx = ctx.active_object
+me, m, c, (op_, ar_, vo_) = _bm_of(_bx)
+_fa = np.empty(len(me.polygons), np.int64)
+me.attributes["brep_face"].data.foreach_get("value", _fa)
+_bmr["box: 6 quads, closed, outward, one polygon per B-rep face"] = \
+    c["faces"] == 6 and c["quads"] == 6 and c["verts"] == 8 and op_ == 0 and abs(vo_ - 8.0) < 1e-9 \
+    and sorted(_fa.tolist()) == list(range(6))
+_bmr["box: its 12 edges are seams and sharp"] = sum(e_.use_seam for e_ in me.edges) == 12 \
+    and sum(not e_.use_edge_sharp for e_ in me.edges) == 0
+me, m, c, (op_, ar_, vo_) = _bm_of(_bx, light=False)
+_bmr["box, Triangles: 12 triangles"] = c["faces"] == 12 and c["tris"] == 12 and op_ == 0
+_bm_clear()
+bpy.ops.nproto.add_primitive(kind="CYLINDER", radius=1.0, height=2.0, caps=True)
+_cy = ctx.active_object
+me, m, c, (op_, ar_, vo_) = _bm_of(_cy)
+_ba = store.get_brep(_cy).area(1e-7)
+_sides = [p_ for p_ in me.polygons if len(p_.vertices) == 4]
+_rad = [math.hypot(*np.mean([me.vertices[v_].co[:2] for v_ in p_.vertices], axis=0)) for p_ in _sides]
+_diag = math.sqrt(2 * 2 + 2 * 2 + 2 * 2)
+_bmr["cylinder: 2 n-gon caps + one strip of quads, closed, within the chord"] = \
+    c["ngons"] == 2 and c["tris"] == 0 and 40 <= c["quads"] <= 64 and op_ == 0 and vo_ > 0 \
+    and max(1 - r_ for r_ in _rad) <= 0.001 * _diag * 1.01 and c["faces"] * 50 < len(_cy.data.polygons)
+_uv = me.uv_layers["UVMap"]
+_suv = np.array([_uv.data[li].uv[:] for p_ in _sides for li in p_.loop_indices])
+_span = np.ptp(_suv, axis=0)
+_bmr["cylinder: Real Size UVs (side 2 pi r by 2 m), seam + rims are seams, rims sharp, side smooth"] = \
+    abs(_span.max() - 2 * math.pi) < 0.05 * 2 * math.pi and abs(_span.min() - 2.0) < 1e-3 \
+    and sum(e_.use_seam for e_ in me.edges) == c["quads"] * 2 + 1 \
+    and sum(e_.use_edge_sharp for e_ in me.edges) == 2 * c["quads"]
+_ok_n = True
+for p_ in me.polygons:
+    for li in p_.loop_indices:
+        if Vector(me.corner_normals[li].vector).dot(p_.normal) <= 0:
+            _ok_n = False
+_bmr["normals: every corner normal on its polygon's outer side"] = _ok_n
+me, m, c, (op_, ar_, vo_) = _bm_of(_cy, uv_mode="NORMALIZED")
+_suv = np.array([d_.uv[:] for d_ in me.uv_layers["UVMap"].data])
+_bmr["0-1 per Face UVs"] = _suv.min() > -1e-9 and _suv.max() < 1 + 1e-9
+_bm_clear()
+bpy.ops.nproto.add_primitive(kind="SPHERE")
+_sp = ctx.active_object
+_cnt = {}
+for d_ in ("LOW", "MEDIUM", "HIGH"):
+    _t0 = _time.perf_counter()
+    me, m, c, (op_, ar_, vo_) = _bm_of(_sp, detail=d_)
+    _cnt[d_] = (c["faces"], op_, _time.perf_counter() - _t0)
+    if d_ == "MEDIUM":
+        _poles = {i_ for i_, v_ in enumerate(me.vertices) if abs(abs(v_.co.z) - 1) < 1e-6 and abs(v_.co.x) < 1e-6}
+        _tri_pole = all(_poles & set(p_.vertices) for p_ in me.polygons if len(p_.vertices) == 3)
+        _sp_q = c["quads"] / c["faces"]
+_bmr["sphere: closed at every detail, more faces with more detail, triangles only at the poles"] = \
+    all(v_[1] == 0 for v_ in _cnt.values()) and _cnt["LOW"][0] < _cnt["MEDIUM"][0] < _cnt["HIGH"][0] \
+    and _tri_pole and _sp_q > 0.9 and _cnt["HIGH"][2] < 3.0
+_bm_clear()
+bpy.ops.nproto.add_primitive(kind="TORUS")
+me, m, c, (op_, ar_, vo_) = _bm_of(ctx.active_object)
+_bmr["torus (no edges): closed, nearly all quads"] = op_ == 0 and c["quads"] > 0.95 * c["faces"] and vo_ > 0
+_bm_clear()
+bpy.ops.nproto.add_primitive(kind="BOX", width=2, depth=2, height=2, degree="0"); _a = ctx.active_object
+bpy.ops.nproto.add_primitive(kind="CYLINDER", radius=0.4, height=4.0, caps=True); _c = ctx.active_object
+_c.location = (0.3, 0.2, -1.0); ctx.view_layer.update()
+bpy.ops.nproto.boolean(operation="DIFFERENCE", names=json.dumps([_a.name, _c.name]))
+_bo = ctx.active_object
+me, m, c, (op_, ar_, vo_) = _bm_of(_bo)
+_bab = store.get_brep(_bo).area(1e-7)
+_bmr["box with a hole: closed, n-gons around the hole, quads in it, area within 0.1%"] = \
+    op_ == 0 and c["ngons"] == 4 and c["tris"] == 0 and abs(ar_ - _bab) < 1e-3 * _bab
+_bm_clear()
+bpy.ops.nproto.add_primitive(kind="SPHERE"); _s = ctx.active_object
+bpy.ops.nproto.add_primitive(kind="BOX", width=1.2, depth=1.2, height=1.2, degree="0"); _b = ctx.active_object
+_b.location = (0.7, 0.6, 0.5); ctx.view_layer.update()
+bpy.ops.nproto.boolean(operation="DIFFERENCE", names=json.dumps([_s.name, _b.name]))
+_so = ctx.active_object
+me, m, c, (op_, ar_, vo_) = _bm_of(_so)
+_bas = store.get_brep(_so).area(1e-7)
+_bmr["sphere cut by a box (trimmed curved face): closed, mostly quads, area within 0.5%"] = \
+    op_ == 0 and c["quads"] > 0.8 * c["faces"] and abs(ar_ - _bas) < 5e-3 * _bas and not m.problems
+_bm_clear()
+bpy.ops.nproto.add_primitive(kind="BOX", width=2, depth=2, height=2, degree="0"); _f = ctx.active_object
+bpy.ops.nproto.edge_fillet(inputs=json.dumps([[_f.name, f"E{i}"] for i in store.shared_edges(_f)]), radius=0.3)
+_fo = ctx.active_object
+me, m, c, (op_, ar_, vo_) = _bm_of(_fo)
+_baf = store.get_brep(_fo).area(1e-7)
+_shp = sum(e_.use_edge_sharp for e_ in me.edges)
+_bmr["filleted box: closed, area within 0.1%, no sharp edges (all tangent)"] = \
+    op_ == 0 and abs(ar_ - _baf) < 1e-3 * _baf and _shp == 0
+check("BREP to Mesh: " + ", ".join(k_ for k_ in _bmr), all(_bmr.values()),
+      str({k_: v_ for k_, v_ in _bmr.items() if not v_}) + f" counts {_cnt}")
+
+# even, symmetric lines: a surface symmetric left to right (its curvature strongest at the sides) meshes into a
+# mirror-symmetric grid of quads (lines picked one by one from an end left a short piece at the far end);
+# an untrimmed face's grid sets its edges' points, so its two rails get the same columns
+_xs = np.linspace(-2.0, 2.0, 7)
+_ys = np.linspace(0.0, 1.5, 5)
+_pts = [(float(x), float(y), float(0.25 * x ** 4 + 0.1 * y * y)) for x in _xs for y in _ys]
+_sym = store.new_object(ctx, "SymPatch", ext.surface_from_cvs(3, 3, _pts, geom.clamped_uniform_knots(7, 3),
+                                                              geom.clamped_uniform_knots(5, 3)))
+_symr = {}
+for d_ in ("LOW", "MEDIUM", "HIGH"):
+    me, m, c, _st = _bm_of(_sym, detail=d_)
+    V_ = np.array([v_.co[:] for v_ in me.vertices])
+    R_ = V_ * (-1, 1, 1)
+    _err = float(np.sqrt(((R_[:, None] - V_[None]) ** 2).sum(axis=2)).min(axis=1).max())
+    _symr[d_] = (c["faces"], c["quads"], c["tris"], round(_err, 9))
+check("BREP to Mesh: a symmetric surface meshes into a mirror-symmetric grid of quads at every detail",
+      all(v_[0] == v_[1] and v_[2] == 0 and v_[3] < 1e-6 for v_ in _symr.values())
+      and _symr["LOW"][0] < _symr["MEDIUM"][0] < _symr["HIGH"][0], str(_symr))
+bpy.data.objects.remove(_sym)
+
+# the operator: a plain mesh object beside the NURBS object (hidden), materials and modifiers kept; Join; Pack
+_bm_clear()
+bpy.ops.nproto.add_primitive(kind="CYLINDER", radius=1.0, height=2.0, caps=True)
+_o1 = ctx.active_object
+_mat = bpy.data.materials.new("BMTest")
+_o1.data.materials.append(_mat)
+_o1.modifiers.new("Bev", 'BEVEL').width = 0.02
+bpy.ops.nproto.add_primitive(kind="BOX", width=1, depth=1, height=1, degree="0")
+_o2 = ctx.active_object
+_o2.location = (4, 0, 0)
+ctx.view_layer.update()
+bpy.ops.object.select_all(action='DESELECT')
+_o1.select_set(True)
+ctx.view_layer.objects.active = _o1
+_r = bpy.ops.nproto.brep_to_mesh(detail="LOW", pack=True)
+_d1 = ctx.active_object
+_puv = np.array([d_.uv[:] for d_ in _d1.data.uv_layers["UVMap"].data])
+_res = {"ran": _r == {'FINISHED'}, "plain": not store.is_nurbs(_d1) and _d1.type == 'MESH' and _d1.name == _o1.name + " Mesh",
+        "material": list(_d1.data.materials) == [_mat], "modifier": [m_.type for m_ in _d1.modifiers] == ['BEVEL']
+        and abs(_d1.modifiers[0].width - 0.02) < 1e-9,
+        "hidden": _o1.hide_get() and _o1.hide_render, "same place": np.allclose(np.array(_d1.matrix_world), np.array(_o1.matrix_world)),
+        "packed": _puv.min() > -1e-9 and _puv.max() < 1 + 1e-9, "counts": _bmm.LAST.get("counts", {}).get("faces") == len(_d1.data.polygons)}
+bpy.ops.object.select_all(action='DESELECT')
+_o1.hide_set(False)
+_o1.select_set(True)
+_o2.select_set(True)
+ctx.view_layer.objects.active = _o2
+_n0 = len(bpy.data.objects)
+_r = bpy.ops.nproto.brep_to_mesh(join=True, hide_original=False)
+_res["join"] = _r == {'FINISHED'} and len(bpy.data.objects) == _n0 + 1 and not _o2.hide_get()
+bpy.ops.object.select_all(action='DESELECT')
+_res["poll needs a NURBS object"] = not bpy.ops.nproto.brep_to_mesh.poll()
+_res["Object > Convert lists it"] = _bmm.menu_convert in getattr(bpy.types.VIEW3D_MT_object_convert.draw, "_draw_funcs", [])
+check("BREP to Mesh operator: plain mesh beside the hidden NURBS object, material + modifier kept, packed UVs, "
+      "counts; Join; poll; Object > Convert menu", all(_res.values()), str({k_: v_ for k_, v_ in _res.items() if not v_}))
+_bm_clear()
+
+
+# --- Ctrl grid snap in a Side view: the step is measured along the drawing plane (world X faces the viewer
+#     there, which made the step huge before the first point)
+class _FCtxSide(_FCtx):
+    """bpy.context with a Right orthographic view (looking along -X: screen x = Y, y = Z), 1000 px = 4 units."""
+    def __init__(self):
+        # (not _FCtx.__init__: a later test reuses the name it builds its view rotation with)
+        self.region = _types.SimpleNamespace(x=0, y=0, width=1000, height=1000, type='WINDOW')
+        R_ = _Mx(((0, 0, 1), (1, 0, 0), (0, 1, 0)))                 # view axes in world
+        V_ = _Mx.Translation((0, 0, -10)) @ R_.transposed().to_4x4()
+        Wm = _Mx(((0.5, 0, 0, 0), (0, 0.5, 0, 0), (0, 0, -0.01, 0), (0, 0, 0, 1)))
+        self.region_data = _types.SimpleNamespace(view_matrix=V_, perspective_matrix=Wm @ V_, window_matrix=Wm,
+                                                  view_rotation=R_.to_quaternion(), is_perspective=False,
+                                                  view_distance=10.0, view_perspective='ORTHO')
+        self.area = _FArea(self.region, self.region_data)
+_bm_clear()
+fcs = _FCtxSide()
+ctx.scene.cursor.location = (0, 0, 0)
+f = _fake(_dt.NPROTO_OT_draw_line, polyline=False, start_mode="FREE", line_mode="EDGE")
+f._edit, f._lines, f._start, f._lock, f._start_refs = None, [], None, None, None
+f._reset_typing()
+f.sketch_start(fcs)
+_q = (0.37, 0.52)                                           # world (y, z)
+_P, _ = f.pick_point(fcs, _ev('MOUSEMOVE', (500 + 250 * _q[0], 500 + 250 * _q[1]), 'NOTHING', ctrl=True))
+_st = f._grid_step(fcs, np.zeros(3), (0, 1, 0))
+_on = _P is not None and abs(_P[0]) < 1e-9 and all(abs(_P[k] / _st - round(_P[k] / _st)) < 1e-6 for k in (1, 2))
+check("Ctrl grid in a Side view: the first point lands on the visible grid in the YZ plane (step <= 1)",
+      _on and _st <= 1.0 and abs(_P[1] - _q[0]) <= 0.5 * _st + 1e-9 and abs(_P[2] - _q[1]) <= 0.5 * _st + 1e-9,
+      f"P {_P} step {_st}")
+f.sketch_end(fcs)
+
+
+# --- In any view that isn't Top / Front / Side the sketch lies on the world's XY plane (the floor grid) through
+#     the origin, Ctrl snaps to the world grid there; nearly level with it, the upright world plane facing the
+#     view; the 3D cursor (moved, rotated) plays no part
+from mathutils import Euler as _Eu
+class _FCtxView(_FCtxSide):
+    """bpy.context with an orthographic view turned by R (view axes in world), 1000 px = 4 units."""
+    def __init__(self, R_):
+        self.region = _types.SimpleNamespace(x=0, y=0, width=1000, height=1000, type='WINDOW')
+        V_ = _Mx.Translation((0, 0, -10)) @ R_.transposed().to_4x4()
+        Wm = _Mx(((0.5, 0, 0, 0), (0, 0.5, 0, 0), (0, 0, -0.01, 0), (0, 0, 0, 1)))
+        self.region_data = _types.SimpleNamespace(view_matrix=V_, perspective_matrix=Wm @ V_, window_matrix=Wm,
+                                                  view_rotation=R_.to_quaternion(), is_perspective=False,
+                                                  view_distance=10.0, view_perspective='ORTHO')
+        self.area = _FArea(self.region, self.region_data)
+_bm_clear()
+ctx.scene.cursor.location = (0.3, -0.7, 0.45)                 # moved and turned: it must not matter
+ctx.scene.cursor.rotation_euler = (math.radians(30), 0, math.radians(15))
+fcv = _FCtxView(_Eu((math.radians(55), 0, math.radians(35))).to_matrix())
+f = _fake(_dt.NPROTO_OT_draw_line, polyline=False, start_mode="FREE", line_mode="EDGE")
+f._edit, f._lines, f._start, f._lock, f._start_refs = None, [], None, None, None
+f._reset_typing()
+f.sketch_start(fcv)
+_pl = f._view_plane(fcv, np.zeros(3))
+_P, _ = f.pick_point(fcv, _ev('MOUSEMOVE', (561, 437), 'NOTHING', ctrl=True))
+_P0, _ = f.pick_point(fcv, _ev('MOUSEMOVE', (561, 437), 'NOTHING'))
+_st = f._grid_step(fcv, np.zeros(3), (1, 0, 0), (0, 1, 0))
+_floor = np.allclose(_pl[1], (0, 0, 1), atol=1e-9) and np.allclose(_pl[2], (1, 0, 0), atol=1e-9) \
+    and _P is not None and abs(_P[2]) < 1e-9 and all(abs(_P[k] / _st - round(_P[k] / _st)) < 1e-6 for k in (0, 1)) \
+    and _st <= 1.0 and _P0 is not None and abs(_P0[2]) < 1e-9
+_lvl = f._view_plane(_FCtxView(_Eu((math.radians(85), 0, math.radians(20))).to_matrix()), np.zeros(3))
+_upright = np.allclose(_lvl[1], (0, -1, 0), atol=1e-9) and np.allclose(_lvl[3], (0, 0, 1), atol=1e-9) \
+    and np.allclose(_lvl[2], (1, 0, 0), atol=1e-9)
+f._lock = "X"                                               # an axis lock's first point: along world X, through the origin
+_PX, _ = f.pick_point(fcv, _ev('MOUSEMOVE', (600, 450), 'NOTHING'))
+f._lock = None
+_axis0 = _PX is not None and abs(_PX[1]) < 1e-9 and abs(_PX[2]) < 1e-9
+f.sketch_end(fcv)
+ctx.scene.cursor.location = (0, 0, 0)
+ctx.scene.cursor.rotation_euler = (0, 0, 0)
+check("Free view: the sketch lies on the world floor through the origin (wherever the 3D cursor is, however turned), "
+      "Ctrl lands on world grid points; nearly level with it the upright world plane facing the view; an X lock's "
+      "first point runs along world X",
+      _floor and _upright and _axis0, f"floor {_pl[1]} {_P} {_P0} step {_st} | level {_lvl[1:]} | X lock {_PX}")
+
+# --- Ctrl on a slanted face: the grid sits square on the face, its lines through the face's centre
+_fc = {"u": np.array([1.0, 0, 0]), "v": np.array([0, 0.6, 0.8]), "c": np.array([0.13, 0.2, 0.4])}
+_fa = {"u": np.array([1.0, 0, 0]), "v": np.array([0, 1.0, 0]), "c": np.array([0.13, 0.2, 0.4])}
+check("Ctrl grid origin: a slanted face's centre; a level face's, and no face, the world origin",
+      np.allclose(_dt.SketchMixin._grid_origin(np.ones(3), _fc), _fc["c"])
+      and np.allclose(_dt.SketchMixin._grid_origin(np.ones(3), _fa), 0)
+      and np.allclose(_dt.SketchMixin._grid_origin(np.ones(3), None), 0))
+
+# --- Ctrl step in a close perspective view: from the projection's derivative (a whole-unit step went behind
+#     the camera and gave 1 m), the fewer pixels per unit of the plane's two axes
+_Rp = _Eu((math.radians(60), 0, 0)).to_matrix()
+_Vp = (_Mx.Translation((0, -0.1, 0.06)) @ _Rp.to_4x4()).inverted()
+_Wp = _Mx(((2.78, 0, 0, 0), (0, 2.78, 0, 0), (0, 0, -1.0002, -0.020002), (0, 0, -1, 0)))
+_rvp = _types.SimpleNamespace(perspective_matrix=_Wp @ _Vp)
+_rgp = _types.SimpleNamespace(width=1000, height=1000)
+_ppx = _dt.pixels_per_unit(_rgp, _rvp, np.zeros(3), [np.array((1.0, 0, 0))])
+_ppy = _dt.pixels_per_unit(_rgp, _rvp, np.zeros(3), [np.array((0, 1.0, 0))])
+_ppb = _dt.pixels_per_unit(_rgp, _rvp, np.zeros(3), [np.array((1.0, 0, 0)), np.array((0, 1.0, 0))])
+_hx = 1e-6
+_q0 = _Wp @ _Vp @ Vector((0, 0, 0, 1)); _q1 = _Wp @ _Vp @ Vector((_hx, 0, 0, 1))
+_fd = np.linalg.norm((np.array(_q1[:2]) / _q1[3] - np.array(_q0[:2]) / _q0[3]) * 500) / _hx
+check("Ctrl step in a close perspective view: pixels per unit from the projection's derivative (matches a tiny "
+      "step), the fewer of the plane's two axes",
+      abs(_ppx - _fd) < 1e-3 * _fd and _ppy < _ppx and abs(_ppb - _ppy) < 1e-9 and _ppx > 5000,
+      f"x {_ppx:.0f} (fd {_fd:.0f}) y {_ppy:.0f}")
+
+# --- Fine floor grid (draw.py): a turned orthographic view gets the levels below 1 m / 1 ft a Top view draws
+from blender_nurbs import draw as _drw
+_flm = _dt.fine_grid_levels("METRIC", 1.0, 1.0, 10)
+_fli = _dt.fine_grid_levels("IMPERIAL", 1.0, 1.0, 10)
+_fl2 = _dt.fine_grid_levels("METRIC", 1.0, 2.0, 10)
+_lv_ok = _flm is not None and np.allclose(_flm[0], [0.001, 0.01, 0.1, 1.0]) and _flm[1] == 1.0 \
+    and _fli is not None and np.allclose(_fli[0], [0.0000254, 0.0254, 0.3048, 0.9144]) and abs(_fli[1] - 0.3048) < 1e-12 \
+    and _fl2 is not None and abs(_fl2[1] - 2.0) < 1e-12 and _dt.fine_grid_levels("NONE", 1.0, 1.0, 10) is None
+_tv = _FCtxView(_Eu((math.radians(30), 0, math.radians(20))).to_matrix())
+_rvo = _types.SimpleNamespace(is_perspective=False, window_matrix=_Mx.Diagonal((2 * 1640 / 1000, 2 * 1640 / 1000, -0.01, 1)),
+                              view_rotation=_tv.region_data.view_rotation, view_location=Vector((0.2, 0.1, 0.0)))
+_rgo = _types.SimpleNamespace(width=1000, height=1000)
+_sqo = _drw.fine_grid_square(_rvo, _rgo, 1000.0, _fli[0], _fli[1], _dt.GRID_FADE_PX)
+_rvf = _types.SimpleNamespace(is_perspective=False, window_matrix=_Mx.Diagonal((0.02, 0.02, -0.01, 1)),
+                              view_rotation=_tv.region_data.view_rotation, view_location=Vector((0, 0, 0)))
+_sqf = _drw.fine_grid_square(_rvf, _rgo, 1000.0, _fli[0], _fli[1], _dt.GRID_FADE_PX)
+_rve = _types.SimpleNamespace(is_perspective=False, window_matrix=_rvo.window_matrix, view_location=Vector((0, 0, 0)),
+                              view_rotation=_Eu((math.radians(90), 0, 0)).to_quaternion())
+_sqe = _drw.fine_grid_square(_rve, _rgo, 1000.0, _fli[0], _fli[1], _dt.GRID_FADE_PX)
+_hw = 1000 / (2 * 1640)
+_camp = _Mx.Translation((0.4, -0.3, 0.8)) @ _Eu((math.radians(50), 0, 0)).to_matrix().to_4x4()
+_rvp2 = _types.SimpleNamespace(is_perspective=True, view_matrix=_camp.inverted(), window_matrix=_Wp)
+_rvp3 = _types.SimpleNamespace(is_perspective=True, view_matrix=(_Mx.Translation((0, 0, 900.0)) @ _camp).inverted(),
+                               window_matrix=_Wp)
+_sqp = _drw.fine_grid_square(_rvp2, _rgo, 1000.0, _flm[0], _flm[1], _dt.GRID_FADE_PX)
+_sqh = _drw.fine_grid_square(_rvp3, _rgo, 1000.0, _flm[0], _flm[1], _dt.GRID_FADE_PX)
+_Rp_exp = 1.5 * 0.1 * 2.78 * 500 / _dt.GRID_FADE_PX
+_vw = bpy.context.window_manager.nproto_view
+check("Fine Grid toggle: on by default, a Display toggle and a header icon",
+      _vw.show_fine_grid is True and ("show_fine_grid", "Fine Grid", 'GRID') in _ui.DISPLAY_TOGGLES)
+check("Fine floor grid: levels mm / cm / 10 cm (thou / inch) under 1 m (1 ft), none without units; a turned "
+      "orthographic view gets a square covering what it sees of the floor, none zoomed out or edge-on; a "
+      "perspective view a square around the eye out to where 10 cm lines get too dense, none from high up",
+      _lv_ok and _sqo is not None and abs(_sqo[0] - 0.2) < 1e-6 and abs(_sqo[1] - 0.1) < 1e-6
+      and _sqo[2] >= _hw / math.cos(math.radians(30)) and _sqo[2] < 1.0 and _sqf is None and _sqe is None
+      and _sqp is not None and abs(_sqp[0] - 0.4) < 1e-6 and abs(_sqp[1] + 0.3) < 1e-6
+      and abs(_sqp[2] - _Rp_exp) < 1e-6 * _Rp_exp and _sqh is None,
+      f"{_flm} {_fli} | square {_sqo} far {_sqf} edge-on {_sqe} | persp {_sqp} high {_sqh}")
 
 print("ALL OK" if ok else "SOME FAILED")

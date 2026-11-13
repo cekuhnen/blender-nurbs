@@ -16,17 +16,23 @@ Line
   Tangent (a line tangent to two circles). A / Shift+A over a line or curve:
   the direction stays parallel / square to it (linesolve.py).
 
-Points land on the drawing plane: the grid plane in an axis-aligned
-orthographic view (Top / Front / Side), else the view plane, through the 3D
-cursor (or through the first snapped point). Clicks snap (see snapping.py) to
+Points land on the drawing plane, chosen by the first point: the plane of
+the flat face under it (a mesh's or a NURBS surface's; axes along the face's
+edges; outlined before the click; snapping.Targets.flat_face), else -- over a
+curved surface, nothing, or with Alt -- the grid plane in an axis-aligned
+orthographic view (Top / Front / Side), else the world's XY plane (the
+floor grid; the upright XZ or YZ plane when the floor is seen nearly
+edge-on), through the world origin (or through the first snapped point).
+The 3D cursor plays no part: it places new objects (Shift+A), not sketches.
+Ctrl snaps to that plane's grid. Clicks snap (see snapping.py) to
 the ends, middles, CVs and any point of visible curves, to the vertices,
 middles and any point of surface edges, to face centres, to the CVs of
 surfaces whose CV net is shown, to the points drawn so far, and (Blender's
 snap menu: the magnet and its elements) to mesh vertices, edges, edge and face
 centres and faces. Ctrl snaps to
 the grid, Shift to 15 degree angles from the previous point.
-Locks: X / Y / Z along that world axis from the previous point (from the 3D
-cursor for the first), stopping where it crosses a smart guide;
+Locks: X / Y / Z along that world axis from the previous point (from the
+world origin for the first), stopping where it crosses a smart guide;
 Shift+X / Y / Z in the plane of the other two axes. A lock, Ctrl or Shift
 leaves only the point snaps on, not the edges.
 CV Curve start / end conditions (S / E keys, or the F9 panel): an end snapped
@@ -517,6 +523,7 @@ DEGREE_PAD = {f"NUMPAD_{i}": i for i in range(1, 6)}
 NUMPAD_CHARS = {f"NUMPAD_{i}": str(i) for i in range(10)} | {
     "NUMPAD_PERIOD": ".", "NUMPAD_MINUS": "-", "NUMPAD_PLUS": "+", "NUMPAD_SLASH": "/", "NUMPAD_ASTERIX": "*"}
 GUIDE_PX = 6.0          # a smart guide snaps within this many pixels
+EDGE_ON_DEG = 12.0      # a free view this close to level with the floor draws on an upright world plane
 GUIDE_LABEL = {"align": "Aligned", "tangent": "Tangent", "extend": "Extension", "perp": "Perpendicular",
                "parallel": "Parallel"}
 COL_GUIDE = (0.75, 0.75, 0.75, 0.9)
@@ -593,6 +600,32 @@ def grid_steps(system, scale_length=1.0, grid_scale=1.0, subdivisions=10):
     return steps
 
 
+# the base unit Blender's floor grid stops at in any view but Top / Front / Side
+# (perspective, or orthographic turned): it skips the levels below it there,
+# which the axis views draw (ED_view3d_grid_steps)
+GRID_BASE = {"METRIC": 1.0, "IMPERIAL": 0.3048}
+
+
+def fine_grid_levels(system, scale_length=1.0, grid_scale=1.0, subdivisions=10):
+    """(levels, base) for the fine floor grid (draw.py): base is the finest
+    level Blender draws on the floor of a perspective or turned orthographic
+    view (1 m, 1 ft, times the Grid Scale); levels are four of the axis-view
+    levels, finest first, starting at most three below base (mm, cm, 10 cm;
+    thou, inch), so those views get the levels a Top view has. None when the floor lacks none
+    (no units)."""
+    steps = grid_steps(system, scale_length, grid_scale, subdivisions)
+    if system not in GRID_BASE:
+        return None
+    base = GRID_BASE[system] * grid_scale / (scale_length or 1.0)
+    fine = [k for k, st in enumerate(steps) if st < base * (1 - 1e-9)]
+    if not fine:
+        return None
+    i0 = max(0, len(fine) - 3)
+    lv = steps[i0:i0 + 4]
+    lv += [lv[-1]] * (4 - len(lv))
+    return lv, base
+
+
 def visible_grid_step(steps, ppu):
     """The finest grid level drawn at least half visible at ppu pixels per unit.
     The viewport fades a level in from GRID_FADE_PX apart (invisible) to the
@@ -608,11 +641,32 @@ def visible_grid_step(steps, ppu):
     return steps[i + 1]
 
 
+def pixels_per_unit(region, rv3d, at, axes):
+    """Screen pixels per world unit at the point `at` along each of `axes`,
+    the smallest: the exact derivative of the view's projection there (a
+    finite step of a whole unit went behind the camera, or far off, in a
+    close perspective view). None behind the camera."""
+    M = np.array(rv3d.perspective_matrix, float)
+    q = M @ np.append(np.asarray(at, float), 1.0)
+    if q[3] <= 1e-12 or not axes:
+        return None
+    half = np.array([region.width, region.height], float) * 0.5
+    rates = []
+    for a in axes:
+        da = M[:, :3] @ np.asarray(a, float)
+        rates.append(float(np.linalg.norm((da[:2] * q[3] - q[:2] * da[3]) / (q[3] * q[3]) * half)))
+    return max(min(rates), 1e-9)
+
+
 class SketchMixin:
     """Point picking on a drawing plane with snapping."""
 
+    face_planes = True          # a first point on a flat face draws on that face's plane
+
     def sketch_start(self, context):
         self._plane = None          # (origin, normal, u, v), fixed by the first point
+        self._plane_face = None     # the flat face (snapping.Targets.flat_face) the plane lies on, or None
+        self._face_hover = None     # the flat face under the mouse the next first point would draw on
         self._snaps = self._snap_targets(context)
         self._hover = None          # (point, snap info)
         self._refs = None           # references at the hovered snap: {"keys", "cands", "i"}
@@ -621,11 +675,11 @@ class SketchMixin:
         self._last_edge = None      # the edge last slid along: it stays the reference at its ends
         self._acquired = []         # points snapped to lately: smart guides align to them too
         draw.sketch_overlay.update(curves=[], hull=[], cvs=[], snap=None, snap_label=None, axes=[],
-                                   refs=[], cursor=None, comb=None, guides=[])
+                                   refs=[], cursor=None, comb=None, guides=[], face=[], face_pts=[])
 
     def sketch_end(self, context):
         draw.sketch_overlay.update(curves=[], hull=[], cvs=[], snap=None, snap_label=None, axes=[],
-                                   refs=[], cursor=None, comb=None, guides=[])
+                                   refs=[], cursor=None, comb=None, guides=[], face=[], face_pts=[])
         hints.clear(context)
 
     # -- key hints (hints.py) shared by the sketch tools ----------------------
@@ -664,6 +718,13 @@ class SketchMixin:
 
     # -- drawing plane ----------------------------------------------------
     def _view_plane(self, context, through):
+        """The drawing plane where no flat face chose one: in a Top / Front /
+        Side view that view's grid plane; in any other view (perspective or
+        turned) the world's XY plane -- the floor grid -- or, seen nearly
+        edge-on (within EDGE_ON_DEG), whichever of the world's XZ / YZ planes
+        faces the view more. Never the screen plane (it turned with every
+        orbit and matched no grid), never the 3D cursor's (Blender turns the
+        cursor to the view when it is placed, which tilted the sketch)."""
         rv3d = self._win(context)[1]
         vdir = np.array(rv3d.view_rotation @ Vector((0.0, 0.0, -1.0)), float)
         axis = int(np.argmax(np.abs(vdir)))
@@ -672,11 +733,30 @@ class SketchMixin:
             n[axis] = 1.0
             u, v = {2: ((1, 0, 0), (0, 1, 0)), 1: ((1, 0, 0), (0, 0, 1)), 0: ((0, 1, 0), (0, 0, 1))}[axis]
             u, v = np.array(u, float), np.array(v, float)
+            return np.asarray(through, float), n, u, v
+        ex, ey, ez = np.eye(3)
+        if abs(float(vdir[2])) >= math.sin(math.radians(EDGE_ON_DEG)):
+            n = ez if vdir[2] < 0 else -ez                   # facing the viewer
+            u = ex
+            v = np.cross(n, u)                               # seen from below the floor: its Y flips
         else:
-            n = -vdir
-            u = np.array(rv3d.view_rotation @ Vector((1.0, 0.0, 0.0)), float)
-            v = np.cross(n, u)
+            n = ey if abs(float(vdir[1])) >= abs(float(vdir[0])) else ex
+            n = n if float(vdir @ n) < 0 else -n
+            v = ez                                           # upright: up stays up
+            u = np.cross(v, n)
         return np.asarray(through, float), n, u, v
+
+    @staticmethod
+    def _grid_origin(O, face=None):
+        """Where Ctrl's grid lines cross on a plane through O: the world origin
+        when its axes are world axes (the grid Blender draws), else -- a
+        slanted face -- the face's centre, so the grid sits square on it."""
+        if face is None:
+            return np.zeros(3)
+        aligned = lambda a: float(np.abs(np.asarray(a, float)).max()) > 1 - 1e-9
+        if aligned(face["u"]) and aligned(face["v"]):
+            return np.zeros(3)
+        return np.asarray(face.get("c", O), float)
 
     def _ray_point(self, context, mouse, plane):
         region, rv3d = self._win(context)
@@ -703,16 +783,21 @@ class SketchMixin:
         region, rv3d = self._win(context)
         return snapping.View(rv3d.perspective_matrix, rv3d.view_matrix, region.width, region.height)
 
-    def _grid_step(self, context, at):
+    def _grid_step(self, context, at, u=None, v=None):
         """The grid step Ctrl snaps to here: the finest grid level the view
         draws at least half visible (visible_grid_step), so points land on
-        lines you can see, never between them."""
-        p0 = self._to_px(context, at)
-        u = self._plane[2] if self._plane else np.array([1.0, 0, 0])
-        p1 = self._to_px(context, at + u)
-        if p0 is None or p1 is None:
+        lines you can see, never between them. The pixels per unit are taken
+        along the drawing plane's axes u and v at the point (the plane's, or
+        before the first point the one the point lands on), the shorter of
+        the two -- as the fine floor grid (draw.py) fades its levels -- from
+        the projection's derivative, so a close perspective view measures
+        right too."""
+        if u is None:
+            pl = self._plane or self._view_plane(context, at)
+            u, v = pl[2], pl[3]
+        ppu = pixels_per_unit(*self._win(context), at, [a for a in (u, v) if a is not None])
+        if ppu is None:
             return 1.0
-        ppu = max(np.linalg.norm(p1 - p0), 1e-9)
         us = context.scene.unit_settings
         ov = getattr(getattr(context.area, "spaces", None) and context.area.spaces.active, "overlay", None)
         steps = grid_steps(us.system, us.scale_length or 1.0, getattr(ov, "grid_scale", 1.0) or 1.0,
@@ -904,11 +989,69 @@ class SketchMixin:
         return [hints.key("Ctrl", "grid"), hints.key("Alt", "no snapping"),
                 hints.toggle("O", "on surface", snapping.SNAP_STATE["surface"])]
 
+    # -- drawing on a flat face ---------------------------------------------
+    def plane_open(self):
+        """Does the next click choose the drawing plane? (no point yet)"""
+        return self._plane is None
+
+    def _face_under(self, context, mouse, free=False):
+        """The flat face under the mouse whose plane the next click draws on
+        (snapping.Targets.flat_face), kept for fix_plane and outlined; None
+        once the plane is chosen, with Alt, or over no flat face."""
+        f = None
+        if self.face_planes and not free and self.plane_open():
+            try:
+                f = self._snaps.flat_face(self._view(context), np.asarray(mouse, float))
+            except Exception as exc:
+                print("NURBS face plane:", exc)
+        self._face_hover = f
+        shown = self._shown_face()
+        draw.sketch_overlay["face"] = list(shown["seg"]) if shown is not None else []
+        draw.sketch_overlay["face_pts"] = [] if shown is None else \
+            [tuple(map(float, q)) for q in shown.get("corners", ())] + [tuple(map(float, q)) for q in shown.get("mids", ())]
+        return f
+
+    def _shown_face(self):
+        """The flat face outlined now: the one under the mouse before the first
+        point, then the one the sketch is drawn on."""
+        f = getattr(self, "_face_hover", None)
+        if f is None and self._plane is not None:
+            f = getattr(self, "_plane_face", None)
+        return f
+
+    @staticmethod
+    def on_face(f, Q):
+        """Does point Q lie on the plane of the flat face f?"""
+        return f is not None and Q is not None \
+            and abs(float((np.asarray(Q, float) - f["P"]) @ f["n"])) <= 1e-4 * f["size"] + 1e-9
+
+    def fix_plane(self, context, P, on=()):
+        """Choose the drawing plane at the first point P: the plane of the flat
+        face under the mouse when P (and the points `on`) lie on it -- axes
+        along its edges --, else the view plane through P (the grid plane in
+        a Top / Front / Side view)."""
+        if not self.plane_open():
+            return
+        f = getattr(self, "_face_hover", None)
+        if f is not None and all(self.on_face(f, Q) for Q in (P, *on)):
+            self._plane = (np.asarray(P, float), f["n"], f["u"], f["v"])
+            self._plane_face = f
+        elif self._plane is None or getattr(self, "_plane_face", None) is not None:
+            self._plane = self._view_plane(context, P)
+            self._plane_face = None
+
     def _pick(self, context, event, extra=(), prev=None):
         mouse = self._mouse(context, event)
         free = bool(getattr(event, "alt", False))       # Alt held: a free point, nothing snaps
         draw.sketch_overlay["guides"] = []
-        plane = self._plane or self._view_plane(context, np.array(context.scene.cursor.location, float))
+        f = self._face_under(context, mouse, free)
+        shown = self._shown_face()
+        if shown is not None and shown.get("snap"):     # a mesh face's corners and edge middles (the squares) snap
+            extra = list(extra) + list(shown["snap"])
+        if f is not None:                               # before the first point: on the flat face under the mouse
+            plane = (f["P"], f["n"], f["u"], f["v"])
+        else:
+            plane = self._plane or self._view_plane(context, np.zeros(3))
         O, n, u, v = plane
         el = getattr(self, "_edge_lock", None)
         k = self._snaps.line_index(*el) if el else None
@@ -919,15 +1062,15 @@ class SketchMixin:
         lock = getattr(self, "_lock", None)
         if lock and (lock[-1] in "XYZT" or (lock == "A" and prev is not None)):
             # world axis lock (X / Y / Z) or plane lock (Shift+X / Y / Z), from
-            # the previous point, or from the 3D cursor for the first one; a
+            # the previous point, or from the world origin for the first one; a
             # direction taken from a line (A) only once there is a previous point
-            base = prev if prev is not None else np.array(context.scene.cursor.location, float)
+            base = prev if prev is not None else np.zeros(3)
             hit = None if free else self._snaps.pick(self._view(context), mouse, extra, edges=False,
                                                      segments=self.drawn_segments())
             region, rv3d = self._win(context)
             ray = (np.array(view3d_utils.region_2d_to_origin_3d(region, rv3d, Vector(mouse)), float),
                    np.array(view3d_utils.region_2d_to_vector_3d(region, rv3d, Vector(mouse)), float))
-            step = self._grid_step(context, base) if event.ctrl and hit is None else None
+            step = self._grid_step(context, base, u, v) if event.ctrl and hit is None else None
             vec = getattr(self, "_tvec", None) if lock[-1] == "T" else getattr(self, "_avec", None) \
                 if lock == "A" else None
             if hit is None and not free and not event.ctrl and lock[0] != "-":
@@ -970,7 +1113,7 @@ class SketchMixin:
                 return None, None
             r = float((P - prev) @ axis)
             if event.ctrl and best is None:
-                st = self._grid_step(context, P)
+                st = self._grid_step(context, P, u, v)
                 r = round(r / st) * st
             return prev + r * axis, None
         if guides:
@@ -986,13 +1129,15 @@ class SketchMixin:
             a = round(a / ANGLE_STEP) * ANGLE_STEP
             r = float(np.linalg.norm([d @ u, d @ v]))
             if event.ctrl:
-                st = self._grid_step(context, P)
+                st = self._grid_step(context, P, u, v)
                 r = max(st, round(r / st) * st)
             P = prev + r * (math.cos(a) * u + math.sin(a) * v)
         elif event.ctrl:
-            st = self._grid_step(context, P)
+            st = self._grid_step(context, P, u, v)
+            face = f if f is not None else (getattr(self, "_plane_face", None) if self._plane is not None else None)
+            g0 = self._grid_origin(O, face)           # the world grid, or a slanted face's own
             x, y = float((P - O) @ u), float((P - O) @ v)
-            ox, oy = float(O @ u), float(O @ v)       # snap to the world grid, not to the cursor
+            ox, oy = float((O - g0) @ u), float((O - g0) @ v)
             x = round((x + ox) / st) * st - ox
             y = round((y + oy) / st) * st - oy
             P = O + x * u + y * v
@@ -1041,7 +1186,7 @@ class SketchMixin:
         lk = getattr(self, "_lock", None)
         out = []
         if lk and (lk[-1] in "XYZT" or (lk == "A" and prev is not None)):
-            base = np.asarray(prev if prev is not None else context.scene.cursor.location, float)
+            base = np.asarray(prev if prev is not None else np.zeros(3), float)
             rv3d = self._win(context)[1]
             big = 50.0 * max(float(getattr(rv3d, "view_distance", 10.0)), 1e-3)
             if lk == "A":
@@ -1123,10 +1268,6 @@ class SketchMixin:
                 out.append(([Vector(p) for p in pl], (COL_REF_FACE[0], COL_REF_FACE[1], COL_REF_FACE[2], alpha), 2.5))
             out.append(([Vector(p) for p in cand["edge"]], (1.0, 1.0, 1.0, alpha), 3.5))
         draw.sketch_overlay["refs"] = out
-
-    def fix_plane(self, context, P):
-        if self._plane is None:
-            self._plane = self._view_plane(context, P)
 
     def typing_ready(self):
         """Typed values are taken now (the tool's first point is placed)."""
@@ -1846,12 +1987,12 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
         if c is None:
             return
         P = self._ray_point(context, Vector(self._mouse(context, event)),
-                            self._plane or self._view_plane(context, np.array(context.scene.cursor.location, float)))
+                            self._plane or self._view_plane(context, np.zeros(3)))
         t = linesolve.nearest_t(c, P if P is not None else c.W[0]) if not c.straight else c.t0
         if kind == "parallel":
             d = c.at(t)[2]
         else:
-            plane = self._plane or self._view_plane(context, np.array(context.scene.cursor.location, float))
+            plane = self._plane or self._view_plane(context, np.zeros(3))
             d = linesolve.side_direction(c, t, plane[1])
         if d is None or np.linalg.norm(d) <= 1e-12:
             return
@@ -1921,6 +2062,10 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
                 if all(abs(float(d @ e)) < 1 - 1e-6 for e, _ in out):
                     out.append((d, "parallel"))
         return out
+
+    def plane_open(self):
+        """Every new line (not one chained on) may start on another flat face."""
+        return getattr(self, "_start", None) is None
 
     def drawn_segments(self):
         out = []
@@ -2391,6 +2536,7 @@ class NPROTO_OT_draw_profile(SketchMixin, bpy.types.Operator):
     bl_label = "Profile"
     bl_options = {'REGISTER', 'UNDO'}
     use_guides = False      # a profile needs a real edge to stand on
+    face_planes = False     # it stands on the edge, square to it
 
     shape: EnumProperty(name="Shape", items=PROFILE_SHAPES, default="CIRCLE")
     radius: FloatProperty(name="Radius", default=0.25, min=1e-6, unit='LENGTH')

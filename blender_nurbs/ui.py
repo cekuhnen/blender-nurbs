@@ -202,6 +202,10 @@ class NprotoView(bpy.types.PropertyGroup):
                                                    "take the picked edges", 'EDGESEL', 4)])
     show_edges: BoolProperty(name="Edges", default=True, update=lambda s, c: _redraw_views(c))
     show_cvs: BoolProperty(name="CVs / Hulls", default=False, update=lambda s, c: _redraw_views(c))
+    show_fine_grid: BoolProperty(name="Fine Grid", default=True, update=lambda s, c: _redraw_views(c),
+                                 description="Finer floor grid lines (mm, cm, 10 cm; inches) in a perspective or turned "
+                                             "orthographic view, where Blender's floor grid stops at 1 m (1 ft); "
+                                             "Ctrl snaps to the lines you see. Blender's Floor overlay hides them too")
     show_cont_labels: BoolProperty(name="Feature Labels", default=True,
                                    description="The continuity each feature was BUILT with: Free / G0 / G1 / G2 labels on the "
                                                "edges of selected Square, Loft, Loft Rails, Blend Curve, Patch and Surface Align "
@@ -495,7 +499,7 @@ class VIEW3D_PT_nproto_active(_SidePanel, bpy.types.Panel):
 class VIEW3D_PT_nproto_analyze_side(_SidePanel, bpy.types.Panel):
     """Continuity check and the analysis overlays (also in the viewport header)"""
     bl_label = "Analyze"
-    bl_order = 5
+    bl_order = 6
     bl_options = {'DEFAULT_CLOSED'}
 
     @classmethod
@@ -513,7 +517,7 @@ class VIEW3D_PT_nproto_analyze_side(_SidePanel, bpy.types.Panel):
 
 
 DISPLAY_TOGGLES = (("show_edges", "Edges", 'MOD_WIREFRAME'), ("show_cvs", "CVs / Hulls", 'OUTLINER_DATA_LATTICE'),
-                   ("show_cont_labels", "Feature Labels", 'FONT_DATA'))
+                   ("show_cont_labels", "Feature Labels", 'FONT_DATA'), ("show_fine_grid", "Fine Grid", 'GRID'))
 
 
 # --------------------------------------------------------------------------
@@ -610,48 +614,48 @@ def draw_clip_warning(layout, context):
 
 
 def draw_display_toggles(layout, v, icons_only=False):
-    """Edges / CVs / Hulls / Feature Labels: in the Display panel, and as icons
-    in the 3D view header (always at hand)."""
-    row = layout.row(align=True)
-    for prop, text, icon in DISPLAY_TOGGLES:
-        row.prop(v, prop, text="" if icons_only else text, icon=icon, toggle=True)
-    return row
+    """Edges / CVs / Hulls / Feature Labels / Fine Grid: two by two in the
+    Display panel (their names fit the sidebar), and as a row of icons in the
+    3D view header (always at hand)."""
+    if icons_only:
+        row = layout.row(align=True)
+        for prop, text, icon in DISPLAY_TOGGLES:
+            row.prop(v, prop, text="", icon=icon, toggle=True)
+        return row
+    col = layout.column(align=True)
+    for i in range(0, len(DISPLAY_TOGGLES), 2):
+        row = col.row(align=True)
+        for prop, text, icon in DISPLAY_TOGGLES[i:i + 2]:
+            row.prop(v, prop, text=text, icon=icon, toggle=True)
+    return col
 
 
 class VIEW3D_PT_nproto_display(_SidePanel, bpy.types.Panel):
     """What the viewport shows of NURBS objects (also as icons in the 3D view header)"""
     bl_label = "Display"
-    bl_order = 6
+    bl_order = 7
 
     @classmethod
     def poll(cls, context):
         return load_kernel() is not None
 
     def draw(self, context):
-        row = draw_display_toggles(self.layout, context.window_manager.nproto_view)
-        row.scale_y = 1.3
-        draw_clip_warning(self.layout, context)
-
-
-class VIEW3D_PT_nproto_tessellation(_SidePanel, bpy.types.Panel):
-    """How finely surfaces are meshed for display (not their exact shape)"""
-    bl_label = "Tessellation"
-    bl_parent_id = "VIEW3D_PT_nproto_display"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
+        col = draw_display_toggles(self.layout, context.window_manager.nproto_view)
+        col.scale_y = 1.3
+        # how finely surfaces are meshed for display (not their exact shape), right under the toggles
         s = context.scene.nproto_settings
         col = self.layout.column(align=True)
         col.prop(s, "chord_tolerance")
         col.prop(s, "angle_tolerance")
         col.prop(s, "edge_angle_tolerance")
         col.prop(s, "max_edge_rel")
+        draw_clip_warning(self.layout, context)
 
 
 class VIEW3D_PT_nproto_history(_SidePanel, bpy.types.Panel):
     """Construction history: on / off, live update, pause, clean up"""
     bl_label = "History"
-    bl_order = 7
+    bl_order = 8
     bl_options = {'DEFAULT_CLOSED'}
 
     @classmethod
@@ -675,7 +679,7 @@ class VIEW3D_PT_nproto_history(_SidePanel, bpy.types.Panel):
 
 
 classes = (NPROTO_OT_rebuild_waiting, NPROTO_OT_fix_clip_start, NprotoSettings, NprotoView, VIEW3D_PT_nproto_active, VIEW3D_PT_nproto_analyze,
-           VIEW3D_PT_nproto_analyze_side, VIEW3D_PT_nproto_display, VIEW3D_PT_nproto_tessellation,
+           VIEW3D_PT_nproto_analyze_side, VIEW3D_PT_nproto_display,
            VIEW3D_PT_nproto_history)
 
 

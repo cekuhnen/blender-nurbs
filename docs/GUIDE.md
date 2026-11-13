@@ -17,11 +17,12 @@ The sidebar tab **NURBS Proto** has one collapsible panel per group. Ctrl+click 
 | **Create Surfaces** | Draw Plane · Plane, Disk, Box, Cylinder, Cone, Sphere, Torus · from curves: Loft, Loft Rails, Sweep, Pipe, Extrude, Revolve, Planar · filling a gap: Boundary, Square, Patch, Dome · from surfaces: Offset, Thicken, Convert Blender Surface |
 | **Curve Edit** | Join / Unjoin Curves, Trim / Split Curves, Rebuild / Extend Curve, Align Curve |
 | **Surface Edit** | Edit CVs, Flip Normal, Rebuild Surface, Extend Surface, Surface Align, Refit to Trim · Trim, Split, Untrim, Join, Unjoin · Surface Fillet, Edge Fillet · solids: Union, Difference, Intersection, Boundary Fill |
+| **Convert** (closed at first) | BREP to Mesh (also in Object › Convert) |
 | **Analyze** (closed at first) | Continuity Check and the overlays (also in the viewport header's Analyze popover) |
-| **Display** | **Edges**, **CVs / Hulls** and **Feature Labels** on / off (also as three icons in the 3D view header, next to the Analyze button, so they are always at hand); **Tessellation** below it (closed at first): Chord / Angle Tolerance, Edge Angle, Max Edge. **Clip Start warning:** a 3D view's depth buffer spreads its precision between Clip Start and Clip End, so a tiny Clip Start (say 1 µm) leaves depth steps of about 8 mm at 0.37 m. Surfaces, edges and Face / Edge highlights then flicker against each other (blotchy fills, dashed edges). When the steps exceed 0.05 % of the view distance, the Display panel says so and a red ⚠ appears in the header: one click sets Clip Start to about a thousandth of the view distance. |
+| **Display** | **Edges**, **CVs / Hulls**, **Feature Labels** and **Fine Grid** on / off (also as four icons in the 3D view header, next to the Analyze button, so they are always at hand); **Fine Grid** draws the floor grid's finer levels (mm, cm, 10 cm; inches) in a perspective or turned orthographic view, where Blender's floor grid stops at 1 m (1 ft); right under them how finely surfaces are meshed for display: Chord / Angle Tolerance, Edge Angle, Max Edge. **Clip Start warning:** a 3D view's depth buffer spreads its precision between Clip Start and Clip End, so a tiny Clip Start (say 1 µm) leaves depth steps of about 8 mm at 0.37 m. Surfaces, edges and Face / Edge highlights then flicker against each other (blotchy fills, dashed edges). When the steps exceed 0.05 % of the view distance, the Display panel says so and a red ⚠ appears in the header: one click sets Clip Start to about a thousandth of the view distance. |
 | **History** (closed at first) | Construction History, Live Update, Pause Rebuild, Delete History, Collect Inputs, Rebuild / Re-tessellate |
 
-The same four tool groups are in the viewport header's **NURBS Proto** menu (Object Mode), so every tool is reachable without the sidebar and **F3** finds each one by name. **Add** (Shift+A) has **NURBS Curves** and **NURBS Surfaces**, the two Create groups. STEP import and export are under File > Import / Export. One table in `toolgroups.py` drives the panels and the menus, so they always list the same tools.
+The same five tool groups are in the viewport header's **NURBS Proto** menu (Object Mode), so every tool is reachable without the sidebar and **F3** finds each one by name. **Add** (Shift+A) has **NURBS Curves** and **NURBS Surfaces**, the two Create groups. STEP import and export are under File > Import / Export. One table in `toolgroups.py` drives the panels and the menus, so they always list the same tools.
 
 ### Key hints (every interactive tool)
 
@@ -124,7 +125,8 @@ Both are under Create Curves. You click in the 3D view to draw.
       anything else lies on the mesh face under the cursor (it leaves the drawing plane). It stays as set for the session
       and shows in the key hints.
     * **Alt: no snapping.** Hold **Alt** to place a point freely on the drawing plane, for example over a dense mesh where
-      a vertex or edge is always near. (With Blender's Emulate 3 Button Mouse on, Alt+click orbits the view instead.)
+      a vertex or edge is always near. A first point placed with Alt also stays on the view plane, not on the face under
+      it. (With Blender's Emulate 3 Button Mouse on, Alt+click orbits the view instead.)
     * **Unselectable objects never snap**: lock a scan, a blueprint or any reference out of snapping by making it
       unselectable (the arrow in the outliner).
     * **Scan data:** a mesh is read the first time the cursor comes near it (about 1.4 s for 2 million faces) and kept
@@ -133,13 +135,31 @@ Both are under Create Curves. You click in the 3D view to draw.
       by point. To keep a scan out of snapping, make it unselectable.
   * **Smart guides** (dashed): the point also snaps onto lines in the drawing plane, within 6 px. Through the points drawn so far and the last points you snapped to (hover a line's end, then move away: its guides stay) they run horizontal and vertical (Aligned), and parallel and perpendicular to the sketch's lines (the 4 newest directions): the perpendicular through a slanted line's end is where an arc makes a half circle; and in Draw Line, from the last point, straight on (Extension, or Tangent after an arc), square to it (Perpendicular) and parallel to the lines drawn (Parallel). Where two guides cross, that point wins over edges, so a slot's return line ends exactly square to its start. With an X / Y / Z lock or a typed angle the point stops where the lock line crosses a guide. Ctrl, Shift and Alt switch guides off.
   * Ends win over the others, then middles and centres, then CVs. Where targets overlap on screen (a box's top and bottom centres in a top view), the one nearest the viewer wins.
-  * **Ctrl** snaps to the grid lines the view shows: the finest grid level drawn at least half visible (whole inches, feet... in Imperial; mm, cm, 10 cm... in Metric), so a point never lands between visible lines. Zoom in for a finer step. **Shift** snaps to 15° steps from the previous point. Both, like **H / V**, keep the point snaps (ends, middles, centres, CVs) but switch the edge snap off, so the grid and angles aren't overridden by every edge nearby.
-  * **Axis locks (both tools):** **X**, **Y** or **Z** locks the next point to that world axis through the previous point (through the 3D cursor for the first point), like G X in Blender. **Shift+X / Y / Z** excludes that axis instead: the point moves in the plane of the other two, so Shift+Z keeps the previous point's height.
+  * **Ctrl** snaps to the grid lines the view shows: the finest grid level drawn at least half visible (whole inches, feet... in Imperial; mm, cm, 10 cm... in Metric), so a point never lands between visible lines. Zoom in for a finer step. In a perspective or turned orthographic view Blender's own floor grid stops at 1 m (1 ft); NURBS Proto draws the finer levels on the floor there (mm, cm, 10 cm; inches), as a Top view has them, so Ctrl has lines to land on. **Display > Fine Grid** (or its grid icon in the header) shows or hides them; Blender's Floor overlay hides them too. **Shift** snaps to 15° steps from the previous point. Both keep the point snaps (ends, middles, centres, CVs) but switch the edge snap off, so the grid and angles aren't overridden by every edge nearby.
+  * **Axis locks (both tools):** **X**, **Y** or **Z** locks the next point to that world axis through the previous point (through the world origin for the first point), like G X in Blender. **Shift+X / Y / Z** excludes that axis instead: the point moves in the plane of the other two, so Shift+Z keeps the previous point's height.
     * The locked axis, or the plane's two axes, are drawn in the axis colours. Pressing the key again unlocks.
     * A lock holds for one point; for a CV Curve, press the key again for the next CV.
     * A snapped point is projected onto the lock's line or plane. **Ctrl** steps the distance from the previous point in grid increments.
     * An axis seen end-on can't be moved along with the mouse: the point stays put (type a length with Draw Line). A plane seen edge-on takes the drawing-plane point under the cursor, projected into the plane.
-  * Points land on the grid plane in Top, Front or Side orthographic views, and on the view plane otherwise, through the 3D cursor or the first snapped point.
+  * **Drawing plane.** The first point chooses the plane the sketch is drawn on:
+    * **On a flat face** (a box side, a cylinder's cap, a flat NURBS face, a mesh's flat face even when it is
+      triangulated or bevelled): that face's plane, its axes along the face's edges. Before the first click the face
+      under the cursor is outlined, with small blue squares on its corners (where the outline turns by 20° or more) and
+      the middle of each side; a free first point lands on it, and so does one snapped to its vertices, edges or
+      centre. The squares snap (on a mesh, the middle of a side made of several edges too), and the outline stays while
+      you draw. A rectangle then lies flat on a slanted face, square to its edges, and a circle sits on it. In Draw Line
+      every new line (not one chained on) can start on another face.
+    * **Elsewhere**, over a curved surface (a cylinder's side, a sphere, a scan, a SubD body: neighbouring facets about
+      as large that bend by less than 30°) or with **Alt** held, on a world grid plane through the world origin (or
+      through the first snapped point):
+      * in a **Top, Front or Side** orthographic view, that view's grid plane;
+      * in **any other view** (perspective, or orthographic turned), the world's **XY plane**: the floor grid, so
+        **Ctrl** lands on its lines. Looking almost level with it (within 12°), the sketch goes on whichever of the
+        world's upright planes (XZ, YZ) faces you more. The sketch never lies in the screen plane, which turned with
+        every orbit and matched no grid.
+      * The **3D cursor** plays no part: it places new objects (Shift+A), not sketches. For a slanted construction
+        plane, place a mesh plane (or a NURBS plane) and sketch on its face: it outlines, its corners and side
+        middles snap, and Ctrl's grid sits square on it, its lines through the face's centre.
   * In curve Edit Mode the new curve becomes a spline of the object being edited.
 * **Other keys:** Backspace undoes the last point (or line), Enter or right-click finishes, Esc cancels.
   * Navigation (middle mouse, wheel, numpad) keeps working while you draw.
@@ -302,7 +322,7 @@ Under Create Surfaces. Like Draw Line, but it makes a flat NURBS surface.
 
 * Click one corner, then the opposite one. Or, after the first click, type the **X** size, press **Tab**, type the **Y** size and press **Enter**. A typed size goes to the side of the mouse; a size you don't type comes from the mouse. Unit letters work as in Draw Line.
 * **C** draws from the centre (the first click is the middle), **Shift** makes it square, **Ctrl** snaps to the grid. The first click snaps like the sketch tools (ends, edges, face centres, CVs) and takes the **X / Y / Z** axis locks. Backspace steps back, Esc or right-click cancels.
-* It lies on the drawing plane: flat in a Top view, standing up in a Front or Side view, facing you in any other view. Its X runs horizontally on screen, its normal towards you.
+* It lies on the drawing plane: on the flat face under the first click (its X along the face's edges), else flat in a Top view, standing up in a Front or Side view, and on the world's XY plane (the floor) in any other view. Its normal points towards you.
 * While you drag, the outline and the CV net it will get are drawn.
 * **Degree U / V** (along X / Y, 1-7, default 3) and **Spans U / V** (default 1, so a 4 x 4 CV plane) are in the Adjust Last Operation panel together with **Size X / Size Y** and **From Centre**. Afterwards they are all in the Feature panel, where Size X / Y resize it about its centre.
 * The **Plane** primitive (placed at the 3D cursor, flat) now has the same Size X / Size Y and its own Degree U / V. Planes made before keep their single degree.
@@ -375,6 +395,43 @@ history. Trimmed and multi-face objects can be picked by their real B-rep edges
 | **Curvature Comb** | Curve objects: NURBS, Bezier, poly (selected, or all visible) | Exact comb from the kernel's 1st/2nd derivatives: hairs of length curvature × **Scale**, pointing away from the centre of curvature, plus the envelope through the tips. An inflection shows as the comb changing side, a curvature jump as a step in the envelope (each knot is sampled just before and after it, so a jump draws as a clean step). **Knots** get a short tick across the curve: grey where the curve is smooth there, **orange where the curvature jumps** (G1 only: a degree-2 curve does this at almost every knot), red at a corner. **Samples** sets the density. **Degree, not Order:** with a curve active, the Active Object panel shows each spline's degree, CVs, spans and kind. **Degree 1-5** buttons set the degree on the same CVs: this is Blender's *Order U* in the spline panel, which is degree + 1, so Order U 3 is degree 2. A degree-2 curve gets a note that its comb steps at the knots. **Rebuild as Degree 3** refits it with the fewest CVs that keep its shape within 0.01 %, so its comb flows (G2). |
 | **Surface Combs** | NURBS surfaces | Curvature combs on iso-curves of the surfaces (Alias Curvature U / V): along U and / or V, with a count for each, and a scale and samples. |
 | **Dynamic Section** | The selected NURBS objects, or all visible ones | Parallel planes through the surfaces with their section curves and curvature combs, live while you move or turn the section: count, step, combs on / off, plane on / off; orient it to X, Y, Z or the view. Click again to switch it off; once more brings it back as it was. One section per scene. |
+
+## Convert
+
+### BREP to Mesh
+
+Under Convert, and in Blender's **Object › Convert › Mesh (NURBS Proto)**. It turns the selected NURBS objects into plain
+mesh objects for rendering, texturing and animation. A dialog shows the settings first (**Convert** runs it); they stay
+adjustable afterwards in the Adjust Last Operation panel. Each object is meshed afresh at the detail you choose, not
+copied from the display mesh. The new object is called "‹name› Mesh"; it keeps the NURBS object's place, parent, collections,
+materials and modifiers. The NURBS object stays with its history, hidden in the viewport and in renders (switch
+**Hide NURBS Objects** off to keep it shown).
+
+* **Mesh: Light** (default) gives every face the lightest mesh that still shades like it:
+  * a **flat face is one n-gon**; a flat face with holes becomes a few n-gons, as Blender's faces can't have holes;
+  * a **curved face is a grid of quads** along its (u, v) lines, only as dense as the surface bends in each
+    direction. A cylinder's side is one strip of long quads, a box 6 quads, a sphere quads with triangle fans at its
+    poles. Where a trim crosses the grid, triangles meet the edge.
+  * The lines are **spread evenly by how much the surface bends** (each step's share of the angle and chord it
+    needs), so a symmetric shape gets a symmetric mesh and the spacing changes smoothly with the curvature.
+  * An **untrimmed face's grid sets the points on its edges**, so it meshes as pure quads: a loft's two rails get the
+    same columns, and a side split into several edges gets a grid line through each vertex.
+  * A NURBS cylinder at Medium is 2 n-gons and 48 quads (360° / 7.5°); its display mesh is 6,332 triangles.
+* **Mesh: Triangles**: the same mesh split into triangles, for game engines and glTF.
+* **Detail**: **Low** (chord 0.4 % of the object's size, 15°), **Medium** (0.1 %, 7.5°), **High** (0.025 %, 3°) or
+  **Custom**. Chord is the largest distance from the mesh to the surface; Angle the largest turn between neighbouring
+  edges or grid lines. Every change re-runs in the Adjust Last Operation panel, which shows the faces (n-gons, quads,
+  triangles), vertices, the triangles a renderer will draw and the display mesh's triangles for comparison.
+* **Welded:** every B-rep edge is sampled once and both faces use its points, so a joined body or a solid comes out
+  closed. Separate objects stay separate meshes; join their surfaces (Surface Edit › Join) first for one closed mesh.
+* **Shading:** each corner gets the exact normal of its own face, so creases stay sharp and tangent joins (fillets)
+  smooth. Edges between faces bending more than 30° are marked sharp as well (for modifiers and Smooth by Angle).
+* **UVs:** one island per face from its (u, v). **Real Size** (default) is in metres, so a texture keeps its scale
+  from face to face; **0-1 per Face** fills the UV square with every face; **None** leaves the UV map out. **Pack
+  Islands** lays the islands side by side in 0-1 for baking. B-rep edges are UV seams, so Unwrap starts from them.
+* **brep_face** (an integer face attribute) names each polygon's B-rep face: select by it in Edit Mode to give a face
+  its own material.
+* **Join** makes one mesh object of all the selected NURBS objects.
 
 ## STEP Import and Export
 

@@ -25,6 +25,13 @@ and around the mouse (MESH_RINGS) hit its faces, and only those faces give
 vertices, edges and centres. So a dense mesh (a subdivided body) snaps as fast
 as a cube, and what lies behind the faces in front is never offered. Mesh
 points have no source: a CV Curve end on a mesh is G0 only.
+Flat faces (flat_face): the sketch tools draw on the plane of the flat face
+under their first point. A mesh face grows into the faces around it on its
+plane (a triangulated or subdivided side is one face) and counts as flat
+unless two neighbours bend by less than 30 degrees and are about as large
+(COMPARABLE): the facets of a cylinder's side, a sphere, a scan -- a bevel
+strip beside a flat face is far smaller, a chamfer at 45 degrees is sharp.
+A NURBS face is flat when its CVs are (_plane_of).
 Everything is measured on screen (SNAP_PX). Where targets overlap on screen (a
 box's top and bottom face centres in a top view) the one nearest the viewer wins.
 
@@ -51,6 +58,10 @@ LABELS = {"first": "Close", "end": "End", "mid": "Mid", "center": "Center", "cv"
 MESH_ELEMENTS = ("VERTEX", "EDGE", "EDGE_MIDPOINT", "FACE", "FACE_MIDPOINT")
 MESH_RINGS = (0.5, 1.0)     # rays around the mouse at these fractions of SNAP_PX (8 each), and one at it
 LOOSE_MAX = 200_000        # more loose vertices + edges than this (a point cloud) don't snap
+FLAT_COS = math.cos(math.radians(0.5))      # faces this parallel (and on one plane) are one flat face
+SHALLOW_COS = math.cos(math.radians(30.0))  # a neighbour bent less than this ...
+COMPARABLE = 0.25       # ... whose own flat part is at least this share of the face: a facet of a curved surface
+FLAT_MAX_LOOPS = 4_000_000      # a denser mesh (a scan) gives no face planes: it would stall the first hover
 CURVE_PER = 32          # samples per Bezier span for the on-curve search
 CENTER_ACC = 1e-6       # kernel centroid accuracy (1e-3 left a disk's centre 4e-6 off)
 _CENTERS = {}           # session_uid -> (rev, {face index: local centre or None})
@@ -148,6 +159,209 @@ class MeshData:
                   f"loose edges; they don't snap (more than {LOOSE_MAX:,}), its faces do")
             self.loose_v = self.loose_v[:0]
             self.loose_e = self.loose_e[:0]
+        self._fg = None             # per-face normals, areas, centres and edge -> faces (flat faces), on demand
+        self._label, self._regions = None, []
+
+    # -- flat faces: the sketch tools draw on the plane of a flat face --------
+    def _faces_geometry(self):
+        """(unit normals, areas, centres) of the faces (local, float64), the
+        face of each loop, and edge -> faces (loops sorted by edge, offsets)."""
+        if self._fg is None:
+            nf, nl = len(self.ls), len(self.lv)
+            W = self.V[self.lv].astype(float)
+            nxt = np.arange(1, nl + 1)
+            nxt[self.ls + self.lt - 1] = self.ls
+            Wn = W[nxt]
+            c = np.stack([(W[:, 1] - Wn[:, 1]) * (W[:, 2] + Wn[:, 2]),
+                          (W[:, 2] - Wn[:, 2]) * (W[:, 0] + Wn[:, 0]),
+                          (W[:, 0] - Wn[:, 0]) * (W[:, 1] + Wn[:, 1])], axis=1)
+            N = np.add.reduceat(c, self.ls, axis=0)             # Newell: twice the area along the normal
+            a2 = np.linalg.norm(N, axis=1)
+            N /= np.maximum(a2, 1e-300)[:, None]
+            C = np.add.reduceat(W, self.ls, axis=0) / self.lt[:, None]
+            lp = np.repeat(np.arange(nf), self.lt)
+            order = np.argsort(self.le, kind="stable")
+            start = np.searchsorted(self.le[order], np.arange(len(self.E) + 1))
+            size = float(np.linalg.norm(np.ptp(self.V, axis=0))) if len(self.V) else 1.0
+            self._fg = (N, 0.5 * a2, C, lp, order, start, size or 1.0)
+            self._label = np.full(nf, -1, np.int32)
+        return self._fg
+
+    def _neighbours(self, polys):
+        """The faces sharing an edge with these faces (themselves included)."""
+        _, _, _, lp, order, start, _ = self._fg
+        es = self.le[_ranges(self.ls[polys], self.lt[polys])]
+        return np.unique(lp[order[_ranges(start[es], start[es + 1] - start[es])]])
+
+    def _grow(self, seed, tol, stop_area=None, cap=200_000):
+        """(mask, area) of the faces reached from seed through faces lying on
+        its plane (parallel within 0.5 degrees, centre within tol); stops
+        once the area reaches stop_area."""
+        N, A, C = self._fg[:3]
+        n0, c0 = N[seed], C[seed]
+        mask = np.zeros(len(self.ls), bool)
+        mask[seed] = True
+        front, area, count = np.array([seed]), float(A[seed]), 1
+        while len(front) and count < cap and (stop_area is None or area < stop_area):
+            nb = self._neighbours(front)
+            nb = nb[~mask[nb]]
+            nb = nb[(np.abs(N[nb] @ n0) >= FLAT_COS) & (np.abs((C[nb] - c0) @ n0) <= tol)]
+            mask[nb] = True
+            front, area, count = nb, area + float(A[nb].sum()), count + len(nb)
+        return mask, area
+
+    def flat_region(self, poly):
+        """The flat face (in local space) that face `poly` is part of: the
+        faces around it on its plane (a box side, a triangulated cap, a
+        subdivided floor). {"flat", "n", "c", "seg" (k, 2, 3) its outline}.
+        flat is False for a facet of a curved surface: two of its neighbours
+        bend by less than 30 degrees and are about as large (a cylinder's
+        side, a sphere, a scan) -- a bevel strip along a flat face is much
+        smaller, a face meeting another at 45 degrees is sharp. None for a
+        mesh too dense to look at (FLAT_MAX_LOOPS) or a degenerate face."""
+        if len(self.lv) > FLAT_MAX_LOOPS or not (0 <= poly < len(self.ls)):
+            return None
+        N, A, C, lp, order, start, size = self._faces_geometry()
+        k = int(self._label[poly])
+        if k >= 0:
+            return self._regions[k]
+        if A[poly] <= 1e-18 * size * size:
+            return None
+        tol = 1e-5 * size
+        mask, area = self._grow(poly, tol)
+        polys = np.flatnonzero(mask)
+        es, cnt = np.unique(self.le[_ranges(self.ls[polys], self.lt[polys])], return_counts=True)
+        border = es[cnt == 1]
+        n0 = N[poly]
+        nb = np.unique(lp[order[_ranges(start[border], start[border + 1] - start[border])]])
+        nb = nb[~mask[nb]]
+        cos = np.abs(N[nb] @ n0)
+        shallow = nb[(cos > SHALLOW_COS) & (cos < FLAT_COS)]
+        seen, big = mask.copy(), 0
+        for q in shallow[np.argsort(-A[shallow])][:64]:
+            if seen[q]:
+                continue
+            m2, a2 = self._grow(int(q), tol, stop_area=COMPARABLE * area)
+            seen |= m2
+            if a2 >= COMPARABLE * area:
+                big += 1
+                if big >= 2:
+                    break
+        s = np.where(N[polys] @ n0 < 0, -1.0, 1.0)
+        n = (N[polys] * (A[polys] * s)[:, None]).sum(axis=0)
+        n /= np.linalg.norm(n) or 1.0
+        c = (C[polys] * A[polys][:, None]).sum(axis=0) / max(float(A[polys].sum()), 1e-300)
+        reg = {"flat": big < 2, "n": n, "c": c, "seg": self.V[self.E[border]].astype(float),
+               "loops": _edge_loops(self.E, border)}
+        self._label[polys] = len(self._regions)
+        self._regions.append(reg)
+        return reg
+
+
+def _ranges(starts, lens):
+    """The indices starts[i] .. starts[i] + lens[i] - 1 of every i, in one array."""
+    lens = np.asarray(lens, np.int64)
+    tot = int(lens.sum())
+    if tot <= 0:
+        return np.zeros(0, np.int64)
+    first = np.asarray(starts, np.int64) - np.concatenate(([0], np.cumsum(lens)[:-1]))
+    return np.repeat(first, lens) + np.arange(tot)
+
+
+def _edge_loops(E, edges):
+    """The edges chained into loops: [(vertex indices, closed)]."""
+    at = {}
+    for e in edges:
+        a, b = int(E[e][0]), int(E[e][1])
+        at.setdefault(a, []).append(int(e))
+        at.setdefault(b, []).append(int(e))
+    used, loops = set(), []
+    for e0 in edges:
+        e0 = int(e0)
+        if e0 in used:
+            continue
+        used.add(e0)
+        a, cur = int(E[e0][0]), int(E[e0][1])
+        loop = [a]
+        while cur != a:
+            loop.append(cur)
+            nxt = next((e for e in at[cur] if e not in used), None)
+            if nxt is None:
+                break
+            used.add(nxt)
+            x, y = int(E[nxt][0]), int(E[nxt][1])
+            cur = y if x == cur else x
+        loops.append((np.array(loop), cur == a))
+    return loops
+
+
+CORNER_DEG = 20.0       # an outline turning by this much is a corner (a 16-gon's are; a 32-gon has none)
+
+
+def outline_marks(loops, turn_deg=CORNER_DEG):
+    """(corners (k, 3), middles (m, 3)) of a flat face's outline loops
+    [(world points, closed)]: the points where it turns by turn_deg or more
+    (an open chain's ends too), and the middle by length of every run from
+    one corner to the next. A loop without corners (a circle) has neither."""
+    cs, ms = [], []
+    cmin = math.cos(math.radians(turn_deg))
+    for W, closed in loops:
+        W = np.asarray(W, float)
+        if len(W) < 2:
+            continue
+        if closed:
+            W = np.vstack([W, W[:1]])
+        n = len(W)
+        corner = np.zeros(n, bool)
+        a, b = W[1:-1] - W[:-2], W[2:] - W[1:-1]
+        den = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1)
+        corner[1:-1] = (a * b).sum(axis=1) <= cmin * np.maximum(den, 1e-300)
+        if closed:
+            a, b = W[0] - W[-2], W[1] - W[0]
+            corner[0] = corner[-1] = float(a @ b) <= cmin * max(float(np.linalg.norm(a) * np.linalg.norm(b)), 1e-300)
+        else:
+            corner[0] = corner[-1] = True
+        idx = np.flatnonzero(corner)
+        if not len(idx):
+            continue
+        if closed and idx[0] != 0:                      # start the loop at a corner
+            k = int(idx[0])
+            W = np.vstack([W[k:-1], W[:k + 1]])
+            corner = np.concatenate([corner[k:-1], corner[:k + 1]])
+            idx = np.flatnonzero(corner)
+        cum = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(W, axis=0), axis=1))])
+        for i, j in zip(idx[:-1], idx[1:]):
+            h = 0.5 * (cum[i] + cum[j])
+            k = int(min(max(np.searchsorted(cum, h) - 1, i), j - 1))
+            t = (h - cum[k]) / ((cum[k + 1] - cum[k]) or 1.0)
+            ms.append(W[k] + t * (W[k + 1] - W[k]))
+        cs.extend(W[idx[:-1]] if closed else W[idx])
+    return np.array(cs, float).reshape(-1, 3), np.array(ms, float).reshape(-1, 3)
+
+
+def face_axis(n, seg):
+    """The drawing plane's first axis on a flat face with normal n and outline
+    segments seg (k, 2, 3): along the face's edges (the direction most of its
+    outline runs, square ones counted too), the one nearest the face's level
+    line (world X on a face looking up or down); just the level line when the
+    outline has no main direction (a disk, a hexagon)."""
+    n = np.asarray(n, float)
+    r = np.cross((0.0, 0.0, 1.0), n)
+    if np.linalg.norm(r) < 1e-4:
+        r = np.array([1.0, 0.0, 0.0]) - n[0] * n
+    r /= np.linalg.norm(r)
+    r2 = np.cross(n, r)
+    seg = np.asarray(seg, float).reshape(-1, 2, 3)
+    D = seg[:, 1] - seg[:, 0]
+    L = np.linalg.norm(D, axis=1)
+    if not len(L) or L.sum() <= 0:
+        return r
+    a = np.arctan2(D @ r2, D @ r)
+    cs, sn = float((L * np.cos(4 * a)).sum()), float((L * np.sin(4 * a)).sum())
+    if math.hypot(cs, sn) < 0.5 * float(L.sum()):
+        return r
+    a0 = math.atan2(sn, cs) / 4.0                   # the edge direction within 45 degrees of r
+    return math.cos(a0) * r + math.sin(a0) * r2
 
 
 MESH_CACHE = {}         # object session_uid -> MeshData
@@ -194,6 +408,22 @@ class MeshTarget:
         Minv = np.linalg.inv(M)
         self.Ri, self.ti = Minv[:3, :3], Minv[:3, 3]
         self.box = np.array(obj.bound_box, float) @ self.R.T + self.t     # world corners (8, 3)
+        self._flat = {}             # region -> its world plane, this tool run
+
+    def flat(self, poly, P):
+        """The flat face that polygon `poly` (hit at world point P) is part
+        of, in world space: {"n" (either side), "c", "seg" its outline
+        segments, "size"}; None on a curved surface."""
+        reg = self.d.flat_region(poly)
+        if reg is None or not reg["flat"]:
+            return None
+        out = self._flat.get(id(reg))
+        if out is None:
+            n = self.Ri.T @ reg["n"]                    # normals go with the inverse transpose
+            cs, ms = outline_marks([(self.world(vs), closed) for vs, closed in reg["loops"]])
+            out = self._flat[id(reg)] = _world_face(n, self.R @ reg["c"] + self.t, reg["seg"] @ self.R.T + self.t,
+                                                    cs, ms, snap=True)
+        return out
 
     def near(self, view, mouse):
         """Could the mouse be within SNAP_PX of this mesh? (its bounding box on screen)"""
@@ -276,6 +506,88 @@ class MeshTarget:
         return np.unique(d.lv[loops]), np.unique(d.le[loops])
 
 
+def _world_face(n, c, seg, corners=(), mids=(), snap=False):
+    """A flat face in world space: normal, a point, outline segments, its
+    corners and edge middles (drawn as small squares) and, for a mesh, those
+    as extra snap points [(point, None, kind)] (a run of collinear edges has
+    its middle there, which no single edge has)."""
+    seg = np.asarray(seg, float).reshape(-1, 2, 3)
+    n = np.asarray(n, float)
+    size = float(np.linalg.norm(np.ptp(seg.reshape(-1, 3), axis=0))) if len(seg) else 0.0
+    cs, ms = np.asarray(corners, float).reshape(-1, 3), np.asarray(mids, float).reshape(-1, 3)
+    pts = [(p, None, "vertex") for p in cs] + [(p, None, "mid") for p in ms] if snap else []
+    return {"n": n / (np.linalg.norm(n) or 1.0), "c": np.asarray(c, float), "seg": seg, "size": size or 1.0,
+            "corners": cs, "mids": ms, "snap": pts}
+
+
+_SURF_FLAT = {}         # NURBS object session_uid -> (rev, {polygon: face index}, {face index: local face or None})
+
+
+class SurfaceTarget(MeshTarget):
+    """A NURBS object's displayed faces: only for the flat face under the
+    mouse (its vertices and edges snap exactly, through the B-rep)."""
+
+    def flat(self, poly, P):
+        obj = self.obj
+        rev = obj.get(store.PROP_REV, 0)
+        c = _SURF_FLAT.get(obj.session_uid)
+        if c is None or c[0] != rev:
+            c = _SURF_FLAT[obj.session_uid] = (rev, {}, {})
+        try:
+            brep = store.get_brep(obj)
+            i = c[1].get(poly)
+            if i is None:
+                from .kernel import load as load_kernel
+                q = self.Ri @ np.asarray(P, float) + self.ti
+                f = load_kernel().find_face(brep, tuple(float(x) for x in q))
+                i = c[1][poly] = next((k for k, g in enumerate(brep.faces()) if g == f), -1)
+            if i < 0:
+                return None
+            if i not in c[2]:
+                c[2][i] = _flat_brep_face(brep.faces()[i])
+        except Exception as exc:
+            print("NURBS face plane skipped", getattr(obj, "name", "?"), exc)
+            return None
+        loc = c[2][i]
+        if loc is None:
+            return None
+        key = (rev, i)
+        out = self._flat.get(key)
+        if out is None:
+            n, cen, seg, cs, ms = loc
+            w = lambda X: np.asarray(X, float).reshape(-1, 3) @ self.R.T + self.t
+            out = self._flat[key] = _world_face(self.Ri.T @ n, w(cen)[0], w(seg.reshape(-1, 3)).reshape(-1, 2, 3),
+                                                w(cs), w(ms))
+        return out
+
+
+def _flat_brep_face(face):
+    """(normal, a point, outline segments (k, 2, 3), corners, edge middles)
+    of a flat NURBS face (local), or None. Its corners are its edges' ends,
+    the middles those of its open edges: what snaps there (End, Mid)."""
+    lo, hi = (np.array(x, float) for x in face.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    pl = _plane_of(face, size)
+    if pl is None:
+        return None
+    segs, cs, ms = [], [], []
+    for e in face.edges():
+        try:
+            t0, t1 = e.parameter_range()
+            W = np.array([e.point_at(t0 + (t1 - t0) * j / 32) for j in range(33)], float)
+        except Exception:
+            continue
+        segs.append(np.stack([W[:-1], W[1:]], axis=1))
+        for q in (W[0], W[-1]):
+            if all(np.linalg.norm(q - c) > 1e-9 * size for c in cs):
+                cs.append(q)
+        hw = None if np.linalg.norm(W[0] - W[-1]) <= 1e-9 * size else _half_way(W)
+        if hw is not None:
+            ms.append(_edge_closest(e, W[hw[0]] + hw[1] * (W[hw[0] + 1] - W[hw[0]])))
+    return (pl[1], pl[0], (np.concatenate(segs) if segs else np.zeros((0, 2, 3))),
+            np.array(cs, float).reshape(-1, 3), np.array(ms, float).reshape(-1, 3))
+
+
 def _ray_segment(o, d, A, B):
     """The point of segment AB nearest the ray (o, d unit), or None when they are parallel."""
     u, w = B - A, A - o
@@ -293,10 +605,42 @@ class Targets:
         self._lines = []        # (world polyline (m, 3), refine(segment, s) -> world point, kind, src, meta)
         self._faces = []        # (world bbox corners (8, 3), centre() -> world point or None)
         self._meshes = []       # MeshTarget
+        self._surfaces = []     # SurfaceTarget: NURBS objects' faces, for flat_face
         self.mesh_elements = lambda: MESH_ELEMENTS      # which mesh elements snap (read on every move)
 
     def mesh(self, target):
         self._meshes.append(target)
+
+    def surface(self, target):
+        self._surfaces.append(target)
+
+    def flat_face(self, view, mouse):
+        """The flat face under the mouse -- of a plain mesh or a NURBS
+        surface, the face nearest the viewer -- as a drawing plane: {"P" the
+        point under the mouse (on the face), "n" its normal towards the
+        viewer, "u", "v" axes in it (u along its edges), "seg" its outline,
+        "size"}; None over nothing, a curved surface, or a face seen edge-on."""
+        mouse = np.asarray(mouse, float)
+        cands = [m for m in self._meshes + self._surfaces if m.near(view, mouse) and m.ready()]
+        if not cands:
+            return None
+        o, d = view.ray(mouse)
+        best = None
+        for m in cands:
+            h = m.cast(o, d)
+            if h is not None and (best is None or h[2] < best[1][2]):
+                best = (m, h)
+        if best is None:
+            return None
+        m, (P, poly, _) = best
+        f = m.flat(poly, P)
+        if f is None:
+            return None
+        n = f["n"] if float(f["n"] @ d) < 0 else -f["n"]
+        if abs(float(n @ d)) < 0.02:
+            return None
+        u = face_axis(n, f["seg"])
+        return dict(f, P=P - float((P - f["c"]) @ n) * n, n=n, u=u, v=np.cross(n, u))
 
     def _mesh_near(self, view, mouse):
         """The mesh elements near the mouse: {"P", "kinds"} points (vertices,
@@ -888,6 +1232,7 @@ def collect(objs, cvs_shown=lambda o: False, mesh_elements=None):
                 add_curve(T, o)
             elif store.is_nurbs(o):
                 add_brep(T, o, cvs_shown(o))
+                T.surface(SurfaceTarget(o))
             elif is_plain_mesh(o):
                 T.mesh(MeshTarget(o))
         except Exception as exc:

@@ -42,7 +42,7 @@ everything built from it rebuilds.
 - **Between curves:** Blend Curve, Fillet (trims and joins)
 - **Shapes:** in Shift+A every shape at the 3D cursor (sized to the view)
 - **From surfaces:** Iso Curve, Duplicate Edge, Project Curve, Intersect
-- **Snapping:** to curves, NURBS surfaces and meshes (vertex, edge, edge center, face center; **O** onto the face), smart guides (aligned, tangent, parallel, perpendicular), **Alt** for a free point, **Ctrl** for the grid
+- **Snapping:** to curves, NURBS surfaces and meshes (vertex, edge, edge center, face center; **O** onto the face), smart guides (aligned, tangent, parallel, perpendicular), sketches flat on the face you start on or on the world grid, **Alt** for a free point, **Ctrl** for the grid (a finer floor grid in perspective, on / off under Display)
 
 ### Curve Edit
 
@@ -70,6 +70,11 @@ everything built from it rebuilds.
 - **Feature Labels:** each feature's edges show the continuity it holds, live; click one to change it
 - **Overlays:** Zebra, Curvature Map, Draft Angle, Matcap
 - **Combs and sections:** Curvature Comb, Surface Combs, Dynamic Section
+
+### Convert
+
+- **BREP to Mesh:** plain meshes for rendering, texturing and animation, at Low, Medium or High detail:
+  n-gons on flat faces and quads on curved ones (or all triangles), welded, with sharp creases, UVs and seams
 
 ### STEP Import and Export
 

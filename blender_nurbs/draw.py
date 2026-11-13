@@ -13,9 +13,10 @@ _label_cache = {}
 pick_overlay = {"hover": None, "picked": []}  # filled by the modal pick operator
 # filled by the sketch tools (CV Curve / Line): world-space polylines and points
 sketch_overlay = {"curves": [], "hull": [], "cvs": [], "snap": None, "snap_label": None, "axes": [],
-                  "refs": [], "cursor": None, "comb": None, "guides": []}
+                  "refs": [], "cursor": None, "comb": None, "guides": [], "face": [], "face_pts": []}
 COL_CURSOR = (1.0, 1.0, 1.0, 1.0)
 COL_SNAP = (0.25, 1.0, 0.45, 1.0)
+COL_FACE_PLANE = (0.35, 0.8, 1.0, 0.85)      # the flat face a sketch is drawn on
 
 COL_EDGE = (0.05, 0.05, 0.05, 1.0)
 COL_EDGE_SEL = (1.0, 0.55, 0.1, 1.0)
@@ -219,6 +220,9 @@ def _draw():
     show_cvs = v.show_cvs if v else False
     gpu.state.blend_set('ALPHA')
     gpu.state.depth_test_set('LESS_EQUAL')
+    if _grid_shader is not False and (v is None or v.show_fine_grid):
+        _draw_fine_grid_safe(ctx)           # under everything
+        gpu.state.depth_test_set('LESS_EQUAL')
     from . import diagnostics
     if v is not None:
         diagnostics.draw_zebra(ctx)          # under the edges
@@ -321,6 +325,8 @@ def _draw():
     so = sketch_overlay
     for pl, col in so.get("axes") or []:          # X / Y / Z lock: the axis (or the plane's two axes)
         _draw_lines(_lines_from_polylines([pl], _IDENT), col, 1.5)
+    if so.get("face"):                    # the flat face the sketch is (or would be) drawn on
+        _draw_lines(_lines_from_polylines(so["face"], _IDENT), COL_FACE_PLANE, 2.0)
     for dashes, col in so.get("guides") or []:    # smart guides the point snapped to (dashed)
         _draw_lines(_lines_from_polylines(dashes, _IDENT), col, 1.0)
     for pl, col, w in so.get("refs") or []:       # the edge (white) / face (beige) a G1 / G2 end follows
@@ -391,6 +397,7 @@ def _draw_px():
     except Exception as exc:
         print("NURBS key hints:", exc)
     _draw_paused(ctx, region)
+    _draw_face_points(region, rv3d)
     _draw_snap_label(region, rv3d)
     from . import contcheck
     try:
@@ -460,6 +467,24 @@ def _draw_px():
                 blf.draw(font, t_)
 
 
+def _draw_face_points(region, rv3d):
+    """Sketch tools: the corners and edge middles of the flat face the sketch
+    is (or would be) drawn on, as small squares (not over the snapped point)."""
+    from bpy_extras.view3d_utils import location_3d_to_region_2d
+    so = sketch_overlay
+    pts = so.get("face_pts") or []
+    if not pts:
+        return
+    snap = so.get("snap")
+    s = location_3d_to_region_2d(region, rv3d, snap) if snap is not None else None
+    for p in pts:
+        q = location_3d_to_region_2d(region, rv3d, p)
+        if q is None or (s is not None and (q - s).length < 4.0):
+            continue
+        _square(q, 3.5, (0.05, 0.05, 0.05, 0.85))
+        _square(q, 2.5, COL_FACE_PLANE[:3] + (1.0,))
+
+
 def _draw_snap_label(region, rv3d):
     """Sketch tools: what the cursor snapped to (End, Mid, Center, CV, Edge...),
     beside the green snap dot."""
@@ -520,6 +545,192 @@ def _disc(c, r, color):
     gpu.state.blend_set('ALPHA')
     sh.uniform_float("color", color)
     batch_for_shader(sh, 'TRIS', {"pos": tris}).draw(sh)
+
+
+# --------------------------------------------------------------------------
+# Fine floor grid. In any view other than Top / Front / Side (perspective, or
+# orthographic turned) Blender's floor grid stops at 1 m (1 ft): it skips the
+# finer levels its Top / Front / Side grids draw (ED_view3d_grid_steps).
+# This draws those levels on the floor, faded in by the rule Ctrl snaps by
+# (drawtools.visible_grid_step, pixels_per_unit), so the grid points a sketch
+# snaps to are lines you see. Display > Fine Grid (a header icon too) shows or
+# hides it; so does Blender's Floor overlay.
+# --------------------------------------------------------------------------
+_grid_shader = None     # compiled on first use; False when it can't be
+
+_GRID_VERT = """
+void main()
+{
+  wpos = pos;
+  gl_Position = ViewProjectionMatrix * vec4(pos, 1.0);
+}
+"""
+
+# params: (base -- the finest level Blender draws itself, fade px, extra line
+# half width, emphasis shade); eye: (the eye point, or the view direction when
+# orthographic; perspective?). Levels, blending and the fade towards edge-on
+# as Blender's grid shader.
+_GRID_FRAG = """
+float grid_line(vec2 co, vec2 fw, float s)
+{
+  vec2 h = vec2(s * 0.5);
+  vec2 d = abs(mod(co + h, vec2(s)) - h) / max(fw, vec2(1e-12));
+  return 1.0 - smoothstep(-0.0924, 1.0924, min(d.x, d.y) - params.z);
+}
+
+void main()
+{
+  vec2 co = wpos.xy;
+  vec2 dx = dFdx(co);
+  vec2 dy = dFdy(co);
+  float det = abs(dx.x * dy.y - dy.x * dx.y);
+  if (det < 1e-30) {
+    discard;
+  }
+  float ppu = min(length(vec2(dx.y, dy.y)), length(vec2(dx.x, dy.x))) / det;
+  float fpx = params.y;
+  float s0, s1, s2, s3;
+  if (steps.x * ppu >= fpx) {
+    s0 = 0.0; s1 = steps.x; s2 = steps.y; s3 = steps.z;
+  }
+  else if (steps.y * ppu >= fpx) {
+    s0 = steps.x; s1 = steps.y; s2 = steps.z; s3 = steps.w;
+  }
+  else if (steps.z * ppu >= fpx) {
+    s0 = steps.y; s1 = steps.z; s2 = steps.w; s3 = steps.w;
+  }
+  else {
+    s0 = steps.z; s1 = steps.w; s2 = steps.w; s3 = steps.w;
+  }
+  if (s1 >= params.x * 0.999) {
+    discard;
+  }
+  float t = clamp((fpx - s0 * ppu) / max((s1 - s0) * ppu, 1e-12), 0.0, 1.0);
+  float blend = 1.0 - t;
+  blend = blend * blend * blend;
+  vec2 fw = abs(dx) + abs(dy);
+  vec4 emph = vec4(clamp(gridColor.rgb + vec3(params.w), 0.0, 1.0), gridColor.a);
+  vec4 c = gridColor;
+  c.a *= grid_line(co, fw, s1) * blend;
+  c = mix(c, mix(gridColor, emph, blend), grid_line(co, fw, s2));
+  c = mix(c, emph, grid_line(co, fw, s3));
+  vec3 vv = (eye.w > 0.5) ? normalize(eye.xyz - wpos) : eye.xyz;
+  float a = 1.0 - abs(vv.z);
+  a *= a;
+  c.a *= 1.0 - a * a;
+  fragColor = c;
+}
+"""
+
+
+def _fine_grid_shader():
+    global _grid_shader
+    if _grid_shader is None:
+        try:
+            iface = gpu.types.GPUStageInterfaceInfo("nproto_fine_grid_iface")
+            iface.smooth('VEC3', "wpos")
+            info = gpu.types.GPUShaderCreateInfo()
+            info.push_constant('MAT4', "ViewProjectionMatrix")
+            info.push_constant('VEC4', "gridColor")
+            info.push_constant('VEC4', "steps")
+            info.push_constant('VEC4', "params")
+            info.push_constant('VEC4', "eye")
+            info.vertex_in(0, 'VEC3', "pos")
+            info.vertex_out(iface)
+            info.fragment_out(0, 'VEC4', "fragColor")
+            info.vertex_source(_GRID_VERT)
+            info.fragment_source(_GRID_FRAG)
+            _grid_shader = gpu.shader.create_from_info(info)
+        except Exception as exc:
+            print("NURBS Proto fine grid:", exc)
+            _grid_shader = False
+    return _grid_shader or None
+
+
+def fine_grid_square(rv3d, region, clip_end, levels, base, fade_px):
+    """(x, y, half size): the square on the floor the fine grid is drawn on,
+    or None where none of its levels can show. Perspective: around the eye,
+    out to where even the coarsest fine level is too dense to see.
+    Orthographic: what the view sees of the floor (none edge-on)."""
+    finest_missing = max(st for st in levels if st < base)
+    W = rv3d.window_matrix
+    if rv3d.is_perspective:
+        eye = rv3d.view_matrix.inverted().translation
+        f = abs(W[1][1]) * region.height * 0.5          # pixels per unit at unit distance
+        R = 1.5 * finest_missing * f / fade_px
+        if abs(eye.z) >= R:
+            return None
+        return float(eye.x), float(eye.y), float(min(R, clip_end))
+    ppu = max(abs(W[0][0]) * region.width, abs(W[1][1]) * region.height) * 0.5
+    if finest_missing * ppu < fade_px:
+        return None
+    vdir = rv3d.view_rotation @ Vector((0.0, 0.0, -1.0))
+    if abs(vdir.z) < 1e-6:
+        return None
+    c = rv3d.view_location
+    c = c - vdir * (c.z / vdir.z)                         # the floor at the middle of the view
+    hw, hh = 1.0 / max(abs(W[0][0]), 1e-12), 1.0 / max(abs(W[1][1]), 1e-12)
+    R = 1.2 * (hw * hw + (hh / abs(vdir.z)) ** 2) ** 0.5
+    return float(c.x), float(c.y), float(min(R, clip_end))
+
+
+def _draw_fine_grid(ctx):
+    sp, rv3d, region = ctx.space_data, ctx.region_data, ctx.region
+    ov = getattr(sp, "overlay", None)
+    if ov is None or rv3d is None or region is None or not (ov.show_overlays and ov.show_floor) \
+            or rv3d.is_orthographic_side_view:
+        return
+    from .drawtools import fine_grid_levels, GRID_FADE_PX
+    us = ctx.scene.unit_settings
+    lv = fine_grid_levels(us.system, us.scale_length or 1.0, ov.grid_scale or 1.0, ov.grid_subdivisions or 10)
+    if lv is None:
+        return
+    levels, base = lv
+    sq = fine_grid_square(rv3d, region, sp.clip_end, levels, base, GRID_FADE_PX)
+    if sq is None:
+        return
+    sh = _fine_grid_shader()
+    if sh is None:
+        return
+    x, y, R = sq
+    quad = [(x - R, y - R, 0.0), (x + R, y - R, 0.0), (x + R, y + R, 0.0), (x - R, y + R, 0.0)]
+    batch = batch_for_shader(sh, 'TRIS', {"pos": quad}, indices=((0, 1, 2), (0, 2, 3)))
+    theme = ctx.preferences.themes[0].view_3d
+    col = tuple(theme.grid)
+    col = col if len(col) == 4 else col + (1.0,)
+    try:
+        bg = tuple(theme.space.gradients.high_gradient)
+    except Exception:
+        bg = (0.24, 0.24, 0.24)
+    shade = (20.0 if sum(col[:3]) + 0.12 > sum(bg[:3]) else -10.0) / 255.0   # Blender's emphasis lines
+    if rv3d.is_perspective:
+        e, persp = rv3d.view_matrix.inverted().translation, 1.0
+    else:
+        e, persp = rv3d.view_rotation @ Vector((0.0, 0.0, 1.0)), 0.0
+    pix = ctx.preferences.system.pixel_size
+    mask = gpu.state.depth_mask_get()
+    gpu.state.depth_mask_set(False)
+    gpu.state.depth_test_set('LESS_EQUAL')
+    gpu.state.blend_set('ALPHA')
+    sh.bind()
+    sh.uniform_float("ViewProjectionMatrix", rv3d.perspective_matrix)
+    sh.uniform_float("gridColor", col)
+    sh.uniform_float("steps", tuple(float(v) for v in levels))
+    sh.uniform_float("params", (float(base), float(GRID_FADE_PX), max(0.0, pix - 1.0) * 0.5, shade))
+    sh.uniform_float("eye", (float(e.x), float(e.y), float(e.z), persp))
+    batch.draw(sh)
+    gpu.state.depth_mask_set(mask)
+
+
+def _draw_fine_grid_safe(ctx):
+    """The fine grid, switched off for the session on its first error (no
+    message every redraw)."""
+    global _grid_shader
+    try:
+        _draw_fine_grid(ctx)
+    except Exception as exc:
+        print("NURBS Proto fine grid off:", exc)
+        _grid_shader = False
 
 
 def register():
