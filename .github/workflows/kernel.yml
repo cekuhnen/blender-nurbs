@@ -7,6 +7,12 @@
 # once the tests pass on all three, the zips are published as a GitHub Release
 # tagged v<version> (the version in blender_nurbs/blender_manifest.toml) -- a
 # pre-release unless the commit is on main.
+#
+# Kernel cache: each built module is cached under a key made of what it is
+# built from (kernel_build/, the USD BRep commit, pybind11, KERNEL_CACHE). A
+# push that changes only Python reuses it and skips the build (the Windows build
+# alone takes about 50 minutes). Bump KERNEL_CACHE when a build step below
+# changes; run by hand with "rebuild_kernel" ticked to build from scratch.
 
 name: Kernel
 
@@ -15,6 +21,10 @@ on:
     inputs:
       release:
         description: "Publish the zips as a GitHub Release v<manifest version> (after the tests pass)"
+        type: boolean
+        default: false
+      rebuild_kernel:
+        description: "Build the kernel from scratch (ignore the cached build)"
         type: boolean
         default: false
   push:
@@ -27,16 +37,25 @@ env:
   PYBIND11_VERSION: "2.13.6"
   BLENDER_SERIES: "5.2"
   BLENDER_VERSION: "5.2.1"
+  KERNEL_CACHE: "1"     # bump when a build step changes (flags, compiler, Python): the cached kernels are rebuilt
 
 jobs:
   build-macos:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - id: cache
+        if: ${{ !inputs.rebuild_kernel }}
+        uses: actions/cache@v4
+        with:
+          path: blender_nurbs/kernel/_nproto_kernel.*
+          key: kernel-macos-${{ env.KERNEL_CACHE }}-${{ env.USD_BREP_COMMIT }}-${{ env.PYBIND11_VERSION }}-${{ hashFiles('kernel_build/CMakeLists.txt', 'kernel_build/ext/**') }}
       - id: py
+        if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/setup-python@v5
         with: { python-version: "3.13" }
       - name: Sources
+        if: steps.cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           git init -q third_party/usd-brep
@@ -45,12 +64,18 @@ jobs:
           git -C third_party/usd-brep checkout -q FETCH_HEAD
           python -m pip install --target third_party/pybind11_pkg "pybind11==$PYBIND11_VERSION"
       - name: Build (arm64; Intel Macs are not supported)
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           cmake -S kernel_build -B kernel_build/build -DCMAKE_BUILD_TYPE=Release \
                 -DPython3_EXECUTABLE="${{ steps.py.outputs.python-path }}" \
                 -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.2
           cmake --build kernel_build/build -j4
           file blender_nurbs/kernel/_nproto_kernel.*
+      - name: Kernel
+        shell: bash
+        run: |
+          ls -la blender_nurbs/kernel/_nproto_kernel.*
+          echo "${{ steps.cache.outputs.cache-hit == 'true' && 'from the cache (kernel sources unchanged)' || 'built' }}"
       - uses: actions/upload-artifact@v4
         with: { name: kernel-macos, path: "blender_nurbs/kernel/_nproto_kernel.*" }
 
@@ -58,10 +83,18 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+      - id: cache
+        if: ${{ !inputs.rebuild_kernel }}
+        uses: actions/cache@v4
+        with:
+          path: blender_nurbs/kernel/_nproto_kernel.*
+          key: kernel-windows-${{ env.KERNEL_CACHE }}-${{ env.USD_BREP_COMMIT }}-${{ env.PYBIND11_VERSION }}-${{ hashFiles('kernel_build/CMakeLists.txt', 'kernel_build/ext/**') }}
       - id: py
+        if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/setup-python@v5
         with: { python-version: "3.13", architecture: x64 }
       - name: Sources
+        if: steps.cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           git init -q third_party/usd-brep
@@ -70,11 +103,17 @@ jobs:
           git -C third_party/usd-brep checkout -q FETCH_HEAD
           python -m pip install --target third_party/pybind11_pkg "pybind11==$PYBIND11_VERSION"
       - name: Build (x64, static C runtime)
+        if: steps.cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           cmake -S kernel_build -B kernel_build/build -A x64 -DPython3_EXECUTABLE="${{ steps.py.outputs.python-path }}"
           cmake --build kernel_build/build --config Release -j4
           ls -la blender_nurbs/kernel/
+      - name: Kernel
+        shell: bash
+        run: |
+          ls -la blender_nurbs/kernel/_nproto_kernel.*
+          echo "${{ steps.cache.outputs.cache-hit == 'true' && 'from the cache (kernel sources unchanged)' || 'built' }}"
       - uses: actions/upload-artifact@v4
         with: { name: kernel-windows, path: "blender_nurbs/kernel/_nproto_kernel.*" }
 
@@ -86,7 +125,14 @@ jobs:
       PY: /opt/python/cp313-cp313/bin/python
     steps:
       - uses: actions/checkout@v4
+      - id: cache
+        if: ${{ !inputs.rebuild_kernel }}
+        uses: actions/cache@v4
+        with:
+          path: blender_nurbs/kernel/_nproto_kernel.*
+          key: kernel-linux-${{ env.KERNEL_CACHE }}-${{ env.USD_BREP_COMMIT }}-${{ env.PYBIND11_VERSION }}-${{ hashFiles('kernel_build/CMakeLists.txt', 'kernel_build/ext/**') }}
       - name: Sources
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           git config --global --add safe.directory '*'
           git init -q third_party/usd-brep
@@ -96,11 +142,17 @@ jobs:
           $PY -m pip install -q cmake
           $PY -m pip install --target third_party/pybind11_pkg "pybind11==$PYBIND11_VERSION"
       - name: Build (x64)
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           CMAKE=$(dirname $PY)/cmake
           $CMAKE -S kernel_build -B kernel_build/build -DCMAKE_BUILD_TYPE=Release -DPython3_EXECUTABLE=$PY
           $CMAKE --build kernel_build/build -j4
           ls -la blender_nurbs/kernel/
+      - name: Kernel
+        shell: bash
+        run: |
+          ls -la blender_nurbs/kernel/_nproto_kernel.*
+          echo "${{ steps.cache.outputs.cache-hit == 'true' && 'from the cache (kernel sources unchanged)' || 'built' }}"
       - uses: actions/upload-artifact@v4
         with: { name: kernel-linux, path: "blender_nurbs/kernel/_nproto_kernel.*" }
 
