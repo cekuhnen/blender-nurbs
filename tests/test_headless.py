@@ -3911,17 +3911,21 @@ _kinds = [e["props"].get("kind") for n, r in _drawn.items() if n.startswith("VIE
           if e.get("op") == "nproto.add_primitive"]
 check("UI: every tool is in exactly one group panel and all operators exist",
       not _ui_err and not _missing and sorted(_tool_ops) == sorted(_all_tools)
-      and sorted(_kinds) == sorted(list(_prims.CURVE_KINDS) + list(_prims.SURFACE_KINDS))
+      and sorted(_kinds) == sorted(_prims.SURFACE_KINDS)
       and _bool_ops == ["DIFFERENCE", "INTERSECTION", "UNION"],
       f"bool={_bool_ops} err={_ui_err} missing={_missing} extra={sorted(set(_tool_ops) - _all_tools)} "
       f"absent={sorted(_all_tools - set(_tool_ops))} dup={sorted({o for o in _tool_ops if _tool_ops.count(o) > 1})}")
 _menu_ops = sorted(e["op"] for n, r in _drawn.items() if n.startswith("VIEW3D_MT") and n != "VIEW3D_MT_nproto_tools"
                    for e in r if "op" in e)
 _subs = [e["menu"] for e in _drawn["VIEW3D_MT_nproto_tools"] if "menu" in e]
-check("UI: header menu holds the four groups, the same tools as the panels",
-      _menu_ops == sorted(_in_panels) and _subs == ["VIEW3D_MT_nproto_curves", "VIEW3D_MT_nproto_surfaces",
-                                                    "VIEW3D_MT_nproto_curve_edit", "VIEW3D_MT_nproto_surface_edit"],
-      str(_subs))
+_menu_kinds = sorted(e["props"].get("kind") for n, r in _drawn.items() if n.startswith("VIEW3D_MT")
+                     and n != "VIEW3D_MT_nproto_tools" for e in r if e.get("op") == "nproto.add_primitive")
+check("UI: header menu holds the four groups, the same tools as the panels, and every shape (the curve shapes "
+      "only there: the panel draws them)",
+      sorted(set(_menu_ops)) == sorted(set(_in_panels))
+      and _menu_kinds == sorted(list(_prims.CURVE_KINDS) + list(_prims.SURFACE_KINDS))
+      and _subs == ["VIEW3D_MT_nproto_curves", "VIEW3D_MT_nproto_surfaces",
+                    "VIEW3D_MT_nproto_curve_edit", "VIEW3D_MT_nproto_surface_edit"], f"{_subs} {_menu_kinds}")
 _act = ctx.view_layer.objects.active
 try:
     _shown = _ui.VIEW3D_PT_nproto_active.poll(ctx)
@@ -5603,7 +5607,7 @@ _sp = _hn.HUD["spec"]
 _grp = [r[0] for r in _sp["rows"]] if _sp else []
 _start = [i for r in _sp["rows"] if r[0] == "Start" for i in r[1]] if _sp else []
 check("hints: Draw Line shows its groups, the start mode lit, a short header",
-      _grp == ["Type", "Direction", "Start", "Reference", "Polyline"] and _start and _start[0]["current"] == "tangent"
+      _grp == ["Type", "Direction", "Snap", "Start", "Reference", "Polyline"] and _start and _start[0]["current"] == "tangent"
       and fc.area.text.startswith("Line  ·  click the start") and "Backspace" not in fc.area.text, f"{_grp} {fc.area.text}")
 f.modal(fc, _ev('ESC'))
 check("hints: leaving the tool clears the header and the panel", fc.area.text is None and _hn.HUD["spec"] is None)
@@ -5943,6 +5947,27 @@ _on_label = _sx2._over_gizmo(_gctx, _gar, _gw, 500, 400)
 _clh.hover["key"] = _h0
 check("Face / Edge mode: clicks on the navigation gizmo (beside the sidebar, under the header) and on continuity "
       "labels go to them; the rest of the view picks", _on_ball and not _on_view and _on_label)
+from blender_nurbs.ops import PickMixin as _PMg
+_ivc = _types.SimpleNamespace(area=_gar, preferences=_gctx.preferences)
+_evg = lambda x, y: _types.SimpleNamespace(mouse_x=x, mouse_y=y)
+_clh.hover["key"] = ("x", 0)                    # a hovered label still takes a sketch tool's click
+_iv = (_PMg._in_view(_ivc, _evg(860, 760)), _PMg._in_view(_ivc, _evg(500, 400)))
+_clh.hover["key"] = _h0
+check("modal tools (sketch tools, picking, trims): the navigation gizmo is not 'in the view', so its clicks and "
+      "drags go to Blender; the rest of the view (a label too) stays the tool's", _iv == (False, True), str(_iv))
+from blender_nurbs import ops as _opsg
+_opsg.GIZMO["held"] = False
+_evt = lambda t, v, x, y: _types.SimpleNamespace(type=t, value=v, mouse_x=x, mouse_y=y)
+_seq = [_PMg._in_view(_ivc, _evt('LEFTMOUSE', 'PRESS', 860, 760)),       # press on the axis ball
+        _PMg._in_view(_ivc, _evt('MOUSEMOVE', 'NOTHING', 500, 400)),     # dragging off it, over the view
+        _PMg._in_view(_ivc, _evt('LEFTMOUSE', 'CLICK_DRAG', 860, 760)),  # Blender starts the rotate
+        _PMg._in_view(_ivc, _evt('MOUSEMOVE', 'NOTHING', 500, 400))]     # (after it) the tool again
+_seq2 = [_PMg._in_view(_ivc, _evt('LEFTMOUSE', 'PRESS', 860, 760)),
+         _PMg._in_view(_ivc, _evt('LEFTMOUSE', 'RELEASE', 860, 760)),    # a click: released on the gizmo
+         _PMg._in_view(_ivc, _evt('MOUSEMOVE', 'NOTHING', 500, 400))]
+check("gizmo drag while a tool runs: after a press on the gizmo the mouse moves go to Blender (so its drag starts), "
+      "until the drag starts or the button comes up", _seq == [False, False, False, True]
+      and _seq2 == [False, False, True] and not _opsg.GIZMO["held"], f"{_seq} {_seq2}")
 # tools take the picked edges -- through their real invoke (background Blender has no window: bpy.ops would run
 # execute straight away), on a stand-in like the sketch tools'
 def _fake_pick(op_cls, **props):
@@ -6086,5 +6111,871 @@ features._remap_dependents(_nb, _old, turned=False)
 _ref2 = features.history(_ec)["inputs"][0][1]
 check("edge renumbering: a feature on a trimmed edge keeps its edge (same numbers stay, a renumbered one follows)",
       r == {'FINISHED'} and _ref0 == _ref1 == f"E{_k_mid}" and _ref2 == f"E{_other}", f"{_ref0} {_ref1} {_ref2}")
+
+# --- Sketch snapping to plain meshes (Snap to Meshes): vertex, edge, edge centre, face, face centre;
+#     evaluated (modifiers applied), only what faces the viewer, loose wire edges, a dense mesh stays fast
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+_ALL = set(_sn.MESH_ELEMENTS)
+_sf0 = _sn.SNAP_STATE["surface"]
+_sn.SNAP_STATE["surface"] = False
+_e_off = _sn.sketch_mesh_elements()
+_sn.SNAP_STATE["surface"] = True
+_e_on = _sn.sketch_mesh_elements()
+_sn.SNAP_STATE["surface"] = _sf0
+check("mesh snap is always on for the sketch tools (vertex, edge, edge / face centre, like curves), Face only with O",
+      _e_off == {"VERTEX", "EDGE", "EDGE_MIDPOINT", "FACE_MIDPOINT"} and _e_on == _e_off | {"FACE"}, f"{_e_off} {_e_on}")
+bpy.ops.mesh.primitive_cube_add(size=2, location=(0, 0, 0)); MC = ctx.active_object; MC.name = "SnapCube"
+bpy.ops.mesh.primitive_cube_add(size=0.2, location=(0.5, 0.5, -5)); MB = ctx.active_object; MB.name = "Behind"
+bpy.ops.nproto.add_primitive(kind='CYLINDER', radius=0.3, height=0.5, caps=True); _ncy = ctx.active_object
+_ncy.location = (6, 0, 0)
+top = _snap_view()
+_els = [_ALL]
+TM = _sn.collect([MC, MB, _ncy], mesh_elements=lambda: _els[0])
+check("mesh snap: plain meshes are mesh targets, a NURBS object is not", TM.counts["meshes"] == 2, str(TM.counts))
+MC.hide_select = True
+_ncy.hide_select = True
+TX = _sn.collect([MC, _ncy], mesh_elements=lambda: _ALL)
+_hx = TX.pick(top, _px(1, 1) + (3, 2))
+MC.hide_select = False
+_ncy.hide_select = False
+check("snap: an object that can't be selected never snaps (a locked scan or reference), mesh or NURBS",
+      _hx is None and TX.counts["meshes"] == 0 and TX.counts.get("end", 0) == 0, f"{_hx} {TX.counts}")
+h = TM.pick(top, _px(1, 1) + (3, 2))
+check("mesh snap: vertex (the top one, nearest the viewer)", h is not None and h[1] == "vertex"
+      and np.allclose(h[0], (1, 1, 1), atol=1e-6) and h[3] is None, f"{h}")
+h = TM.pick(top, _px(1, 0) + (-3, 4))
+check("mesh snap: edge centre", h is not None and h[1] == "mid" and np.allclose(h[0], (1, 0, 1), atol=1e-6), f"{h}")
+h = TM.pick(top, _px(0, 0) + (4, 3))
+check("mesh snap: face centre", h is not None and h[1] == "center" and np.allclose(h[0], (0, 0, 1), atol=1e-6), f"{h}")
+h = TM.pick(top, _px(1, 0.5) + (5, 0))
+check("mesh snap: a point on an edge lies on it", h is not None and h[1] == "edge"
+      and abs(h[0][0] - 1) < 1e-6 and abs(h[0][2] - 1) < 1e-6 and abs(h[0][1] - 0.5) < 0.03, f"{h}")
+h = TM.pick(top, _px(0.4, -0.3))
+check("mesh snap: Face puts the point on the face under the mouse", h is not None and h[1] == "face"
+      and np.allclose(h[0], (0.4, -0.3, 1), atol=1e-6), f"{h}")
+h2 = TM.pick(top, _px(0.4, -0.3), edges=False)
+check("mesh snap: a lock, Ctrl or Shift leaves only the point snaps (no edge, no face)", h2 is None, f"{h2}")
+_hf = TM.pick(top, _px(1, 0.5) + (5, 0))
+_fr = _hf[2] if _hf is not None else None
+check("mesh snap: an edge carries its frame (direction, its face's normal) for a profile",
+      _fr is not None and np.shape(_fr) == (2, 3) and abs(abs(_fr[0][1]) - 1) < 1e-9
+      and np.allclose(_fr[1], (0, 0, 1), atol=1e-9), f"{_fr}")
+import json as _jsm
+_prof_n = len(bpy.data.objects)
+r = bpy.ops.nproto.draw_profile('EXEC_DEFAULT', shape='CIRCLE', radius=0.2, rotation=0.0,
+                                 data=_jsm.dumps({"mesh": True, "P": [1.0, 0.5, 1.0], "T": [0.0, 1.0, 0.0],
+                                                  "up": [0.0, 0.0, 1.0]}))
+_pf = ctx.active_object
+_Mp = np.array(_pf.matrix_world)
+_hp = features.history(_pf)
+check("Profile on a mesh edge: perpendicular to the edge, standing square to its face, at the click; a one-off "
+      "(no history on the mesh)", r == {'FINISHED'} and len(bpy.data.objects) == _prof_n + 1
+      and np.allclose(_Mp[:3, 2], (0, 1, 0), atol=1e-6) and np.allclose(_Mp[:3, 1], (0, 0, 1), atol=1e-6)
+      and np.allclose(_Mp[:3, 3], (1, 0.5, 1), atol=1e-6) and _hp is not None and _hp["op"] == "prim_circle",
+      f"{r} {_Mp[:3, 1:].T.round(6).tolist()} {_hp and _hp['op']} objects {_prof_n} -> {len(bpy.data.objects)}")
+bpy.data.objects.remove(_pf)
+_els[0] = _ALL - {"FACE"}
+h = TM.pick(top, _px(0.4, -0.3))
+check("mesh snap: Face off: the point stays free (the drawing plane)", h is None, f"{h}")
+h = TM.pick(top, _px(0.6, 0.6) + (1, 1))
+check("mesh snap: a vertex hidden behind a face never snaps", h is None or h[1] != "vertex", f"{h}")
+_els[0] = set()
+h = TM.pick(top, _px(1, 1) + (3, 2))
+check("mesh snap: Snap to Meshes off: no mesh snaps at all", h is None, f"{h}")
+_els[0] = {"EDGE"}
+h = TM.pick(top, _px(1, 1) + (3, 2))
+check("mesh snap: only the switched-on elements (Edge only: no vertex)", h is not None and h[1] == "edge", f"{h}")
+# read once per session: the next tool run reuses it; a geometry change drops it
+_d1 = _sn.MESH_CACHE.get(MC.session_uid)
+T2 = _sn.collect([MC], mesh_elements=lambda: _ALL)
+T2.pick(top, _px(1, 1) + (3, 2))
+_reused = _d1 is not None and _sn.MESH_CACHE.get(MC.session_uid) is _d1
+MC.location.x += 0.25                           # a move: same mesh, the next run snaps in the new place
+ctx.view_layer.update()
+T3 = _sn.collect([MC], mesh_elements=lambda: _ALL)
+h = T3.pick(top, _px(1.25, 1) + (3, 2))
+_moved = _sn.MESH_CACHE.get(MC.session_uid) is _d1 and h is not None and np.allclose(h[0], (1.25, 1, 1), atol=1e-6)
+MC.location.x -= 0.25
+MC.data.vertices[0].co.z -= 0.5                 # a geometry change
+MC.data.update()
+ctx.view_layer.update()
+_dropped = MC.session_uid not in _sn.MESH_CACHE
+check("mesh snap: a mesh is read once per session (the next tool reuses it, also after a move); a geometry change "
+      "drops it", _reused and _moved and _dropped, f"{_reused} {_moved} {_dropped} {h}")
+# evaluated geometry: a subdivided cube snaps on its smooth surface, not its cage
+bpy.ops.object.select_all(action='DESELECT')
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+bpy.ops.mesh.primitive_cube_add(size=2); MS = ctx.active_object
+_md = MS.modifiers.new("Subdivision", 'SUBSURF'); _md.levels = 2
+_dg = ctx.evaluated_depsgraph_get()
+_me = MS.evaluated_get(_dg).to_mesh()
+_ztop = max(v_.co.z for v_ in _me.vertices if abs(v_.co.x) < 1e-6 and abs(v_.co.y) < 1e-6)
+MS.evaluated_get(_dg).to_mesh_clear()
+TS = _sn.collect([MS], mesh_elements=lambda: _ALL)
+h = TS.pick(top, _px(0, 0) + (2, 2))
+check("mesh snap: a subdivided mesh snaps to what the view shows (modifiers applied)",
+      h is not None and h[1] == "vertex" and np.linalg.norm(h[0][:2]) < 1e-6 and abs(h[0][2] - _ztop) < 1e-6
+      and _ztop < 0.99, f"{h} top {_ztop:.4f}")
+h = TS.pick(top, _px(0.35, -0.2) + (1, 0))
+_hit = MS.ray_cast((0.35 + 1 / 250, -0.2, 5), (0, 0, -1))
+check("mesh snap: the face point lies on the smooth surface", h is not None and (h[1] != "face" or
+      abs(h[0][2] - _hit[1][2]) < 1e-5), f"{h} ray {_hit[1][:] if _hit[0] else None}")
+# loose edges (a wire outline: no face for a ray to hit)
+_mw = bpy.data.meshes.new("Wire"); _mw.from_pydata([(3, 0, 0), (4, 0, 0), (4, 1, 0)], [(0, 1), (1, 2)], [])
+MW = bpy.data.objects.new("Wire", _mw); ctx.collection.objects.link(MW)
+TW = _sn.collect([MW], mesh_elements=lambda: _ALL)
+hm = TW.pick(top, _px(3.5, 0) + (2, 1))
+he = TW.pick(top, _px(3.25, 0) + (0, 5))
+hv = TW.pick(top, _px(4, 1) + (-2, -2))
+check("mesh snap: loose wire edges snap (centre, a point on the edge, vertex)",
+      hm is not None and hm[1] == "mid" and np.allclose(hm[0], (3.5, 0, 0), atol=1e-6)
+      and he is not None and he[1] == "edge" and abs(he[0][1]) < 1e-9 and abs(he[0][0] - 3.25) < 0.03
+      and hv is not None and hv[1] == "vertex" and np.allclose(hv[0], (4, 1, 0), atol=1e-6), f"{hm} | {he} | {hv}")
+# a point cloud (more loose points than LOOSE_MAX) doesn't snap point by point: it would cost every mouse move
+_lm0 = _sn.LOOSE_MAX
+_sn.LOOSE_MAX = 50
+_mp = bpy.data.meshes.new("Cloud"); _mp.from_pydata([(5 + 0.01 * k, 0, 0) for k in range(80)], [], [])
+MP = bpy.data.objects.new("Cloud", _mp); ctx.collection.objects.link(MP)
+TP = _sn.collect([MP], mesh_elements=lambda: _ALL)
+_hp = TP.pick(top, _px(5.2, 0) + (1, 1))
+_skip = _sn.MESH_CACHE[MP.session_uid].loose_skipped
+_sn.LOOSE_MAX = _lm0
+check("mesh snap: a point cloud past LOOSE_MAX snaps only on its faces (no per-point cost)", _skip and _hp is None,
+      f"{_skip} {_hp}")
+# a dense mesh (160k faces) snaps at mouse-move speed
+bpy.ops.mesh.primitive_grid_add(x_subdivisions=400, y_subdivisions=400, size=3, location=(0, 0, 0.5)); MG = ctx.active_object
+TG = _sn.collect([MG], mesh_elements=lambda: _ALL)
+TG.pick(top, _px(0.1, 0.1))                    # the first move reads the mesh
+import time as _tm
+_t0 = _tm.perf_counter()
+_hs = [TG.pick(top, _px(0.1 + 0.01 * k, 0.1)) for k in range(20)]
+_dtm = (_tm.perf_counter() - _t0) / 20
+check("mesh snap: a dense mesh (160k faces) snaps at mouse-move speed",
+      _dtm < 0.03 and all(h_ is not None and h_[1] in ("vertex", "mid", "center", "edge") for h_ in _hs),
+      f"{_dtm * 1000:.1f} ms per move, {len(MG.data.polygons)} faces")
+
+# --- Ctrl grid snapping: the grid the view draws (its unit levels, faded in by spacing), never a finer one
+from blender_nurbs import drawtools as _dtg
+_gi = _dtg.grid_steps("IMPERIAL", 1.0)
+_gm = _dtg.grid_steps("METRIC", 1.0)
+_gn = _dtg.grid_steps("NONE", 1.0, 1.0, 10)
+_snap_in = lambda ppi: round(_dtg.visible_grid_step(_gi, ppi / 0.0254) / 0.0254, 6)
+_snap_cm = lambda ppcm: round(_dtg.visible_grid_step(_gm, ppcm / 0.01) * 100, 6)
+check("grid snap: Imperial levels are its units (thou, inch, foot, yard...), no inch fractions; the step is the finest "
+      "level drawn at least half visible",
+      _snap_in(74) == 1.0 and _snap_in(2000) == 1.0 and _snap_in(10) == 12.0 and _snap_in(25) == 1.0
+      and len(_gi) == 8 and abs(_gi[1] - 0.0254) < 1e-12, f"{_snap_in(74)} {_snap_in(2000)} {_snap_in(10)}")
+check("grid snap: Metric steps by tens with the zoom (mm, cm, 10 cm, m); no units: Grid Scale x Subdivisions",
+      _snap_cm(200) == 0.1 and _snap_cm(40) == 1.0 and _snap_cm(5) == 10.0 and _snap_cm(1) == 100.0
+      and _gn[:3] == [1.0, 10.0, 100.0], f"{_snap_cm(200)} {_snap_cm(40)} {_snap_cm(5)} {_snap_cm(1)}")
+check("grid snap: the scene's Unit Scale and the overlay's Grid Scale move the levels",
+      abs(_dtg.grid_steps("METRIC", 0.001)[4] - 1000.0) < 1e-9 and abs(_dtg.grid_steps("METRIC", 1.0, 2.0)[4] - 2.0) < 1e-12)
+
+# --- Draw Line: the lines drawn so far snap (their ends, middles, any point on them); Alt places a free point;
+#     O switches snapping onto mesh faces
+_TL = _sn.collect([])
+_segs = [(np.array([0.0, 0, 0]), np.array([2.0, 0, 0])), (np.array([2.0, 0, 0]), np.array([2.0, 1.0, 0]))]
+hm = _TL.pick(top, _px(1, 0) + (3, -2), segments=_segs)
+hl = _TL.pick(top, _px(0.4, 0) + (0, 5), segments=_segs)
+hv = _TL.pick(top, _px(2, 0.75) + (-4, 0), segments=_segs)
+check("drawn lines snap: a middle, and any point on a line (exactly on it)",
+      hm is not None and hm[1] == "mid" and np.allclose(hm[0], (1, 0, 0)) and hl is not None and hl[1] == "line"
+      and abs(hl[0][1]) < 1e-12 and abs(hl[0][0] - 0.4) < 0.02 and hv is not None and hv[1] == "line"
+      and abs(hv[0][0] - 2) < 1e-12, f"{hm} | {hl} | {hv}")
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+f = _ln_tool(polyline=True)
+_click(f, (0.0, 0.0, 0))
+_click(f, (2.0, 0.0, 0))
+_click(f, (2.0, 1.0, 0))
+_at(f, (1.0, 0.0, 0), (2, 3))
+_lm = _drw.sketch_overlay["snap_label"]
+_at(f, (0.5, 0.0, 0), (0, 5))
+_ll = _drw.sketch_overlay["snap_label"]
+_evA = lambda xy: _types.SimpleNamespace(type='MOUSEMOVE', value='NOTHING', mouse_x=float(xy[0]), mouse_y=float(xy[1]),
+                                         shift=False, ctrl=False, alt=True, oskey=False, unicode="")
+f.modal(fc, _evA(np.array(_wpx(1.0, 0.0)) + (2, 3)))
+_la = _drw.sketch_overlay["snap_label"]
+_sf0 = _sn.SNAP_STATE["surface"]
+_sn.SNAP_STATE["surface"] = False
+_evO = _types.SimpleNamespace(type='O', value='PRESS', mouse_x=600.0, mouse_y=600.0, shift=False, ctrl=False,
+                              alt=False, oskey=False, unicode="o")
+f.modal(fc, _evO)
+_on = _sn.SNAP_STATE["surface"]
+_row = dict(_hn.HUD["spec"]["rows"]).get("Snap") if _hn.HUD.get("spec") else None
+f.modal(fc, _evO)
+_off = _sn.SNAP_STATE["surface"]
+_sn.SNAP_STATE["surface"] = _sf0
+f.modal(fc, _ev('ESC', (600, 600)))
+check("Draw Line: the polyline drawn so far snaps (Mid, On Line); Alt: no snapping; O toggles on-surface snapping "
+      "(shown in the key hints)", _lm == "Mid" and _ll == "On Line" and _la is None and _on and not _off
+      and _row is not None and [it for it in _row if it["keys"] == ["O"]][0].get("current") == "on",
+      f"{_lm} {_ll} {_la} {_on} {_off} {_row}")
+
+# --- Draw Line: tangent arcs (R) -- a slot: line, arc, line, arc, one exact closed curve
+_m = _dt.tangent_arc((0, 0, 0), (1, 0, 0), (0, 2, 0))
+_C, _r, _x, _y, _th = _dt.arc_circle((0, 0, 0), _m, (0, 2, 0))
+_te = _dt.seg_end_tangent((0, 0, 0), (0, 2, 0), _m)
+_m3 = _dt.tangent_arc((0, 0, 0), (1, 0, 0), (-1, 1, 0))
+_th3 = _dt.arc_circle((0, 0, 0), _m3, (-1, 1, 0))[4]
+check("tangent arc: leaves along the last direction, sweeps twice the tangent-chord angle (180 / 270 degrees), "
+      "ends in the mirrored direction; none along the tangent line",
+      np.allclose(_m, (1, 1, 0)) and np.allclose(_C, (0, 1, 0)) and abs(_r - 1) < 1e-12 and abs(_th - math.pi) < 1e-12
+      and np.allclose(_te, (-1, 0, 0)) and abs(_th3 - 1.5 * math.pi) < 1e-12
+      and np.allclose(_m3, (math.cos(math.pi / 4), 1 + math.sin(math.pi / 4), 0))
+      and _dt.tangent_arc((0, 0, 0), (1, 0, 0), (3, 0, 0)) is None, f"{_m} {_C} {_th} {_te} {_m3} {_th3}")
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+f = _ln_tool(polyline=True)
+_click(f, (0.0, 0.0, 0))
+_click(f, (2.0, 0.0, 0))
+f.modal(fc, _ev('R', _wpx(2.0, 0.5)))
+_st_arc = fc.area.text
+_click(f, (2.0, 1.0, 0))
+f.modal(fc, _ev('R', _wpx(1.0, 1.0)))
+_click(f, (0.0, 1.0, 0))
+f.modal(fc, _ev('R', _wpx(0.0, 0.5)))
+_click(f, (0.0, 0.0, 0))
+_arcs = list(f._arc_list())
+_n0 = set(bpy.data.objects)
+f.modal(fc, _ev('RET', (600, 600)))
+_new = [o for o in bpy.data.objects if o not in _n0 and o.type == 'CURVE']
+_sl = _new[0] if len(_new) == 1 else None
+_spl = _sl.data.splines[0] if _sl is not None else None
+_dev = 1.0
+if _spl is not None:
+    _kc = features.input_curve(_sl, "S0")
+    _t0, _t1 = _kc.parameter_range()
+    def _slot_d(p):                       # distance to the exact slot: two lines and two half circles
+        x, y = p[0], p[1]
+        if 0 <= x <= 2:
+            return min(abs(y), abs(y - 1)) if not (0 < y < 1) or True else 0
+        c = (2.0, 0.5) if x > 2 else (0.0, 0.5)
+        return abs(math.hypot(x - c[0], y - c[1]) - 0.5)
+    _dev = max(_slot_d(_kc.evaluate(_t0 + (_t1 - _t0) * k / 400)) for k in range(401))
+check("Draw Line + R: a slot (line, tangent arc, line, tangent arc back to the start) is one closed exact curve "
+      "(order 3, Bezier knots), on the slot's lines and half circles (to Blender's single-precision CVs)",
+      [m_ is not None for m_ in _arcs] == [False, True, False, True] and "arc ends" in _st_arc
+      and _spl is not None and _spl.order_u == 3 and _spl.use_bezier_u and _spl.use_cyclic_u
+      and len(_spl.points) == 12 and _dev < 1e-7, f"{_arcs} | {_st_arc} | {_spl and len(_spl.points)} dev {_dev:.1e}")
+
+# --- Draw Line arcs: typed Radius / Angle (90: a half circle); smart guides align to the sketch
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+_glin = nurbs("GuideRef", [(3.0, 3.0, 0.0), (4.0, 3.0, 0.0)], order=2)
+f = _ln_tool(polyline=True)
+_click(f, (0.0, 0.0, 0))
+_click(f, (2.0, 0.0, 0))
+f.modal(fc, _ev('R', _wpx(2.3, 0.6)))
+_xy = _at(f, (2.3, 0.6, 0))
+for ch_, ty_ in (("0", "ZERO"), (".", "PERIOD"), ("5", "FIVE")):
+    _type(f, ch_, ty_, _xy)
+f.modal(fc, _ev('TAB', _xy))
+for ch_, ty_ in (("9", "NINE"), ("0", "ZERO")):
+    _type(f, ch_, ty_, _xy)
+_hdr = fc.area.text
+_type(f, "", "RET", _xy)
+_seg, _mid = f._lines[-1], f._arc_list()[-1]
+check("Draw Line arc: typed Radius 0.5 and Angle 90 (from the direction it leaves) make an exact half circle; "
+      "the header shows Radius, Angle and the arc's sweep",
+      np.allclose(_seg[1], (2, 1, 0), atol=1e-12) and _mid is not None and np.allclose(_mid, (2.5, 0.5, 0), atol=1e-12)
+      and "Radius" in _hdr and "arc 180" in _hdr, f"{_seg[1]} {_mid} | {_hdr}")
+f.modal(fc, _ev('R', _xy))                      # lines again
+_at(f, (1.0, 1.0, 0), (0, 4))
+_g1 = (_drw.sketch_overlay["snap_label"], f._target(fc, _ev('MOUSEMOVE', np.array(_wpx(1.0, 1.0)) + (0, 4), 'NOTHING'))[0])
+_at(f, (0.0, 1.0, 0), (3, 3))
+_g2_label, _g2_guides = _drw.sketch_overlay["snap_label"], len(_drw.sketch_overlay["guides"])
+_g2 = f._target(fc, _ev('MOUSEMOVE', np.array(_wpx(0.0, 1.0)) + (3, 3), 'NOTHING'))[0]
+_click(f, (0.0, 1.0, 0), (3, 3))
+_end = f._lines[-1][1]
+_at(f, (4.0, 3.0, 0), (2, 2))                   # hover an old line's end: guides align to it from now on
+_at(f, (4.0, 1.0, 0), (3, -4))
+_g3 = (_drw.sketch_overlay["snap_label"], f._target(fc, _ev('MOUSEMOVE', np.array(_wpx(4.0, 1.0)) + (3, -4), 'NOTHING'))[0])
+_snap_row = [it["keys"][0] for it in dict(_hn.HUD["spec"]["rows"])["Snap"]]
+f.modal(fc, _ev('ESC', (600, 600)))
+check("smart guides: the line back stays on the arc's tangent line; where it crosses the first point's vertical "
+      "it snaps exactly (dashed guides drawn), so the slot's sides end square; a hovered point's guides align too",
+      _g1[0] in ("Tangent", "Aligned", "Aligned · Tangent", "Tangent · Aligned") and abs(_g1[1][1] - 1) < 1e-12
+      and "Aligned" in (_g2_label or "") and _g2_guides > 0 and np.allclose(_g2, (0, 1, 0), atol=1e-12)
+      and np.allclose(_end, (0, 1, 0), atol=1e-12) and "Aligned" in (_g3[0] or "")
+      and np.allclose(_g3[1], (4, 1, 0), atol=1e-12), f"{_g1} | {_g2_label} {_g2} {_end} | {_g3}")
+check("key hints: the Snap row reads Ctrl grid, Alt no snapping, O on surface", _snap_row == ["Ctrl", "Alt", "O"],
+      str(_snap_row))
+
+# --- smart guides follow the sketch: perpendicular / parallel to its lines, not only horizontal / vertical
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+f = _ln_tool(polyline=True)
+_click(f, (0.0, 0.0, 0))
+_click(f, (2.0, 1.0, 0))                        # a slanted line
+f.modal(fc, _ev('R', _wpx(2.4, 0.2)))
+_dl = np.array([2.0, 1.0, 0.0]) / math.sqrt(5)
+_Qp = np.array([2.0, 1.0, 0.0]) + np.array([1.0, -2.0, 0.0]) / math.sqrt(5)      # on the perpendicular through its end
+_off = np.array([2.0, 1.0]) / math.sqrt(5) * 3                                  # 3 px off that guide
+_at(f, _Qp, _off)
+_gl = _drw.sketch_overlay["snap_label"]
+_Pp = f._target(fc, _ev('MOUSEMOVE', np.array(_wpx(*_Qp[:2])) + _off, 'NOTHING'))[0]
+_click(f, _Qp, _off)
+_th = _dt.arc_circle(f._lines[-1][0], f._arc_list()[-1], f._lines[-1][1])[4] if f._arc_list()[-1] is not None else 0
+f.modal(fc, _ev('ESC', (600, 600)))
+check("smart guides: perpendicular to a slanted sketch line through its end -- the arc ending there is a half circle",
+      _gl is not None and "Perpendicular" in _gl and abs(float((_Pp - np.array([2.0, 1.0, 0.0])) @ _dl)) < 1e-9
+      and abs(_th - math.pi) < 1e-9, f"{_gl} {_Pp} sweep {math.degrees(_th):.6f}")
+
+# --- no H / V any more: X / Y / Z lock a world axis and stop where it crosses a smart guide
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+f = _ln_tool(polyline=True)
+_click(f, (0.0, 0.0, 0))
+_click(f, (2.0, 1.0, 0))
+f.modal(fc, _ev('H', _wpx(1.0, 1.0)))
+_hlock = f._lock
+f.modal(fc, _ev('X', _wpx(1.0, 1.0)))
+_xy = _at(f, (0.0, 1.0, 0), (2, 3))
+_lx = _drw.sketch_overlay["snap_label"]
+_Px = f._target(fc, _ev('MOUSEMOVE', _xy, 'NOTHING'))[0]
+_dir_keys = [it["keys"][0] for it in dict(_hn.HUD["spec"]["rows"])["Direction"]]
+f.modal(fc, _ev('ESC', (600, 600)))
+check("H / V are gone (the guides do horizontal / vertical); an X lock stops where it crosses a guide (above the "
+      "first point)", _hlock is None and "H V" not in _dir_keys and "Aligned" in (_lx or "")
+      and np.allclose(_Px, (0, 1, 0), atol=1e-12), f"{_hlock} {_dir_keys} {_lx} {_Px}")
+
+# --- new shapes are sized to the view (a quarter of its width, on the visible grid), not a fixed 2 m
+from mathutils import Matrix as _Mx
+from blender_nurbs import feature_ui as _fui
+def _vs_ctx(width_units, system):
+    VM = _Mx.Translation((0, 0, -10))
+    WM = _Mx.Diagonal((2.0 / width_units, 2.0 / width_units * 1000 / 800, -0.01, 1.0))
+    rv = _types.SimpleNamespace(view_matrix=VM, window_matrix=WM, perspective_matrix=WM @ VM, is_perspective=False,
+                                view_perspective='ORTHO')
+    rg = _types.SimpleNamespace(type='WINDOW', width=1000, height=800, x=0, y=0)
+    sp = _types.SimpleNamespace(region_3d=rv, overlay=_types.SimpleNamespace(grid_scale=1.0, grid_subdivisions=10))
+    ar = _types.SimpleNamespace(type='VIEW_3D', regions=[rg], spaces=_types.SimpleNamespace(active=sp))
+    ctx.scene.unit_settings.system = system
+    return _types.SimpleNamespace(area=ar, scene=ctx.scene)
+_us0 = (ctx.scene.unit_settings.system, ctx.scene.unit_settings.scale_length)
+ctx.scene.cursor.location = (0, 0, 0)
+ctx.scene.unit_settings.scale_length = 1.0
+_vm = _fui.view_size(_vs_ctx(0.2, 'METRIC'))
+_vi = _fui.view_size(_vs_ctx(0.2, 'IMPERIAL'))
+_vbig = _fui.view_size(_vs_ctx(40.0, 'METRIC'))
+ctx.scene.unit_settings.system, ctx.scene.unit_settings.scale_length = _us0
+_none = _fui.view_size(_types.SimpleNamespace(area=None, scene=ctx.scene))
+check("shape size from the view: a 20 cm wide view gives 5 cm (metric) / exactly 2 in (imperial); a 40 m view 10 m; "
+      "no 3D view: the panel defaults", abs(_vm - 0.05) < 1e-12 and abs(_vi - 0.0508) < 1e-12 and abs(_vbig - 10.0) < 1e-9
+      and _none is None, f"{_vm} {_vi} {_vbig} {_none}")
+_cg = [sec[0] for sec in [g for g in __import__("blender_nurbs.toolgroups", fromlist=["GROUPS"]).GROUPS if g[0] == "CURVES"][0][2]]
+check("Create Curves: Blend Curve right under the drawing tools", _cg[:2] == ["Draw", "Between Curves"], str(_cg))
+
+# --- Circle and Arc drawing tools: modes, snapping, typed values; exact prim_circle / prim_arc features
+from blender_nurbs import drawshapes as _ds
+def _fake_shape(op_cls, **props):
+    base_ = next(b_ for b_ in op_cls.__mro__[1:] if isinstance(b_, type) and issubclass(b_, _ds._ShapeTool))
+    cls = type("Fake" + op_cls.__name__, (base_,), {})
+    for k_, v_ in op_cls.__dict__.items():
+        if ((callable(v_) or isinstance(v_, (staticmethod, property))) and k_ not in ("invoke", "__init__")
+                and not k_.startswith("bl_")) or k_ in ("MODES", "TITLE", "STEPS", "PARAMS", "FIELD_NAMES", "FIELD_HINTS", "NUMBERS"):
+            setattr(cls, k_, v_)
+    cls.passthrough = lambda self, c, e: False
+    cls.report = lambda self, t, m: self.msgs.append(m)
+    f_ = cls()
+    f_.msgs, f_.data = [], ""
+    for k_, v_ in props.items():
+        setattr(f_, k_, v_)
+    f_._reset()
+    f_.sketch_start(fc)
+    return f_
+def _typ(f_, text, xy):
+    names = {".": "PERIOD", "0": "ZERO", "1": "ONE", "2": "TWO", "3": "THREE", "4": "FOUR", "5": "FIVE",
+             "6": "SIX", "7": "SEVEN", "8": "EIGHT", "9": "NINE"}
+    for ch_ in text:
+        _type(f_, ch_, names[ch_], xy)
+def _newest_curve(before):
+    new_ = [o for o in bpy.data.objects if o not in before and o.type == 'CURVE']
+    return new_[-1] if new_ else None
+def _ends(o):
+    kc_ = features.input_curve(o, "S0")
+    t0_, t1_ = kc_.parameter_range()
+    return (np.array(kc_.evaluate(t0_)), np.array(kc_.evaluate(0.5 * (t0_ + t1_))), np.array(kc_.evaluate(t1_)),
+            [np.array(kc_.evaluate(t0_ + (t1_ - t0_) * k / 40)) for k in range(41)])
+def _on_circle(pts, C, r):
+    return max(abs(np.linalg.norm(q - np.asarray(C)) - r) for q in pts)
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+_res = {}
+# Circle: centre + typed radius
+f = _fake_shape(_ds.NPROTO_OT_draw_circle, mode="CENTER", radius=0.5)
+_b = set(bpy.data.objects)
+_click(f, (0.0, 0.0, 0))
+_xy = _at(f, (0.8, 0.3, 0))
+_typ(f, "0.5", _xy)
+_type(f, "", "RET", _xy)
+_o = _newest_curve(_b)
+_res["centre"] = None if _o is None else (_on_circle(_ends(_o)[3], (0, 0, 0), 0.5), features.history(_o)["op"])
+# Circle: 2 points, 3 points
+f = _fake_shape(_ds.NPROTO_OT_draw_circle, mode="TWO", radius=0.5)
+_b = set(bpy.data.objects)
+_click(f, (0.0, 0.0, 0))
+_click(f, (2.0, 0.0, 0))
+_o = _newest_curve(_b)
+_res["two"] = None if _o is None else _on_circle(_ends(_o)[3], (1, 0, 0), 1.0)
+f = _fake_shape(_ds.NPROTO_OT_draw_circle, mode="THREE", radius=0.5)
+_b = set(bpy.data.objects)
+for q_ in ((1.0, 0.0, 0), (0.0, 1.0, 0), (-1.0, 0.0, 0)):
+    _click(f, q_)
+_o = _newest_curve(_b)
+_res["three"] = None if _o is None else _on_circle(_ends(_o)[3], (0, 0, 0), 1.0)
+check("Circle tool: centre + typed radius, 2 points (diameter), 3 points -- exact circles, prim_circle features",
+      _res["centre"] is not None and _res["centre"][0] < 1e-6 and _res["centre"][1] == "prim_circle"
+      and _res["two"] is not None and _res["two"] < 1e-6 and _res["three"] is not None and _res["three"] < 1e-6,
+      str(_res))
+# two straight lines meeting at the origin: tangent circle / fillet arc in the corner the mouse is in
+_lx = nurbs("TanX", [(-2.0, 0.0, 0.0), (2.0, 0.0, 0.0)], order=2)
+_ly = nurbs("TanY", [(0.0, -2.0, 0.0), (0.0, 2.0, 0.0)], order=2)
+f = _fake_shape(_ds.NPROTO_OT_draw_circle, mode="TANGENT", radius=0.5)
+_b = set(bpy.data.objects)
+_click(f, (1.5, 0.0, 0))
+_click(f, (0.0, 1.5, 0))
+_xy = _at(f, (0.8, 0.6, 0))
+_typ(f, "0.5", _xy)
+_type(f, "", "RET", _xy)
+_o = _newest_curve(_b)
+_res["tan"] = None if _o is None else _on_circle(_ends(_o)[3], (0.5, 0.5, 0), 0.5)
+f = _fake_shape(_ds.NPROTO_OT_draw_arc, mode="FILLET", radius=0.5, angle=90.0)
+_b = set(bpy.data.objects)
+_click(f, (1.5, 0.0, 0))
+_click(f, (0.0, 1.5, 0))
+_xy = _at(f, (0.8, 0.6, 0))
+_typ(f, "0.5", _xy)
+_type(f, "", "RET", _xy)
+_o = _newest_curve(_b)
+_fe = _ends(_o) if _o is not None else None
+_res["fillet"] = None if _fe is None else (_on_circle(_fe[3], (0.5, 0.5, 0), 0.5),
+                                           sorted([tuple(np.round(_fe[0], 6)), tuple(np.round(_fe[2], 6))]))
+check("Circle tool Tangent / Arc tool Fillet: tangent to two lines, in the mouse's corner, typed radius",
+      _res["tan"] is not None and _res["tan"] < 1e-6 and _res["fillet"] is not None and _res["fillet"][0] < 1e-6
+      and _res["fillet"][1] == [(0.0, 0.5, 0.0), (0.5, 0.0, 0.0)], f"{_res['tan']} {_res['fillet']}")
+bpy.data.objects.remove(_lx)
+bpy.data.objects.remove(_ly)
+# Arc: 3 points (start, end, through), centre (the mouse sweeps either way, past 180), tangent from a line's end
+f = _fake_shape(_ds.NPROTO_OT_draw_arc, mode="THREE", radius=0.5, angle=90.0)
+_b = set(bpy.data.objects)
+for q_ in ((1.0, 0.0, 0), (-1.0, 0.0, 0), (0.6, 0.8, 0)):
+    _click(f, q_)
+_o = _newest_curve(_b)
+_a3 = _ends(_o) if _o is not None else None
+f = _fake_shape(_ds.NPROTO_OT_draw_arc, mode="CENTER", radius=0.5, angle=90.0)
+_b = set(bpy.data.objects)
+_click(f, (0.0, 0.0, 0))
+_click(f, (1.0, 0.0, 0))
+for q_ in ((0.9, 0.4, 0), (0.6, 0.8, 0), (0.0, 1.0, 0), (-0.7, 0.7, 0), (-1.0, 0.0, 0), (-0.6, -0.8, 0)):
+    _at(f, q_)
+_click(f, (0.0, -1.0, 0))
+_o = _newest_curve(_b)
+_ac = (_ends(_o), features.history(_o)["params"]["angle"]) if _o is not None else None
+_ln = nurbs("TanStart", [(-2.0, 0.0, 0.0), (0.0, 0.0, 0.0)], order=2)
+f = _fake_shape(_ds.NPROTO_OT_draw_arc, mode="TANGENT", radius=0.5, angle=90.0)
+_b = set(bpy.data.objects)
+_click(f, (0.0, 0.0, 0), (2, 1))                 # the line's end
+_xy = _at(f, (0.3, 0.9, 0))
+_typ(f, "0.5", _xy)
+f.modal(fc, _ev('TAB', _xy))
+_typ(f, "90", _xy)
+_type(f, "", "RET", _xy)
+_o = _newest_curve(_b)
+_at_ = _ends(_o) if _o is not None else None
+check("Arc tool: 3 points through a point, centre sweeping 270 degrees round, tangent from a line's end "
+      "(typed 0.5 and 90: a half circle) -- exact arcs, prim_arc features",
+      _a3 is not None and _on_circle(_a3[3], (0, 0, 0), 1.0) < 1e-6 and np.allclose(_a3[1], (0, 1, 0), atol=1e-6)
+      and _ac is not None and abs(_ac[1] - 270.0) < 1e-4 and np.allclose(_ac[0][2], (0, -1, 0), atol=1e-6)
+      and np.allclose(_ac[0][1], (-math.sqrt(0.5), math.sqrt(0.5), 0), atol=1e-6)
+      and _at_ is not None and np.allclose(_at_[0], (0, 0, 0), atol=1e-6) and np.allclose(_at_[2], (0, 1, 0), atol=1e-6)
+      and np.allclose(_at_[1], (0.5, 0.5, 0), atol=1e-6),
+      f"{_a3 and _a3[1]} | {_ac and (_ac[1], _ac[0][2])} | {_at_ and (_at_[0], _at_[1], _at_[2])}")
+
+# --- a Tangent arc from a curve's end always leaves outward (a slot's end behind the start used to flip it)
+_mids = []
+for _pts in (((-2.0, 0.0, 0.0), (0.0, 0.0, 0.0)), ((0.0, 0.0, 0.0), (-2.0, 0.0, 0.0))):      # end, then start
+    for o in list(bpy.data.objects):
+        bpy.data.objects.remove(o)
+    nurbs("TanOut", list(_pts), order=2)
+    f = _fake_shape(_ds.NPROTO_OT_draw_arc, mode="TANGENT", radius=0.5, angle=90.0)
+    _b = set(bpy.data.objects)
+    _click(f, (0.0, 0.0, 0), (2, 1))
+    for q_ in ((0.2, 0.6, 0), (0.0, 1.0, 0), (-0.05, 1.0, 0)):
+        _at(f, q_)
+    _click(f, (-0.05, 1.0, 0))
+    _o = _newest_curve(_b)
+    _mids.append(_ends(_o)[1] if _o is not None else None)
+check("Arc Tangent: from a curve's end (its end or its start) the arc carries the curve on, outward, even when "
+      "its end lies a little behind -- no flip",
+      all(m_ is not None and m_[0] > 0.3 for m_ in _mids), str(_mids))
+
+# --- Ellipse, Rectangle (rounded corners), Slot, Polygon drawing tools: exact, editable features
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+def _rbox(p_, c_, hw_, hh_, r_):                  # distance to a rounded box's outline (0: on it)
+    qx, qy = abs(p_[0] - c_[0]) - (hw_ - r_), abs(p_[1] - c_[1]) - (hh_ - r_)
+    return abs(math.hypot(max(qx, 0.0), max(qy, 0.0)) + min(max(qx, qy), 0.0) - r_)
+_res = {}
+f = _fake_shape(_ds.NPROTO_OT_draw_ellipse, mode="CENTER", radius=0.5, radius2=0.25)
+_b = set(bpy.data.objects)
+_click(f, (0.0, 0.0, 0))
+_click(f, (1.0, 0.0, 0))
+_click(f, (0.3, 0.4, 0))
+_o = _newest_curve(_b)
+_p = features.history(_o)["params"] if _o is not None else {}
+_res["ell"] = None if _o is None else (max(abs((q[0] / 1.0) ** 2 + (q[1] / 0.4) ** 2 - 1) for q in _ends(_o)[3]),
+                                       _p.get("elliptic"), _p.get("radius2"))
+f = _fake_shape(_ds.NPROTO_OT_draw_ellipse, mode="AXIS", radius=0.5, radius2=0.25)
+_b = set(bpy.data.objects)
+_click(f, (-1.0, 0.0, 0))
+_xy = _at(f, (0.6, 0.0, 0))
+_typ(f, "2", _xy)
+_type(f, "", "RET", _xy)
+_xy = _at(f, (0.0, 0.3, 0))
+_typ(f, "0.5", _xy)
+_type(f, "", "RET", _xy)
+_o = _newest_curve(_b)
+_res["ell2"] = None if _o is None else max(abs(q[0] ** 2 + (q[1] / 0.5) ** 2 - 1) for q in _ends(_o)[3])
+check("Ellipse tool: centre / major end / minor size; both axis ends + typed sizes -- exact ellipses",
+      _res["ell"] is not None and _res["ell"][0] < 1e-5 and _res["ell"][1] and abs(_res["ell"][2] - 0.4) < 1e-6
+      and _res["ell2"] is not None and _res["ell2"] < 1e-5, str(_res))
+f = _fake_shape(_ds.NPROTO_OT_draw_rectangle, mode="CORNERS", width=1.0, depth=0.5, corner=0.0)
+_b = set(bpy.data.objects)
+_click(f, (0.0, 0.0, 0))
+_xy = _at(f, (2.0, 1.0, 0))
+f.modal(fc, _ev('TAB', _xy))
+f.modal(fc, _ev('TAB', _xy))
+_typ(f, "0.25", _xy)
+_type(f, "", "RET", _xy)
+_o = _newest_curve(_b)
+_rp = features.history(_o)["params"] if _o is not None else {}
+_res["rect"] = None if _o is None else (max(_rbox(q, (1.0, 0.5), 1.0, 0.5, 0.25) for q in _ends(_o)[3]), _rp.get("corner"))
+f = _fake_shape(_ds.NPROTO_OT_draw_rectangle, mode="THREE", width=1.0, depth=0.5, corner=0.0)
+_b = set(bpy.data.objects)
+_click(f, (0.0, 0.0, 0))
+_click(f, (1.0, 1.0, 0))
+_click(f, (-0.5, 0.5, 0))
+_o = _newest_curve(_b)
+_rp3 = features.history(_o)["params"] if _o is not None else {}
+check("Rectangle tool: two corners with a typed corner radius (exact rounded corners); three points (rotated)",
+      _res["rect"] is not None and _res["rect"][0] < 1e-5 and abs(_res["rect"][1] - 0.25) < 1e-9
+      and abs(_rp3.get("width", 0) - math.sqrt(2)) < 1e-6 and abs(_rp3.get("depth", 0) - math.sqrt(0.5)) < 1e-6,
+      f"{_res['rect']} {_rp3}")
+f = _fake_shape(_ds.NPROTO_OT_draw_slot, mode="CENTERS", length=1.0, width=0.4)
+_b = set(bpy.data.objects)
+_click(f, (0.0, 0.0, 0))
+_click(f, (2.0, 0.0, 0))
+_click(f, (1.0, 0.25, 0))
+_o = _newest_curve(_b)
+def _seg_d(p_):
+    x_ = min(max(p_[0], 0.0), 2.0)
+    return math.hypot(p_[0] - x_, p_[1])
+_res["slot"] = None if _o is None else (max(abs(_seg_d(q) - 0.25) for q in _ends(_o)[3]),
+                                        features.history(_o)["op"], features.history(_o)["params"])
+check("Slot tool: both arc centres, then the width -- an exact slot (lines and half circles), a prim_slot feature",
+      _res["slot"] is not None and _res["slot"][0] < 1e-5 and _res["slot"][1] == "prim_slot"
+      and abs(_res["slot"][2]["length"] - 2) < 1e-9 and abs(_res["slot"][2]["width"] - 0.5) < 1e-6, str(_res["slot"]))
+f = _fake_shape(_ds.NPROTO_OT_draw_polygon, mode="SIDE", radius=0.5, sides=6)
+_b = set(bpy.data.objects)
+_click(f, (0.0, 0.0, 0))
+f.modal(fc, _ev('UP_ARROW', _wpx(1.0, 0.0)))
+f.modal(fc, _ev('UP_ARROW', _wpx(1.0, 0.0)))
+_click(f, (1.0, 0.0, 0))
+_o = _newest_curve(_b)
+_pp = features.history(_o)["params"] if _o is not None else {}
+_kc = features.input_curve(_o, "S0") if _o is not None else None
+_dmid = min(np.linalg.norm(np.array(_kc.evaluate(_kc.parameter_range()[0] + (_kc.parameter_range()[1] - _kc.parameter_range()[0]) * k / 4000)) - (1, 0, 0))
+            for k in range(4001)) if _kc else 1
+check("Polygon tool: Up / Down set the sides (8); 'to a side' puts the clicked point at a side's middle",
+      _pp.get("sides") == 8 and abs(_pp.get("radius", 0) - 1 / math.cos(math.pi / 8)) < 1e-6 and _dmid < 1e-3,
+      f"{_pp} {_dmid:.2e}")
+
+# --- shape tools: guides along the shape's own axes (a rotated ellipse's minor axis through its centre)
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+f = _fake_shape(_ds.NPROTO_OT_draw_ellipse, mode="CENTER", radius=0.5, radius2=0.25)
+_click(f, (0.0, 0.0, 0))
+_click(f, (1.0, 1.0, 0))                        # the major axis at 45 degrees
+_q = np.array([-0.3, 0.3, 0.0])                 # on the minor axis
+_off = np.array([1.0, 1.0]) / math.sqrt(2) * 3  # 3 px off it
+_at(f, _q, _off)
+_gl = _drw.sketch_overlay["snap_label"]
+_gp = f._point(fc, _ev('MOUSEMOVE', np.array(_wpx(*_q[:2])) + _off, 'NOTHING'))[0]
+f.modal(fc, _ev('ESC', (600, 600)))
+check("shape tools: guides follow the shape's own axes -- a rotated ellipse's minor axis through its centre",
+      _gl is not None and "Perpendicular" in _gl and abs(float(_gp @ np.array([1.0, 1.0, 0.0]))) < 1e-9, f"{_gl} {_gp}")
+
+# --- Fillet (curves): exact arc tangent to both, trims to the tangent points, joins; a polyline's corner in place
+from blender_nurbs import fillet as _fl
+_ln = lambda a, b: [np.array([[*a, 1.0], [*b, 1.0]])]
+_sol = _fl.solve_fillet(_ln((-2, 0, 0), (0, 0, 0)), _ln((0, 0, 0), (0, 2, 0)), (-1, 0, 0), (0, 1, 0), 0.5)
+_circ = _fl.arc_spans((1, 1.2, 0), (0, 2.2, 0), (-1, 1.2, 0)) + _fl.arc_spans((-1, 1.2, 0), (0, 0.2, 0), (1, 1.2, 0))
+_sol2 = _fl.solve_fillet(_ln((-3, 0, 0), (3, 0, 0)), _circ, (2.5, 0, 0), (1.0, 1.2, 0), 0.5)
+check("Fillet geometry: two lines -- the exact corner circle; a line and a circle -- solved on the curves "
+      "(tangent to both: 0.5 from the line, 1.5 from the circle's centre)",
+      _sol is not None and np.allclose(_sol["centre"], (-0.5, 0.5, 0), atol=1e-12)
+      and np.allclose(_sol["t1"], (-0.5, 0, 0), atol=1e-12) and np.allclose(_sol["t2"], (0, 0.5, 0), atol=1e-12)
+      and _sol2 is not None and abs(_sol2["centre"][1] - 0.5) < 1e-9
+      and abs(np.linalg.norm(_sol2["centre"] - np.array([0, 1.2, 0])) - 1.5) < 1e-9 and _sol2["centre"][0] > 0,
+      f"{_sol and _sol['centre']} {_sol2 and _sol2['centre']}")
+def _fil_setup(join=False):
+    for o in list(bpy.data.objects):
+        bpy.data.objects.remove(o)
+    a_ = nurbs("FilA", [(-2.0, 0.0, 0.0), (0.0, 0.0, 0.0)], order=2)
+    b_ = nurbs("FilB", [(0.0, 0.0, 0.0), (0.0, 2.0, 0.0)], order=2)
+    f_ = _fake_shape(_fl.NPROTO_OT_fillet_curves, mode="RADIUS", radius=0.25, join=join, trim=True)
+    _click(f_, (-1.0, 0.0, 0), (0, 2))
+    _click(f_, (0.0, 1.0, 0), (2, 0))
+    xy_ = _at(f_, (-0.3, 0.3, 0))
+    _typ(f_, "0.5", xy_)
+    _type(f_, "", "RET", xy_)
+    return a_, b_
+def _sp_ends(o):
+    kc_ = features.input_curve(o, "S0")
+    t0_, t1_ = kc_.parameter_range()
+    return np.array(kc_.evaluate(t0_)), np.array(kc_.evaluate(t1_)), \
+        [np.array(kc_.evaluate(t0_ + (t1_ - t0_) * k / 200)) for k in range(201)]
+def _lfil_d(p_):          # distance to the L (x-axis from -2, y-axis to 2) rounded with r 0.5 at the corner
+    x_, y_ = p_[0], p_[1]
+    if x_ <= -0.5 and abs(y_) < 0.3:
+        return abs(y_)
+    if y_ >= 0.5 and abs(x_) < 0.3:
+        return abs(x_)
+    return abs(math.hypot(x_ + 0.5, y_ - 0.5) - 0.5)
+_a, _b = _fil_setup()
+_arc = [o for o in bpy.data.objects if o.name.startswith("Fillet")]
+_ea, _eb = _sp_ends(_a), _sp_ends(_b)
+_earc = _sp_ends(_arc[0]) if _arc else None
+check("Fillet tool: two lines, typed radius -- both trimmed to the tangent points, an exact arc between",
+      np.allclose(sorted([tuple(np.round(_ea[0], 9)), tuple(np.round(_ea[1], 9))]), [(-2, 0, 0), (-0.5, 0, 0)])
+      and np.allclose(sorted([tuple(np.round(_eb[0], 9)), tuple(np.round(_eb[1], 9))]), [(0, 0.5, 0), (0, 2, 0)])
+      and _earc is not None and max(abs(np.linalg.norm(q - np.array([-0.5, 0.5, 0])) - 0.5) for q in _earc[2]) < 1e-7,
+      f"{_ea[:2]} {_eb[:2]} {len(_arc)}")
+_a, _b = _fil_setup(join=True)
+_objs = [o for o in bpy.data.objects if o.type == 'CURVE']
+_ej = _sp_ends(_objs[0]) if len(_objs) == 1 else None
+check("Fillet tool with Join: one curve -- line, arc, line -- exact all along",
+      _ej is not None and max(_lfil_d(q) for q in _ej[2]) < 1e-7
+      and sorted([tuple(np.round(_ej[0], 9)), tuple(np.round(_ej[1], 9))]) == [(-2.0, 0.0, 0.0), (0.0, 2.0, 0.0)],
+      f"{len(_objs)} {_ej and (_ej[0], _ej[1])}")
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+_pl = nurbs("FilPoly", [(-2.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 2.0, 0.0)], order=2)
+f = _fake_shape(_fl.NPROTO_OT_fillet_curves, mode="RADIUS", radius=0.25, join=False, trim=True)
+_click(f, (-1.0, 0.0, 0), (0, 2))
+_click(f, (0.0, 1.0, 0), (2, 0))
+_xy = _at(f, (-0.3, 0.3, 0))
+_typ(f, "0.5", _xy)
+_type(f, "", "RET", _xy)
+_ep = _sp_ends(_pl)
+check("Fillet tool on one polyline: its corner is rounded in place (one curve, exact)",
+      len([o for o in bpy.data.objects if o.type == 'CURVE']) == 1 and max(_lfil_d(q) for q in _ep[2]) < 1e-7
+      and sorted([tuple(np.round(_ep[0], 9)), tuple(np.round(_ep[1], 9))]) == [(-2.0, 0.0, 0.0), (0.0, 2.0, 0.0)],
+      f"{_ep[0]} {_ep[1]} {max(_lfil_d(q) for q in _ep[2]):.1e}")
+
+# --- Fillet: clicks close to the corner (the tangent points beyond them) still keep the outer parts
+_near = {}
+for _kind in ("poly", "two", "join"):
+    for o in list(bpy.data.objects):
+        bpy.data.objects.remove(o)
+    if _kind == "poly":
+        nurbs("FilNear", [(-2.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 2.0, 0.0)], order=2)
+    else:
+        nurbs("FilNA", [(-2.0, 0.0, 0.0), (0.0, 0.0, 0.0)], order=2)
+        nurbs("FilNB", [(0.0, 0.0, 0.0), (0.0, 2.0, 0.0)], order=2)
+    f = _fake_shape(_fl.NPROTO_OT_fillet_curves, mode="RADIUS", radius=0.25, join=_kind == "join", trim=True)
+    _click(f, (-0.2, 0.0, 0), (0, 2))
+    _click(f, (0.0, 0.2, 0), (2, 0))
+    _xy = _at(f, (-0.4, 0.4, 0))
+    _typ(f, "0.5", _xy)
+    _type(f, "", "RET", _xy)
+    _cs = [o for o in bpy.data.objects if o.type == 'CURVE']
+    _near[_kind] = (len(_cs), max(max(_lfil_d(q) for q in _sp_ends(o)[2]) for o in _cs),
+                    sorted(tuple(np.round(e, 6)) for o in _cs for e in _sp_ends(o)[:2]))
+check("Fillet: clicked close to the corner (inside the tangent points) -- the outer parts are kept, the corner goes "
+      "(one polyline, two lines, two lines joined)",
+      _near["poly"][0] == 1 and _near["poly"][1] < 1e-7 and _near["poly"][2] == [(-2.0, 0.0, 0.0), (0.0, 2.0, 0.0)]
+      and _near["two"][0] == 3 and _near["two"][1] < 1e-7
+      and (-2.0, 0.0, 0.0) in _near["two"][2] and (0.0, 2.0, 0.0) in _near["two"][2]
+      and (0.0, 0.0, 0.0) not in _near["two"][2]
+      and _near["join"][0] == 1 and _near["join"][1] < 1e-7 and _near["join"][2] == [(-2.0, 0.0, 0.0), (0.0, 2.0, 0.0)],
+      str(_near))
+
+# --- Helix Taper: narrower (or wider) on top, like a thread on a cone
+_hx = {}
+for _tp in (10.0, 0.0, -10.0):
+    for o in list(bpy.data.objects):
+        bpy.data.objects.remove(o)
+    ctx.scene.cursor.location = (0, 0, 0)
+    bpy.ops.nproto.add_primitive(kind='HELIX', radius=1.0, height=2.0, turns=3.0, taper=_tp, spans_u=8)
+    _ho = ctx.active_object
+    _kc = features.input_curve(_ho, "S0")
+    _t0, _t1 = _kc.parameter_range()
+    _pts = [np.array(_kc.evaluate(_t0 + (_t1 - _t0) * k / 300)) for k in range(301)]
+    _hx[_tp] = (max(abs(math.hypot(q[0], q[1]) - (1.0 - q[2] * math.tan(math.radians(_tp)))) for q in _pts),
+                math.hypot(*_pts[-1][:2]), features.history(_ho)["params"].get("taper"))
+check("Helix Taper: the helix follows the cone (10 degrees: narrower on top, -10: wider), 0 stays straight; "
+      "in the Feature panel", all(v_[0] < 5e-3 for v_ in _hx.values()) and abs(_hx[10.0][1] - (1 - 2 * math.tan(math.radians(10)))) < 5e-3
+      and abs(_hx[0.0][1] - 1) < 5e-3 and _hx[-10.0][1] > 1.3 and _hx[10.0][2] == 10.0, str(_hx))
+
+# --- Helix drawing tool: centre, start, height in 3D; turns / pitch / taper typed; left-handed; around a circle
+check("helix height: the axis point nearest the view ray; none when the ray runs down the axis",
+      abs(_ds.axis_height((0, 0, 0), (0, 0, 1), (5, 0, 1.5), (-1, 0, 0)) - 1.5) < 1e-12
+      and _ds.axis_height((0, 0, 0), (0, 0, 1), (0, 0, 9), (0, 0, -1)) is None)
+def _helix_pts(o, k=200):
+    kc_ = features.input_curve(o, "S0")
+    t0_, t1_ = kc_.parameter_range()
+    return [np.array(kc_.evaluate(t0_ + (t1_ - t0_) * j / k)) for j in range(k + 1)]
+_hres = {}
+for _case in ("turns", "pitch", "left"):
+    for o in list(bpy.data.objects):
+        bpy.data.objects.remove(o)
+    f = _fake_shape(_ds.NPROTO_OT_draw_helix, mode="CENTER", radius=0.5, height=1.0, turns=3.0, taper=0.0, left=False)
+    _b = set(bpy.data.objects)
+    _click(f, (0.0, 0.0, 0))
+    _click(f, (1.0, 0.0, 0))
+    _xy = _at(f, (1.2, 0.4, 0))
+    if _case == "left":
+        f.modal(fc, _ev('L', _xy))
+    _typ(f, "2", _xy)
+    f.modal(fc, _ev('TAB', _xy))
+    if _case == "pitch":
+        f.modal(fc, _ev('TAB', _xy))
+        _typ(f, "0.5", _xy)
+    else:
+        _typ(f, "4", _xy)
+    _type(f, "", "RET", _xy)
+    _o = _newest_curve(_b)
+    _hp = features.history(_o)["params"] if _o is not None else {}
+    _pt = _helix_pts(_o) if _o is not None else []
+    _hres[_case] = (_hp.get("radius"), _hp.get("height"), _hp.get("turns"), _hp.get("left"),
+                    max((abs(math.hypot(q[0], q[1]) - 1.0) for q in _pt), default=1),
+                    _pt[0] if _pt else None, _pt[-1] if _pt else None, _pt[3][1] if _pt else 0)
+_rt, _rp, _rl = _hres["turns"], _hres["pitch"], _hres["left"]
+check("Helix tool: centre, start (radius 1), typed height 2 and 4 turns -- or a pitch of 0.5 (4 turns); "
+      "right-handed rising, L left-handed",
+      abs(_rt[0] - 1) < 1e-6 and abs(_rt[1] - 2) < 1e-9 and abs(_rt[2] - 4) < 1e-9 and not _rt[3] and _rt[4] < 5e-3
+      and np.allclose(_rt[5], (1, 0, 0), atol=1e-3) and abs(_rt[6][2] - 2) < 1e-3 and _rt[7] > 0
+      and abs(_rp[2] - 4) < 1e-9 and _rl[3] and _rl[7] < 0, str(_hres))
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+ctx.scene.cursor.location = (0, 0, 0)
+bpy.ops.nproto.add_primitive(kind='CIRCLE', radius=0.5, degree="0")
+f = _fake_shape(_ds.NPROTO_OT_draw_helix, mode="AROUND", radius=0.5, height=1.0, turns=3.0, taper=0.0, left=False)
+_b = set(bpy.data.objects)
+_click(f, (0.5, 0.0, 0), (2, 1))                 # the circle
+_click(f, (0.0, 0.7, 0))                        # where it starts: on the circle, a quarter turn round
+_xy = _at(f, (0.8, 0.3, 0))
+_typ(f, "1", _xy)
+_type(f, "", "RET", _xy)
+_o = _newest_curve(_b)
+_ha = features.history(_o)["params"] if _o is not None else {}
+_pa = _helix_pts(_o) if _o is not None else []
+check("Helix tool Around: a circle gives the centre, radius and axis; then the start on it; typed height 1",
+      abs(_ha.get("radius", 0) - 0.5) < 1e-6 and abs(_ha.get("height", 0) - 1) < 1e-9
+      and max((abs(math.hypot(q[0], q[1]) - 0.5) for q in _pa), default=1) < 5e-3
+      and _pa and abs(_pa[-1][2] - 1) < 1e-3 and np.allclose(_pa[0], (0, 0.5, 0), atol=1e-3),
+      f"{_ha} {_pa[0] if _pa else None} {_pa[-1] if _pa else None}")
+
+# --- Helix around a cone: the height snapped to the cone's other rim gives the taper -- it follows the cone
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+ctx.scene.cursor.location = (0, 0, 0)
+bpy.ops.nproto.add_primitive(kind='CONE', radius=1.0, radius2=0.5, height=2.0, caps=False, degree="0")
+_cone = ctx.active_object
+_rims = []
+for e_ in store.get_brep(_cone).edges():
+    t0_, t1_ = e_.parameter_range()
+    q_ = np.array([e_.point_at(t0_ + (t1_ - t0_) * k / 8) for k in range(9)])
+    if np.ptp(q_[:, 2]) < 1e-9:
+        _rims.append((float(q_[0, 2]), float(np.linalg.norm(q_[0, :2]))))
+_rims.sort(key=lambda zr: -zr[1])               # the wide rim first
+f = _fake_shape(_ds.NPROTO_OT_draw_helix, mode="AROUND", radius=0.5, height=1.0, turns=3.0, taper=0.0, left=False)
+_b = set(bpy.data.objects)
+_click(f, (1.0, 0.0, 0), (2, 1))                 # the wide rim
+_click(f, (0.0, 1.3, 0))                        # the start, on it
+_xy = _at(f, (0.0, 0.5, 0), (-1, 2))            # the height: onto the narrow rim
+_note = fc.area.text
+_click(f, (0.0, 0.5, 0), (-1, 2))
+_o = _newest_curve(_b)
+_hc = features.history(_o)["params"] if _o is not None else {}
+_dz = abs(_rims[1][0] - _rims[0][0]) if len(_rims) == 2 else 0
+_pc = _helix_pts(_o) if _o is not None else []
+_dev = max((abs(math.hypot(q[0], q[1]) - (1.0 - abs(q[2] - _rims[0][0]) * 0.5 / _dz)) for q in _pc), default=1) \
+    if _dz else 1
+check("Helix around a cone: snapping the height to its other rim takes that rim's level and the cone's taper -- "
+      "the helix follows the cone", len(_rims) == 2 and abs(_hc.get("height", 0) - _dz) < 1e-6
+      and abs(_hc.get("taper", 0) - math.degrees(math.atan(0.5 / _dz))) < 1e-6 and _dev < 5e-3
+      and "from the cone" in _note, f"{_rims} {_hc} dev {_dev:.1e} | {_note}")
+
+# --- Helix around a pointed cone: its tip, or its seam line, gives the taper (no other rim to snap to)
+_pc_res = {}
+for _where in ("tip", "seam"):
+    for o in list(bpy.data.objects):
+        bpy.data.objects.remove(o)
+    ctx.scene.cursor.location = (0, 0, 0)
+    bpy.ops.nproto.add_primitive(kind='CONE', radius=1.0, radius2=0.0, height=2.0, caps=False, degree="0")
+    _cn = ctx.active_object
+    _seam, _zb = None, None
+    for e_ in store.get_brep(_cn).edges():
+        t0_, t1_ = e_.parameter_range()
+        q_ = np.array([e_.point_at(t0_ + (t1_ - t0_) * k / 8) for k in range(9)])
+        if np.ptp(q_[:, 2]) < 1e-9 and np.linalg.norm(q_[0, :2]) > 0.5:
+            _zb = float(q_[0, 2])                      # the base rim
+        elif np.ptp(q_[:, 2]) > 1e-6:
+            _seam = (q_[0], q_[-1])                    # the seam line: base to tip
+    _tip = max(_seam, key=lambda q: q[2]) if _seam is not None else np.array([0, 0, 2.0])
+    _mid = 0.5 * (_seam[0] + _seam[1]) if _seam is not None else np.array([0.5, 0, 1.0])
+    f = _fake_shape(_ds.NPROTO_OT_draw_helix, mode="AROUND", radius=0.5, height=1.0, turns=3.0, taper=0.0, left=False)
+    _b = set(bpy.data.objects)
+    _click(f, (0.0, -1.0, 0), (1, -2))              # the base rim
+    _click(f, (0.0, -1.3, 0))                       # the start
+    _q = _tip if _where == "tip" else _mid
+    _xy = _at(f, (_q[0], _q[1], 0), (2, 1) if _where == "tip" else (0, 0))
+    _nt = fc.area.text
+    _click(f, (_q[0], _q[1], 0), (2, 1) if _where == "tip" else (0, 0))
+    _o = _newest_curve(_b)
+    _hh = features.history(_o)["params"] if _o is not None else {}
+    _pts_ = _helix_pts(_o) if _o is not None else []
+    _dev = max((abs(math.hypot(q[0], q[1]) - max(0.0, 1.0 - (q[2] - _zb) * 0.5)) for q in _pts_), default=1)
+    _pc_res[_where] = (_hh.get("height"), _hh.get("taper"), _dev, "from the cone" in _nt)
+_tp = math.degrees(math.atan(0.5))
+check("Helix around a pointed cone: snapping the height to its tip, or along its seam line, takes the cone's taper "
+      "(no other rim needed) -- the helix follows the cone",
+      abs(_pc_res["tip"][0] - 2) < 1e-6 and abs(_pc_res["tip"][1] - _tp) < 1e-6 and _pc_res["tip"][2] < 1e-2
+      and _pc_res["tip"][3] and abs(_pc_res["seam"][0] - 1) < 1e-6 and abs(_pc_res["seam"][1] - _tp) < 1e-6
+      and _pc_res["seam"][2] < 5e-3, str(_pc_res))
+
+# --- Center snap on circles and arcs (curves) and circular surface edges (a cylinder's rim)
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+ctx.scene.cursor.location = (2.0, 1.0, 0.0)
+bpy.ops.nproto.add_primitive(kind='CIRCLE', radius=0.5, degree="0")
+ctx.scene.cursor.location = (-2.0, 1.0, 0.0)
+bpy.ops.nproto.add_primitive(kind='ARC', radius=0.5, angle=90.0, degree="0")
+ctx.scene.cursor.location = (0.0, -2.0, 0.0)
+bpy.ops.nproto.add_primitive(kind='ELLIPSE', radius=0.6, radius2=0.3, degree="0")
+ctx.scene.cursor.location = (0.0, 2.0, 0.0)
+bpy.ops.nproto.add_primitive(kind='CYLINDER', radius=0.4, height=1.0, caps=False)
+ctx.scene.cursor.location = (0, 0, 0)
+_Tc = _sn.collect(list(ctx.scene.objects))
+_vw4 = _snap_view(s=4.0)
+_px4 = lambda x, y: np.array([500 + 500 * x / 4.0, 500 + 500 * y / 4.0])
+_hc = _Tc.pick(_vw4, _px4(2.0, 1.0) + (2, 1))
+_ha = _Tc.pick(_vw4, _px4(-2.0, 1.0) + (2, 1))
+_he = _Tc.pick(_vw4, _px4(0.0, -2.0) + (2, 1))
+_hr = _Tc.pick(_vw4, _px4(0.0, 2.0) + (2, 1))
+_zr = max(v_.co.z for v_ in [o for o in ctx.scene.objects if o.type == 'MESH'][0].data.vertices) \
+    if [o for o in ctx.scene.objects if o.type == 'MESH'] else None
+check("Center snap: a circle's and an arc's centre (curves), a cylinder rim's centre (the top one); not an ellipse",
+      _hc is not None and _hc[1] == "center" and np.allclose(_hc[0], (2, 1, 0), atol=1e-9)
+      and _ha is not None and _ha[1] == "center" and np.allclose(_ha[0], (-2, 1, 0), atol=1e-9)
+      and (_he is None or _he[1] != "center")
+      and _hr is not None and _hr[1] == "center" and np.allclose(_hr[0][:2], (0, 2), atol=1e-9) and _hr[0][2] > 0.1,
+      f"{_hc} | {_ha} | {_he} | {_hr}")
 
 print("ALL OK" if ok else "SOME FAILED")

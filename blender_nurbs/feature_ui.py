@@ -46,9 +46,10 @@ FIELDS = {
     "prim_line": ["length", "degree", "spans_u"],
     "prim_arc": ["radius", "angle", "degree", "spans_u"],
     "prim_circle": ["radius", "elliptic", "radius2", "degree", "spans_u"],
-    "prim_rectangle": ["width", "depth"],
+    "prim_rectangle": ["width", "depth", "corner"],
+    "prim_slot": ["length", "width"],
     "prim_polygon": ["radius", "sides"],
-    "prim_helix": ["radius", "height", "turns", "degree", "spans_u"],
+    "prim_helix": ["radius", "height", "turns", "taper", "left", "degree", "spans_u"],
     "prim_plane": ["width", "depth", "pl_degree_u", "pl_degree_v", "spans_u", "spans_v"],
     "perp_profile": ["pp_shape", "radius", "radius2", "width", "depth", "degree", "spans_u", "pp_at", "pp_rotation"],
     "prim_box": ["width", "depth", "height", "degree", "spans_u"],
@@ -288,8 +289,12 @@ class NprotoFeature(bpy.types.PropertyGroup):
     length: FloatProperty(name="Length", min=1e-4, unit='LENGTH', **_F())
     width: FloatProperty(name="Width", min=1e-4, unit='LENGTH', **_F())
     depth: FloatProperty(name="Depth", min=1e-4, unit='LENGTH', **_F())
+    corner: FloatProperty(name="Corner Radius", min=0.0, unit='LENGTH', **_F())
     height: FloatProperty(name="Height", min=1e-4, unit='LENGTH', **_F())
     turns: FloatProperty(name="Turns", min=0.1, soft_max=20.0, **_F())
+    left: BoolProperty(name="Left-Handed", **_F(description="The helix turns the other way as it rises"))
+    taper: FloatProperty(name="Taper °", min=-80.0, max=80.0, soft_min=-45.0, soft_max=45.0, **_F(
+        description="Lean the helix in (positive: narrower on top) or out (negative: wider), like a thread on a cone"))
     sides: IntProperty(name="Sides", min=3, max=64, **_F())
     degree: EnumProperty(name="Degree", items=DEGREE_ITEMS, **_F())
     spans_u: IntProperty(name="Spans U", min=1, max=64, **_F())
@@ -660,9 +665,64 @@ class NPROTO_OT_remove_step(bpy.types.Operator):
 # --------------------------------------------------------------------------
 
 KIND_ITEMS = [(k, k.title(), "") for k in list(primitives.CURVE_KINDS) + list(primitives.SURFACE_KINDS)]
-DEFAULTS = {"radius": 1.0, "radius2": 0.4, "length": 2.0, "width": 2.0, "depth": 2.0, "height": 2.0,
+DEFAULTS = {"radius": 1.0, "radius2": 0.4, "length": 2.0, "width": 2.0, "depth": 2.0, "height": 2.0, "corner": 0.0, "taper": 0.0, "left": False,
             "turns": 3.0, "sides": 6, "angle": 90.0, "spans_u": 8, "spans_v": 4, "degree": 0, "caps": False,
             "elliptic": False}
+
+
+def view_size(context):
+    """A size for a new shape that suits the view: about a quarter of the 3D
+    view's width at the 3D cursor, rounded to the grid step the view shows
+    (so 2" or 1' in an inch scene, never a fixed 2 m). None without a 3D view."""
+    from bpy_extras import view3d_utils
+    from .drawtools import grid_steps, visible_grid_step
+    area = context.area
+    if area is None or area.type != 'VIEW_3D':
+        return None
+    region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+    rv3d = getattr(area.spaces.active, "region_3d", None)
+    if region is None or rv3d is None or region.width < 2:
+        return None
+    cur = context.scene.cursor.location
+    c = view3d_utils.location_3d_to_region_2d(region, rv3d, cur)
+    y = c.y if c is not None else region.height * 0.5
+    a = view3d_utils.region_2d_to_location_3d(region, rv3d, (0.0, y), cur)
+    b = view3d_utils.region_2d_to_location_3d(region, rv3d, (float(region.width), y), cur)
+    W = (b - a).length
+    if not W > 1e-9:
+        return None
+    us = context.scene.unit_settings
+    ov = getattr(area.spaces.active, "overlay", None)
+    steps = grid_steps(us.system, us.scale_length or 1.0, getattr(ov, "grid_scale", 1.0) or 1.0,
+                       getattr(ov, "grid_subdivisions", 10) or 10)
+    step = visible_grid_step(steps, region.width / W)
+    return max(step, round(W / 4.0 / step) * step)
+
+
+def place_primitive(context, name, op, params, M, g=None):
+    """A primitive feature (op, params: built in its own space) as a new object
+    with world matrix M; it stays editable in the Feature panel. g: the built
+    geometry when it is at hand. Returns the object."""
+    if g is None:
+        g = features.run(op, [], params)
+    if isinstance(g, tuple) and g[0] == "spline":
+        cu = bpy.data.curves.new(name, 'CURVE')
+        obj = bpy.data.objects.new(name, cu)
+        (context.collection or context.scene.collection).objects.link(obj)
+        obj.matrix_world = M
+        primitives.write_spline_object(obj, g[1])
+    else:
+        obj = store.new_object(context, name, g, M)
+    features.record(obj, op, [], params)
+    sync_from_history(obj)
+    return obj
+
+
+def primitive_params(op, **values):
+    """The full parameter set of a primitive feature: its fields' defaults, then values."""
+    p = {n: DEFAULTS[n] for n in FIELDS[op] if n in DEFAULTS}
+    p.update(values)
+    return p
 
 
 class NPROTO_OT_add_primitive(bpy.types.Operator):
@@ -677,8 +737,14 @@ class NPROTO_OT_add_primitive(bpy.types.Operator):
     length: FloatProperty(name="Length", default=2.0, min=1e-4, unit='LENGTH')
     width: FloatProperty(name="Size X", default=2.0, min=1e-4, unit='LENGTH')
     depth: FloatProperty(name="Size Y", default=2.0, min=1e-4, unit='LENGTH')
+    corner: FloatProperty(name="Corner Radius", default=0.0, min=0.0, unit='LENGTH',
+                          description="Round the rectangle's corners (exact quarter circles); 0: sharp")
     height: FloatProperty(name="Height", default=2.0, min=1e-4, unit='LENGTH')
     turns: FloatProperty(name="Turns", default=3.0, min=0.1, soft_max=20.0)
+    taper: FloatProperty(name="Taper °", default=0.0, min=-80.0, max=80.0, soft_min=-45.0, soft_max=45.0,
+                         description="Lean the helix in (positive: narrower on top) or out (negative: wider), "
+                                     "like a thread on a cone")
+    left: BoolProperty(name="Left-Handed", default=False, description="The helix turns the other way as it rises")
     sides: IntProperty(name="Sides", default=6, min=3, max=64)
     angle: FloatProperty(name="Angle", default=90.0, min=0.01, max=360.0)
     degree: EnumProperty(name="Degree", items=DEGREE_ITEMS, default="0")
@@ -702,12 +768,18 @@ class NPROTO_OT_add_primitive(bpy.types.Operator):
         return p
 
     def invoke(self, context, event):
+        # sized to the view (a quarter of its width, on the visible grid), not a fixed 2 m
+        S = view_size(context)
+        if S:
+            self.length = self.width = self.depth = self.height = S
+            self.radius = 0.5 * S
+            self.radius2 = 0.5 * S * (0.3 if self.kind == "TORUS" else 0.4)
         # sensible per-kind defaults on first use
         if self.kind in ("LINE",):
             self.spans_u = 1
         if self.kind in ("PLANE", "BOX"):
             self.spans_u, self.spans_v = 1, 1
-        if self.kind == "TORUS":
+        if self.kind == "TORUS" and not S:
             self.radius2 = 0.3
         if self.kind == "CONE":
             self.radius2 = 0.0
@@ -724,17 +796,7 @@ class NPROTO_OT_add_primitive(bpy.types.Operator):
             self.report({'ERROR'}, f"{self.kind.title()} failed: {exc}")
             return {'CANCELLED'}
         M = Matrix.Translation(context.scene.cursor.location)
-        name = "NURBS " + self.kind.title()
-        if isinstance(g, tuple) and g[0] == "spline":
-            cu = bpy.data.curves.new(name, 'CURVE')
-            obj = bpy.data.objects.new(name, cu)
-            (context.collection or context.scene.collection).objects.link(obj)
-            obj.matrix_world = M
-            primitives.write_spline_object(obj, g[1])
-        else:
-            obj = store.new_object(context, name, g, M)
-        features.record(obj, op, [], params)
-        sync_from_history(obj)
+        obj = place_primitive(context, "NURBS " + self.kind.title(), op, params, M, g)
         for o in context.selected_objects:
             o.select_set(False)
         obj.select_set(True)

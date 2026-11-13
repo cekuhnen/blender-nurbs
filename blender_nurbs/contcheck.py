@@ -871,6 +871,8 @@ class NPROTO_OT_continuity(bpy.types.Operator):
             return {'CANCELLED'}
         if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM'}:
             return {'PASS_THROUGH'}
+        if event.type == 'INBETWEEN_MOUSEMOVE':
+            return {'PASS_THROUGH'}       # not used here; a gizmo drag needs them unhandled
         if event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MOUSEMOVE'} and not PickMixin._in_view(context, event):
             return {'PASS_THROUGH'}
         from . import hints

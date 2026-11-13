@@ -13,7 +13,7 @@ The sidebar tab **NURBS Proto** has one collapsible panel per group. Ctrl+click 
 | Panel | Contents |
 |---|---|
 | **Active Object** | Shown only when the active object has something to show: CV editing (Done / Cancel), its feature settings and history, its face and edge count |
-| **Create Curves** | CV Curve, Draw Line, Profile · Line, Arc, Circle, Ellipse, Rectangle, Polygon, Helix · from surfaces: Iso Curve, Duplicate Edge, Project Curve, Intersect · between curves: Blend Curve |
+| **Create Curves** | CV Curve, Draw Line, Arc, Circle, Ellipse, Rectangle, Polygon, Slot, Profile · between curves: Blend Curve, Fillet · Helix (the other shapes, placed at the 3D cursor: Shift+A) · from surfaces: Iso Curve, Duplicate Edge, Project Curve, Intersect |
 | **Create Surfaces** | Draw Plane · Plane, Disk, Box, Cylinder, Cone, Sphere, Torus · from curves: Loft, Loft Rails, Sweep, Pipe, Extrude, Revolve, Planar · filling a gap: Boundary, Square, Patch, Dome · from surfaces: Offset, Thicken, Convert Blender Surface |
 | **Curve Edit** | Join / Unjoin Curves, Trim / Split Curves, Rebuild / Extend Curve, Align Curve |
 | **Surface Edit** | Edit CVs, Flip Normal, Rebuild Surface, Extend Surface, Surface Align, Refit to Trim · Trim, Split, Untrim, Join, Unjoin · Surface Fillet, Edge Fillet · solids: Union, Difference, Intersection, Boundary Fill |
@@ -36,10 +36,10 @@ While a tool runs (the sketch tools, any tool that asks you to pick, Trim, Trim 
 In the tool settings bar, right after Blender's selection modes:
 
 * **Body** is Blender's own object selection.
-* **Face** / **Edge**: a click picks a face or edge of a NURBS body (and selects the body), Shift+click adds or removes one, and a click on nothing clears the picks. What's under the mouse lights up, and this works with any tool active. Picks are kept with the object, survive rebuilds and undo, and count while the body is selected.
+* **Face** / **Edge**: a click picks a face or edge of a NURBS body (and selects the body), Shift+click adds or removes one. A click that misses every NURBS face and edge clears the picks and goes to Blender as usual: it selects a mesh body (or a curve) there, or deselects on empty space. What's under the mouse lights up, and this works with any tool active. Picks are kept with the object, survive rebuilds and undo, and count while the body is selected.
 * **Face and Edge together:** Shift+click the second button. An edge within 10 px of the mouse is picked, otherwise the face under it. Body always stands alone: clicking it switches the others off, and adding Face or Edge switches Body off. Turning a mode off drops only that kind's picks.
 * **Tools take the picks.** Edge Fillet, Continuity Check and Dome use the picked edges, and so do Loft, Planar (one edge brings its whole planar loop), Square, Boundary, Patch, Loft Rails, Duplicate Edge, Extend Surface, Pipe and Revolve, when the picks fit the tool. The tool then runs at once; otherwise it lets you pick as usual. **Alt+click** a tool to pick by hand anyway. CVs / Hulls shows only the picked faces' nets. **Unjoin** splits the picked faces off (one object each, the rest stays joined), and **X / Delete** removes the picked faces (a body whose faces are all picked is deleted).
-* Clicks on the navigation gizmo (axis ball, zoom / pan / camera / perspective buttons) and on continuity labels go to them, not to picking.
+* Clicks on the navigation gizmo (axis ball, zoom / pan / camera / perspective buttons) and on continuity labels go to them, not to picking. The gizmo also works while any tool runs (drawing, picking inputs, trimming), so you can turn the view mid-curve.
 
 ## Construction History
 
@@ -96,7 +96,7 @@ Both are under Create Curves. You click in the 3D view to draw.
   * **Exact lines:** after the start point, type a length and press **Enter**. A plain number is in the scene's length unit, and unit letters work too (`3`, `2' 6"`, `2ft 6in`, `10mm`). Number-pad digits type too, and so do the top-row digits with Blender's **Emulate Numpad** on (which sends them as number-pad keys). Before the first click there is nothing to type into, so those keys still switch the view.
   * **Tab** switches to the angle field, in degrees counter-clockwise from horizontal (`90` = straight up, `-45`, `30+15`). A typed angle on its own locks the direction and the mouse sets the length.
   * A line placed by typing chains on: the next line starts at its end, so `3` Enter, Tab `90` Tab `2` Enter draws an L. Backspace edits the typing, then drops the pending start.
-  * **H / V** lock the line horizontal or vertical; a snapped point is projected onto the lock line, so the line lines up with it. **Shift** snaps to 15°.
+  * Horizontal and vertical need no key: the smart guides hold the line straight across or up when it is close (Aligned). **X / Y / Z** lock a world axis (below). **Shift** snaps to 15°.
   * With an axis lock (below), a typed length goes along that axis.
   * **Perpendicular / Tangent end:** once the start is placed, the end also snaps where the line meets a curve or surface edge at a right angle (**Perpendicular**), or where it touches one (**Tangent**). Move the mouse near that point (within 24 px) and it clicks in, with the label beside the snap dot. Both points are solved exactly on the curve, not on its drawn polyline. A right angle works on any curve or edge, in 3D. Tangent works on planar curves (circles, arcs, ellipses, planar splines) when the start lies in their plane; a straight line has no tangent point. Ends, middles, centres and CVs nearer the mouse still win. A lock of your own (H / V / X / Y / Z / A), Ctrl or Shift switches these snaps off.
   * **Start (S)** cycles **free → tangent → perpendicular**, for a line started on a surface edge or a curve:
@@ -107,16 +107,33 @@ Both are under Create Curves. You click in the 3D view to draw.
   * **Parallel / square (A / Shift+A):** with the mouse over a line, curve or edge, **A** locks the line's direction parallel to it, **Shift+A** square to it (in its plane, or the drawing plane). For a curve it is the direction at the point under the mouse. The reference stays highlighted. Press A before or after the start; the lock holds for one line, and pressing it again unlocks. A typed length goes along it.
   * The header shows the live length and angle (counter-clockwise from horizontal in the drawing plane).
   * **Polyline** (key **P**, or the Adjust Last Operation panel): every click adds a segment. The next line starts where the last one ended, so you just keep clicking. Clicking the first point again closes the polyline. Backspace steps back one segment, and Enter or right-click finishes. The lines become one degree-1 curve (closed if you closed it).
+  * **Arcs (key R):** switches the next segments between lines and tangent arcs (and turns Polyline on). An arc leaves the last point in the direction the previous segment ended, and ends where you click. Or type it: the fields become **Radius** and **Angle** (Tab), the angle measured from the direction the arc leaves, so **90 makes a half circle** (the arc sweeps twice the angle; the header shows it). A radius alone keeps the end on that circle, following the mouse; the mouse picks the side. Press R again for lines. A slot: a line, R, the arc across the width, R, the line back, R, the arc back to the first point. A polyline with arcs becomes one exact curve (order 3, rational, Bezier knots), closed if you closed it. While drawing, the arcs already placed snap like the lines: ends, middles and any point on them.
 * **Snapping and placement**
   * Clicks snap to what is near the cursor on screen (12 px). A small label beside the green snap dot names the target:
     * **End**: the ends of visible curves and of surface edges (B-rep vertices), and the points drawn so far.
-    * **Mid**: the middle, by length, of a curve or surface edge.
-    * **Center**: the centre of a face, worked out once the cursor is over the face. A planar face gives its area centroid (a disk's or a hole's centre); a curved face gives the point on the face nearest its centroid; a face that wraps around its centroid (a cylinder, a sphere) gives the axis or centre point itself.
+    * **Mid**: the middle, by length, of a curve or surface edge, and of each line drawn so far (Draw Line).
+    * **Center**: the centre of a circle or an arc (a curve, or a circular surface edge such as a cylinder's rim), exact; and the centre of a face, worked out once the cursor is over the face. A planar face gives its area centroid (a disk's or a hole's centre); a curved face gives the point on the face nearest its centroid; a face that wraps around its centroid (a cylinder, a sphere) gives the axis or centre point itself.
     * **CV**: the CVs of curves, and of surfaces whose CV net is shown (**CVs / Hulls** on and the surface selected, or a selected Square).
     * **Edge** / **On Curve**: any point on a surface edge or a curve, when none of the above is near. The point is put exactly on the edge (the kernel's closest point on it), or on the curve's own spans, not on the drawn polyline.
+    * **On Line** (Draw Line): any point on a line drawn so far in this run, so a polyline can come back onto itself.
     * **Perpendicular** / **Tangent** (Draw Line, for the end): see above.
+    * **Meshes** snap like curves and surfaces, always: **Vertex**, **Edge** (any point on an edge), **Edge Center** and
+      **Face Center**, as the view shows the mesh (modifiers applied: a SubD body snaps on its smooth surface). Only what
+      faces the viewer snaps. A CV Curve end on a mesh is G0 only (G1 / G2 need a curve or a surface edge).
+    * **O: on surface.** While drawing, **O** switches face snapping on and off: with it on, a point that isn't near
+      anything else lies on the mesh face under the cursor (it leaves the drawing plane). It stays as set for the session
+      and shows in the key hints.
+    * **Alt: no snapping.** Hold **Alt** to place a point freely on the drawing plane, for example over a dense mesh where
+      a vertex or edge is always near. (With Blender's Emulate 3 Button Mouse on, Alt+click orbits the view instead.)
+    * **Unselectable objects never snap**: lock a scan, a blueprint or any reference out of snapping by making it
+      unselectable (the arrow in the outliner).
+    * **Scan data:** a mesh is read the first time the cursor comes near it (about 1.4 s for 2 million faces) and kept
+      for the session, so later tools start at once; it's read again only when its geometry changes. After that a dense
+      mesh snaps as quickly as a cube. A point cloud (more than 200,000 loose points) snaps only on its faces, not point
+      by point. To keep a scan out of snapping, make it unselectable.
+  * **Smart guides** (dashed): the point also snaps onto lines in the drawing plane, within 6 px. Through the points drawn so far and the last points you snapped to (hover a line's end, then move away: its guides stay) they run horizontal and vertical (Aligned), and parallel and perpendicular to the sketch's lines (the 4 newest directions): the perpendicular through a slanted line's end is where an arc makes a half circle; and in Draw Line, from the last point, straight on (Extension, or Tangent after an arc), square to it (Perpendicular) and parallel to the lines drawn (Parallel). Where two guides cross, that point wins over edges, so a slot's return line ends exactly square to its start. With an X / Y / Z lock or a typed angle the point stops where the lock line crosses a guide. Ctrl, Shift and Alt switch guides off.
   * Ends win over the others, then middles and centres, then CVs. Where targets overlap on screen (a box's top and bottom centres in a top view), the one nearest the viewer wins.
-  * **Ctrl** snaps to the grid (unit-aware, e.g. inches in Imperial), **Shift** to 15° steps from the previous point. Both, like **H / V**, keep the point snaps (ends, middles, centres, CVs) but switch the edge snap off, so the grid and angles aren't overridden by every edge nearby.
+  * **Ctrl** snaps to the grid lines the view shows: the finest grid level drawn at least half visible (whole inches, feet... in Imperial; mm, cm, 10 cm... in Metric), so a point never lands between visible lines. Zoom in for a finer step. **Shift** snaps to 15° steps from the previous point. Both, like **H / V**, keep the point snaps (ends, middles, centres, CVs) but switch the edge snap off, so the grid and angles aren't overridden by every edge nearby.
   * **Axis locks (both tools):** **X**, **Y** or **Z** locks the next point to that world axis through the previous point (through the 3D cursor for the first point), like G X in Blender. **Shift+X / Y / Z** excludes that axis instead: the point moves in the plane of the other two, so Shift+Z keeps the previous point's height.
     * The locked axis, or the plane's two axes, are drawn in the axis colours. Pressing the key again unlocks.
     * A lock holds for one point; for a CV Curve, press the key again for the next CV.
@@ -127,9 +144,78 @@ Both are under Create Curves. You click in the 3D view to draw.
 * **Other keys:** Backspace undoes the last point (or line), Enter or right-click finishes, Esc cancels.
   * Navigation (middle mouse, wheel, numpad) keeps working while you draw.
 
+### Arc, Circle, Ellipse, Rectangle, Polygon, Slot
+
+Drawing tools with the same snapping, smart guides and keys (Ctrl grid, Alt free, O on surface) as Line. **M** switches
+the mode (shown in the key hints); type a value and press Enter, Tab for the next one. Each ends as an exact NURBS
+circle or arc (rational, like Blender's own), placed where you drew it, with its radius (and angle) editable later in
+the Feature panel.
+
+* **Circle**
+  * **Centre:** click the centre, then the radius (or type it).
+  * **2 Points:** two points across it, its diameter (type the diameter).
+  * **3 Points:** through three points.
+  * **Tangent:** click two straight lines or edges, then move into the corner you want: the circle touches both; its
+    size follows the mouse, or type the radius.
+* **Arc**
+  * **3 Points:** start, end, then a point the arc passes through.
+  * **Centre:** centre, start (the radius), then the end. The mouse sweeps either way round, past 180 degrees too;
+    type the angle.
+  * **Tangent:** start on a curve, line, surface edge or mesh edge; the arc leaves along it: at a curve's end it
+    carries the curve on (outward, it never turns back), mid-curve the way the mouse clearly goes. Then
+    click the end, or type the radius and (Tab) the angle: 90 is a half circle.
+  * **Fillet:** click two straight lines or edges, then the corner: the arc between the two tangent points, with the
+    radius from the mouse or typed. It doesn't touch the lines; to trim them too, use **Fillet** (below).
+* **Ellipse**
+  * **Centre:** the centre, the end of the major axis (its length and direction), then the minor size.
+  * **Axis:** both ends of the major axis, then the minor size. Type the major radius (or the axis' full length), then
+    the minor radius.
+* **Rectangle**
+  * **2 Corners**, **Centre** (centre, then a corner), or **3 Points**: two corners along one side (it can be at any
+    angle), then the other side's length.
+  * Type the width, Tab the height, Tab the **corner radius**: the corners become exact quarter circles. The corner
+    radius is kept for the next rectangle, and it is in the Feature panel with the width and height.
+* **Slot:** click both arc centres, then the width (type the length, then the width). One exact closed curve: two
+  lines and two half circles, with its length and width in the Feature panel.
+* **Polygon**
+  * **To a Corner** or **To a Side:** the centre, then a corner, or the middle of a side (the side then sits square to
+    the mouse). **Up / Down** change the number of sides (shown in the key hints). Type the radius.
+
+### Helix (drawn in 3D)
+
+* **Centre:** click the centre, then the start (its radius and where it starts round), then the height: the mouse moves
+  along the axis, square to the drawing plane, up or down; snap to a point to rise level with it, Ctrl for grid steps.
+  Looking straight down the axis (a top view) the mouse can't show a height: type it, or turn the view.
+* **Around:** click a circle or a circular edge (a cylinder's rim): the helix takes its centre, radius and axis (facing
+  you). Then click where it starts on that circle (it slides round the circle and snaps, e.g. to a seam's end), then
+  the height. It sits exactly on that cylinder or cone.
+* **On a cone:** snap the height to the cone's other rim (any circle on the helix's axis), to its seam line, or to
+  its tip (a pointed cone): the helix takes that height and the cone's taper, so it follows the cone all the way --
+  to the tip it narrows to nothing (the header says "taper ... from the cone"). A typed taper still wins. A tapered
+  helix is fitted with the same CVs for every turn, so it hugs the cone even in the small turns near the tip.
+* Type the **height** (negative: the other way), Tab **turns**, Tab **pitch** (sets the turns from the height), Tab the
+  **taper** (degrees: narrower on top, like a thread on a cone). **L** makes it left-handed. All of it stays editable in
+  the Feature panel (Left-Handed is a switch there too); the Helix shape is in Shift+A for placing at the 3D cursor.
+
+### Fillet (Between Curves)
+
+Rounds the corner between two curves, like Rhino's curve fillet. Click the first curve, then the second, near the
+corner: the parts you click are the parts kept. The radius follows the mouse along the corner's bisector, or type it
+and press Enter.
+
+* The arc is exact (rational) and tangent to both curves; straight lines are filleted exactly, curved ones are solved
+  on the curves themselves (a line and a circle, two splines).
+* **T** trims both curves back to the arc's tangent points (on by default); **J** joins the trimmed curves and the arc
+  into one curve. Without Join the arc is its own curve object.
+* Two segments of **one polyline** (a Draw Line polyline): that corner is rounded in place, and it stays one curve.
+* A closed curve (a circle) is not trimmed, only touched by the arc. A curve with construction history loses it when
+  it is trimmed (as with Trim Curves). Radius, Trim and Join are in the Adjust Last Operation panel afterwards.
+
 ### Profile (circle, ellipse, square, rectangle perpendicular to a curve)
 
 Under Create Curves, next to CV Curve and Draw Line: a section for Sweep or Pipe, standing perpendicular to a curve, a line or a surface edge.
+
+* **On a mesh edge**: the profile stands perpendicular to the edge and square to the face the edge bounds. It's a one-off: it doesn't follow the mesh when that changes, and the redo panel has no Position slider for it.
 
 * Move onto a curve or surface edge: a preview of the profile follows the cursor, and the snaps work as in the sketch tools (End, Mid, any point on it). Click for the centre, then drag out the size or type it (**Tab** for the second size of an ellipse or rectangle) and click or press **Enter**. Enter without typing uses the sizes in the panel.
 * **C** circle, **E** ellipse, **S** square, **R** rectangle. **Ctrl** steps the size in grid increments.
@@ -200,7 +286,7 @@ Rebuild, Extend, Split and Trim Curves also work in curve Edit Mode, so the CVs 
 
 ### Primitives and shapes
 
-Sidebar **Create Curves** / **Create Surfaces** panels, the **NURBS Proto** header menu, or **Add > NURBS Curves / NURBS Surfaces**. Each primitive is placed at the 3D cursor and stays editable in the Feature panel.
+Sidebar **Create Curves** / **Create Surfaces** panels, the **NURBS Proto** header menu, or **Add > NURBS Curves / NURBS Surfaces**. Each primitive is placed at the 3D cursor and stays editable in the Feature panel. Its size suits the view: about a quarter of the 3D view's width at the cursor, rounded to the grid step the view shows (a couple of inches zoomed in on a part, feet or metres zoomed out), never a fixed 2 m; change it in the Adjust Last Operation panel or later in the Feature panel.
 
 | Curves (Blender NURBS curves) | Surfaces (kernel NURBS) |
 |---|---|
@@ -208,6 +294,7 @@ Sidebar **Create Curves** / **Create Surfaces** panels, the **NURBS Proto** head
 
 * **Degree**: **Exact** (rational: true circles, arcs, spheres, cylinders, cones and tori) or **1–5** with **Spans U/V**. Non-rational versions are built periodic, so closed directions stay smooth across the seam (as in Alias's degree / sections options).
 * **Caps** on Cylinder and Cone joins planar caps into a healed solid (true volume).
+* **Helix Taper °** leans the helix in (positive: narrower on top) or out (negative: wider), like a thread on a cone; 0 is a straight helix. It is in the Feature panel with the radius, height and turns.
 
 ### Draw Plane
 

@@ -131,11 +131,15 @@ def prim_arc(inputs, p):
     return ("spline", _fit_open_spec(samples, deg, n))
 
 
-def _fit_open_spec(samples, deg, n_cvs):
-    """Least-squares open clamped fit with UNIFORM knots (Blender endpoint mode)."""
+def _fit_open_spec(samples, deg, n_cvs, params=None):
+    """Least-squares open clamped fit with UNIFORM knots (Blender endpoint mode).
+    params: the samples' parameters in [0, 1] (default: by chord length)."""
     S = np.array(samples)
-    d = np.linalg.norm(np.diff(S, axis=0), axis=1)
-    t = np.concatenate([[0.0], np.cumsum(d)]) / d.sum()
+    if params is not None:
+        t = np.asarray(params, float)
+    else:
+        d = np.linalg.norm(np.diff(S, axis=0), axis=1)
+        t = np.concatenate([[0.0], np.cumsum(d)]) / d.sum()
     U = geom.clamped_uniform_knots(n_cvs, deg)
     A = geom.interp_matrix(t, U, deg, n_cvs)
     X = np.zeros((n_cvs, 3))
@@ -145,10 +149,40 @@ def _fit_open_spec(samples, deg, n_cvs):
     return spec([tuple(x) for x in X], order=deg + 1)
 
 
+def rounded_rect_spec(hw, hh, r):
+    """Exact rounded rectangle (half sizes hw, hh, corner radius r): straight
+    sides and quarter-circle corners as rational quadratic Bezier pieces
+    (order 3, Bezier knots, cyclic), like Blender's exact circle. Sides that
+    the corners use up entirely (a slot's ends) are left out."""
+    r = max(0.0, min(float(r), hw, hh))
+    w45 = math.cos(math.pi / 4)
+    corners = [((hw, -hh), (hw - r, -hh), (hw, -hh + r)), ((hw, hh), (hw, hh - r), (hw - r, hh)),
+               ((-hw, hh), (-hw + r, hh), (-hw, hh - r)), ((-hw, -hh), (-hw, -hh + r), (-hw + r, -hh))]
+    pts, w = [], []
+    for k, (c, a, b) in enumerate(corners):
+        prev_b = corners[k - 1][2]                     # the side runs from the last corner's end to this one's start
+        if math.hypot(a[0] - prev_b[0], a[1] - prev_b[1]) > 1e-12 * max(hw, hh, 1e-12):
+            pts += [prev_b, ((prev_b[0] + a[0]) / 2, (prev_b[1] + a[1]) / 2)]
+            w += [1.0, 1.0]
+        pts += [a, c]
+        w += [1.0, w45]
+    return spec([(x, y, 0.0) for x, y in pts], w, order=3, cyclic=True, endpoint=True, bezier=True)
+
+
 @features.builder("prim_rectangle")
 def prim_rectangle(inputs, p):
     w, h = p.get("width", 2.0) / 2, p.get("depth", 1.0) / 2
+    r = float(p.get("corner", 0.0) or 0.0)
+    if r > 1e-12:
+        return ("spline", rounded_rect_spec(w, h, r))
     return ("spline", spec([(-w, -h, 0), (w, -h, 0), (w, h, 0), (-w, h, 0)], order=2, cyclic=True, endpoint=False))
+
+
+@features.builder("prim_slot")
+def prim_slot(inputs, p):
+    """A slot: two half circles of the given width, their centres `length` apart."""
+    L, W = max(0.0, p.get("length", 2.0)), max(1e-9, p.get("width", 0.5))
+    return ("spline", rounded_rect_spec(L / 2 + W / 2, W / 2, W / 2))
 
 
 @features.builder("prim_polygon")
@@ -163,10 +197,18 @@ def prim_polygon(inputs, p):
 def prim_helix(inputs, p):
     r, turns, height = p.get("radius", 1.0), max(0.1, p.get("turns", 3.0)), p.get("height", 3.0)
     deg = max(2, int(p.get("degree", 3)) or 3)
-    samples = [(r * math.cos(2 * math.pi * turns * k / 400), r * math.sin(2 * math.pi * turns * k / 400),
-                height * k / 400) for k in range(401)]
+    # Taper: the helix leans in (narrower on top) or out by this angle, like a thread on a cone
+    lean = math.tan(math.radians(max(-80.0, min(80.0, float(p.get("taper", 0.0) or 0.0)))))
+    rz = lambda z: max(0.0, r - z * lean)
+    hand = -1.0 if p.get("left") else 1.0          # left-handed: it turns the other way as it rises
+    samples = [(rz(height * k / 400) * math.cos(2 * math.pi * turns * k / 400),
+                hand * rz(height * k / 400) * math.sin(2 * math.pi * turns * k / 400), height * k / 400)
+               for k in range(401)]
     n = max(deg + 1, int(round(turns * max(4, int(p.get("spans_u", 8))))) + deg)
-    return ("spline", _fit_open_spec(samples, deg, n))
+    # tapered: the same CVs for every turn (by chord length the shrinking turns
+    # near a cone's tip got too few); straight: chord length (as always)
+    even = np.linspace(0.0, 1.0, len(samples)) if abs(lean) > 1e-12 else None
+    return ("spline", _fit_open_spec(samples, deg, n, even))
 
 
 # --------------------------------------------------------------------------
@@ -197,6 +239,16 @@ def profile_frame(path_obj, ref, at, rotation=0.0, face=0):
             up = np.asarray(surface_frame(path_obj, ref, P, face)[0], float)
         except Exception:
             up = None
+    return profile_axes(P, T, up, rotation)
+
+
+def profile_axes(P, T, up=None, rotation=0.0):
+    """World matrix of a profile at P: local Z along the tangent T, local Y
+    towards `up` (world up when it is missing or along T), turned `rotation`
+    degrees about the tangent."""
+    P, T = np.asarray(P, float), np.asarray(T, float)
+    T = T / (np.linalg.norm(T) or 1.0)
+    up = None if up is None else np.asarray(up, float)
     if up is None or np.linalg.norm(up - (up @ T) * T) < 1e-6:
         up = np.array([0.0, 0.0, 1.0]) if abs(T[2]) < 0.99 else np.array([0.0, 1.0, 0.0])
     Y = up - (up @ T) * T

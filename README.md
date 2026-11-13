@@ -38,10 +38,11 @@ everything built from it rebuilds.
 
 ### Create Curves
 
-- **Draw:** CV Curve, Draw Line, Profile
-- **Shapes:** Line, Arc, Circle, Ellipse, Rectangle, Polygon, Helix
+- **Draw:** CV Curve, Draw Line (lines and tangent arcs), Arc, Circle, Ellipse, Rectangle (rounded corners), Polygon, Slot, Helix (3D: pitch, taper, left-handed), Profile
+- **Between curves:** Blend Curve, Fillet (trims and joins)
+- **Shapes:** in Shift+A every shape at the 3D cursor (sized to the view)
 - **From surfaces:** Iso Curve, Duplicate Edge, Project Curve, Intersect
-- **Between curves:** Blend Curve
+- **Snapping:** to curves, NURBS surfaces and meshes (vertex, edge, edge center, face center; **O** onto the face), smart guides (aligned, tangent, parallel, perpendicular), **Alt** for a free point, **Ctrl** for the grid
 
 ### Curve Edit
 

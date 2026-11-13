@@ -164,6 +164,9 @@ class AskValue:
                                                           confirm_text=self.bl_label)
 
 
+GIZMO = {"held": False}     # the left button went down on the navigation gizmo (PickMixin._in_view)
+
+
 class PickMixin:
     """Modal picking of curves / surface edges. Subclasses set:
     pick_count (min), pick_max, allow_edges, and implement finish_picks()."""
@@ -277,6 +280,8 @@ class PickMixin:
             return {'PASS_THROUGH'}
         if self.hints_key(context, event):
             return {'RUNNING_MODAL'}
+        if event.type == 'INBETWEEN_MOUSEMOVE':
+            return {'PASS_THROUGH'}       # not used here; a gizmo drag needs them unhandled
         if event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MOUSEMOVE'} and not self._in_view(context, event):
             # a click on the sidebar / header (e.g. the CVs / Hulls toggle): let the UI have it
             return {'PASS_THROUGH'}
@@ -334,7 +339,20 @@ class PickMixin:
     @staticmethod
     def _in_view(context, event):
         """Is the mouse over the 3D view's drawing area (not a sidebar / header
-        overlapping it)?"""
+        overlapping it, nor the navigation gizmo: clicks and drags there go to
+        Blender, so the view can be turned while a tool runs)?
+        A press on the gizmo is remembered (GIZMO): Blender makes a drag of
+        that press only from mouse moves nobody else handled, so until the drag
+        starts (its rotate / pan / zoom takes over) or the button comes up,
+        the moves go to Blender too."""
+        if GIZMO["held"]:
+            etype = getattr(event, "type", None)
+            if etype in ('MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'):
+                return False
+            if etype == 'LEFTMOUSE':
+                GIZMO["held"] = False
+                if getattr(event, "value", None) != 'PRESS':    # released, or the drag has started
+                    return False
         area = context.area
         if area is None:
             return True
@@ -348,6 +366,15 @@ class PickMixin:
                     continue         # a hidden Adjust Last Operation panel keeps its size, parked below the view
                 if r.x <= x < r.x + r.width and r.y <= y < r.y + r.height:
                     return False
+        from .subsel import over_navigation
+        try:
+            on_gizmo = over_navigation(context, area, win, x, y)
+        except Exception:
+            on_gizmo = False
+        if on_gizmo:
+            if getattr(event, "type", None) == 'LEFTMOUSE' and getattr(event, "value", None) == 'PRESS':
+                GIZMO["held"] = True
+            return False
         return True
 
     def _finish(self, context):

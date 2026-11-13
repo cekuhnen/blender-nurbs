@@ -21,10 +21,12 @@ orthographic view (Top / Front / Side), else the view plane, through the 3D
 cursor (or through the first snapped point). Clicks snap (see snapping.py) to
 the ends, middles, CVs and any point of visible curves, to the vertices,
 middles and any point of surface edges, to face centres, to the CVs of
-surfaces whose CV net is shown, and to the points drawn so far. Ctrl snaps to
+surfaces whose CV net is shown, to the points drawn so far, and (Blender's
+snap menu: the magnet and its elements) to mesh vertices, edges, edge and face
+centres and faces. Ctrl snaps to
 the grid, Shift to 15 degree angles from the previous point.
-Locks: H / V horizontal / vertical in the drawing plane; X / Y / Z along that
-world axis from the previous point (from the 3D cursor for the first);
+Locks: X / Y / Z along that world axis from the previous point (from the 3D
+cursor for the first), stopping where it crosses a smart guide;
 Shift+X / Y / Z in the plane of the other two axes. A lock, Ctrl or Shift
 leaves only the point snaps on, not the edges.
 CV Curve start / end conditions (S / E keys, or the F9 panel): an end snapped
@@ -251,6 +253,118 @@ def chain_lines(lines, tol=1e-9):
     return out
 
 
+# --------------------------------------------------------------------------
+# Tangent arcs in a polyline (Draw Line, R): an arc leaves the last point
+# along the previous segment's end direction and ends where you click
+# --------------------------------------------------------------------------
+
+def _unit(v):
+    v = np.asarray(v, float)
+    return v / (float(np.linalg.norm(v)) or 1.0)
+
+
+def tangent_arc(S, t, E, tol=1e-6):
+    """Middle point of the circular arc that leaves S along the unit direction t
+    and ends at E (its sweep is twice the angle between t and the chord), or
+    None when E lies on t's line (no arc: a straight segment)."""
+    S, t, E = (np.asarray(x, float) for x in (S, t, E))
+    d = E - S
+    c = float(np.linalg.norm(d))
+    if c < 1e-12:
+        return None
+    dh = d / c
+    cos_phi = float(t @ dh)
+    perp = t - cos_phi * dh
+    sin_phi = float(np.linalg.norm(perp))
+    if sin_phi < tol:
+        return None
+    r = c / (2.0 * sin_phi)
+    return S + 0.5 * d + r * (1.0 - cos_phi) * (perp / sin_phi)
+
+
+def arc_circle(S, M, E):
+    """(centre, radius, unit x towards S, unit y the way the arc runs, sweep in
+    radians) of the circle through S, M, E, running S -> M -> E."""
+    S, M, E = (np.asarray(x, float) for x in (S, M, E))
+    a, b = S - M, E - M
+    axb = np.cross(a, b)
+    den = 2.0 * float(axb @ axb)
+    C = M + (np.cross(axb, a) * float(b @ b) + np.cross(b, axb) * float(a @ a)) / den
+    r = float(np.linalg.norm(S - C))
+    x = (S - C) / r
+    m = M - C
+    y = m - float(m @ x) * x
+    y /= float(np.linalg.norm(y))
+    half = math.atan2(float(m @ y), float(m @ x))       # S -> M: half the sweep (up to 180 degrees)
+    return C, r, x, y, 2.0 * half
+
+
+def arc_points(S, M, E, n=24):
+    """n + 1 points along the arc S -> M -> E."""
+    C, r, x, y, th = arc_circle(S, M, E)
+    return [C + r * (math.cos(a) * x + math.sin(a) * y) for a in np.linspace(0.0, th, n + 1)]
+
+
+def seg_end_tangent(a, b, mid=None):
+    """The unit direction a segment ends with: a line's own, an arc's tangent at its end."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    if mid is None:
+        d = b - a
+        return d / (float(np.linalg.norm(d)) or 1.0)
+    C, r, x, y, th = arc_circle(a, mid, b)
+    return -math.sin(th) * x + math.cos(th) * y
+
+
+def arc_bezier(S, M, E):
+    """(points, weights) of the exact arc S -> M -> E as rational quadratic
+    Bezier pieces of at most 90 degrees (order 3, Bezier knots)."""
+    C, r, x, y, th = arc_circle(S, M, E)
+    k = max(1, int(math.ceil(th / (math.pi / 2) - 1e-9)))
+    dt = th / k
+    at = lambda a, rr=r: C + rr * (math.cos(a) * x + math.sin(a) * y)
+    pts, w = [np.asarray(S, float)], [1.0]
+    for j in range(k):
+        t0, t1 = j * dt, (j + 1) * dt
+        pts.append(at(0.5 * (t0 + t1), r / math.cos(dt / 2)))
+        w.append(math.cos(dt / 2))
+        pts.append(np.asarray(E, float) if j == k - 1 else at(t1))
+        w.append(1.0)
+    return pts, w
+
+
+def chain_segments(segs, tol=1e-9):
+    """Connected segments (a, b, arc middle or None) -> chains, in drawing order."""
+    out = []
+    for a, b, m in segs:
+        a, b = np.asarray(a, float), np.asarray(b, float)
+        if out and np.linalg.norm(out[-1][-1][1] - a) <= tol:
+            out[-1].append((a, b, m))
+        else:
+            out.append([(a, b, m)])
+    return out
+
+
+def segments_spec(chain, tol=1e-9):
+    """One spline spec for a chain of lines and arcs: exact, order 3 with
+    Bezier knots (a line is a straight Bezier piece), cyclic when it closes."""
+    from .primitives import spec
+    pts, w = [], []
+    for k, (a, b, m) in enumerate(chain):
+        if m is None:
+            P, W = [np.asarray(a, float), 0.5 * (np.asarray(a, float) + np.asarray(b, float)), np.asarray(b, float)], \
+                [1.0, 1.0, 1.0]
+        else:
+            P, W = arc_bezier(a, m, b)
+        if k:
+            P, W = P[1:], W[1:]
+        pts += P
+        w += W
+    closed = bool(len(chain) > 1 and np.linalg.norm(pts[0] - pts[-1]) <= tol)
+    if closed:
+        pts, w = pts[:-1], w[:-1]
+    return spec([tuple(p) for p in pts], w, order=3, cyclic=closed, endpoint=True, bezier=True)
+
+
 AXES = {"X": np.array([1.0, 0.0, 0.0]), "Y": np.array([0.0, 1.0, 0.0]), "Z": np.array([0.0, 0.0, 1.0])}
 AXIS_COL = {"X": (1.0, 0.2, 0.32, 1.0), "Y": (0.55, 0.86, 0.0, 1.0), "Z": (0.16, 0.56, 1.0, 1.0)}
 COL_TANGENT = (1.0, 0.85, 0.2, 1.0)
@@ -402,9 +516,15 @@ MODE_ITEMS = [("CV", "CVs", "Every click places a control point"),
 DEGREE_PAD = {f"NUMPAD_{i}": i for i in range(1, 6)}
 NUMPAD_CHARS = {f"NUMPAD_{i}": str(i) for i in range(10)} | {
     "NUMPAD_PERIOD": ".", "NUMPAD_MINUS": "-", "NUMPAD_PLUS": "+", "NUMPAD_SLASH": "/", "NUMPAD_ASTERIX": "*"}
+GUIDE_PX = 6.0          # a smart guide snaps within this many pixels
+GUIDE_LABEL = {"align": "Aligned", "tangent": "Tangent", "extend": "Extension", "perp": "Perpendicular",
+               "parallel": "Parallel"}
+COL_GUIDE = (0.75, 0.75, 0.75, 0.9)
+POINT_KINDS = {"first", "end", "mid", "center", "cv", "vertex"}
+REFRESH_KEYS = {'MOUSEMOVE', 'LEFT_CTRL', 'RIGHT_CTRL', 'LEFT_SHIFT', 'RIGHT_SHIFT', 'LEFT_ALT', 'RIGHT_ALT'}
 PASS_KEYS = {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM', 'MOUSEROTATE',
              'NDOF_MOTION', 'NUMPAD_0', 'NUMPAD_1', 'NUMPAD_2', 'NUMPAD_3', 'NUMPAD_4', 'NUMPAD_5', 'NUMPAD_6',
-             'NUMPAD_7', 'NUMPAD_8', 'NUMPAD_9', 'NUMPAD_PERIOD', 'NUMPAD_PLUS', 'NUMPAD_MINUS', 'ACCENT_GRAVE'}
+             'NUMPAD_7', 'NUMPAD_8', 'NUMPAD_9', 'NUMPAD_PERIOD', 'NUMPAD_PLUS', 'NUMPAD_MINUS', 'ACCENT_GRAVE', 'INBETWEEN_MOUSEMOVE'}
 
 
 def add_curve(context, name, specs_world, edit_obj=None):
@@ -448,6 +568,46 @@ def _select_new(context, objs):
         context.view_layer.objects.active = objs[-1]
 
 
+# --------------------------------------------------------------------------
+# The viewport grid (as Blender draws it), for Ctrl grid snapping
+# --------------------------------------------------------------------------
+
+# Blender's length units (its unit table), smallest first, in metres; the grid
+# has a line level at each, then x10 levels to fill GRID_STEPS_LEN
+GRID_UNITS = {"METRIC": [1e-6, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0, 1000.0],        # um mm cm dm m dam hm km
+              "IMPERIAL": [0.0000254, 0.0254, 0.3048, 0.9144, 20.1168, 201.168, 1609.344]}  # thou in ft yd ch fur mi
+GRID_STEPS_LEN = 8
+GRID_FADE_PX = 4.0      # a grid level starts to fade in when its lines are this far apart
+
+
+def grid_steps(system, scale_length=1.0, grid_scale=1.0, subdivisions=10):
+    """The viewport grid's line levels in Blender units, finest first (Blender's
+    ED_view3d_grid_steps for an axis view): one per unit of the unit system,
+    or Grid Scale times powers of the Subdivisions without units."""
+    units = GRID_UNITS.get(system)
+    if units is None:
+        return [grid_scale * subdivisions ** i for i in range(GRID_STEPS_LEN)]
+    steps = [u * grid_scale / scale_length for u in units]
+    while len(steps) < GRID_STEPS_LEN:
+        steps.append(10.0 * steps[-1])
+    return steps
+
+
+def visible_grid_step(steps, ppu):
+    """The finest grid level drawn at least half visible at ppu pixels per unit.
+    The viewport fades a level in from GRID_FADE_PX apart (invisible) to the
+    level below it reaching GRID_FADE_PX (fully drawn), alpha cubed; below half
+    its lines are hard to see, so the next level up is the one to snap to."""
+    px = [s * ppu for s in steps]
+    i = next((k for k, p in enumerate(px) if p >= GRID_FADE_PX), len(px) - 1)
+    s0 = px[i - 1] if i > 0 else 0.0
+    t = (GRID_FADE_PX - s0) / max(px[i] - s0, 1e-12)
+    blend = 1.0 - min(max(t, 0.0), 1.0)
+    if blend ** 3 >= 0.5 or i + 1 >= len(steps):
+        return steps[i]
+    return steps[i + 1]
+
+
 class SketchMixin:
     """Point picking on a drawing plane with snapping."""
 
@@ -459,12 +619,13 @@ class SketchMixin:
         self._hover_cand = None
         self._edge_lock = None      # (object, ref): L locked the point onto this edge / curve
         self._last_edge = None      # the edge last slid along: it stays the reference at its ends
+        self._acquired = []         # points snapped to lately: smart guides align to them too
         draw.sketch_overlay.update(curves=[], hull=[], cvs=[], snap=None, snap_label=None, axes=[],
-                                   refs=[], cursor=None, comb=None)
+                                   refs=[], cursor=None, comb=None, guides=[])
 
     def sketch_end(self, context):
         draw.sketch_overlay.update(curves=[], hull=[], cvs=[], snap=None, snap_label=None, axes=[],
-                                   refs=[], cursor=None, comb=None)
+                                   refs=[], cursor=None, comb=None, guides=[])
         hints.clear(context)
 
     # -- key hints (hints.py) shared by the sketch tools ----------------------
@@ -472,10 +633,9 @@ class SketchMixin:
         """Direction keys; the active lock lit."""
         lk = getattr(self, "_lock", None)
         on = lambda c: True if c else None
-        return ([hints.key("H V", "horizontal / vertical", on=on(lk in ("H", "V"))),
-                 hints.key("X Y Z", "axis", on=on(lk in ("X", "Y", "Z"))),
+        return ([hints.key("X Y Z", "axis", on=on(lk in ("X", "Y", "Z"))),
                  hints.key("Shift+X/Y/Z", "plane", on=on(lk in ("-X", "-Y", "-Z")))]
-                + list(extra) + [hints.key("Shift", "15°"), hints.key("Ctrl", "grid")])
+                + list(extra) + [hints.key("Shift", "15°")])
 
     def reference_hints(self, mode):
         """Which edge / face an end follows: T next, L lock onto it, F edge or face."""
@@ -535,15 +695,18 @@ class SketchMixin:
 
     # -- snapping ---------------------------------------------------------
     def _snap_targets(self, context):
-        """Snap targets of the visible curves and surfaces (snapping.Targets)."""
-        return snapping.collect(context.visible_objects, lambda o: draw.cv_net_shown(context, o))
+        """Snap targets of the visible curves, surfaces and meshes (snapping.Targets)."""
+        return snapping.collect(context.visible_objects, lambda o: draw.cv_net_shown(context, o),
+                                snapping.sketch_mesh_elements)
 
     def _view(self, context):
         region, rv3d = self._win(context)
         return snapping.View(rv3d.perspective_matrix, rv3d.view_matrix, region.width, region.height)
 
     def _grid_step(self, context, at):
-        """A grid increment that is at least ~12 px on screen here."""
+        """The grid step Ctrl snaps to here: the finest grid level the view
+        draws at least half visible (visible_grid_step), so points land on
+        lines you can see, never between them."""
         p0 = self._to_px(context, at)
         u = self._plane[2] if self._plane else np.array([1.0, 0, 0])
         p1 = self._to_px(context, at + u)
@@ -551,16 +714,10 @@ class SketchMixin:
             return 1.0
         ppu = max(np.linalg.norm(p1 - p0), 1e-9)
         us = context.scene.unit_settings
-        scale = us.scale_length or 1.0
-        if us.system == 'IMPERIAL':
-            inch = 0.0254 / scale
-            steps = [inch * f for f in (1 / 16, 1 / 8, 1 / 4, 1 / 2, 1, 3, 6, 12, 36, 120, 1200)]
-        else:
-            steps = [10.0 ** k * f / scale for k in range(-4, 5) for f in (1, 2, 5)]
-        for st in steps:
-            if st * ppu >= SNAP_PX:
-                return st
-        return steps[-1]
+        ov = getattr(getattr(context.area, "spaces", None) and context.area.spaces.active, "overlay", None)
+        steps = grid_steps(us.system, us.scale_length or 1.0, getattr(ov, "grid_scale", 1.0) or 1.0,
+                           getattr(ov, "grid_subdivisions", 10) or 10)
+        return visible_grid_step(steps, ppu)
 
     def pick_point(self, context, event, extra=(), prev=None):
         """(world point, snap) under the mouse. snap = (kind, outward tangent,
@@ -579,11 +736,178 @@ class SketchMixin:
             snap = (snap[0], snap[1], src, ref_label(snap[0], cand, n, self._refs["i"] if n else 0,
                                                      getattr(self, "_edge_lock", None) is not None))
         elif snap is not None:
-            snap = (snap[0], snap[1], None, snapping.LABELS.get(snap[0]))
+            label = snapping.LABELS.get(snap[0]) or (snap[0][6:] if snap[0].startswith("guide:") else None)
+            snap = (snap[0], snap[1], None, label)
+        if snap is not None and snap[0] in POINT_KINDS and P is not None:
+            self._acquire(P)            # guides align to the points you snap to
         return P, snap
+
+    def drawn_segments(self):
+        """[(A, B)] the lines drawn so far in this tool run: they snap too
+        (their middles, any point on them). Draw Line has them."""
+        return ()
+
+    # -- smart guides: lines in the drawing plane the point can snap onto ------
+    use_guides = True
+
+    def guide_points(self):
+        """Points of this run that guides align to (horizontal / vertical in the plane)."""
+        return []
+
+    def guide_dirs(self, prev):
+        """[(unit direction, kind)] of guides through the previous point."""
+        return []
+
+    def guide_axes(self):
+        """Directions of the sketch's straight lines, newest first: guides run
+        parallel and perpendicular to them, through every guide point."""
+        return []
+
+    def _acquire(self, P):
+        """A point snapped to: guides align to it for a while (the 3 latest)."""
+        P = np.asarray(P, float)
+        acq = [q for q in (getattr(self, "_acquired", None) or []) if np.linalg.norm(q - P) > 1e-9]
+        self._acquired = [P] + acq[:2]
+
+    def _guide_lines(self, context, prev, plane):
+        """[(base, unit direction, kind)] in the drawing plane."""
+        O, n, u, v = plane
+        flat = lambda p: np.asarray(p, float) - float((np.asarray(p, float) - O) @ n) * n
+        pts = []
+        for p in list(self.guide_points()) + list(getattr(self, "_acquired", None) or []):
+            q = flat(p)
+            if all(np.linalg.norm(q - r) > 1e-9 for r in pts):
+                pts.append(q)
+        dirs = [(u, "align"), (v, "align")]
+        n_sketch = 0
+        for d in self.guide_axes():
+            d = np.asarray(d, float)
+            d = d - float(d @ n) * n
+            if np.linalg.norm(d) < 1e-9:
+                continue
+            d = _unit(d)
+            fresh = False
+            for e, kind in ((d, "parallel"), (_unit(np.cross(n, d)), "perp")):
+                if all(abs(float(e @ f)) < 1 - 1e-6 for f, _ in dirs):
+                    dirs.append((e, kind))
+                    fresh = True
+            n_sketch += fresh
+            if n_sketch >= 4:               # the 4 newest directions of the sketch
+                break
+        out = [(q, e, kind) for q in pts for e, kind in dirs]
+        if prev is not None:
+            out += [(flat(prev), _unit(d), k) for d, k in self.guide_dirs(prev)]
+        return out
+
+    def _dashes(self, context, a, b):
+        """Dashes (2-point polylines) from a to b, about 6 px long."""
+        pa, pb = self._to_px(context, a), self._to_px(context, b)
+        n = 1 if pa is None or pb is None else int(min(max(np.linalg.norm(pb - pa) / 6.0, 1), 400))
+        out = []
+        for k in range(0, n, 2):
+            out.append([Vector(a + (b - a) * k / n), Vector(a + (b - a) * min(k + 1, n) / n)])
+        return out
+
+    def _guide_snap(self, context, mouse, prev, plane, along=None):
+        """The point the smart guides give near the mouse, or None: (point,
+        label, dashes). Where two guides cross near the mouse, that crossing;
+        else the nearest guide within GUIDE_PX. along=(base, direction): only
+        where that line (a lock) crosses a guide."""
+        if not getattr(self, "use_guides", True):
+            return None
+        mouse = np.asarray(mouse, float)
+        lines = self._guide_lines(context, prev, plane)
+        if along is not None:
+            lines = [(b, e, k) for b, e, k in lines if abs(float(_unit(along[1]) @ e)) < 1 - 1e-6]
+        near = []
+        if lines:
+            view = self._view(context)
+            Bs = np.array([b for b, _, _ in lines], float)
+            Es = np.array([e for _, e, _ in lines], float)
+            a, _, oka = view.project(Bs)
+            b, _, okb = view.project(Bs + Es * max(float(np.ptp(Bs, axis=0).max()), 1.0))
+            w = b - a
+            L = np.linalg.norm(w, axis=1)
+            good = oka & okb & (L > 1e-9)
+            w = w / np.where(L > 1e-9, L, 1.0)[:, None]
+            dist = np.abs((mouse - a)[:, 0] * w[:, 1] - (mouse - a)[:, 1] * w[:, 0])
+            for k in np.flatnonzero(good & ((dist <= GUIDE_PX) if along is None else True)):
+                near.append((float(dist[k]), lines[k][0], lines[k][1], lines[k][2]))
+        if not near:
+            return None
+        near.sort(key=lambda g: g[0])
+
+        def cross(b1, e1, b2, e2):
+            M = np.stack([e1, -e2], axis=1)
+            st, *_ = np.linalg.lstsq(M, b2 - b1, rcond=None)
+            X = b1 + st[0] * e1
+            return X if np.linalg.norm(X - (b2 + st[1] * e2)) < 1e-9 * (1 + np.linalg.norm(X)) else None
+
+        best = None
+        if along is not None:
+            for dist, base, e, kind in near:
+                X = cross(np.asarray(along[0], float), _unit(along[1]), base, e)
+                px = self._to_px(context, X) if X is not None else None
+                if px is not None and np.linalg.norm(px - mouse) <= GUIDE_PX * 1.5 \
+                        and (best is None or np.linalg.norm(px - mouse) < best[0]):
+                    best = (float(np.linalg.norm(px - mouse)), X, [(base, kind)])
+        else:
+            for i in range(min(len(near), 6)):
+                for j in range(i + 1, min(len(near), 6)):
+                    _, b1, e1, k1 = near[i]
+                    _, b2, e2, k2 = near[j]
+                    if abs(float(e1 @ e2)) > 1 - 1e-6:
+                        continue
+                    X = cross(b1, e1, b2, e2)
+                    px = self._to_px(context, X) if X is not None else None
+                    if px is not None and np.linalg.norm(px - mouse) <= GUIDE_PX * 1.5 \
+                            and (best is None or np.linalg.norm(px - mouse) < best[0]):
+                        best = (float(np.linalg.norm(px - mouse)), X, [(b1, k1), (b2, k2)])
+            if best is None:
+                _, base, e, kind = near[0]
+                Pm = self._ray_point(context, Vector(mouse), plane)
+                if Pm is None:
+                    return None
+                X = base + float((Pm - base) @ e) * e
+                best = (0.0, X, [(base, kind)])
+        if best is None:
+            return None
+        X = best[1]
+        labels = []
+        for _, kind in best[2]:
+            if GUIDE_LABEL[kind] not in labels:
+                labels.append(GUIDE_LABEL[kind])
+        dashes = [d for base, _ in best[2] for d in self._dashes(context, base, X)]
+        return X, " · ".join(labels), dashes, len(best[2])
+
+    def _guided(self, g):
+        """A guide snap as _pick's (point, snap): its dashes drawn, its label shown."""
+        draw.sketch_overlay["guides"] = [(g[2], COL_GUIDE)]
+        return g[0], ("guide:" + g[1], None, None)
+
+    def snap_key(self, context, event):
+        """O: snap onto the mesh face under the mouse (the point lies on the
+        mesh, off the drawing plane) on / off; kept for the session. True when
+        it was that key (the caller refreshes the preview)."""
+        if event.type != 'O' or event.value != 'PRESS' or event.ctrl or getattr(event, "alt", False) \
+                or getattr(event, "oskey", False) or getattr(self, "_buf", ""):
+            return False
+        snapping.SNAP_STATE["surface"] = not snapping.SNAP_STATE["surface"]
+        try:
+            self._status(context)
+        except Exception:
+            pass
+        return True
+
+    @staticmethod
+    def snap_hints():
+        return [hints.key("Ctrl", "grid"), hints.key("Alt", "no snapping"),
+                hints.toggle("O", "on surface", snapping.SNAP_STATE["surface"])]
 
     def _pick(self, context, event, extra=(), prev=None):
         mouse = self._mouse(context, event)
+        free = bool(getattr(event, "alt", False))       # Alt held: a free point, nothing snaps
+        draw.sketch_overlay["guides"] = []
         plane = self._plane or self._view_plane(context, np.array(context.scene.cursor.location, float))
         O, n, u, v = plane
         el = getattr(self, "_edge_lock", None)
@@ -598,34 +922,49 @@ class SketchMixin:
             # the previous point, or from the 3D cursor for the first one; a
             # direction taken from a line (A) only once there is a previous point
             base = prev if prev is not None else np.array(context.scene.cursor.location, float)
-            hit = self._snaps.pick(self._view(context), mouse, extra, edges=False)
+            hit = None if free else self._snaps.pick(self._view(context), mouse, extra, edges=False,
+                                                     segments=self.drawn_segments())
             region, rv3d = self._win(context)
             ray = (np.array(view3d_utils.region_2d_to_origin_3d(region, rv3d, Vector(mouse)), float),
                    np.array(view3d_utils.region_2d_to_vector_3d(region, rv3d, Vector(mouse)), float))
             step = self._grid_step(context, base) if event.ctrl and hit is None else None
             vec = getattr(self, "_tvec", None) if lock[-1] == "T" else getattr(self, "_avec", None) \
                 if lock == "A" else None
+            if hit is None and not free and not event.ctrl and lock[0] != "-":
+                along = AXES.get(lock, vec)
+                if along is not None and np.linalg.norm(along) > 1e-12:
+                    g = self._guide_snap(context, mouse, prev, plane, along=(base, np.asarray(along, float)))
+                    if g is not None:
+                        return self._guided(g)
             P = axis_lock_point(lock, base, ray, None if hit is None else hit[0],
                                 self._ray_point(context, Vector(mouse), plane), step, vec)
             return P, None
         axis = None
         if prev is not None:
             alock = getattr(self, "_angle_lock", None)
-            if lock in ('H', 'V'):
-                axis = u if lock == 'H' else v
-            elif alock is not None:
+            if alock is not None:
                 axis = math.cos(math.radians(alock)) * u + math.sin(math.radians(alock)) * v
         # points (ends, middles, centres, CVs) always snap; edges only when
-        # nothing else is in charge (a lock, Ctrl grid, Shift angles)
-        hit = self._snaps.pick(self._view(context), mouse, extra,
-                               edges=axis is None and not event.ctrl and not event.shift)
+        # nothing else is in charge (a lock, Ctrl grid, Shift angles); Alt: nothing
+        hit = None if free else self._snaps.pick(self._view(context), mouse, extra,
+                                                 edges=axis is None and not event.ctrl and not event.shift,
+                                                 segments=self.drawn_segments())
         best = None if hit is None else (0.0, hit[0], hit[2], hit[1])
+        guides = not free and not event.ctrl and not event.shift
         if best is not None and axis is None:
+            if hit[1] not in POINT_KINDS and guides:
+                g = self._guide_snap(context, mouse, prev, plane)
+                if g is not None and g[3] >= 2:         # two guides crossing beat an edge
+                    return self._guided(g)
             return best[1], (best[3], best[2], hit[3])
         if axis is not None:
-            # locked direction (horizontal / vertical / typed angle): slide along
+            # locked direction (a typed angle): slide along
             # the line through the previous point; a snapped point is projected
-            # onto it, so the line lines up with that point
+            # onto it, so the line lines up with that point -- or with a guide
+            if best is None and not free and not event.ctrl:
+                g = self._guide_snap(context, mouse, prev, plane, along=(prev, axis))
+                if g is not None:
+                    return self._guided(g)
             P = best[1] if best is not None else self._ray_point(context, Vector(mouse), plane)
             if P is None:
                 return None, None
@@ -634,6 +973,10 @@ class SketchMixin:
                 st = self._grid_step(context, P)
                 r = round(r / st) * st
             return prev + r * axis, None
+        if guides:
+            g = self._guide_snap(context, mouse, prev, plane)
+            if g is not None:
+                return self._guided(g)
         P = self._ray_point(context, Vector(mouse), plane)
         if P is None:
             return None, None
@@ -685,8 +1028,6 @@ class SketchMixin:
             if lk[0] == "-":
                 return " · plane " + "XYZ".replace(lk[-1], "") + f" (not {lk[-1]})"
             return f" · along {lk}"
-        if lk:
-            return " · " + ("horizontal" if lk == 'H' else "vertical")
         if getattr(self, "_angle_lock", None) is not None:
             return f" · angle {self._angle_lock:g}°"
         return ""
@@ -842,6 +1183,13 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
     bl_label = "CV Curve"
     bl_options = {'REGISTER', 'UNDO'}
 
+    def guide_points(self):
+        return list(getattr(self, "_pts", []))
+
+    def guide_axes(self):
+        P = [np.asarray(p, float) for p in getattr(self, "_pts", [])]
+        return [_unit(P[k + 1] - P[k]) for k in range(len(P) - 2, -1, -1) if np.linalg.norm(P[k + 1] - P[k]) > 1e-12]
+
     mode: EnumProperty(name="Mode", items=MODE_ITEMS, default="CV")
     degree: EnumProperty(name="Degree", items=DEGREE_ITEMS, default="3")
     closed: BoolProperty(name="Closed", default=False, description="Close the curve (smooth, periodic)")
@@ -894,7 +1242,7 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
         if not self.closed:
             rows.append(("Ends", [hints.cycle("S", conts, self.start_cont, "start"),
                                   hints.cycle("E", conts, self.end_cont, "end")]))
-        rows += [("Reference", self.reference_hints(self.edge_mode)),
+        rows += [("Snap", self.snap_hints()), ("Reference", self.reference_hints(self.edge_mode)),
                  ("Curve", [hints.cycle("M", ["CVs", "through points"],
                                         "CVs" if self.mode == "CV" else "through points"),
                             hints.cycle("1-5", [str(d) for d in range(1, 6)], str(self.degree), "degree")]),
@@ -992,7 +1340,7 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
         prev = self._pts[-1] if self._pts else None
         first = [(self._pts[0], None, "first")] if len(self._pts) >= 3 else []
         hover = lambda: self.pick_point(context, event, first, prev)
-        if event.type in {'MOUSEMOVE', 'LEFT_CTRL', 'RIGHT_CTRL', 'LEFT_SHIFT', 'RIGHT_SHIFT'}:
+        if event.type in REFRESH_KEYS or self.snap_key(context, event):
             self._preview(context, hover())
         elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
             P, snap = hover()
@@ -1019,10 +1367,6 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
                 self._plane = None
                 self._start_refs = None
             self._preview(context)
-            self._status(context)
-        elif event.value == 'PRESS' and event.type in {'H', 'V'}:
-            self.toggle_lock(event.type)
-            self._preview(context, hover())
             self._status(context)
         elif event.value == 'PRESS' and event.type in {'X', 'Y', 'Z'}:
             self.axis_key(event)
@@ -1168,10 +1512,10 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
 # --------------------------------------------------------------------------
 
 class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
-    """Draw straight lines: click the start, then click the end or type a
+    """Draw straight lines and, in a polyline, tangent arcs (R): click the start, then click the end or type a
     length (Tab: angle) and press Enter. The end snaps Perpendicular and
-    Tangent to curves and edges. H / V lock horizontal / vertical, X / Y / Z a
-    world axis (Shift+X / Y / Z: the plane of the other two), A / Shift+A
+    Tangent to curves and edges. X / Y / Z lock a world axis (Shift+X / Y /
+    Z: the plane of the other two), smart guides align it, A / Shift+A
     parallel / square to the line or curve under the mouse, Shift snaps to 15
     degrees, Ctrl to the grid. S: a start snapped onto an edge or curve leaves
     tangent or square to it, and slides along it to meet a second curve
@@ -1201,6 +1545,7 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
             bpy.ops.object.mode_set(mode='OBJECT')
         self._edit = _edit_target(context)
         self._lines, self._start, self._lock = [], None, None
+        self._arcs, self._arc_mode = [], False      # per segment: its arc's middle, or None (a line)
         self._start_refs = None
         self._seg_start = None          # where the line starts while the start slides (Tangent to both, ...)
         self._curves, self._solved = {}, {}
@@ -1236,8 +1581,9 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
         L, A = self._live(context)
         self._seg_start = None
         if self._start is not None:
-            self._angle_lock = A
-            if A is not None:
+            arcing = self._arc_from() is not None
+            self._angle_lock = None if arcing else A      # an arc's angle is its own (from its start direction)
+            if A is not None and not arcing:
                 self._lock = None
         P, snap = self.pick_point(context, event, self._extra(), self._start)
         if snap is not None and snap[0] == "cv" and snap[2] is None and P is not None:
@@ -1247,17 +1593,21 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
                 src, cand, n = self._choose_ref(P, on[0][0], "cv")
                 self._hover_cand = cand
                 snap = (snap[0], snap[1], src, snap[3])
-        if self._start is not None and L is None and A is None:
+        if self._start is not None and L is None and A is None and not getattr(event, "alt", False) \
+                and self._arc_from() is None:
             sp = self._special(context, event, P, snap)
             if sp is not None:
                 return sp
+        arc = self._arc_from()
+        if arc is not None and (L is not None or A is not None):
+            return self._arc_end(arc, P, L, A), None
         if self._start is None or L is None:
             return P, snap
         O, n, u, v = self._plane
         if A is not None:
             d = math.cos(math.radians(A)) * u + math.sin(math.radians(A)) * v
-        elif getattr(self, "_lock", None) in ('H', 'V', 'X', 'Y', 'Z', 'T', 'A'):
-            d = {'H': u, 'V': v, 'T': np.asarray(getattr(self, "_tvec", u), float),
+        elif getattr(self, "_lock", None) in ('X', 'Y', 'Z', 'T', 'A'):
+            d = {'T': np.asarray(getattr(self, "_tvec", u), float),
                  'A': np.asarray(getattr(self, "_avec", u), float)}.get(self._lock, AXES.get(self._lock))
             d = d / (np.linalg.norm(d) or 1.0)
             if P is not None and float((P - self._start) @ d) < 0:
@@ -1268,12 +1618,38 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
             d = u
         return self._start + L * d, None
 
+    def _arc_end(self, arc, P, R, A):
+        """The arc's end from a typed Radius and / or Angle. The angle is the
+        turn from the direction the arc leaves to its chord: 90 gives a half
+        circle (it sweeps twice the angle); the mouse picks the side."""
+        S, t = arc
+        n = self._plane[1]
+        m = _unit(np.cross(n, t))
+        ref = np.asarray(P, float) if P is not None else S + m
+        if float((ref - S) @ m) < 0:
+            m = -m
+        if A is not None:
+            phi = math.radians(min(max(abs(float(A)), 0.01), 179.99))
+            d = math.cos(phi) * t + math.sin(phi) * m
+            if R is not None:
+                return S + 2.0 * float(R) * math.sin(phi) * d
+            return S + max(float((ref - S) @ d), 1e-9) * d
+        C = S + float(R) * m                  # Radius only: the end follows the mouse round that circle
+        w = ref - C
+        w -= float(w @ n) * n
+        if np.linalg.norm(w) < 1e-12:
+            w = -m
+        return C + float(R) * _unit(w)
+
     def _status(self, context, length=None, angle=None):
         us = context.scene.unit_settings
         fmt = lambda x: bpy.utils.units.to_string(us.system, 'LENGTH', x * (us.scale_length or 1.0), precision=4)
         step = (("click the next point (on the first one closes it)" if self.polyline and self._lines
                  and self._start is not None and np.linalg.norm(self._start - self._lines[-1][1]) <= 1e-9
                  else "place the end") if self._start is not None else "click the start")
+        if getattr(self, "_arc_mode", False):
+            step = ("click where the arc ends" if self._arc_from() is not None
+                    else "arc: draw a line first, the arc continues from it")
         state = [step, f"{len(self._lines)} drawn" if self._lines else ""]
         if self._start is not None:
             L, A = self._live(context)
@@ -1282,24 +1658,39 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
             at = (self._buf + "_" if self._field == "ANG" and self._buf else
                   (f"{A:g}°" if A is not None else (f"{angle:.1f}°" if angle is not None else "-")))
             mark = lambda f, t: f"[{t}]" if self._field == f else t
-            state += [f"Length {mark('LEN', lt)}", f"Angle {mark('ANG', at)}"]
+            shown = getattr(self, "_arc_shown", None) if self._arc_from() is not None else None
+            if self._arc_from() is not None:
+                lt = (self._buf + "_" if self._field == "LEN" and self._buf else
+                      (fmt(L) if L is not None else (fmt(shown[0]) if shown else "-")))
+                at = (self._buf + "_" if self._field == "ANG" and self._buf else
+                      (f"{abs(A):g}°" if A is not None else (f"{shown[1]:.1f}°" if shown else "-")))
+                sweep = 2.0 * abs(A) if A is not None else (2.0 * shown[1] if shown else None)
+                state += [f"Radius {mark('LEN', lt)}", f"Angle {mark('ANG', at)}"
+                          + (f" (arc {sweep:.0f}°)" if sweep is not None else "")]
+            else:
+                state += [f"Length {mark('LEN', lt)}", f"Angle {mark('ANG', at)}"]
         state.append(self.lock_text().strip(" ·"))
         if self.start_mode != "FREE":
             state.append(f"start {START_TEXT[self.start_mode]}")
         lk, ak = getattr(self, "_lock", None), getattr(self, "_akind", None)
         on = lambda c: True if c else None
         ready = self._start is not None
-        rows = [("Type", [hints.key("123", "an exact length (3, 2' 6\", 10mm)" if ready else
+        arcing = self._arc_from() is not None
+        rows = [("Type", [hints.key("123", ("a radius" if arcing else "an exact length (3, 2' 6\", 10mm)") if ready else
                                     "an exact length, after the first click",
                                     on=on(ready and self._field == "LEN" and self._buf) if ready else False),
-                          hints.key("Tab", "switch to the angle", on=on(self._field == "ANG")),
+                          hints.key("Tab", "switch to the angle (90: half circle)" if arcing else "switch to the angle",
+                                    on=on(self._field == "ANG")),
                           hints.key("Enter", "place it"), hints.key("Backspace", "delete / undo")]),
                 ("Direction", self.direction_hints([hints.key("A", "parallel", on=on(lk == "A" and ak == "parallel")),
                                                     hints.key("Shift+A", "square",
                                                               on=on(lk == "A" and ak == "square"))])),
+                ("Snap", self.snap_hints()),
                 ("Start", [hints.cycle("S", [START_TEXT[m[0]] for m in START_MODES], START_TEXT[self.start_mode])]),
                 ("Reference", self.reference_hints(self.line_mode)),
-                ("Polyline", [hints.toggle("P", "", self.polyline)])]
+                ("Polyline", [hints.toggle("P", "", self.polyline),
+                              hints.cycle("R", ["line", "arc"], "arc" if getattr(self, "_arc_mode", False) else "line",
+                                          "segment")])]
         hints.show(context, "Line", state, rows, MOUSE_SKETCH)
 
     # -- Tangent / Perpendicular start: the edge / curve it was snapped onto ---
@@ -1473,19 +1864,91 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
         self._start_refs = dict(self._refs, cands=list(self._refs["cands"])) \
             if snap and snap[2] is not None and getattr(self, "_refs", None) else None
 
+    def _arc_list(self):
+        """Each drawn segment's arc middle (None: a line), as long as _lines."""
+        arcs = getattr(self, "_arcs", None)
+        if arcs is None or len(arcs) != len(self._lines):
+            arcs = self._arcs = (list(arcs or []) + [None] * len(self._lines))[:len(self._lines)]
+        return arcs
+
+    def _arc_from(self):
+        """(start, unit direction) the next arc leaves with: the chain's last
+        point and its last segment's end direction; None out of arc mode, or
+        with no segment to continue."""
+        if not getattr(self, "_arc_mode", False) or self._start is None or not self._lines \
+                or getattr(self, "_seg_start", None) is not None:
+            return None
+        a, b = self._lines[-1]
+        if np.linalg.norm(np.asarray(b, float) - self._start) > 1e-9:
+            return None
+        return np.asarray(self._start, float), seg_end_tangent(a, b, self._arc_list()[-1])
+
     def _extra(self):
         out = []
-        for a, b in self._lines:
+        for (a, b), m in zip(self._lines, self._arc_list()):
             out += [(a, None, "end"), (b, None, "end")]
+            if m is not None:
+                out.append((np.asarray(m, float), None, "mid"))     # an arc's middle
+        return out
+
+    def guide_points(self):
+        pts = [p for ab in self._lines for p in ab]
+        return pts + ([self._start] if self._start is not None else [])
+
+    def guide_axes(self):
+        out = []
+        for (a, b), m in reversed(list(zip(self._lines, self._arc_list()))):
+            if m is None and np.linalg.norm(np.asarray(b) - np.asarray(a)) > 1e-12:
+                out.append(_unit(np.asarray(b, float) - np.asarray(a, float)))
+        return out
+
+    def guide_dirs(self, prev):
+        """From the last point: straight on (Extension after a line, Tangent
+        after an arc) and square to it; parallel to the straight lines drawn.
+        None while an arc is being placed (its end only aligns)."""
+        if self._arc_from() is not None:
+            return []
+        out = []
+        if self._lines and np.linalg.norm(np.asarray(self._lines[-1][1], float) - np.asarray(prev, float)) <= 1e-9:
+            m = self._arc_list()[-1]
+            t = seg_end_tangent(*self._lines[-1], m)
+            out.append((t, "extend" if m is None else "tangent"))
+            if self._plane is not None:
+                out.append((_unit(np.cross(self._plane[1], t)), "perp"))
+        for (a, b), m in zip(self._lines, self._arc_list()):
+            if m is None and np.linalg.norm(np.asarray(b) - np.asarray(a)) > 1e-12:
+                d = _unit(np.asarray(b, float) - np.asarray(a, float))
+                if all(abs(float(d @ e)) < 1 - 1e-6 for e, _ in out):
+                    out.append((d, "parallel"))
+        return out
+
+    def drawn_segments(self):
+        out = []
+        for (a, b), m in zip(self._lines, self._arc_list()):
+            if m is None:
+                out.append((a, b))
+                continue
+            C, r, x, y, th = arc_circle(a, m, b)
+            onto = lambda Q, C=C, r=r, x=x, y=y: C + r * _unit(((Q - C) @ x) * x + ((Q - C) @ y) * y)
+            pts = arc_points(a, m, b, 32)
+            out += [(pts[k], pts[k + 1], False, onto) for k in range(len(pts) - 1)]
         return out
 
     def _preview(self, context, hover=None):
         ov = draw.sketch_overlay
-        lines = [[Vector(a), Vector(b)] for a, b in self._lines]
+        seg = lambda a, b, m: [Vector(a), Vector(b)] if m is None else [Vector(p) for p in arc_points(a, m, b)]
+        lines = [seg(a, b, m) for (a, b), m in zip(self._lines, self._arc_list())]
         length = angle = None
         a = self._seg_start if getattr(self, "_seg_start", None) is not None else self._start
         if self._start is not None and hover and hover[0] is not None:
-            lines.append([Vector(a), Vector(hover[0])])
+            arc = self._arc_from()
+            m = tangent_arc(arc[0], arc[1], hover[0]) if arc is not None else None
+            lines.append(seg(a, hover[0], m))
+            if m is not None:
+                _, rr, _, _, th = arc_circle(a, m, hover[0])
+                self._arc_shown = (rr, math.degrees(th) / 2.0)
+            else:
+                self._arc_shown = None
             d = hover[0] - a
             length = float(np.linalg.norm(d))
             if self._plane is not None:
@@ -1510,6 +1973,9 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
         a = self._seg_start if getattr(self, "_seg_start", None) is not None else self._start
         if np.linalg.norm(P - a) <= 1e-9:
             return
+        arc = self._arc_from()
+        mid = tangent_arc(arc[0], arc[1], P) if arc is not None else None
+        self._arc_list().append(mid)
         self._lines.append((np.asarray(a, float), P))
         self._seg_start = None
         # typed lines, and every line with Polyline on, chain on from their end
@@ -1533,7 +1999,7 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
             self._buf += ch
             self._preview(context, self._target(context, event))
             return {'RUNNING_MODAL'}
-        if event.type in {'MOUSEMOVE', 'LEFT_CTRL', 'RIGHT_CTRL', 'LEFT_SHIFT', 'RIGHT_SHIFT'}:
+        if event.type in REFRESH_KEYS or self.snap_key(context, event):
             self._preview(context, self._target(context, event))
         elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
             P, snap = self._target(context, event)
@@ -1563,6 +2029,7 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
             elif self._start is not None and (self._len is not None or self._ang is not None):
                 self._reset_typing()
             elif self._start is not None and self._lines and np.linalg.norm(self._start - self._lines[-1][1]) <= 1e-9:
+                self._arc_list().pop()
                 self._start = np.asarray(self._lines.pop()[0], float)    # chaining: step back one segment
                 self._lock = None
             elif self._start is not None:
@@ -1570,11 +2037,8 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
                 self._lock = None
                 self._start_refs = None
             elif self._lines:
+                self._arc_list().pop()
                 self._lines.pop()
-            self._preview(context, self._target(context, event))
-        elif event.value == 'PRESS' and event.type in {'H', 'V'} and not self._buf:
-            self.toggle_lock(event.type)
-            self._ang = None
             self._preview(context, self._target(context, event))
         elif event.value == 'PRESS' and event.type in {'X', 'Y', 'Z'} and not self._buf:
             self.axis_key(event)
@@ -1584,6 +2048,15 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
             order = [m[0] for m in START_MODES]
             self.start_mode = order[(order.index(self.start_mode) + 1) % len(order)]
             self._apply_start()
+            self._preview(context, self._target(context, event))
+        elif event.value == 'PRESS' and event.type == 'R' and not self._buf \
+                and not (event.ctrl or getattr(event, "alt", False) or getattr(event, "oskey", False)):
+            # the next segments are tangent arcs (or lines again); an arc needs a segment to continue
+            self._arc_mode = not getattr(self, "_arc_mode", False)
+            if self._arc_mode and not self.polyline:
+                self.polyline = True
+                if self._start is None and self._lines:
+                    self._start = np.asarray(self._lines[-1][1], float)
             self._preview(context, self._target(context, event))
         elif event.value == 'PRESS' and event.type == 'A' and not self._buf:
             self._direction_key(context, event)
@@ -1625,6 +2098,7 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
             if not self._lines or event.type == 'ESC':
                 return {'CANCELLED'}
             self.data = json.dumps({"lines": [[list(map(float, a)), list(map(float, b))] for a, b in self._lines],
+                                    "arcs": [None if m is None else list(map(float, m)) for m in self._arc_list()],
                                     "edit": self._edit.name if self._edit else ""})
             return self.execute(context)
         return {'RUNNING_MODAL'}
@@ -1642,16 +2116,25 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
         edit = bpy.data.objects.get(d.get("edit", "")) if d.get("edit") else None
         if edit is not None and context.mode != 'EDIT_CURVE':
             edit = None
-        groups = chain_lines(lines) if self.polyline else [[np.array(a), np.array(b)] for a, b in lines]
+        arcs = (d.get("arcs") or []) + [None] * len(lines)
+        segs = [(np.array(a, float), np.array(b, float), None if m is None else np.array(m, float))
+                for (a, b), m in zip(lines, arcs)]
+        groups = chain_segments(segs) if self.polyline else [[sg] for sg in segs]
         made = []
-        for pl in groups:
-            closed = bool(len(pl) > 3 and np.linalg.norm(pl[0] - pl[-1]) < 1e-9)
-            pts = pl[:-1] if closed else pl
-            sp = spec([tuple(p) for p in pts], order=2, cyclic=closed, endpoint=not closed)
+        for g in groups:
+            if all(m is None for _, _, m in g):
+                pl = [g[0][0]] + [b for _, b, _ in g]
+                closed = bool(len(pl) > 3 and np.linalg.norm(pl[0] - pl[-1]) < 1e-9)
+                pts = pl[:-1] if closed else pl
+                sp = spec([tuple(p) for p in pts], order=2, cyclic=closed, endpoint=not closed)
+            else:
+                sp = segments_spec(g)           # lines and tangent arcs: one exact curve
             made.append(add_curve(context, "NURBS Line", [sp], edit))
         if edit is None:
             _select_new(context, made)
-        self.report({'INFO'}, f"{len(lines)} line(s)" + (f" as {len(groups)} polyline(s)" if self.polyline else ""))
+        n_arcs = sum(1 for _, _, m in segs if m is not None)
+        self.report({'INFO'}, f"{len(lines) - n_arcs} line(s)" + (f", {n_arcs} arc(s)" if n_arcs else "")
+                    + (f" as {len(groups)} polyline(s)" if self.polyline else ""))
         return {'FINISHED'}
 
 
@@ -1751,10 +2234,10 @@ class NPROTO_OT_draw_plane(SketchMixin, bpy.types.Operator):
                                     on=(True if self._field == "X" and self._buf else None) if ready else False),
                           hints.key("Tab", "switch to the Y size", on=True if self._field == "Y" else None),
                           hints.key("Enter", "place it"), hints.key("Backspace", "delete / undo")]),
-                ("Shape", [hints.toggle("C", "from centre", self.from_center), hints.key("Shift", "square"),
-                           hints.key("Ctrl", "grid")]),
+                ("Shape", [hints.toggle("C", "from centre", self.from_center), hints.key("Shift", "square")]),
                 ("Direction", [hints.key("X Y Z", "axis (first click)",
                                          on=True if lk and lk[-1] in "XYZ" else None)])]
+        rows.append(("Snap", self.snap_hints()))
         hints.show(context, "Plane", state, rows, MOUSE_SHAPE)
 
     def _preview(self, context, hover=None, event=None):
@@ -1797,7 +2280,7 @@ class NPROTO_OT_draw_plane(SketchMixin, bpy.types.Operator):
             self._preview(context, self.pick_point(context, event), event)
             return {'RUNNING_MODAL'}
         hover = lambda: self.pick_point(context, event)
-        if event.type in {'MOUSEMOVE', 'LEFT_CTRL', 'RIGHT_CTRL', 'LEFT_SHIFT', 'RIGHT_SHIFT'}:
+        if event.type in REFRESH_KEYS or self.snap_key(context, event):
             self._preview(context, hover(), event)
         elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
             P, snap = hover()
@@ -1899,13 +2382,15 @@ def profile_size(shape, o, X, Y):
 
 
 class NPROTO_OT_draw_profile(SketchMixin, bpy.types.Operator):
-    """Place a circle, ellipse, square or rectangle perpendicular to a curve or
-    a surface edge: click on it for the centre, then drag (or type) the size.
-    On a surface edge it stands square to the surface. With Construction
-    History it stays perpendicular there when the curve or edge changes"""
+    """Place a circle, ellipse, square or rectangle perpendicular to a curve, a
+    surface edge or a mesh edge: click on it for the centre, then drag (or
+    type) the size. On a surface or mesh edge it stands square to the surface.
+    With Construction History it stays perpendicular to a curve or surface edge
+    when that changes (a mesh edge is a one-off placement)"""
     bl_idname = "nproto.draw_profile"
     bl_label = "Profile"
     bl_options = {'REGISTER', 'UNDO'}
+    use_guides = False      # a profile needs a real edge to stand on
 
     shape: EnumProperty(name="Shape", items=PROFILE_SHAPES, default="CIRCLE")
     radius: FloatProperty(name="Radius", default=0.25, min=1e-6, unit='LENGTH')
@@ -1936,7 +2421,8 @@ class NPROTO_OT_draw_profile(SketchMixin, bpy.types.Operator):
             col.prop(self, "width", text="Size" if self.shape == "SQUARE" else "Size X")
             if self.shape == "RECTANGLE":
                 col.prop(self, "depth")
-        lay.prop(self, "at")
+        if '"mesh": true' not in (self.data or ""):     # a mesh edge has no position along it to move
+            lay.prop(self, "at")
         lay.prop(self, "rotation")
 
     def invoke(self, context, event):
@@ -1982,6 +2468,15 @@ class NPROTO_OT_draw_profile(SketchMixin, bpy.types.Operator):
              "pp_face": int(face or 0), "degree": int(self.degree), "spans_u": int(self.spans_u)}
         p.update(sizes or {})
         return p
+
+    def _mesh_frame(self, snap, P):
+        """The profile's frame on a mesh edge or edge centre (its snap carries
+        the edge's direction and its face's normal), or None."""
+        from .primitives import profile_axes
+        fr = snap[1] if snap is not None and snap[2] is None and snap[0] in ("edge", "mid") else None
+        if not isinstance(fr, np.ndarray) or fr.shape != (2, 3):
+            return None
+        return profile_axes(P, fr[0], fr[1] if np.linalg.norm(fr[1]) > 0.5 else None, self.rotation)
 
     def _frame_at(self, src, P):
         from .primitives import curve_param_at, profile_frame
@@ -2039,7 +2534,7 @@ class NPROTO_OT_draw_profile(SketchMixin, bpy.types.Operator):
     def _status(self, context, sizes=None):
         us = context.scene.unit_settings
         fmt = lambda x: bpy.utils.units.to_string(us.system, 'LENGTH', x * (us.scale_length or 1.0), precision=4)
-        state = ["drag or type the size" if self._center is not None else "click on a curve or surface edge"]
+        state = ["drag or type the size" if self._center is not None else "click on a curve, surface edge or mesh edge"]
         if self._center is not None and sizes:
             state += [f"{k.replace('width', 'X').replace('depth', 'Y').title()} {fmt(v)}"
                       for k, v in sizes.items() if k in ("radius", "radius2", "width", "depth")]
@@ -2073,7 +2568,7 @@ class NPROTO_OT_draw_profile(SketchMixin, bpy.types.Operator):
                 except Exception:
                     M = None
             else:
-                M = None
+                M = self._mesh_frame(snap, P)
         else:
             M = self._frame
             sizes = self._mouse_sizes(context, event)
@@ -2108,14 +2603,20 @@ class NPROTO_OT_draw_profile(SketchMixin, bpy.types.Operator):
         elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
             if not placed:
                 P, snap = self.pick_point(context, event)
-                if snap is None or snap[2] is None:
-                    self.report({'WARNING'}, "Profile: click on a curve or a surface edge")
+                Mm = self._mesh_frame(snap, P) if snap is not None and P is not None else None
+                if snap is None or (snap[2] is None and Mm is None):
+                    self.report({'WARNING'}, "Profile: click on a curve, a surface edge or a mesh edge")
                     return {'RUNNING_MODAL'}
-                try:
-                    self.at, self._frame = self._frame_at(snap[2], P)
-                except Exception as exc:
-                    self.report({'WARNING'}, f"Profile: {exc}")
-                    return {'RUNNING_MODAL'}
+                if Mm is not None:          # a mesh edge: placed there, no history
+                    self.at, self._frame = 0.0, Mm
+                    self._mesh = (np.asarray(P, float), np.asarray(snap[1][0], float), np.asarray(snap[1][1], float))
+                else:
+                    try:
+                        self.at, self._frame = self._frame_at(snap[2], P)
+                    except Exception as exc:
+                        self.report({'WARNING'}, f"Profile: {exc}")
+                        return {'RUNNING_MODAL'}
+                    self._mesh = None
                 self._center, self._src = np.asarray(P, float), snap[2]
                 self._edge_lock = None
                 self._preview(context, event)
@@ -2156,26 +2657,35 @@ class NPROTO_OT_draw_profile(SketchMixin, bpy.types.Operator):
         for k, v in sizes.items():
             if v is not None and v > 1e-9:
                 setattr(self, k, v)
-        name, ref, snap, face = (list(self._src) + [None])[:4]
-        self.data = json.dumps({"obj": name, "ref": ref, "face": face})
+        if self._src is None and getattr(self, "_mesh", None) is not None:
+            P, T, up = self._mesh
+            self.data = json.dumps({"mesh": True, "P": P.tolist(), "T": T.tolist(), "up": up.tolist()})
+        else:
+            name, ref, snap, face = (list(self._src) + [None])[:4]
+            self.data = json.dumps({"obj": name, "ref": ref, "face": face})
         self.sketch_end(context)
         return self.execute(context)
 
     def execute(self, context):
         from mathutils import Matrix
         from . import features
-        from .primitives import profile_frame, profile_spec, write_spline_object
+        from .primitives import profile_axes, profile_frame, profile_spec, write_spline_object
         try:
             d = json.loads(self.data or "{}")
         except ValueError:
             d = {}
+        on_mesh = bool(d.get("mesh"))
         path = bpy.data.objects.get(d.get("obj", "")) if d.get("obj") else None
-        if path is None:
+        if path is None and not on_mesh:
             self.report({'WARNING'}, "Profile is interactive: start it from the panel or menu")
             return {'CANCELLED'}
         params = self._params(face=d.get("face"))
         try:
-            M = profile_frame(path, d["ref"], self.at, self.rotation, d.get("face") or 0)
+            if on_mesh:                 # on a mesh edge: square to its face, turned by Rotation (F9)
+                up = np.asarray(d["up"], float)
+                M = profile_axes(d["P"], d["T"], up if np.linalg.norm(up) > 0.5 else None, self.rotation)
+            else:
+                M = profile_frame(path, d["ref"], self.at, self.rotation, d.get("face") or 0)
             sp = profile_spec(params)
         except Exception as exc:
             self.report({'ERROR'}, f"Profile failed: {exc}")
@@ -2187,7 +2697,7 @@ class NPROTO_OT_draw_profile(SketchMixin, bpy.types.Operator):
         (context.collection or context.scene.collection).objects.link(obj)
         obj.matrix_world = Matrix(M.tolist())
         write_spline_object(obj, sp)
-        if features.history_enabled(context):
+        if features.history_enabled(context) and not on_mesh:
             features.record(obj, "perp_profile", [(path, d["ref"])], params)
             hist = f", follows {path.name} {d['ref']}"
         else:
@@ -2201,7 +2711,7 @@ class NPROTO_OT_draw_profile(SketchMixin, bpy.types.Operator):
                                                              else params["depth"]})
             hist = ""
         _select_new(context, [obj])
-        self.report({'INFO'}, f"{name} on {path.name} {d['ref']} at {self.at:.3f}{hist}")
+        self.report({'INFO'}, f"{name} on a mesh edge" if on_mesh else f"{name} on {path.name} {d['ref']} at {self.at:.3f}{hist}")
         return {'FINISHED'}
 
 

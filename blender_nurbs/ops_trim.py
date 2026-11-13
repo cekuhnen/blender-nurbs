@@ -118,6 +118,8 @@ class NPROTO_OT_trim(bpy.types.Operator):
         if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM'}:
             return {'PASS_THROUGH'}
         from .ops import PickMixin
+        if event.type == 'INBETWEEN_MOUSEMOVE':
+            return {'PASS_THROUGH'}       # not used here; a gizmo drag needs them unhandled
         if event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MOUSEMOVE'} and not PickMixin._in_view(context, event):
             return {'PASS_THROUGH'}            # the sidebar / headers stay usable
         from . import hints

@@ -446,6 +446,12 @@ def _over_gizmo(context, area, region, x, y):
     from . import contlabels
     if contlabels.hover.get("key") is not None:
         return True
+    return over_navigation(context, area, region, x, y)
+
+
+def over_navigation(context, area, region, x, y):
+    """The mouse (window x, y) is over the 3D view's navigation gizmo: the axis
+    ball and the zoom / pan / camera / perspective buttons."""
     sp = area.spaces.active
     if not getattr(sp, "show_gizmo", True) or not getattr(sp, "show_gizmo_navigate", True):
         return False
@@ -494,8 +500,10 @@ def apply_pick(context, kind, hit, extend):
 
 class NPROTO_OT_subsel_picker(bpy.types.Operator):
     """Face / Edge mode: picks faces or edges with any tool active (a click
-    picks, Shift+click adds or removes, a click on nothing clears; the face /
-    edge under the mouse lights up). Everything else passes through"""
+    picks, Shift+click adds or removes; the face / edge under the mouse lights
+    up). A click on no NURBS face / edge clears the picks and goes on to
+    Blender, which selects what is there (a mesh body) or deselects. Everything
+    else passes through"""
     bl_idname = "nproto.subsel_picker"
     bl_label = "Face / Edge Picking"
     bl_options = {'INTERNAL'}
@@ -557,9 +565,17 @@ class NPROTO_OT_subsel_picker(bpy.types.Operator):
             area, region = where
             with context.temp_override(window=win, area=area, region=region):
                 h = _hit(bpy.context, ks, (event.mouse_x - region.x, event.mouse_y - region.y))
-                apply_pick(bpy.context, None, h, event.shift)
-            bpy.ops.ed.undo_push(message="Pick " + (h[2].title() if h else "Nothing"))
+                if h is None:
+                    if not event.shift:
+                        clear_all(bpy.context.scene)
+                else:
+                    apply_pick(bpy.context, None, h, event.shift)
             _redraw(context)
+            if h is None:
+                # not on a NURBS face / edge: Blender's own click selects (a mesh
+                # body, a curve, a NURBS body away from its edges) or deselects
+                return {'PASS_THROUGH'}
+            bpy.ops.ed.undo_push(message="Pick " + h[2].title())
             return {'RUNNING_MODAL'}
         except Exception as exc:
             print("NURBS select:", exc)

@@ -13,7 +13,7 @@ _label_cache = {}
 pick_overlay = {"hover": None, "picked": []}  # filled by the modal pick operator
 # filled by the sketch tools (CV Curve / Line): world-space polylines and points
 sketch_overlay = {"curves": [], "hull": [], "cvs": [], "snap": None, "snap_label": None, "axes": [],
-                  "refs": [], "cursor": None, "comb": None}
+                  "refs": [], "cursor": None, "comb": None, "guides": []}
 COL_CURSOR = (1.0, 1.0, 1.0, 1.0)
 COL_SNAP = (0.25, 1.0, 0.45, 1.0)
 
@@ -321,6 +321,8 @@ def _draw():
     so = sketch_overlay
     for pl, col in so.get("axes") or []:          # X / Y / Z lock: the axis (or the plane's two axes)
         _draw_lines(_lines_from_polylines([pl], _IDENT), col, 1.5)
+    for dashes, col in so.get("guides") or []:    # smart guides the point snapped to (dashed)
+        _draw_lines(_lines_from_polylines(dashes, _IDENT), col, 1.0)
     for pl, col, w in so.get("refs") or []:       # the edge (white) / face (beige) a G1 / G2 end follows
         _draw_lines(_lines_from_polylines([pl], _IDENT), col, w)
     if so.get("comb"):                     # CV Curve with the comb on: under the curve being drawn

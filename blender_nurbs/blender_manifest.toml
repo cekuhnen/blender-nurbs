@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "nurbs_modeling"
-version = "0.3.1"
+version = "0.3.2"
 name = "NURBS Proto"
 tagline = "NURBS surfaces for concept design, on NVIDIA’s USD BRep kernel"
 maintainer = "ckbrd <info@ckbrd.de>"

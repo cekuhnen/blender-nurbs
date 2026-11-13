@@ -15,6 +15,10 @@ def _t(op, text=None, icon='NONE'):
     return (op, text, icon, None)
 
 
+class MenuOnly(tuple):
+    """A row only the menus list (NURBS header menu, Add / Shift+A), not the panel."""
+
+
 def _p(kind, text=None):
     return ("nproto.add_primitive", text or kind.title(), 'NONE', {"kind": kind})
 
@@ -23,18 +27,23 @@ GROUPS = (
     ("CURVES", "Create Curves", (
         ("Draw", (
             (_t("nproto.draw_curve", "CV Curve", 'CURVE_NCURVE'), _t("nproto.draw_line", "Draw Line", 'IPO_LINEAR'),
-             _t("nproto.draw_profile", "Profile", 'MESH_CIRCLE')),
+             _t("nproto.draw_arc", "Arc", 'IPO_CIRC')),
+            (_t("nproto.draw_circle", "Circle", 'CURVE_NCIRCLE'), _t("nproto.draw_ellipse", "Ellipse", 'SURFACE_NCIRCLE'),
+             _t("nproto.draw_rectangle", "Rectangle", 'MESH_PLANE')),
+            (_t("nproto.draw_polygon", "Polygon", 'SEQ_CHROMA_SCOPE'), _t("nproto.draw_slot", "Slot", 'MESH_CAPSULE'),
+             _t("nproto.draw_helix", "Helix", 'FORCE_VORTEX')),
+            (_t("nproto.draw_profile", "Profile", 'MESH_CIRCLE'),),
         )),
-        ("Shapes", (
-            (_p("LINE"), _p("ARC"), _p("CIRCLE"), _p("ELLIPSE")),
-            (_p("RECTANGLE"), _p("POLYGON"), _p("HELIX")),
+        ("Between Curves", (
+            (_t("nproto.blend_curve", icon='IPO_EASE_IN_OUT'), _t("nproto.fillet_curves", "Fillet", 'SPHERECURVE')),
+        )),
+        ("Shapes", (                                         # at the 3D cursor: the menus only (the panel
+            MenuOnly((_p("LINE"), _p("ARC"), _p("CIRCLE"), _p("ELLIPSE"), _p("RECTANGLE"), _p("POLYGON"),
+                      _p("HELIX"))),                         # draws them with the tools above)
         )),
         ("From Surfaces", (
             (_t("nproto.iso_curve", icon='IPO_LINEAR'), _t("nproto.dup_edge", icon='DUPLICATE')),
             (_t("nproto.project_curve", icon='MOD_SHRINKWRAP'), _t("nproto.intersect", icon='SELECT_INTERSECT')),
-        )),
-        ("Between Curves", (
-            (_t("nproto.blend_curve", icon='IPO_EASE_IN_OUT'),),
         )),
     )),
     ("SURFACES", "Create Surfaces", (
@@ -121,10 +130,16 @@ def _button(lay, tool):
 
 def draw_panel(lay, key):
     col = lay.column(align=True)
-    for i, (_label, rows) in enumerate(GROUP[key][2]):
-        if i:
+    first = True
+    for _label, rows in GROUP[key][2]:
+        if all(isinstance(r, MenuOnly) for r in rows):
+            continue                                       # a section only the menus list
+        if not first:
             col.separator(factor=0.6)
+        first = False
         for row in rows:
+            if isinstance(row, MenuOnly):
+                continue
             r = col.row(align=True)
             for tool in row:
                 _button(r, tool)

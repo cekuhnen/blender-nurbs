@@ -759,6 +759,8 @@ class NPROTO_OT_trim_curves(bpy.types.Operator):
         if hints.handle(event):
             context.area.tag_redraw()
             return {'RUNNING_MODAL'}
+        if event.type == 'INBETWEEN_MOUSEMOVE':
+            return {'PASS_THROUGH'}       # not used here; a gizmo drag needs them unhandled
         if event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MOUSEMOVE'} and not PickMixin._in_view(context, event):
             return {'PASS_THROUGH'}
         if event.type == 'MOUSEMOVE':
