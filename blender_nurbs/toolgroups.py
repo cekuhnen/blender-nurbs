@@ -107,6 +107,10 @@ GROUPS = (
         ("To Mesh", (
             (_t("nproto.brep_to_mesh", "BREP to Mesh", 'MESH_DATA'),),
         )),
+        ("To BREP", (
+            (_t("nproto.mesh_to_brep", "Mesh to BREP", 'MESH_CUBE'),),
+            (_t("nproto.subd_to_brep", "SubD to BREP", 'MOD_SUBSURF'),),
+        )),
     )),
 )
 

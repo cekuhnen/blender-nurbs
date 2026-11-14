@@ -1044,33 +1044,79 @@ def _corner_normals(brep, pts, nrm, tris):
         return None
     P = np.asarray(pts, float)
     T = [list(map(int, t)) for t in tris]
-    tri_n = []
-    for t in T:
-        n = np.cross(P[t[1]] - P[t[0]], P[t[2]] - P[t[0]])
-        tri_n.append(n / (np.linalg.norm(n) or 1.0))
-    tri_n = np.array(tri_n)
-    inc = [[] for _ in range(len(P))]
-    for k, t in enumerate(T):
-        for v in t:
-            inc[v].append(k)
     cos_c = np.cos(np.radians(CREASE_DEG))
     crease = np.zeros(len(P), bool)
-    for v, ks in enumerate(inc):
-        if len(ks) > 1:
-            N_ = tri_n[ks]
-            if (N_ @ N_.T).min() < cos_c:
-                crease[v] = True
+    if all(len(t) == 3 for t in T):
+        A = np.array(T, int)
+        tri_n = np.cross(P[A[:, 1]] - P[A[:, 0]], P[A[:, 2]] - P[A[:, 0]])
+        ln = np.linalg.norm(tri_n, axis=1)
+        tri_n /= np.where(ln > 0, ln, 1.0)[:, None]
+        flat, tri_of = A.ravel(), np.repeat(np.arange(len(A)), 3)
+        # a vertex whose triangles all lie within half the crease angle of their mean is no crease;
+        # only the others get the pairwise test (triangles of no area have no normal: left out)
+        real = ln[tri_of] > 1e-14 * max(float(ln.max()), 1e-300)
+        mean = np.stack([np.bincount(flat[real], tri_n[tri_of[real], c], len(P)) for c in range(3)], 1)
+        ml = np.linalg.norm(mean, axis=1)
+        mean /= np.where(ml > 0, ml, 1.0)[:, None]
+        worst = np.full(len(P), np.inf)
+        np.minimum.at(worst, flat[real], (tri_n[tri_of[real]] * mean[flat[real]]).sum(1))
+        count = np.bincount(flat[real], minlength=len(P))
+        order = np.argsort(flat, kind="stable")
+        starts = np.searchsorted(flat[order], np.arange(len(P) + 1))
+        for v in np.nonzero((count > 1) & (worst < np.cos(np.radians(CREASE_DEG / 2))))[0]:
+            ks = tri_of[order[starts[v]:starts[v + 1]]]
+            N_ = tri_n[ks[ln[ks] > 1e-14 * max(float(ln.max()), 1e-300)]]
+            crease[v] = len(N_) > 1 and (N_ @ N_.T).min() < cos_c
+    else:
+        tri_n = []
+        for t in T:
+            n = np.cross(P[t[1]] - P[t[0]], P[t[2]] - P[t[0]])
+            tri_n.append(n / (np.linalg.norm(n) or 1.0))
+        tri_n = np.array(tri_n)
+        inc = [[] for _ in range(len(P))]
+        for k, t in enumerate(T):
+            for v in t:
+                inc[v].append(k)
+        for v, ks in enumerate(inc):
+            if len(ks) > 1:
+                N_ = tri_n[ks]
+                if (N_ @ N_.T).min() < cos_c:
+                    crease[v] = True
     if not crease.any():
         return None
     from .square import _foot
+    sm, _ = _k()
     faces = brep.faces()
-    surf_cache = {}
+    # which face a triangle lies on: the nearest of the faces whose box holds
+    # its middle (all of them only when none does)
+    boxes = []
+    for f in faces:
+        lo, hi = (np.array(b, float) for b in f.bounding_box())
+        pad = 1e-6 * (float(np.linalg.norm(hi - lo)) + 1e-9) + 1e-9
+        boxes.append((lo - pad, hi + pad))
+    lo_all, hi_all = np.array([b[0] for b in boxes]), np.array([b[1] for b in boxes])
+    surf_cache, flat_n = {}, {}
     face_of = {}
+    if all(len(t) == 3 for t in T):                 # the smooth corners at once, the crease ones below
+        out = np.asarray(nrm, float)[np.array(T, int)].reshape(-1, 3)
+        for k in np.nonzero(crease[np.array(T, int)].any(1))[0]:
+            t = T[k]
+            c = P[t].mean(axis=0)
+            cand = np.nonzero(np.all((lo_all <= c) & (c <= hi_all), axis=1))[0]
+            cand = cand if len(cand) else range(len(faces))
+            fi = int(cand[0]) if len(cand) == 1 else min(cand, key=lambda i: faces[i].closest_point(tuple(c))[1])
+            for j, v in enumerate(t):
+                if crease[v]:
+                    out[3 * k + j] = _crease_normal(sm, faces, fi, surf_cache, flat_n, P[v], tri_n[k])
+        return out.tolist()
     loops = []
     for k, t in enumerate(T):
         if any(crease[v] for v in t) and k not in face_of:
             c = P[t].mean(axis=0)
-            face_of[k] = min(range(len(faces)), key=lambda i: faces[i].closest_point(tuple(c))[1])
+            cand = np.nonzero(np.all((lo_all <= c) & (c <= hi_all), axis=1))[0]
+            cand = cand if len(cand) else range(len(faces))
+            face_of[k] = int(cand[0]) if len(cand) == 1 else \
+                min(cand, key=lambda i: faces[i].closest_point(tuple(c))[1])
     for k, t in enumerate(T):
         for v in t:
             if not crease[v]:
@@ -1080,8 +1126,20 @@ def _corner_normals(brep, pts, nrm, tris):
             f = faces[fi]
             s = surf_cache.setdefault(fi, f.surface())
             try:
-                uv = _foot(s, P[v], None)
-                n = np.array(f.outward_normal_at_uv(*uv), float)
+                if fi not in flat_n:            # a flat face has one normal: no foot to search for
+                    flat_n[fi] = None
+                    if s.is_planar(1e-9):
+                        (u0, u1), (v0, v1) = s.u_domain(), s.v_domain()
+                        flat_n[fi] = np.array(f.outward_normal_at_uv(0.5 * (u0 + u1), 0.5 * (v0 + v1)), float)
+                if flat_n[fi] is not None:
+                    n = flat_n[fi].copy()
+                else:
+                    try:                        # the kernel's own foot point (a grid search in Python was slow)
+                        w = sm.surface_closest_point(s, tuple(map(float, P[v])))[1][0]
+                        uv = (float(w.x), float(w.y)) if hasattr(w, "x") else (float(w[0]), float(w[1]))
+                    except Exception:
+                        uv = _foot(s, P[v], None)
+                    n = np.array(f.outward_normal_at_uv(*uv), float)
                 n /= np.linalg.norm(n) or 1.0
                 if n @ tri_n[k] < 0:
                     n = -n
@@ -1089,6 +1147,32 @@ def _corner_normals(brep, pts, nrm, tris):
                 n = tri_n[k]
             loops.append(tuple(n))
     return loops
+
+
+def _crease_normal(sm, faces, fi, surf_cache, flat_n, p, tri_n):
+    """The exact normal of face fi at point p (on a crease), turned like the triangle's."""
+    from .square import _foot
+    f = faces[fi]
+    s = surf_cache.setdefault(fi, f.surface())
+    try:
+        if fi not in flat_n:                    # a flat face has one normal: no foot to search for
+            flat_n[fi] = None
+            if s.is_planar(1e-9):
+                (u0, u1), (v0, v1) = s.u_domain(), s.v_domain()
+                flat_n[fi] = np.array(f.outward_normal_at_uv(0.5 * (u0 + u1), 0.5 * (v0 + v1)), float)
+        if flat_n[fi] is not None:
+            n = flat_n[fi].copy()
+        else:
+            try:                                # the kernel's own foot point
+                w = sm.surface_closest_point(s, tuple(map(float, p)))[1][0]
+                uv = (float(w.x), float(w.y)) if hasattr(w, "x") else (float(w[0]), float(w[1]))
+            except Exception:
+                uv = _foot(s, p, None)
+            n = np.array(f.outward_normal_at_uv(*uv), float)
+        n /= np.linalg.norm(n) or 1.0
+        return -n if n @ tri_n < 0 else n
+    except Exception:
+        return tri_n
 
 
 def set_geometry(obj, geom, context=None):

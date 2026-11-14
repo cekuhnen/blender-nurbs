@@ -1581,8 +1581,98 @@ def job_thicken(job):
     return {"faces": r.face_count(), "volume": volume}
 
 
+def job_mesh_to_brep(job):
+    """Mesh to BREP (mesh_brep.py): planar faces from their outlines (outer
+    loop, then holes) sewn into a body, cylinders added and holes cut
+    ({origin, axis, r, h, cut}), then each fillet group ({r, mids}, the sharp
+    edges' midpoints) rounded, the largest radius first. Built in world space;
+    "base" (before the fillets) and "result" written in job['xform']'s space."""
+    np = _np()
+    tol = float(job.get("tol", 1e-6))
+    body = None
+    parts = []
+    at = lambda q: tuple(q["p"]) if isinstance(q, dict) else tuple(q)
+    for loops in job["faces"]:
+        cs = []
+        for P in loops:                       # a point: a line to the next; {p, cvs, knots, degree}: a curve to it
+            for k, q in enumerate(P):
+                if isinstance(q, dict):
+                    cs.append(ext.curve_from_cvs(int(q["degree"]), [tuple(c) for c in q["cvs"]], list(q["knots"])))
+                else:
+                    cs.append(sm.create_line_segment(at(q), at(P[(k + 1) % len(P)])))
+        parts.append(sm.create_planar_faces(cs))
+    for g in job.get("patches", []):          # a free-form patch: a C1 bicubic B-spline (u-major net)
+        parts.append(ext.brep_from_surface(ext.surface_from_cvs(3, 3, [tuple(c) for c in g["net"]],
+                                                                list(g["ku"]), list(g["kv"]))))
+    for w in job.get("sweeps", []):           # a boxy bevel: ruled between its profiles at its two ends
+        pts = [tuple(c) for a, b in zip(w["cvs"], w["cvs2"]) for c in (a, b)]
+        parts.append(ext.brep_from_surface(ext.surface_from_cvs(int(w["degree"]), 1, pts, list(w["knots"]),
+                                                                [0.0, 0.0, 1.0, 1.0])))
+    if parts:
+        body = parts[0]
+        for q in parts[1:]:                   # faces side by side (no intersecting: they only share edges)
+            ext.append_brep(body, q)
+        body = sm.stitch_advanced(body, tol, squeeze_small_edges=False, making_manifold_solid=True)[0]
+        try:
+            sm.unify_normals(body, max(body.faces(), key=lambda f: f.area()), 100)
+        except Exception:
+            pass
+        if body.is_manifold_solid():
+            h = sm.heal_brep(body)
+            body = h if h is not None and h.face_count() else body
+    for c in job.get("cylinders", []):
+        cyl = sm.create_cylinder((0.0, 0.0, 0.0), float(c["r"]), float(c["h"]))
+        ax = np.array(c["axis"], float)
+        if ax[2] < 1 - 1e-12:
+            k = np.cross((0.0, 0.0, 1.0), ax)
+            k = k / np.linalg.norm(k) if np.linalg.norm(k) > 1e-12 else np.array([1.0, 0.0, 0.0])
+            cyl = sm.rotate(cyl, (0.0, 0.0, 0.0), tuple(map(float, k)), float(np.degrees(np.arccos(np.clip(ax[2], -1, 1)))))
+        cyl = sm.translate(cyl, tuple(map(float, c["origin"])))
+        if body is None:
+            body = cyl
+            continue
+        op = sm.BooleanOp.DIFFERENCE if c["cut"] else sm.BooleanOp.UNION
+        out = sm.boolean(body, cyl, operation=op)
+        if out is None or out.face_count() == 0:
+            raise RuntimeError("a hole or cylinder could not be combined with the body")
+        body = out
+    if body is None:
+        raise RuntimeError("nothing to build")
+    solid = bool(body.is_manifold_solid())
+    base = body.copy()
+    done, failed = [], []
+    for g in job.get("fillets", []):
+        b = body.copy()
+        edges = b.edges()
+        mids = np.array([_edge_mid(e) if _edge_mid(e) is not None else [np.inf] * 3 for e in edges], float)
+        sel = []
+        for m in g["mids"]:
+            i = int(np.argmin(np.linalg.norm(mids - np.array(m), axis=1)))
+            if len(edges[i].faces()) == 2 and edges[i] not in sel:
+                sel.append(edges[i])
+        try:
+            r = sm.fillet_edges(b, sel, radius=float(g["r"])) if sel else None
+        except Exception:
+            r = None
+        if r is None or r.face_count() == 0:
+            failed.append(g["r"])
+            continue
+        body = r
+        done.append(g)
+    xf = job.get("xform")
+    save(to_local(base, xf), job["out"]["base"])
+    save(to_local(body, xf), job["out"]["result"])
+    try:
+        volume = abs(float(body.volume(1e-6))) if solid else 0.0
+    except Exception:
+        volume = 0.0
+    return {"solid": solid and bool(body.is_manifold_solid()), "faces": body.face_count(), "volume": volume,
+            "filleted": done, "failed": failed}
+
+
 JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean,
-        "flip": job_flip, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken}
+        "flip": job_flip, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken,
+        "mesh_to_brep": job_mesh_to_brep}
 
 
 def main():

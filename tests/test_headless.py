@@ -7492,4 +7492,354 @@ check("Fine floor grid: levels mm / cm / 10 cm (thou / inch) under 1 m (1 ft), n
       and abs(_sqp[2] - _Rp_exp) < 1e-6 * _Rp_exp and _sqh is None,
       f"{_flm} {_fli} | square {_sqo} far {_sqf} edge-on {_sqe} | persp {_sqp} high {_sqh}")
 
+# --- Mesh to BREP: planes, bevels (Profile 0.5) as fillets of the bevel's radius, holes and cylinders exact,
+#     the fillets as Edge Fillet history steps; unrecognised areas keep their facets; open meshes become sheets
+from blender_nurbs import mesh_brep as _m2b
+_bm_clear()
+def _m2b_cube(name, a=0.6, bevel=None, w=0.1, seg=6, profile=0.5):
+    """A cube of side a about the origin, the edges bevel(edge midpoint) picks bevelled by w (Blender's bevel)."""
+    me_ = bpy.data.meshes.new(name)
+    b_ = _bmx.new()
+    _bmx.ops.create_cube(b_, size=a)
+    if bevel is not None:
+        es_ = [e_ for e_ in b_.edges if bevel(0.5 * (e_.verts[0].co + e_.verts[1].co))]
+        _bmx.ops.bevel(b_, geom=es_, offset=w, offset_type='OFFSET', segments=seg, profile=profile, affect='EDGES')
+    b_.to_mesh(me_)
+    b_.free()
+    o_ = bpy.data.objects.new(name, me_)
+    ctx.scene.collection.objects.link(o_)
+    return o_
+def _m2b_run(o_, **kw):
+    new_, summ_, note_ = _m2b.convert(ctx, o_, **kw)
+    b_ = store.get_brep(new_)
+    return new_, summ_, note_, b_, abs(b_.volume(1e-6)), bool(b_.is_manifold_solid())
+_a, _w = 0.6, 0.1
+_top_x = lambda m_: abs(m_.x) < 1e-6 and m_.y > 0.29 and m_.z > 0.29          # the top edge along X at +Y
+_corner3 = lambda m_: sum(abs(abs(c_) - 0.3) < 1e-6 for c_ in m_) == 2 and all(c_ > -1e-6 for c_ in m_)
+_m2r = {}
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_cube("M2B_Cube"))
+_m2r["plain cube: 6 planes, a closed solid of the mesh's volume"] = \
+    s_ == "6 planes" and b_.face_count() == 6 and sol_ and abs(v_ - _a ** 3) < 1e-6 * _a ** 3 and no_ is None
+for seg_ in (2, 3, 6, 12):
+    n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_cube(f"M2B_Edge{seg_}", bevel=_top_x, seg=seg_))
+    st_ = features.stack(n_)
+    exp_ = _a ** 3 - (1 - math.pi / 4) * _w ** 2 * _a
+    _m2r[f"one edge bevelled ({seg_} segments): a fillet of the bevel's radius, exact volume, an Edge Fillet step"] = \
+        b_.face_count() == 7 and sol_ and abs(v_ - exp_) < 1e-6 * exp_ and len(st_) == 1 \
+        and st_[0]["op"] == "edge_fillet" and abs(st_[0]["params"]["radius"] - _w) < 1e-6 and "1 fillet" in s_
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_cube("M2B_Chamfer", bevel=_top_x, seg=1))
+_m2r["a chamfer (1 segment) stays a plane"] = s_ == "7 planes" and b_.face_count() == 7 and sol_ \
+    and abs(v_ - (_a ** 3 - 0.5 * _w ** 2 * _a)) < 1e-6 * _a ** 3 and not features.stack(n_)
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_cube("M2B_Corner", bevel=_corner3, seg=6))
+_m2r["three bevelled edges at a corner: three fillets, one radius, a corner patch, closed"] = \
+    b_.face_count() == 10 and sol_ and "3 fillets" in s_ and len(features.stack(n_)) == 1 \
+    and store.brep_from_text(n_[features.PROP_BASE]).face_count() == 6
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_cube("M2B_All", bevel=lambda m_: True, seg=5))
+_bb = _a - 2 * _w
+_exp = _bb ** 3 + 6 * _bb ** 2 * _w + 3 * math.pi * _bb * _w ** 2 + 4 / 3 * math.pi * _w ** 3
+_m2r["all twelve edges bevelled: 12 fillets with sphere corners, the rounded box's exact volume"] = \
+    b_.face_count() == 26 and sol_ and abs(v_ - _exp) < 1e-6 * _exp and "12 fillets" in s_
+# a plate with a vertical and a horizontal hole (Boolean modifiers, exact solver)
+bpy.ops.mesh.primitive_cube_add(size=1.0, location=(3.0, 0.0, 0.0), scale=(1.0, 0.6, 0.2))
+_pl = ctx.active_object
+for i_, (loc_, rot_, r_, h_) in enumerate((((3.2, 0.0, 0.0), (0, 0, 0), 0.1, 0.5),
+                                           ((2.75, 0.0, 0.0), (math.radians(90), 0, 0), 0.05, 1.0))):
+    bpy.ops.mesh.primitive_cylinder_add(vertices=48, radius=r_, depth=h_, location=loc_, rotation=rot_)
+    md_ = _pl.modifiers.new(f"Hole{i_}", 'BOOLEAN')
+    md_.object, md_.solver, md_.operation = ctx.active_object, 'EXACT', 'DIFFERENCE'
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_pl)
+_exp = 1.0 * 0.6 * 0.2 - math.pi * 0.1 ** 2 * 0.2 - math.pi * 0.05 ** 2 * 0.6
+_m2r["a plate with a vertical and a horizontal hole: both exact (diameter, volume), the plate's 6 planes"] = \
+    sol_ and abs(v_ - _exp) < 1e-6 * _exp and "6 planes" in s_ and "2 holes" not in s_ and s_.count("hole") == 2 \
+    and b_.face_count() == 8
+bpy.ops.mesh.primitive_cube_add(size=1.0, location=(3.0, 2.0, 0.0), scale=(0.6, 0.6, 0.2))
+_pb = ctx.active_object
+bpy.ops.mesh.primitive_cylinder_add(vertices=40, radius=0.08, depth=0.2, location=(3.0, 2.0, 0.1))  # 0.1 deep
+md_ = _pb.modifiers.new("Blind", 'BOOLEAN')
+md_.object, md_.solver, md_.operation = ctx.active_object, 'EXACT', 'DIFFERENCE'
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_pb)
+_exp = 0.6 * 0.6 * 0.2 - math.pi * 0.08 ** 2 * 0.1
+_m2r["a blind hole: exact diameter and depth (its flat bottom made by the cylinder)"] = \
+    sol_ and abs(v_ - _exp) < 1e-6 * _exp and s_.count("hole") == 1 and b_.face_count() == 8
+bpy.ops.mesh.primitive_cylinder_add(vertices=32, radius=0.3, depth=0.6, location=(5.0, 0.0, 0.0),
+                                    rotation=(math.radians(90), 0, 0))
+n_, s_, no_, b_, v_, sol_ = _m2b_run(ctx.active_object)
+_m2r["a cylinder (turned on its side): an exact cylinder with trimmed caps"] = \
+    "1 cylinder" in s_ and b_.face_count() == 3 and sol_ and abs(v_ - math.pi * 0.09 * 0.6) < 1e-6
+bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=2, radius=0.5, location=(7.0, 0.0, 0.0))
+_nf = len(ctx.active_object.data.polygons)
+n_, s_, no_, b_, v_, sol_ = _m2b_run(ctx.active_object)
+_m2r["an icosphere (nothing to recognise): a solid of its flat facets"] = b_.face_count() == _nf == 80 and sol_
+bpy.ops.mesh.primitive_grid_add(x_subdivisions=3, y_subdivisions=3, size=1.0, location=(9.0, 0.0, 0.0))
+n_, s_, no_, b_, v_, sol_ = _m2b_run(ctx.active_object)
+_m2r["an open mesh: a sheet, said so"] = b_.face_count() == 1 and not sol_ and no_ is not None and "open" in no_
+# boxy bevels (Profile above 0.5): an exact superellipse strip, G2 to both faces, where it ends on flat faces
+def _boxy_vol(p_, w_=0.1, a_=0.6):
+    r_ = -2 * math.log(2) / math.log(p_)
+    return a_ ** 3 - a_ * w_ * w_ * (1 - math.gamma(1 + 1 / r_) ** 2 / math.gamma(1 + 2 / r_))
+for p_, seg_ in ((0.6, 8), (0.75, 4), (0.75, 8), (0.9, 8), (0.9, 16), (0.93, 12)):
+    n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_cube(f"M2B_Boxy{p_}_{seg_}", bevel=_top_x, seg=seg_, profile=p_))
+    exp_ = _boxy_vol(p_)
+    _m2r[f"a boxy bevel (profile {p_}, {seg_} segments): one exact strip, the profile read back, exact volume"] = \
+        b_.face_count() == 7 and sol_ and abs(v_ - exp_) < 1e-5 * exp_ and f"1 bevel profile {p_:.3g}" in s_ \
+        and not features.stack(n_) and no_ is None
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_cube("M2B_BoxyG1", bevel=_top_x, seg=8, profile=0.8))
+_sw = [f_ for f_ in b_.faces() if not f_.surface().is_planar(1e-9)]
+_tan = 0
+if len(_sw) == 1:
+    s_g = _sw[0].surface()
+    (u0_, u1_), (v0_, v1_) = s_g.u_domain(), s_g.v_domain()
+    for u_, v_g in ((u0_, 0.5 * (v0_ + v1_)), (u1_, 0.5 * (v0_ + v1_)), (0.5 * (u0_ + u1_), v0_), (0.5 * (u0_ + u1_), v1_)):
+        nn_ = np.array(s_g.normal(u_, v_g), float)
+        nn_ /= np.linalg.norm(nn_)
+        _tan += int(max(abs(nn_[1]), abs(nn_[2])) > 1 - 1e-9)
+_m2r["the boxy strip meets both faces tangentially (its normal on each rail is the face's)"] = len(_sw) == 1 and _tan == 2
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_cube("M2B_Boxy95", bevel=_top_x, seg=16, profile=0.96))
+_m2r["profile 0.96 (Blender makes a square corner from about 0.95): the plain cube it is"] = \
+    s_ == "6 planes" and sol_ and abs(v_ - 0.6 ** 3) < 1e-6
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_cube("M2B_Boxy3", bevel=_top_x, seg=3, profile=0.8))
+_m2r["a boxy bevel of 3 segments keeps its facets (any 3 facets fit some profile): a valid solid"] = \
+    b_.face_count() == 9 and sol_ and "profile" not in s_
+_top_xx = lambda m_: abs(m_.x) < 1e-6 and abs(m_.y) > 0.29 and m_.z > 0.29        # both top edges along X
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_cube("M2B_Boxy2", bevel=_top_xx, seg=8, profile=0.8))
+_exp = _boxy_vol(0.8) * 2 - 0.6 ** 3
+_m2r["two parallel boxy bevels: both exact"] = b_.face_count() == 8 and sol_ and "2 bevels profile 0.8" in s_ \
+    and abs(v_ - _exp) < 1e-5 * _exp
+_corner2 = lambda m_: (abs(m_.x) < 1e-6 and m_.y < -0.29 and m_.z > 0.29) or (abs(m_.z) < 1e-6 and m_.x > 0.29 and m_.y < -0.29)
+def _m2b_seams(b_):
+    """Largest normal jump (degrees) across seams that touch a curved face: (tangent joins, creases excluded;
+    patch-to-patch median)."""
+    tang, pp = [0.0], []
+    for e_ in b_.edges():
+        fs_ = e_.faces()
+        if len(fs_) != 2:
+            continue
+        curved = [not f_.surface().is_planar(1e-9) for f_ in fs_]
+        if not any(curved):
+            continue
+        t0_, t1_ = e_.parameter_range()
+        js_ = []
+        for t_ in np.linspace(t0_, t1_, 9)[1:-1]:
+            q_ = e_.point_at(t_)
+            q_ = (q_.x, q_.y, q_.z) if hasattr(q_, "x") else tuple(q_)
+            ns_ = []
+            for f_ in fs_:
+                w_ = _sm_k.surface_closest_point(f_.surface(), q_)[1][0]
+                n2_ = np.array(f_.outward_normal_at_uv(float(w_.x), float(w_.y)), float)
+                ns_.append(n2_ / np.linalg.norm(n2_))
+            js_.append(math.degrees(math.acos(min(1.0, abs(float(ns_[0] @ ns_[1]))))))
+        if max(js_) > 80:
+            continue                                        # a crease (the bevel's end against a face)
+        (pp if all(curved) else tang).append(max(js_) if not all(curved) else float(np.median(js_)))
+    return max(tang), (float(np.median(pp)) if pp else 0.0)
+from blender_nurbs.kernel import load as _klm
+_sm_k = _klm()
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_cube("M2B_BoxyCorner", bevel=_corner2, seg=6, profile=0.8))
+_tg = _m2b_seams(b_)[0]
+_m2r["two boxy bevels meeting at a box corner: exact strips mitred where they meet, tangent to the faces"] = \
+    sol_ and b_.face_count() == 8 and "2 bevels profile 0.8" in s_ and no_ is None and _tg < 0.01
+_ring = lambda m_: m_.z > 0.29 and (abs(m_.x) < 1e-6 or abs(m_.y) < 1e-6)
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_cube("M2B_BoxyRing", bevel=_ring, seg=6, profile=0.8))
+_m2r["the four top edges boxy: four exact strips mitred round the top"] = \
+    sol_ and b_.face_count() == 10 and "4 bevels profile 0.8" in s_
+for seg_ in (6, 12):
+    n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_cube(f"M2B_Boxy3c{seg_}", bevel=_corner3, seg=seg_, profile=0.8))
+    _tg, _pp = _m2b_seams(b_)
+    _m2r[f"three boxy bevels at a corner ({seg_} segments): free-form patches through the corner, tangent to the "
+         f"faces and to each other"] = sol_ and "free-form patch" in s_ and no_ is None and _tg < 0.01 and _pp < 0.01
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_cube("M2B_BoxyAll", bevel=lambda m_: True, seg=6, profile=0.8))
+_m2r["all twelve edges boxy: a closed solid of the six faces and free-form patches"] = \
+    sol_ and s_.startswith("6 planes") and "free-form patch" in s_ and no_ is None
+# a bevel swept along a boxy bevel's profile (bevel an edge, then the outline of the face at its end)
+_me = bpy.data.meshes.new("M2B_Swept")
+_bs = _bmx.new()
+_bmx.ops.create_cube(_bs, size=0.6)
+_bmx.ops.bevel(_bs, geom=[e_ for e_ in _bs.edges if _top_x(0.5 * (e_.verts[0].co + e_.verts[1].co))], offset=0.15,
+               offset_type='OFFSET', segments=8, profile=0.75, affect='EDGES')
+_bs.faces.ensure_lookup_table()
+_endf = max(_bs.faces, key=lambda f_: f_.calc_center_median().x)
+_rim = [e_ for e_ in _endf.edges if not (max(v_.co.z for v_ in e_.verts) < -0.29 or max(v_.co.y for v_ in e_.verts) < -0.29)]
+_bmx.ops.bevel(_bs, geom=_rim, offset=0.05, offset_type='OFFSET', segments=6, profile=0.5, affect='EDGES')
+_bs.to_mesh(_me)
+_bs.free()
+_os = bpy.data.objects.new("M2B_Swept", _me)
+ctx.scene.collection.objects.link(_os)
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_os)
+_tg, _pp = _m2b_seams(b_)
+_m2r["a bevel swept along a boxy bevel's profile: free-form patches, a closed solid, tangent where the mesh is smooth"] = \
+    sol_ and "free-form patch" in s_ and _tg < 0.01 and _pp < 0.01
+# the operator: the selected meshes, originals hidden, the new bodies selected; not for NURBS objects
+_srcs = [bpy.data.objects["M2B_Cube"], bpy.data.objects["M2B_Corner"]]
+for o_ in ctx.view_layer.objects:
+    o_.select_set(o_ in _srcs)
+ctx.view_layer.objects.active = _srcs[0]
+_r = bpy.ops.nproto.mesh_to_brep()
+_sel = [o_ for o_ in ctx.selected_objects]
+_m2r["the operator converts the selected meshes, hides them and selects the new bodies"] = \
+    _r == {'FINISHED'} and len(_sel) == 2 and all(store.is_nurbs(o_) for o_ in _sel) \
+    and all(o_.hide_get() and o_.hide_render for o_ in _srcs)
+_m2r["the operator needs a mesh selected (not a NURBS body)"] = not bpy.ops.nproto.mesh_to_brep.poll()
+for k_, v_ in _m2r.items():
+    check("Mesh to BREP: " + k_, v_)
+
+# -- SubD to BREP ------------------------------------------------------------------------
+from blender_nurbs import subd_brep as _sdb
+def _sd_obj(name, build, crease=None, levels=2):
+    """A mesh object built by build(bmesh) with a Subdivision Surface modifier; edges crease(mesh, edge) picks creased 1.0."""
+    me_ = bpy.data.meshes.new(name)
+    b_ = _bmx.new()
+    build(b_)
+    b_.to_mesh(me_)
+    b_.free()
+    o_ = bpy.data.objects.new(name, me_)
+    ctx.scene.collection.objects.link(o_)
+    if crease:
+        a_ = me_.attributes.new("crease_edge", 'FLOAT', 'EDGE')
+        for e_ in me_.edges:
+            a_.data[e_.index].value = 1.0 if crease(me_, e_) else 0.0
+    m_ = o_.modifiers.new("Subdivision", 'SUBSURF')
+    m_.levels = m_.render_levels = levels
+    return o_
+def _sd_run(o_, **kw):
+    new_, summ_, note_ = _sdb.convert(ctx, o_, **kw)
+    return new_, summ_, note_, store.get_brep(new_)
+def _sd_seams(b_, crease_deg=20.0):
+    """Largest normal jump (degrees) along the smooth edges, their ends (the star points) included; the
+    sharp ones (over crease_deg) left out and counted."""
+    worst_, sharp_ = 0.0, 0
+    for e_ in b_.edges():
+        fs_ = e_.faces()
+        if len(fs_) != 2:
+            continue
+        t0_, t1_ = e_.parameter_range()
+        js_ = []
+        for t_ in np.linspace(t0_, t1_, 13):
+            q_ = e_.point_at(t_)
+            q_ = (q_.x, q_.y, q_.z) if hasattr(q_, "x") else tuple(q_)
+            ns_ = []
+            for f_ in fs_:
+                w_ = _sm_k.surface_closest_point(f_.surface(), q_)[1][0]
+                n2_ = np.array(f_.outward_normal_at_uv(float(w_.x), float(w_.y)), float)
+                ns_.append(n2_ / np.linalg.norm(n2_))
+            js_.append(math.degrees(math.acos(min(1.0, float(ns_[0] @ ns_[1])))))
+        if max(js_) > crease_deg:
+            sharp_ += 1
+        else:
+            worst_ = max(worst_, max(js_))
+    return worst_, sharp_
+def _sd_dev(o_, b_, k_=250):
+    """Largest distance from Blender's own limit surface (the modifier's vertices) to the body."""
+    dg_ = ctx.evaluated_depsgraph_get()
+    me_ = o_.evaluated_get(dg_).to_mesh()
+    P_ = np.array([v_.co for v_ in me_.vertices], float)
+    o_.evaluated_get(dg_).to_mesh_clear()
+    P_ = P_[np.random.default_rng(1).choice(len(P_), min(k_, len(P_)), replace=False)]
+    surfs_ = [f_.surface() for f_ in b_.faces()]
+    out_ = 0.0
+    for q_ in P_:
+        out_ = max(out_, min(float(_sm_k.surface_closest_point(s2_, tuple(map(float, q_)))[2]) for s2_ in surfs_))
+    return out_
+_sdr = {}
+_ocube = _sd_obj("SD_Cube", lambda b_: _bmx.ops.create_cube(b_, size=1.0), levels=4)
+n_, s_, no_, b_ = _sd_run(_ocube)
+_g1, _sh = _sd_seams(b_)
+_dv = _sd_dev(_ocube, b_)
+_cv = max(ext.surface_cvs(f_.surface())["count_u"] * ext.surface_cvs(f_.surface())["count_v"] for f_ in b_.faces())
+_sdr["a SubD cube (eight star points): six faces, a closed solid, G1 within 0.05 degrees along every edge and "
+     "at the star points, within 0.1% of its size of the SubD surface"] = \
+    b_.face_count() == 6 and b_.is_manifold_solid() and _g1 < 0.06 and _sh == 0 and _dv < 1e-3 * math.sqrt(3) \
+    and no_ is None and "G1 within" in s_
+_sdr["... G1: 4 even spans and a sliver knot by each star point, 9 x 9 CVs a face"] = _cv == 9 * 9
+print("   SubD cube:", s_, f"| measured G1 {_g1:.4f} deg, deviation {_dv * 1000:.3f} mm, {_cv} CVs")
+def _torus(b_, R_=1.0, r_=0.4, nu_=8, nv_=6):
+    vs_ = [b_.verts.new(((R_ + r_ * math.cos(v2_)) * math.cos(u2_), (R_ + r_ * math.cos(v2_)) * math.sin(u2_), r_ * math.sin(v2_)))
+           for u2_ in np.linspace(0, 2 * math.pi, nu_ + 1)[:-1] for v2_ in np.linspace(0, 2 * math.pi, nv_ + 1)[:-1]]
+    for i_ in range(nu_):
+        for j_ in range(nv_):
+            b_.faces.new([vs_[i_ * nv_ + j_], vs_[((i_ + 1) % nu_) * nv_ + j_], vs_[((i_ + 1) % nu_) * nv_ + (j_ + 1) % nv_],
+                          vs_[i_ * nv_ + (j_ + 1) % nv_]])
+_otor = _sd_obj("SD_Torus", _torus, levels=4)
+n_, s_, no_, b_ = _sd_run(_otor)
+_g1, _sh = _sd_seams(b_)
+_sdr["an all-ordinary cage (a torus): every face exact, 16 CVs, C2 across edges"] = \
+    b_.face_count() == 48 and b_.is_manifold_solid() and "1 even span" in s_ and _g1 < 1e-3 \
+    and all(ext.surface_cvs(f_.surface())["count_u"] == 4 and ext.surface_cvs(f_.surface())["count_v"] == 4 for f_ in b_.faces()) \
+    and _sd_dev(_otor, b_, 120) < 1e-5
+_ocr = _sd_obj("SD_Crease", lambda b_: _bmx.ops.create_cube(b_, size=1.0),
+               crease=lambda me_, e_: all(me_.vertices[v_].co.z > 0.4 for v_ in e_.vertices), levels=4)
+n_, s_, no_, b_ = _sd_run(_ocr)
+_g1, _sh = _sd_seams(b_)
+_sdr["a creased top ring (crease 1.0): its four edges sharp, the others G1, a closed solid near the SubD surface"] = \
+    b_.face_count() == 6 and b_.is_manifold_solid() and _sh == 4 and _g1 < 0.06 and _sd_dev(_ocr, b_) < 1e-3 * math.sqrt(3)
+print("   creased cube:", s_, f"| measured G1 {_g1:.4f} deg, {_sh} sharp edges")
+_ocyl = _sd_obj("SD_Cyl", lambda b_: _bmx.ops.create_cone(b_, cap_ends=True, segments=8, radius1=0.5, radius2=0.5, depth=1.0))
+n_, s_, no_, b_ = _sd_run(_ocyl)
+_g1, _sh = _sd_seams(b_)
+_sdr["n-gon caps (a cylinder): quads after one subdivision step, a closed G1 solid"] = \
+    b_.face_count() == 48 and b_.is_manifold_solid() and _g1 < 0.06 and _sh == 0
+# the CV rows run on from face to face: away from star points the CVs either side of an edge make the
+# surface's own C1 join (first CV steps over first spans equal and opposite); every face has even knots, with
+# a sliver knot added only at the ends of the strips that reach a star point
+_ogrid = _sd_obj("SD_Grid", lambda b_: (_bmx.ops.create_cube(b_, size=1.0),
+                                        _bmx.ops.subdivide_edges(b_, edges=b_.edges[:], cuts=2, use_grid_fill=True)))
+_V, _F, _S, _M = _sdb.cage(_ogrid, ctx.evaluated_depsgraph_get())
+_cv_ = _sdb.Converter(_V, _F, _S)
+_nets, _kns, _st = _cv_.run()
+_irr = set(_cv_.irregular())
+def _step(f_, k_):
+    """Face f_'s first knot span into the face from its side k_."""
+    ku_, kv_ = _kns[f_]
+    return (kv_[4], 1 - ku_[-5], 1 - kv_[-5], ku_[4])[k_]
+_flow = 0.0
+for _e, _uses in _cv_.edges.items():
+    if _e[0] in _irr or _e[1] in _irr or len(_uses) != 2:
+        continue
+    _rows = []
+    for _f, _k, _fl in _uses:
+        _cells, _din = _sdb._side_cells(_nets[_f].shape[0] - 1, _k, _nets[_f].shape[1] - 1)
+        _cells = _cells[::-1] if _fl else _cells
+        _rows.append((np.array([_nets[_f][c_] for c_ in _cells]),
+                      np.array([_nets[_f][c_[0] + _din[0], c_[1] + _din[1]] for c_ in _cells]) , _step(_f, _k)))
+    (_P0, _A, _ha), (_, _B, _hb) = _rows
+    _flow = max(_flow, float(np.abs((_A - _P0) / _ha + (_B - _P0) / _hb).max()))
+_spans = sorted({len(k_[0]) - 7 for k_ in _kns} | {len(k_[1]) - 7 for k_ in _kns})
+_sdr["CV rows run on across the edges between faces (the surface's own C1 join), 4 even spans, a sliver knot "
+     "only where a strip reaches a star point"] = \
+    _flow < 1e-8 and _spans[0] == 4 and _spans[-1] <= 6 and _st["normal"] < 0.001
+print("   flow:", f"{_flow:.1e}", "spans per strip", _spans, _st)
+# G1 and G2: even spans (G1 4, G2 8); next to each star point the CVs are solved so the faces join exactly
+# past a 1/512 sliver -- C1 (G1) or C2 (G2) -- and meet tangentially at the point too
+for _nm, _ob in (("a SubD cube", _ocube), ("n-gon caps (a cylinder)", _ocyl)):
+    _V, _F, _S, _M = _sdb.cage(_ob, ctx.evaluated_depsgraph_get())
+    _res = {}
+    for _g2 in (False, True):
+        _c2 = _sdb.Converter(_V, _F, _S)
+        _n2, _k2, _s2 = _c2.run(g2=_g2)
+        _res[_g2] = _s2
+        print("  ", "G2" if _g2 else "G1", _nm, _s2)
+        _ok = _s2["normal"] <= 0.001 and _s2["normal_all"] <= 0.05 and _s2["joins"] < 1e-6 \
+            and _s2["deviation"] < 5e-3 * _c2.size
+        if _g2:
+            _ok = _ok and _s2["curvature"] <= 0.001
+        _sdr[f"{'G2' if _g2 else 'G1'} on {_nm}: G1 within 0.001 deg across every edge (0.05 at the star points)"
+             + (", G2 within 0.1 %" if _g2 else "") + ", the joins exact, within 0.5 % of its size of the SubD "
+             "surface"] = _ok
+    _sdr[f"G1 on {_nm} needs fewer CVs than G2"] = _res[False]["cvs"] < _res[True]["cvs"]
+new_, s_, no_, b_ = _sd_run(_ocube, g2=True)
+_g1, _sh = _sd_seams(b_)
+_sdr["G2 builds a closed solid, its summary gives the curvature difference"] = \
+    b_.is_manifold_solid() and "G2 within" in s_ and _g1 < 0.06 and no_ is None
+# the operator: the selected meshes, originals hidden, the new bodies selected; not for NURBS objects
+for o_ in ctx.view_layer.objects:
+    o_.select_set(o_ in (_ocube, _otor))
+ctx.view_layer.objects.active = _ocube
+_r = bpy.ops.nproto.subd_to_brep(angle=0.1)
+_sel = list(ctx.selected_objects)
+_sdr["the operator converts the selected SubD meshes, hides them and selects the new bodies"] = \
+    _r == {'FINISHED'} and len(_sel) == 2 and all(store.is_nurbs(o_) for o_ in _sel) \
+    and all(o_.hide_get() and o_.hide_render for o_ in (_ocube, _otor))
+_sdr["the operator needs a mesh selected (not a NURBS body)"] = not bpy.ops.nproto.subd_to_brep.poll()
+for k_, v_ in _sdr.items():
+    check("SubD to BREP: " + k_, v_)
+
 print("ALL OK" if ok else "SOME FAILED")

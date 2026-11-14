@@ -17,7 +17,7 @@ The sidebar tab **NURBS Proto** has one collapsible panel per group. Ctrl+click 
 | **Create Surfaces** | Draw Plane · Plane, Disk, Box, Cylinder, Cone, Sphere, Torus · from curves: Loft, Loft Rails, Sweep, Pipe, Extrude, Revolve, Planar · filling a gap: Boundary, Square, Patch, Dome · from surfaces: Offset, Thicken, Convert Blender Surface |
 | **Curve Edit** | Join / Unjoin Curves, Trim / Split Curves, Rebuild / Extend Curve, Align Curve |
 | **Surface Edit** | Edit CVs, Flip Normal, Rebuild Surface, Extend Surface, Surface Align, Refit to Trim · Trim, Split, Untrim, Join, Unjoin · Surface Fillet, Edge Fillet · solids: Union, Difference, Intersection, Boundary Fill |
-| **Convert** (closed at first) | BREP to Mesh (also in Object › Convert) |
+| **Convert** (closed at first) | BREP to Mesh, Mesh to BREP, SubD to BREP (all also in Object › Convert) |
 | **Analyze** (closed at first) | Continuity Check and the overlays (also in the viewport header's Analyze popover) |
 | **Display** | **Edges**, **CVs / Hulls**, **Feature Labels** and **Fine Grid** on / off (also as four icons in the 3D view header, next to the Analyze button, so they are always at hand); **Fine Grid** draws the floor grid's finer levels (mm, cm, 10 cm; inches) in a perspective or turned orthographic view, where Blender's floor grid stops at 1 m (1 ft); right under them how finely surfaces are meshed for display: Chord / Angle Tolerance, Edge Angle, Max Edge. **Clip Start warning:** a 3D view's depth buffer spreads its precision between Clip Start and Clip End, so a tiny Clip Start (say 1 µm) leaves depth steps of about 8 mm at 0.37 m. Surfaces, edges and Face / Edge highlights then flicker against each other (blotchy fills, dashed edges). When the steps exceed 0.05 % of the view distance, the Display panel says so and a red ⚠ appears in the header: one click sets Clip Start to about a thousandth of the view distance. |
 | **History** (closed at first) | Construction History, Live Update, Pause Rebuild, Delete History, Collect Inputs, Rebuild / Re-tessellate |
@@ -432,6 +432,93 @@ materials and modifiers. The NURBS object stays with its history, hidden in the 
 * **brep_face** (an integer face attribute) names each polygon's B-rep face: select by it in Edit Mode to give a face
   its own material.
 * **Join** makes one mesh object of all the selected NURBS objects.
+
+### Mesh to BREP
+
+Under Convert, and in Blender's **Object › Convert › NURBS Body (NURBS Proto)**. It rebuilds the selected mesh objects as
+NURBS bodies you can keep working on, by recognising what was modelled and making it again with the kernel, not by
+copying facets:
+
+* **Flat faces** become planes: coplanar facets merge into one face, however the mesh triangulated or split them. A
+  point a knife line or a Boolean left in the middle of a straight edge doesn't count.
+* **Bevels** with a round profile (Profile 0.5, Ctrl+B or the Bevel modifier, 2 segments or more) become **fillets** of
+  the bevel's radius: the strip's vertices are fitted with a circle, and the fillet must touch both faces beside it.
+  The body is rebuilt with sharp edges and those edges rounded with the kernel's rolling-ball fillet, so the fillet is
+  exact and G1 to both faces, and where three bevelled edges met there is a smooth corner. One bevelled edge, two at a
+  corner, three at a corner and all twelve of a box all work. A chamfer (1 segment) stays a flat face.
+* **Boxy bevels** (Profile above 0.5) become exact strips of the bevel's shape: Blender's profile is a superellipse,
+  and the converter reads its exponent and setbacks from the mesh (the report gives the Profile value, e.g. *1 bevel
+  profile 0.75 w 10 cm*). The strip is the profile swept along the edge, a B-spline within 0.002 % of the bevel's width
+  of the true curve, meeting both faces with matching tangent and curvature (G2). A boxy bevel needs **4 segments or
+  more**: with fewer, any polyline fits some profile, so it keeps its facets. Its first segments may lie almost flat on
+  the faces; they are found and used anyway. From about Profile 0.95 Blender makes a square corner, and that is what
+  converts. A boxy bevel that ends on flat faces (one edge, parallel edges, any end face) or where two boxy bevels
+  meet in a **mitre** (two bevelled edges at a box corner, all four edges round a top) is exact.
+* **Free-form patches.** What is smooth but not one of the shapes above becomes free-form patches: where three boxy
+  bevels meet at a corner, all edges of a box bevelled boxy, a bevel swept along a curved edge (an end face's outline
+  bevelled after a boxy bevel), and the bevels running into them. The smooth quad grid is cut into rectangular blocks
+  at its irregular vertices, and each block becomes a C1 bicubic B-spline through the mesh's vertices. A vertex has one
+  tangent for every curve and patch through it, so patches share their edges exactly with each other and with the flat
+  faces, and meet them tangentially (G1, the normals agree to within 0.01°) wherever the mesh is smooth; only at the point
+  where three patches meet (the middle of a three-bevel corner) the normals differ by a few degrees (about 3° with 12
+  segments, 11° with 6). The report counts them (*6 planes · 9 free-form patches*). A round fillet that runs into a
+  patch becomes part of it. Patches follow the mesh's vertices, so they are as fine as the bevel's segments; the exact
+  shapes above stay light.
+* **Round holes** (a Boolean with a cylinder, for instance) become exact cylindrical holes of the mesh's diameter,
+  through or blind (the flat bottom at the hole's depth), in any direction. Knife lines and bridges between holes are fine.
+* **Cylinders** become exact cylinders whose caps are trimmed planes.
+* The fillets are **Edge Fillet steps** in the body's history, one per radius, so you can change the radius in the
+  Feature panel afterwards.
+* The report says what was found, e.g. *6 planes · 3 fillets r 6.29" · 1 hole ⌀ 2'*.
+* Anything not recognised keeps its facets as flat faces (an icosphere becomes a body of its flat facets). If the rebuilt
+  faces don't close into a solid, the whole body is made of the mesh's flat regions instead, and the report says so. An
+  open mesh becomes a sheet.
+* The settings (Adjust Last Operation panel): **Fillets**, **Holes and Cylinders** (each off keeps those facets),
+  **Tolerance** (how far points may be off a plane or circle, as a fraction of the object's size: raise it for imported
+  or scanned meshes) and **Hide Meshes**.
+* Modifiers count: a Bevel or Boolean modifier is converted as you see it. Apply scale first: under a non-uniform scale
+  Blender's round bevel is elliptical and stays faceted.
+* Not yet: fewer, larger patches (neighbouring blocks merged), rounded hole lips, countersinks, holes at an angle to a face,
+  bosses on faces, chamfers as editable steps, bevels of different widths meeting at a corner, custom bevel profiles,
+  and boxy bevels as editable steps (the kernel has no superellipse fillet, so their shape is fixed).
+
+### SubD to BREP
+
+Under Convert, and in Blender's **Object › Convert › NURBS Body from SubD (NURBS Proto)**. It turns the selected
+Subdivision Surface models into NURBS bodies of the smooth surface you see, built from the control cage (the mesh
+before its Subdivision Surface modifier), with **one face per cage face**.
+
+* **Even nets from the cage.** Catmull-Clark's surface is a uniform bicubic B-spline wherever the mesh is regular, so
+  every face gets even knots (**G1: 4 spans, G2: 8**) and its CVs are the cage subdivided that far, borders clamped.
+  The CV rows run on from face to face as the subdivided mesh does, evenly spaced, and the faces ARE the SubD surface
+  and join with matching curvature (C2) everywhere but in the first span next to a star point (a corner where 3, 5
+  or more edges meet).
+* **At each star point** no bicubic faces can be the surface and also join smoothly, so the CVs within four of the
+  point are solved for, one small linear solve per point. One extra knot 1/512 of the edge from the point (inside
+  the ends Continuity Check leaves out) frees each face's corner, so that past it the faces join **exactly**:
+  parametrically C1 in G1, C2 in G2. Within that, they stay as close as they can to the SubD surface and to the
+  subdivided cage's CVs. The first two CVs of every edge at the point lie on Catmull-Clark's own tangent there (an
+  affine-regular n-gon in the tangent plane), so the faces meet tangentially at the point too.
+* **G1 is G1, G2 is G2:** Continuity Check (which leaves 1.5 % of each edge's ends out) reads G1 0.000° on every edge
+  of a jack (3-, 5- and 6-edge star points), a boot (with creases) and a cylinder with 8-edge poles in G1, and G1
+  0.000° and G2 0.00 % in G2. A G1 body does not match curvature next to the star points (it is not G2 there). At
+  the star points themselves G1 holds within 0.01° (G1) or 0.04° (G2).
+* **Light:** the jack is 2,790 CVs in G1 (4 spans), 6,006 in G2 (8 spans); the boot 2,466 and 5,330.
+* **Close to the SubD surface:** exactly on it away from the star points; next to them within about 0.5 % of the
+  model's size in G1 and 0.25 % in G2 (Spans 16 brings it closer).
+* **Speed:** about 0.3 s for the jack's nets; with the body and its display mesh about 1 s.
+* **It asks first:** a dialog with **Continuity** (G1 or G2), **Spans** (Auto: 4 for G1, 8 for G2; or 4, 8, 16),
+  **Angle**, **Curvature %** (G2) and **Hide Meshes** (the SubD objects stay, hidden in the viewport and in renders);
+  **Convert** runs it. The same settings stay in the Adjust Last Operation panel afterwards.
+* A cage without star points or odd creases (a torus) becomes exact faces of 16 CVs (one span).
+* **Creases** (edge crease 1.0) become sharp edges: each side follows its own surface. Open borders stay open (a sheet).
+* Triangles and n-gons in the cage are split into quads first (one subdivision step), like Catmull-Clark does.
+* The report gives faces, spans, CVs, the largest angle across an edge (and at the star points), in G2 the curvature
+  difference, and how close the faces stay to the SubD surface, e.g. *38 faces · 8 even spans · 6,006 CVs · G1
+  within 0.000° (0.037° at the star points) · G2 within 0.00% · within 2.0 mm of the SubD surface (exactly on it
+  away from the 22 star points)*.
+* Modifiers other than the Subdivision Surface count (a Mirror, for instance). Creases below 1.0 are treated as smooth.
+* Not yet: partial creases (below 1.0).
 
 ## STEP Import and Export
 
