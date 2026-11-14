@@ -78,10 +78,10 @@ everything built from it rebuilds.
 - **Mesh to BREP:** mesh bodies rebuilt as NURBS bodies: flat faces as planes, round holes and cylinders exact,
   bevels (Profile 0.5) as G1 fillets of the bevel's radius, editable afterwards, boxy bevels (Profile above 0.5) as
   exact G2 superellipse strips, mitred where two meet; boxy corners and swept bevels as G1 free-form patches
-- **SubD to BREP:** Subdivision Surface models as NURBS bodies with one face per cage face: even nets straight
-  from the subdivided cage (G1: 4 spans, G2: 8; rows run on from face to face), the SubD surface away from star
-  points, and next to them CVs solved so the faces join exactly (Continuity Check: G1 0.000°, G2 0.00 %), creases as
-  sharp edges
+- **SubD to BREP:** Subdivision Surface models as NURBS bodies with one face per cage face: one bicubic span (the
+  SubD surface exactly) wherever the cage is regular, and at star points faces of 2 x 2 pieces with even nets
+  (G2: degree 6, 12 x 12; G1: degree 5, 10 x 10), solved so every face joins exactly (Continuity Check: G1 0.000°,
+  G2 0.00 %, star points included), creases as sharp edges
 
 ### STEP Import and Export
 

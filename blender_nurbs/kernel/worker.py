@@ -1602,8 +1602,9 @@ def job_mesh_to_brep(job):
                 else:
                     cs.append(sm.create_line_segment(at(q), at(P[(k + 1) % len(P)])))
         parts.append(sm.create_planar_faces(cs))
-    for g in job.get("patches", []):          # a free-form patch: a C1 bicubic B-spline (u-major net)
-        parts.append(ext.brep_from_surface(ext.surface_from_cvs(3, 3, [tuple(c) for c in g["net"]],
+    for g in job.get("patches", []):          # a free-form patch: a B-spline (u-major net; bicubic unless said)
+        d = int(g.get("degree", 3))
+        parts.append(ext.brep_from_surface(ext.surface_from_cvs(d, d, [tuple(c) for c in g["net"]],
                                                                 list(g["ku"]), list(g["kv"]))))
     for w in job.get("sweeps", []):           # a boxy bevel: ruled between its profiles at its two ends
         pts = [tuple(c) for a, b in zip(w["cvs"], w["cvs2"]) for c in (a, b)]

@@ -26,10 +26,57 @@
 #include <algorithm>
 
 #include <cmath>
+#include <chrono>
+#include <memory>
+#include <cstdint>
 #include <vector>
+
+// Sparse linear algebra for the add-on's solvers (SubD to BREP): Eigen's
+// sparse LDL^T with its fill-reducing ordering. Only Eigen's MPL2 code is used.
+#define EIGEN_MPL2_ONLY
+#include <Eigen/SparseCore>
+#include <Eigen/SparseCholesky>
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#endif
+#include <cstdlib>
+#include <pybind11/numpy.h>
 
 namespace
 {
+
+using SpMat = Eigen::SparseMatrix<double, Eigen::ColMajor, std::int64_t>;
+using F64 = py::array_t<double, py::array::c_style | py::array::forcecast>;
+using I64 = py::array_t<std::int64_t, py::array::c_style | py::array::forcecast>;
+
+// C (m x n) from triplets (duplicates add up).
+SpMat sparse_from(const I64& rows, const I64& cols, const F64& vals, std::int64_t m, std::int64_t n)
+{
+    const auto nnz = vals.size();
+    if (rows.size() != nnz || cols.size() != nnz)
+        throw std::invalid_argument("rows, cols and vals differ in length");
+    const auto* r = rows.data();
+    const auto* c = cols.data();
+    const auto* v = vals.data();
+    std::vector<Eigen::Triplet<double, std::int64_t>> t;
+    t.reserve(static_cast<size_t>(nnz));
+    for (py::ssize_t k = 0; k < nnz; ++k)
+    {
+        if (r[k] < 0 || r[k] >= m || c[k] < 0 || c[k] >= n)
+            throw std::out_of_range("triplet index out of range");
+        t.emplace_back(r[k], c[k], v[k]);
+    }
+    SpMat C(m, n);
+    C.setFromTriplets(t.begin(), t.end());
+    return C;
+}
+
+py::array_t<double> to_numpy(const Eigen::VectorXd& x)
+{
+    py::array_t<double> out(x.size());
+    std::copy(x.data(), x.data() + x.size(), out.mutable_data());
+    return out;
+}
 
 // Split a full knot vector into unique values + multiplicities.
 void split_knots(const std::vector<double>& full, SmTArray<double>& uniq, SmTArray<ULONG>& mult)
@@ -71,6 +118,157 @@ SmBSplineCurve* as_bspline_curve(SmCurve* c)
         throw std::invalid_argument("curve is not a B-spline curve");
     return b;
 }
+
+// The quasi-definite system K = [[M, C^T], [C, -delta s I]] (s: M's mean diagonal), factorised once and
+// solved many times; each solve refines against delta = 0. Supernodal LDL^T from Accelerate on macOS,
+// Eigen's simplicial LDL^T elsewhere (or on request).
+class KKTFactor
+{
+public:
+    KKTFactor(const SpMat& M, const SpMat& C, double delta, bool eigen_only)
+        : n_(M.rows()), m_(C.rows())
+    {
+        using clock = std::chrono::steady_clock;
+        auto t0 = clock::now();
+        std::vector<Eigen::Triplet<double, std::int64_t>> t;
+        t.reserve(static_cast<size_t>(M.nonZeros() + 2 * C.nonZeros() + m_));
+        double scale = 0.0;
+        for (std::int64_t k = 0; k < M.outerSize(); ++k)
+            for (SpMat::InnerIterator it(M, k); it; ++it)
+            {
+                t.emplace_back(it.row(), it.col(), it.value());
+                if (it.row() == it.col())
+                    scale += it.value();
+            }
+        scale = n_ > 0 ? scale / static_cast<double>(n_) : 1.0;
+        for (std::int64_t k = 0; k < C.outerSize(); ++k)
+            for (SpMat::InnerIterator it(C, k); it; ++it)
+            {
+                t.emplace_back(n_ + it.row(), it.col(), it.value());
+                t.emplace_back(it.col(), n_ + it.row(), it.value());
+            }
+        reg_ = delta * scale;
+        for (std::int64_t i = 0; i < m_; ++i)
+            t.emplace_back(n_ + i, n_ + i, -reg_);
+        K_ = SpMat(n_ + m_, n_ + m_);
+        K_.setFromTriplets(t.begin(), t.end());
+        const SpMat& K = K_;
+        auto t1 = clock::now();
+#ifdef __APPLE__
+        if (!eigen_only)
+        {
+            const std::int64_t N = n_ + m_;
+            cs_.assign(N + 1, 0);
+            ri_.reserve(static_cast<size_t>(K.nonZeros() / 2 + N));
+            va_.reserve(ri_.capacity());
+            for (std::int64_t k = 0; k < N; ++k)
+            {
+                for (SpMat::InnerIterator it(K, k); it; ++it)
+                    if (it.row() >= k)
+                    {
+                        ri_.push_back(static_cast<int>(it.row()));
+                        va_.push_back(it.value());
+                    }
+                cs_[k + 1] = static_cast<long>(ri_.size());
+            }
+            SparseMatrixStructure st{};
+            st.rowCount = static_cast<int>(N);
+            st.columnCount = static_cast<int>(N);
+            st.columnStarts = cs_.data();
+            st.rowIndices = ri_.data();
+            st.attributes.kind = SparseSymmetric;
+            st.attributes.triangle = SparseLowerTriangle;
+            st.blockSize = 1;
+            SparseSymbolicFactorOptions so{};
+            so.control = SparseDefaultControl;
+            so.orderMethod = SparseOrderDefault;
+            so.malloc = [](size_t sz) { return std::malloc(sz); };
+            so.free = std::free;
+            sym_ = SparseFactor(SparseFactorizationLDLTUnpivoted, st, so);
+            if (sym_.status != SparseStatusOK)
+                throw std::runtime_error("KKT analysis failed");
+            auto t2 = clock::now();
+            SparseMatrix_Double A{st, va_.data()};
+            fac_ = SparseFactor(sym_, A);
+            if (fac_.status != SparseStatusOK)
+            {
+                SparseCleanup(sym_);
+                throw std::runtime_error("KKT factorisation failed");
+            }
+            accelerate_ = true;
+            auto t3 = clock::now();
+            times_ = {sec(t1 - t0), sec(t2 - t1), sec(t3 - t2)};
+            return;
+        }
+#endif
+        ldlt_ = std::make_unique<Eigen::SimplicialLDLT<SpMat>>();
+        ldlt_->analyzePattern(K);
+        auto t2 = clock::now();
+        ldlt_->factorize(K);
+        if (ldlt_->info() != Eigen::Success)
+            throw std::runtime_error("KKT factorisation failed");
+        auto t3 = clock::now();
+        times_ = {sec(t1 - t0), sec(t2 - t1), sec(t3 - t2)};
+    }
+    ~KKTFactor()
+    {
+#ifdef __APPLE__
+        if (accelerate_)
+        {
+            SparseCleanup(fac_);
+            SparseCleanup(sym_);
+        }
+#endif
+    }
+    KKTFactor(const KKTFactor&) = delete;
+    KKTFactor& operator=(const KKTFactor&) = delete;
+
+    // [x; y] for the right side [rx; ry], with a few refinement steps against the delta = 0 system
+    Eigen::VectorXd solve(const Eigen::VectorXd& b, int refine = 3) const
+    {
+        Eigen::VectorXd s = raw(b);
+        for (int it = 0; it < refine; ++it)
+        {
+            Eigen::VectorXd r = b - K_ * s;                    // against delta = 0: K0 s = K s + reg [0; s_y]
+            r.tail(m_) -= reg_ * s.tail(m_);
+            s += raw(r);
+        }
+        return s;
+    }
+    std::int64_t n() const { return n_; }
+    std::int64_t m() const { return m_; }
+    bool accelerate() const { return accelerate_; }
+    const std::vector<double>& times() const { return times_; }
+
+private:
+    static double sec(std::chrono::steady_clock::duration d) { return std::chrono::duration<double>(d).count(); }
+    Eigen::VectorXd raw(const Eigen::VectorXd& b) const
+    {
+#ifdef __APPLE__
+        if (accelerate_)
+        {
+            Eigen::VectorXd out = b;
+            DenseVector_Double xv{static_cast<int>(out.size()), out.data()};
+            SparseSolve(fac_, xv);
+            return out;
+        }
+#endif
+        return ldlt_->solve(b);
+    }
+    std::int64_t n_, m_;
+    SpMat K_;
+    double reg_ = 0.0;
+    std::unique_ptr<Eigen::SimplicialLDLT<SpMat>> ldlt_;
+    bool accelerate_ = false;
+    std::vector<double> times_;
+#ifdef __APPLE__
+    std::vector<long> cs_;
+    std::vector<int> ri_;
+    std::vector<double> va_;
+    SparseOpaqueSymbolicFactorization sym_{};
+    SparseOpaqueFactorization_Double fac_{};
+#endif
+};
 
 } // namespace
 
@@ -383,4 +581,62 @@ void bind_usd(py::module_& m)
         py::arg("delete_edges") = true, py::arg("region_nesting") = true,
         "Delete faces (and edges/vertices left dangling) from a Brep, in place. "
         "Face handles passed here are stale afterwards.");
+
+    py::class_<KKTFactor>(ext, "KKTFactor",
+        "The system [[M, C^T], [C, -delta I]] factorised once (supernodal LDL^T from Accelerate on macOS, "
+        "Eigen's simplicial LDL^T elsewhere); solve(rx, ry) returns x, the move of least x^T M x - 2 rx^T x "
+        "meeting C x = ry, for any number of right sides.")
+        .def(py::init([](const I64& mr, const I64& mc, const F64& mv, std::int64_t n,
+                         const I64& cr, const I64& cc, const F64& cv, std::int64_t m, double delta, bool eigen_only) {
+                 SpMat M = sparse_from(mr, mc, mv, n, n);
+                 SpMat C = sparse_from(cr, cc, cv, m, n);
+                 py::gil_scoped_release nogil;
+                 return std::make_unique<KKTFactor>(M, C, delta, eigen_only);
+             }),
+             py::arg("mr"), py::arg("mc"), py::arg("mv"), py::arg("n"),
+             py::arg("cr"), py::arg("cc"), py::arg("cv"), py::arg("m"),
+             py::arg("delta") = 1e-12, py::arg("eigen_only") = false)
+        .def("solve",
+             [](const KKTFactor& k, const F64& rx, const F64& ry, int refine) {
+                 if (rx.size() != k.n() || ry.size() != k.m())
+                     throw std::invalid_argument("rx must have n entries, ry m");
+                 Eigen::VectorXd b(k.n() + k.m());
+                 std::copy(rx.data(), rx.data() + k.n(), b.data());
+                 std::copy(ry.data(), ry.data() + k.m(), b.data() + k.n());
+                 Eigen::VectorXd x;
+                 {
+                     py::gil_scoped_release nogil;
+                     x = k.solve(b, refine).head(k.n());
+                 }
+                 return to_numpy(x);
+             },
+             py::arg("rx"), py::arg("ry"), py::arg("refine") = 3)
+        .def_property_readonly("accelerate", &KKTFactor::accelerate)
+        .def_property_readonly("times", &KKTFactor::times);
+
+    ext.def("sparse_kkt",
+        [](const I64& mr, const I64& mc, const F64& mv, std::int64_t n,
+           const I64& cr, const I64& cc, const F64& cv, std::int64_t m,
+           const F64& rx, const F64& ry, double delta, bool eigen_only) {
+            if (rx.size() != n || ry.size() != m)
+                throw std::invalid_argument("rx must have n entries, ry m");
+            SpMat M = sparse_from(mr, mc, mv, n, n);
+            SpMat C = sparse_from(cr, cc, cv, m, n);
+            Eigen::VectorXd x;
+            {
+                py::gil_scoped_release nogil;
+                KKTFactor k(M, C, delta, eigen_only);
+                Eigen::VectorXd b(n + m);
+                std::copy(rx.data(), rx.data() + n, b.data());
+                std::copy(ry.data(), ry.data() + m, b.data() + n);
+                x = k.solve(b).head(n);
+            }
+            return to_numpy(x);
+        },
+        py::arg("mr"), py::arg("mc"), py::arg("mv"), py::arg("n"),
+        py::arg("cr"), py::arg("cc"), py::arg("cv"), py::arg("m"),
+        py::arg("rx"), py::arg("ry"), py::arg("delta") = 1e-12, py::arg("eigen_only") = false,
+        "Solve the quasi-definite system [[M, C^T], [C, -delta I]] [x; y] = [rx; ry] once; "
+        "with rx = 0 that is the move x of least x^T M x meeting C x = ry. Returns x.");
+
 }

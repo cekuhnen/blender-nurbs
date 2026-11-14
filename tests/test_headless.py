@@ -7744,13 +7744,15 @@ _ocube = _sd_obj("SD_Cube", lambda b_: _bmx.ops.create_cube(b_, size=1.0), level
 n_, s_, no_, b_ = _sd_run(_ocube)
 _g1, _sh = _sd_seams(b_)
 _dv = _sd_dev(_ocube, b_)
-_cv = max(ext.surface_cvs(f_.surface())["count_u"] * ext.surface_cvs(f_.surface())["count_v"] for f_ in b_.faces())
-_sdr["a SubD cube (eight star points): six faces, a closed solid, G1 within 0.05 degrees along every edge and "
-     "at the star points, within 0.1% of its size of the SubD surface"] = \
-    b_.face_count() == 6 and b_.is_manifold_solid() and _g1 < 0.06 and _sh == 0 and _dv < 1e-3 * math.sqrt(3) \
-    and no_ is None and "G1 within" in s_
-_sdr["... G1: 4 even spans and a sliver knot by each star point, 9 x 9 CVs a face"] = _cv == 9 * 9
-print("   SubD cube:", s_, f"| measured G1 {_g1:.4f} deg, deviation {_dv * 1000:.3f} mm, {_cv} CVs")
+_cvs = [ext.surface_cvs(f_.surface()) for f_ in b_.faces()]
+_sdr["a SubD cube (eight star points), G2 by default: six faces, a closed solid, G1 within 0.01 degrees along "
+     "every edge and at the star points, within 0.1% of its size of the SubD surface"] = \
+    b_.face_count() == 6 and b_.is_manifold_solid() and _g1 < 0.01 and _sh == 0 and _dv < 1e-3 * math.sqrt(3) \
+    and no_ is None and "G2 within 0.00%" in s_
+_sdr["... its faces by star points: degree 6, 12 x 12 CVs, knots [0^7, .5^5, 1^7] (C1 between 2 x 2 pieces)"] = \
+    all(c_["degree_u"] == 6 and c_["degree_v"] == 6 and c_["count_u"] == 12 and c_["count_v"] == 12
+        and np.allclose(c_["knots_u"], [0.0] * 7 + [0.5] * 5 + [1.0] * 7) for c_ in _cvs)
+print("   SubD cube:", s_, f"| measured G1 {_g1:.4f} deg, deviation {_dv * 1000:.3f} mm")
 def _torus(b_, R_=1.0, r_=0.4, nu_=8, nv_=6):
     vs_ = [b_.verts.new(((R_ + r_ * math.cos(v2_)) * math.cos(u2_), (R_ + r_ * math.cos(v2_)) * math.sin(u2_), r_ * math.sin(v2_)))
            for u2_ in np.linspace(0, 2 * math.pi, nu_ + 1)[:-1] for v2_ in np.linspace(0, 2 * math.pi, nv_ + 1)[:-1]]
@@ -7761,74 +7763,55 @@ def _torus(b_, R_=1.0, r_=0.4, nu_=8, nv_=6):
 _otor = _sd_obj("SD_Torus", _torus, levels=4)
 n_, s_, no_, b_ = _sd_run(_otor)
 _g1, _sh = _sd_seams(b_)
-_sdr["an all-ordinary cage (a torus): every face exact, 16 CVs, C2 across edges"] = \
-    b_.face_count() == 48 and b_.is_manifold_solid() and "1 even span" in s_ and _g1 < 1e-3 \
+_sdr["an all-ordinary cage (a torus): every face one bicubic span (16 CVs), the SubD exactly, C2 across edges"] = \
+    b_.face_count() == 48 and b_.is_manifold_solid() and "one bicubic span each" in s_ and _g1 < 1e-3 \
     and all(ext.surface_cvs(f_.surface())["count_u"] == 4 and ext.surface_cvs(f_.surface())["count_v"] == 4 for f_ in b_.faces()) \
     and _sd_dev(_otor, b_, 120) < 1e-5
 _ocr = _sd_obj("SD_Crease", lambda b_: _bmx.ops.create_cube(b_, size=1.0),
                crease=lambda me_, e_: all(me_.vertices[v_].co.z > 0.4 for v_ in e_.vertices), levels=4)
 n_, s_, no_, b_ = _sd_run(_ocr)
 _g1, _sh = _sd_seams(b_)
-_sdr["a creased top ring (crease 1.0): its four edges sharp, the others G1, a closed solid near the SubD surface"] = \
-    b_.face_count() == 6 and b_.is_manifold_solid() and _sh == 4 and _g1 < 0.06 and _sd_dev(_ocr, b_) < 1e-3 * math.sqrt(3)
+_sdr["a creased top ring (crease 1.0): its four edges sharp, the others G1 and G2, a closed solid near the SubD surface"] = \
+    b_.face_count() == 6 and b_.is_manifold_solid() and _sh == 4 and _g1 < 0.01 and _sd_dev(_ocr, b_) < 1e-3 * math.sqrt(3) \
+    and no_ is None
 print("   creased cube:", s_, f"| measured G1 {_g1:.4f} deg, {_sh} sharp edges")
 _ocyl = _sd_obj("SD_Cyl", lambda b_: _bmx.ops.create_cone(b_, cap_ends=True, segments=8, radius1=0.5, radius2=0.5, depth=1.0))
 n_, s_, no_, b_ = _sd_run(_ocyl)
 _g1, _sh = _sd_seams(b_)
-_sdr["n-gon caps (a cylinder): quads after one subdivision step, a closed G1 solid"] = \
-    b_.face_count() == 48 and b_.is_manifold_solid() and _g1 < 0.06 and _sh == 0
-# the CV rows run on from face to face: away from star points the CVs either side of an edge make the
-# surface's own C1 join (first CV steps over first spans equal and opposite); every face has even knots, with
-# a sliver knot added only at the ends of the strips that reach a star point
-_ogrid = _sd_obj("SD_Grid", lambda b_: (_bmx.ops.create_cube(b_, size=1.0),
-                                        _bmx.ops.subdivide_edges(b_, edges=b_.edges[:], cuts=2, use_grid_fill=True)))
-_V, _F, _S, _M = _sdb.cage(_ogrid, ctx.evaluated_depsgraph_get())
-_cv_ = _sdb.Converter(_V, _F, _S)
-_nets, _kns, _st = _cv_.run()
-_irr = set(_cv_.irregular())
-def _step(f_, k_):
-    """Face f_'s first knot span into the face from its side k_."""
-    ku_, kv_ = _kns[f_]
-    return (kv_[4], 1 - ku_[-5], 1 - kv_[-5], ku_[4])[k_]
-_flow = 0.0
-for _e, _uses in _cv_.edges.items():
-    if _e[0] in _irr or _e[1] in _irr or len(_uses) != 2:
-        continue
-    _rows = []
-    for _f, _k, _fl in _uses:
-        _cells, _din = _sdb._side_cells(_nets[_f].shape[0] - 1, _k, _nets[_f].shape[1] - 1)
-        _cells = _cells[::-1] if _fl else _cells
-        _rows.append((np.array([_nets[_f][c_] for c_ in _cells]),
-                      np.array([_nets[_f][c_[0] + _din[0], c_[1] + _din[1]] for c_ in _cells]) , _step(_f, _k)))
-    (_P0, _A, _ha), (_, _B, _hb) = _rows
-    _flow = max(_flow, float(np.abs((_A - _P0) / _ha + (_B - _P0) / _hb).max()))
-_spans = sorted({len(k_[0]) - 7 for k_ in _kns} | {len(k_[1]) - 7 for k_ in _kns})
-_sdr["CV rows run on across the edges between faces (the surface's own C1 join), 4 even spans, a sliver knot "
-     "only where a strip reaches a star point"] = \
-    _flow < 1e-8 and _spans[0] == 4 and _spans[-1] <= 6 and _st["normal"] < 0.001
-print("   flow:", f"{_flow:.1e}", "spans per strip", _spans, _st)
-# G1 and G2: even spans (G1 4, G2 8); next to each star point the CVs are solved so the faces join exactly
-# past a 1/512 sliver -- C1 (G1) or C2 (G2) -- and meet tangentially at the point too
-for _nm, _ob in (("a SubD cube", _ocube), ("n-gon caps (a cylinder)", _ocyl)):
+_sdr["n-gon caps (a cylinder): quads after one subdivision step, a closed G2 solid"] = \
+    b_.face_count() == 48 and b_.is_manifold_solid() and _g1 < 0.01 and _sh == 0 and no_ is None
+# G1 and G2 on the converter's own measures (Continuity Check's): exact along every edge and at the star points,
+# close to the SubD; a face with no star corner keeps the SubD's own bicubic span, so its joins are C2
+for _nm, _ob in (("a SubD cube", _ocube), ("n-gon caps (a cylinder)", _ocyl), ("a creased cube", _ocr)):
     _V, _F, _S, _M = _sdb.cage(_ob, ctx.evaluated_depsgraph_get())
-    _res = {}
+    _res, _out = {}, {}
     for _g2 in (False, True):
-        _c2 = _sdb.Converter(_V, _F, _S)
-        _n2, _k2, _s2 = _c2.run(g2=_g2)
-        _res[_g2] = _s2
-        print("  ", "G2" if _g2 else "G1", _nm, _s2)
-        _ok = _s2["normal"] <= 0.001 and _s2["normal_all"] <= 0.05 and _s2["joins"] < 1e-6 \
-            and _s2["deviation"] < 5e-3 * _c2.size
+        _n2, _k2, _s2, _c2 = _sdb.build(_V, _F, _S, g2=_g2)
+        _res[_g2], _out[_g2] = _s2, (_n2, _k2, _c2)
+        print("  ", "G2" if _g2 else "G1", _nm, {k_: v_ for k_, v_ in _s2.items() if k_ != "solver"},
+              "newton", len(_s2["solver"].get("newton", [])), f"{_s2['solver'].get('seconds', 0):.2f}s")
+        _ok = _s2["normal"] <= 0.001 and _s2["normal_all"] <= 0.01 and _s2["deviation"] < 3e-3 * _c2.size \
+            and _s2["fallback"] is None
         if _g2:
-            _ok = _ok and _s2["curvature"] <= 0.001
-        _sdr[f"{'G2' if _g2 else 'G1'} on {_nm}: G1 within 0.001 deg across every edge (0.05 at the star points)"
-             + (", G2 within 0.1 %" if _g2 else "") + ", the joins exact, within 0.5 % of its size of the SubD "
-             "surface"] = _ok
-    _sdr[f"G1 on {_nm} needs fewer CVs than G2"] = _res[False]["cvs"] < _res[True]["cvs"]
-new_, s_, no_, b_ = _sd_run(_ocube, g2=True)
+            _ok = _ok and _s2["curvature"] <= 1e-4
+        _sdr[f"{'G2' if _g2 else 'G1'} on {_nm}: G1 within 0.001 deg across every edge (0.01 at the star points)"
+             + (", G2 within 0.01 %" if _g2 else "") + ", within 0.3 % of its size of the SubD surface"] = _ok
+    _n1, _k1, _c1 = _out[False]
+    _six = {f_ for f_, (ku_, _) in enumerate(_k1) if len(ku_) != 8}
+    _ed = {e_ for e_, u_ in _c1.edges.items() if len(u_) == 2 and e_ not in _S and any(f_ in _six for f_, _, _ in u_)}
+    _cg1 = max((j_ for j_, _ in _c1.curvature_jumps(_n1, _k1, edges=_ed).values()), default=0.0)
+    _sdr[f"G2 on {_nm} bends alike across the edges at least as well as G1 (G1 {100 * _cg1:.2f} %)"] = \
+        _res[True]["curvature"] <= _cg1 + 1e-9
+    _sdr[f"G1 on {_nm} is the lighter net ({_res[False]['cvs']} CVs, G2 {_res[True]['cvs']})"] = \
+        _res[False]["cvs"] < 0.8 * _res[True]["cvs"]
+new_, s_, no_, b_ = _sd_run(_ocube, g2=False)
 _g1, _sh = _sd_seams(b_)
-_sdr["G2 builds a closed solid, its summary gives the curvature difference"] = \
-    b_.is_manifold_solid() and "G2 within" in s_ and _g1 < 0.06 and no_ is None
+_cvs = [ext.surface_cvs(f_.surface()) for f_ in b_.faces()]
+_sdr["G1 builds a closed solid of degree-5 faces by the star points (10 x 10 CVs, knots [0^6, .5^4, 1^6]), "
+     "its summary leaves G2 out"] = \
+    b_.is_manifold_solid() and "G1 within" in s_ and "G2" not in s_ and _g1 < 0.01 and no_ is None \
+    and all(c_["degree_u"] == 5 and c_["count_u"] == 10 and c_["count_v"] == 10
+            and np.allclose(c_["knots_v"], [0.0] * 6 + [0.5] * 4 + [1.0] * 6) for c_ in _cvs)
 # the operator: the selected meshes, originals hidden, the new bodies selected; not for NURBS objects
 for o_ in ctx.view_layer.objects:
     o_.select_set(o_ in (_ocube, _otor))

@@ -488,38 +488,38 @@ Under Convert, and in Blender's **Object › Convert › NURBS Body from SubD (N
 Subdivision Surface models into NURBS bodies of the smooth surface you see, built from the control cage (the mesh
 before its Subdivision Surface modifier), with **one face per cage face**.
 
-* **Even nets from the cage.** Catmull-Clark's surface is a uniform bicubic B-spline wherever the mesh is regular, so
-  every face gets even knots (**G1: 4 spans, G2: 8**) and its CVs are the cage subdivided that far, borders clamped.
-  The CV rows run on from face to face as the subdivided mesh does, evenly spaced, and the faces ARE the SubD surface
-  and join with matching curvature (C2) everywhere but in the first span next to a star point (a corner where 3, 5
-  or more edges meet).
-* **At each star point** no bicubic faces can be the surface and also join smoothly, so the CVs within four of the
-  point are solved for, one small linear solve per point. One extra knot 1/512 of the edge from the point (inside
-  the ends Continuity Check leaves out) frees each face's corner, so that past it the faces join **exactly**:
-  parametrically C1 in G1, C2 in G2. Within that, they stay as close as they can to the SubD surface and to the
-  subdivided cage's CVs. The first two CVs of every edge at the point lie on Catmull-Clark's own tangent there (an
-  affine-regular n-gon in the tangent plane), so the faces meet tangentially at the point too.
-* **G1 is G1, G2 is G2:** Continuity Check (which leaves 1.5 % of each edge's ends out) reads G1 0.000° on every edge
-  of a jack (3-, 5- and 6-edge star points), a boot (with creases) and a cylinder with 8-edge poles in G1, and G1
-  0.000° and G2 0.00 % in G2. A G1 body does not match curvature next to the star points (it is not G2 there). At
-  the star points themselves G1 holds within 0.01° (G1) or 0.04° (G2).
-* **Light:** the jack is 2,790 CVs in G1 (4 spans), 6,006 in G2 (8 spans); the boot 2,466 and 5,330.
-* **Close to the SubD surface:** exactly on it away from the star points; next to them within about 0.5 % of the
-  model's size in G1 and 0.25 % in G2 (Spans 16 brings it closer).
-* **Speed:** the jack about 0.95 s, the boot about 0.7 s (G1 or G2): 0.2-0.3 s for the nets, 0.15 s for the kernel
-  to build the body, the rest for the display mesh (mostly its tessellation, which follows the display settings, not
-  the CV count). The continuity in the summary is measured only on the edges the star points' joins touched; the
-  others join exactly by construction.
-* **It asks first:** a dialog with **Continuity** (G1 or G2), **Spans** (Auto: 4 for G1, 8 for G2; or 4, 8, 16),
-  **Angle**, **Curvature %** (G2) and **Hide Meshes** (the SubD objects stay, hidden in the viewport and in renders);
-  **Convert** runs it. The same settings stay in the Adjust Last Operation panel afterwards.
-* A cage without star points or odd creases (a torus) becomes exact faces of 16 CVs (one span).
-* **Creases** (edge crease 1.0) become sharp edges: each side follows its own surface. Open borders stay open (a sheet).
+* **The SubD itself where it can be.** Catmull-Clark's surface is a bicubic B-spline wherever the mesh is regular,
+  so every face without a star point (a corner where 3, 5 or more edges meet) is **one bicubic span**, 16 CVs: exactly
+  the SubD surface, joining its neighbours with matching curvature (C2).
+* **Higher degree at the star points.** No bicubic faces can be the surface there and also join smoothly, so a face
+  with a star corner becomes **2 x 2 polynomial pieces**, evenly spread like the subdivided cage (knots 0, ½, 1) and
+  smooth across its own middle lines: **degree 6 in G2** (12 x 12 CVs), **degree 5 in G1** (10 x 10 CVs, the lighter
+  net). It is fitted to the SubD, then moved as little and as smoothly as possible until it joins every neighbour
+  **exactly**: the normals agree all along each edge (G1) and, in G2, the curvature too, right to the star point.
+  No extra knots, no flattened points: the faces bend through the star point as the SubD does.
+* **G1 is G1, G2 is G2:** Continuity Check reads G1 0.000° and G2 0.00 % on every edge of a jack (3-, 5- and 6-edge
+  star points), a boot (creases, corners) and a cylinder with 8-edge poles, star points included. In G1 the faces by
+  star points are only tangent: their curvature may differ across edges there.
+* **Light:** the jack is 2,792 CVs in G1, 3,936 in G2; the boot 2,308 and 3,232. (Lower degrees than 5 cannot join
+  G1 at 5-edge star points without bending their edges there into near-straight curves: they would leave the SubD
+  by about 1 % of the model's size.)
+* **Close to the SubD surface:** exactly on it on the bicubic faces; on the others within about 0.15 % of the
+  model's size in G2 (the jack 0.11 %, the boot 0.07 %) and 0.25 % in G1 (the jack 0.24 %, the boot 0.06 %). Next to a star point with 5 or more edges the SubD's own curvature
+  grows without bound; there the faces stay a little smoother than the SubD.
+* **Speed:** the jack about 2 s in G2 (0.55 s in G1), the boot about 1.5 s (0.6 s), on Apple Silicon. The joins are
+  one sparse solve per step (Apple's Accelerate on macOS; Windows and Linux use a slower solver, a few times longer).
+* **It asks first:** a dialog with **Continuity** (G1 or G2; G2 by default), **Angle** and **Curvature %** (G2: a
+  join further off than these is reported) and **Hide Meshes** (the SubD objects stay, hidden in the viewport and in
+  renders); **Convert** runs it. The same settings stay in the Adjust Last Operation panel afterwards.
+* A cage without star points or odd creases (a torus) becomes exact faces of 16 CVs.
+* **Creases** (edge crease 1.0) become sharp edges along the SubD's own crease curves: each side follows its own
+  surface, and the smooth faces around a crease's star point join exactly within their side. Open borders stay
+  open (a sheet).
 * Triangles and n-gons in the cage are split into quads first (one subdivision step), like Catmull-Clark does.
-* The report gives faces, spans, CVs, the largest angle across an edge (and at the star points), in G2 the curvature
-  difference, and how close the faces stay to the SubD surface, e.g. *38 faces · 8 even spans · 6,006 CVs · G1
-  within 0.000° (0.037° at the star points) · G2 within 0.00% · within 2.0 mm of the SubD surface (exactly on it
-  away from the 22 star points)*.
+* The report gives faces, how many are of the higher degree, CVs, the largest angle across an edge (and at the star points),
+  in G2 the curvature difference, and how close the faces stay to the SubD surface, e.g. *38 faces · 26 of degree 6
+  by the 22 star points, the rest one bicubic span · 3,936 CVs · G1 within 0.000° · G2 within 0.00% · within 2.8 mm
+  of the SubD surface (exactly on it on the one-span faces)*.
 * Modifiers other than the Subdivision Surface count (a Mirror, for instance). Creases below 1.0 are treated as smooth.
 * Not yet: partial creases (below 1.0).
 

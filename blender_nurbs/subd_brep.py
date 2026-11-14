@@ -318,6 +318,7 @@ class Levels:
                 limit = cc_limit(Vk, Fk, Kk)
                 self.corners = np.array([[limit[grid[f, i, j]] for i, j in ((0, 0), (N, 0), (N, N), (0, N))]
                                          for f in range(m)])
+                self.limit = limit[grid]                           # (m, N + 1, N + 1, 3): the surface at (i, j) / N
 
     @staticmethod
     def _extend(V, F, grid, N, hard, near=None):
@@ -451,9 +452,10 @@ def rows(knots, u, v, du=0, dv=0, kv=None):
 
 def derivs(net, ku, kv, u, v, ders):
     """{(a, b): d^(a+b) S / du^a dv^b at the points (u, v)} of a face's net,
-    from 1D bases (no dense rows)."""
-    Bu = {a: basis(ku, u, a) for a in {a for a, _ in ders}}
-    Bv = {b: basis(kv, v, b) for b in {b for _, b in ders}}
+    from 1D bases (no dense rows); the degrees from the (clamped) knots."""
+    pu, pv = int(np.count_nonzero(ku == ku[0])) - 1, int(np.count_nonzero(kv == kv[0])) - 1
+    Bu = {a: basis(ku, u, a, pu) for a in {a for a, _ in ders}}
+    Bv = {b: basis(kv, v, b, pv) for b in {b for _, b in ders}}
     X = {a: np.tensordot(B, net, axes=(1, 0)) for a, B in Bu.items()}      # (t, nv, 3); no einsum path search
     return {(a, b): np.einsum("tj,tjc->tc", Bv[b], X[a]) for a, b in ders}  # (it was 40% of einsum's time)
 
@@ -619,10 +621,11 @@ class Converter:
                     todo.append(eo)
         return ring, start, ok
 
-    def layout(self, L):
+    def layout(self, L, sliver=True):
         """Every face's knots (u, v), its two edge rings': 2^L even spans and a
-        sliver knot at each end of the ring that reaches an irregular vertex;
-        and per face corner how far in that knot sits (2^-t; 0: an ordinary corner)."""
+        sliver knot at each end of the ring that reaches an irregular vertex
+        (none without sliver); and per face corner how far in that knot sits
+        (2^-t; 0: an ordinary corner)."""
         ring, start, ok = self.strips()
         a, b = np.zeros(len(ok), int), np.zeros(len(ok), int)
         for e, r in ring.items():
@@ -632,7 +635,7 @@ class Converter:
         for r, fine in enumerate(ok):
             if not fine:                                           # a ring that turns round: both ends alike
                 a[r] = b[r] = a[r] | b[r]
-        kr = [even_knots(a[r], b[r], L) for r in range(len(ok))]
+        kr = [even_knots(a[r] and sliver, b[r] and sliver, L) for r in range(len(ok))]
         self.fk, self.ctop = [], []
         for fv in self.F:
             ks = []
@@ -696,11 +699,12 @@ class Converter:
         tov = (fv[3], fv[2], fv[1], fv[0])[i]
         return (ci, cj), (ci + di, cj), (ci, cj + dj), (ci + di, cj + dj), tou, tov
 
-    def natural(self, L):
+    def natural(self, L, sliver=True):
         """Every face's net on its knots: the cage subdivided to level L, its
-        borders clamped, the sliver knots inserted, the corners on their exact
-        limit points -- the SubD surface but the first span at irregular vertices."""
-        self.layout(L)
+        borders clamped, the sliver knots inserted (unless not sliver), the
+        corners on their exact limit points -- the SubD surface but the first
+        span at irregular vertices."""
+        self.layout(L, sliver)
         Lb = max(L, 2) if self.irr else L
         self.L = Lb
         deep = {}                                                  # per vertex the deepest any face there needs
@@ -970,7 +974,9 @@ class Converter:
         D = derivs(net, ku, kv, u, v, ((1, 0), (0, 1), (2, 0), (1, 1), (0, 2)))
         su, sv = D[(1, 0)], D[(0, 1)]
         n = np.cross(su, sv)
-        n /= np.maximum(np.linalg.norm(n, axis=1), 1e-300)[:, None]
+        ln = np.linalg.norm(n, axis=1)
+        flat = ln < 1e-7 * np.linalg.norm(su, axis=1) * np.linalg.norm(sv, axis=1)       # a corner folded flat
+        n /= np.maximum(ln, 1e-300)[:, None]
         (au, av) = ALONG[k]
         T = (-1.0 if flip else 1.0) * (au * su + av * sv)
         b = np.cross(n, T)
@@ -979,7 +985,8 @@ class Converter:
         p_, q_ = (su * b).sum(1), (sv * b).sum(1)
         den = np.maximum(E * G_ - F_ * F_, 1e-300)
         a_, c_ = (G_ * p_ - F_ * q_) / den, (E * q_ - F_ * p_) / den      # b in (u, v)
-        return a_ * a_ * (D[(2, 0)] * n).sum(1) + 2 * a_ * c_ * (D[(1, 1)] * n).sum(1) + c_ * c_ * (D[(0, 2)] * n).sum(1), n
+        kn = a_ * a_ * (D[(2, 0)] * n).sum(1) + 2 * a_ * c_ * (D[(1, 1)] * n).sum(1) + c_ * c_ * (D[(0, 2)] * n).sum(1)
+        return np.where(flat, np.nan, kn), n
 
     def _by_length(self, net, ku, kv, k, flip, n, skip):
         """Edge parameters (edge direction) evenly spaced by arc length from
@@ -1015,8 +1022,8 @@ class Converter:
             u0, v0 = SIDE_UV[k0](1 - t if fl0 else t)
             L = float(np.linalg.norm(np.diff(derivs(nets[f0], *knots[f0], u0, v0, ((0, 0),))[(0, 0)], axis=0),
                                      axis=1).sum()) or 1.0
-            scale = max(np.abs(ka).max(), np.abs(kb).max(), kmax[uses[0][0]], kmax[uses[1][0]], 0.05 / L)
-            rel = np.abs(ka - kb) / scale
+            scale = max(np.nanmax(np.abs(np.r_[ka, kb, 0.0])), kmax[uses[0][0]], kmax[uses[1][0]], 0.05 / L)
+            rel = np.nan_to_num(np.abs(ka - kb) / scale)                  # (none where a corner folds flat)
             out[e] = (float(rel.max()), float(t[rel.argmax()]))
         return out
 
@@ -1046,15 +1053,19 @@ class Converter:
             n_skip = len(t)
             if also_ends:
                 t = np.r_[t, t_all]
-            ns = []
+            ns, flat = [], np.zeros(len(t), bool)
             for f, k, flip in uses:
                 u, v = SIDE_UV[k](1 - t if flip else t)
                 D = derivs(nets[f], *knots[f], u, v, ((1, 0), (0, 1)))
                 (au, av), (iu, iv) = ALONG[k], INWARD[k]
                 T = (-1.0 if flip else 1.0) * (au * D[(1, 0)] + av * D[(0, 1)])
-                n = np.cross(T, iu * D[(1, 0)] + iv * D[(0, 1)])
-                ns.append(n / np.maximum(np.linalg.norm(n, axis=1), 1e-300)[:, None])
+                I = iu * D[(1, 0)] + iv * D[(0, 1)]
+                n = np.cross(T, I)
+                ln = np.linalg.norm(n, axis=1)
+                flat |= ln < 1e-7 * np.linalg.norm(T, axis=1) * np.linalg.norm(I, axis=1)   # a corner folded flat:
+                ns.append(n / np.maximum(ln, 1e-300)[:, None])                                # no normal there
             ang = np.degrees(np.arccos(np.clip(np.abs((ns[0] * ns[1]).sum(1)), -1, 1)))
+            ang[flat] = 0.0
             a, ta = ang[:n_skip], t[:n_skip]
             out[e] = (float(a.max()), float(ta[a.argmax()]))
             if also_ends:
@@ -1068,16 +1079,50 @@ def _length(context, x):
     return bpy.utils.units.to_string(us.system, 'LENGTH', x * (us.scale_length or 1.0), precision=3)
 
 
-def convert(context, obj, angle_tol=0.05, spans=None, g2=False, curv_tol=0.02):
-    """(new NURBS object, summary text, note) for a SubD (or any quad) mesh
-    object; spans: even spans per face (None: Auto)."""
+def build(V, F, sharp, g2=True, angle_tol=0.05, curv_tol=0.02):
+    """(nets, knots, stats, conv) for a quad cage: faces without a star corner one
+    bicubic span (the SubD exactly), the others 2 x 2 pieces joined exactly, of
+    degree 6 in G2, 5 in G1 (subd_g2); the joins measured as Continuity Check
+    would."""
+    import sys
+    from . import subd_g2
+    conv = Converter(V, F, sharp, angle_tol, curv_tol)
+    info, fallback = {}, None
+    if conv.irr:
+        try:
+            nets, knots, info = subd_g2.build(sys.modules[__name__], conv, g2=g2, kernel=store._k()[1])
+        except (RuntimeError, ValueError, np.linalg.LinAlgError, AttributeError) as exc:
+            # the solve failed (or a kernel older than this add-on, without KKTFactor, is loaded): the earlier joints
+            fallback = str(exc) if not isinstance(exc, AttributeError) else "restart Blender to load the new kernel"
+            nets, knots, _ = conv.run(g2=g2)
+            knots = list(knots)
+    else:
+        nets = conv.natural(0, sliver=False)
+        knots = list(conv.fk)
+    six = {f for f, (ku, _) in enumerate(knots) if len(ku) != 8}
+    edges = {e for e, uses in conv.edges.items() if len(uses) == 2 and e not in sharp
+             and any(f in six for f, _, _ in uses)}                # the others join as the SubD does: C2
+    ends, every = conv.edge_jumps(nets, knots, CHECK_ENDS, edges=edges, also_ends=True)
+    st = {"normal": max((j for j, _ in ends.values()), default=0.0),
+          "normal_all": max((j for j, _ in every.values()), default=0.0),
+          "curvature": max((j for j, _ in conv.curvature_jumps(nets, knots, edges=edges).values()), default=0.0)
+          if g2 else None,
+          "deviation": subd_g2.deviation(sys.modules[__name__], conv, nets, knots) if six and not fallback else conv.deviation,
+          "cvs": sum(n.shape[0] * n.shape[1] for n in nets), "star_points": len(conv.irr), "split": len(six),
+          "degree": max((int(np.count_nonzero(knots[f][0] == 0.0)) - 1 for f in six), default=3),
+          "fallback": fallback, "solver": info}
+    return nets, knots, st, conv
+
+
+def convert(context, obj, angle_tol=0.05, g2=True, curv_tol=0.02):
+    """(new NURBS object, summary text, note) for a SubD (or any quad) mesh object."""
     V, F, sharp, M = cage(obj, context.evaluated_depsgraph_get())
     if not F:
         raise RuntimeError("the mesh has no faces")
-    conv = Converter(V, F, sharp, angle_tol, curv_tol)
-    nets, knots, st = conv.run(spans, g2=g2)
+    nets, knots, st, conv = build(V, F, sharp, g2, angle_tol, curv_tol)
     patches = [{"net": [list(map(float, c)) for c in net.reshape(-1, 3)], "ku": list(map(float, ku)),
-                "kv": list(map(float, kv))} for net, (ku, kv) in zip(nets, knots)]
+                "kv": list(map(float, kv)), "degree": int(np.count_nonzero(ku == ku[0])) - 1}
+               for net, (ku, kv) in zip(nets, knots)]
     tol = 1e-5 * conv.size
     info, breps = jobs.run("mesh_to_brep", {}, ["result"], xform=None, faces=[], cylinders=[], fillets=[],
                            sweeps=[], patches=patches, tol=tol)
@@ -1089,18 +1134,20 @@ def convert(context, obj, angle_tol=0.05, spans=None, g2=False, curv_tol=0.02):
         context.collection.objects.unlink(new)
     for mat in obj.data.materials:
         new.data.materials.append(mat)
-    sp = st["spans"]
-    layout = f"{sp} even span{'s' if sp > 1 else ''}"
     if st["star_points"]:
         scale = abs(np.linalg.det(np.asarray(M)[:3, :3])) ** (1 / 3) or 1.0
+        pieces = f"of degree {st['degree']}"
+        layout = f"{st['split']} {pieces} by the {st['star_points']} star points, the rest one bicubic span"
         near = (f"within {_length(context, st['deviation'] * scale)} of the SubD surface "
-                f"(exactly on it away from the {st['star_points']} star points)")
-        at_points = f" ({st['normal_all']:.3f}° at the star points)"
+                f"(exactly on it on the one-span faces)")
+        at_points = f" ({st['normal_all']:.3f}° at the star points)" if st["normal_all"] > st["normal"] + 5e-4 else ""
     else:
-        near, at_points = "exactly the SubD surface", ""
+        layout, near, at_points = "one bicubic span each", "exactly the SubD surface", ""
     summary = (f"{len(F)} faces · {layout} · {st['cvs']:,} CVs · G1 within {st['normal']:.3f}°{at_points}"
                + (f" · G2 within {100 * st['curvature']:.2f}%" if g2 else "") + f" · {near}")
     notes = [] if info.get("solid") or conv.open else ["the faces did not close into a solid"]
+    if st["fallback"]:
+        notes.append(f"the exact solve failed ({st['fallback']}): joined by the earlier method")
     if st["normal"] > angle_tol + 1e-9:
         notes.append(f"G1 {st['normal']:.3f}°, not {angle_tol:.3f}°")
     if g2 and st["curvature"] > curv_tol + 1e-9:
@@ -1111,31 +1158,24 @@ def convert(context, obj, angle_tol=0.05, spans=None, g2=False, curv_tol=0.02):
 
 class NPROTO_OT_subd_to_brep(bpy.types.Operator):
     """Convert the selected SubD models (Subdivision Surface on a quad cage) to NURBS
-    bodies: one face per cage face with the subdivided cage's CVs on even spans, G1 or
-    G2 across every smooth edge, creases (1.0) as sharp edges. The meshes are kept (hidden)"""
+    bodies: one face per cage face, each one bicubic span (the SubD exactly) but by star
+    points, where faces of degree 6 (G2) or 5 (G1) join exactly; creases (1.0) as sharp
+    edges. The meshes are kept (hidden)"""
     bl_idname = "nproto.subd_to_brep"
     bl_label = "SubD to BREP"
     bl_options = {'REGISTER', 'UNDO'}
 
     continuity: EnumProperty(
-        name="Continuity", default="G1",
-        items=[("G1", "G1", "Tangent across every edge, light: 4 even spans per face; next to each star point the "
-                            "CVs are solved so the faces join exactly C1 (curvature may differ there)"),
-               ("G2", "G2", "Tangent and bending alike across every edge: 8 even spans per face; next to each star "
-                            "point the CVs are solved so the faces join exactly C2")])
-    spans: EnumProperty(
-        name="Spans", default="AUTO",
-        description="Even spans per face and direction: the CVs come from the cage subdivided that far, so they "
-                    "run on from face to face",
-        items=[("AUTO", "Auto", "G1: 4, G2: 8 (1 on a cage without star points: 16 CVs a face)"),
-               ("4", "4", "4 even spans: 7 x 7 CVs a face (one more row by a star point)"),
-               ("8", "8", "8 even spans: 11 x 11 CVs a face (one more row by a star point)"),
-               ("16", "16", "16 even spans: 19 x 19 CVs a face (one more row by a star point)")])
+        name="Continuity", default="G2",
+        items=[("G1", "G1", "Tangent across every edge, lighter: the faces by star points (degree 5, 10 x 10 CVs) "
+                            "are solved so their normals agree exactly; the bending may differ there"),
+               ("G2", "G2", "Tangent and bending alike across every edge: the faces by star points (degree 6, "
+                            "12 x 12 CVs) are solved so normals and curvature agree exactly")])
     angle: FloatProperty(name="Angle", default=0.05, min=0.005, max=1.0, precision=3, step=1,
-                         description="Largest angle between neighbouring faces along a smooth edge "
-                                     "(degrees; Continuity Check's default is 0.1)")
+                         description="Report a join whose faces' normals differ more than this along a smooth "
+                                     "edge (degrees; Continuity Check's default is 0.1)")
     curvature: FloatProperty(name="Curvature %", default=2.0, min=0.1, max=20.0, precision=1,
-                             description="G2: largest difference of the curvature across an edge, in percent of "
+                             description="G2: report a join whose curvature differs more than this, in percent of "
                                          "the faces' largest curvature (as Continuity Check measures it)")
     hide_original: BoolProperty(name="Hide Meshes", default=True,
                                 description="Hide the SubD objects in the viewport and in renders (they stay)")
@@ -1149,7 +1189,6 @@ class NPROTO_OT_subd_to_brep(bpy.types.Operator):
         col = self.layout.column()
         col.use_property_split = True
         col.prop(self, "continuity", expand=True)
-        col.prop(self, "spans")
         col.prop(self, "angle")
         if self.continuity == "G2":
             col.prop(self, "curvature")
@@ -1165,9 +1204,8 @@ class NPROTO_OT_subd_to_brep(bpy.types.Operator):
         made, lines, warn = [], [], []
         for src in srcs:
             try:
-                new, summary, note = convert(context, src, self.angle,
-                                             spans=None if self.spans == "AUTO" else int(self.spans),
-                                             g2=self.continuity == "G2", curv_tol=self.curvature / 100.0)
+                new, summary, note = convert(context, src, self.angle, g2=self.continuity == "G2",
+                                             curv_tol=self.curvature / 100.0)
             except (jobs.JobError, RuntimeError, np.linalg.LinAlgError) as exc:
                 warn.append(f"{src.name}: not converted ({exc})")
                 continue

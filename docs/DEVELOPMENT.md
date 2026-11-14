@@ -13,7 +13,7 @@ your system in `blender_nurbs/kernel/` (see [Build the kernel](#build-the-kernel
 
 The kernel is NVIDIA's USD BRep (SMLib), written in C++. `kernel_build/` compiles
 it, its upstream pybind11 bindings and our extension (`kernel_build/ext/`: CV
-access, surfaces from CVs, surface → Brep, the tighter trim) into ONE Python
+access, surfaces from CVs, surface → Brep, the tighter trim, sparse solves) into ONE Python
 module, without OpenUSD. The module is per platform; all can sit side by side in
 `blender_nurbs/kernel/`, and Python loads the one for its platform:
 
@@ -36,6 +36,12 @@ git -C third_party/usd-brep checkout 3fd5b9548d19aa8c12c29bc9637a96d42a06f8a5
 ```bash
 python3 -m pip install --target third_party/pybind11_pkg pybind11==2.13.6
 ```
+```bash
+git clone --depth 1 --branch 3.4.0 https://gitlab.com/libeigen/eigen.git third_party/eigen
+```
+
+Eigen (headers only, MPL2 parts only) gives the sparse LDLᵀ that SubD to BREP's joins solve with on Windows and
+Linux; on macOS the module links Apple's Accelerate for a supernodal one (the system's, nothing to install).
 
 The build needs a CPython **3.13 with its headers**, the version Blender 5.x runs. Blender's bundled Python has only `pyconfig.h`, so any normal 3.13 install is used for the headers; the module then loads into Blender's own 3.13. `-DPython3_EXECUTABLE` names it, else a `python3.13` on the PATH is used.
 
@@ -74,7 +80,7 @@ The build copies the module into `blender_nurbs/kernel/` under a temporary name 
 
 **Status:** the macOS arm64, Windows x64 and Linux x64 modules all build on GitHub Actions (below), and the headless test suite runs in Blender on each. Locally only the macOS build has been tried. Linux and Windows builds of the kernel refuse to evaluate a curve one rounding step past the end of its range, where the macOS build clamps; `kernel/harden.py` wraps those calls so every build behaves the same.
 
-**All three at once (GitHub Actions):** `.github/workflows/kernel.yml` builds the module on macOS (arm64), Windows x64 and Linux x64 (manylinux_2_28). It then runs the headless test suite in Blender 5.2.1 on each and packages the extension: one zip per platform and one with all three, each checked with Blender's `extension validate`. It runs on a push that touches the add-on, the kernel build, the tests or the packaging, or by hand (workflow_dispatch). Each built module is cached under a key made of what it is built from (`kernel_build/`, the USD BRep commit, pybind11 and the workflow's `KERNEL_CACHE` number), so a push that changes only Python skips the kernel builds (the Windows one alone takes about 50 minutes) and goes straight to the tests. Bump `KERNEL_CACHE` when a build step in the workflow changes, or run it by hand with **rebuild_kernel** ticked to build from scratch. The project has to be a GitHub repository for this; `.gitignore` keeps `third_party/`, build trees and the built modules out of it.
+**All three at once (GitHub Actions):** `.github/workflows/kernel.yml` builds the module on macOS (arm64), Windows x64 and Linux x64 (manylinux_2_28). It then runs the headless test suite in Blender 5.2.1 on each and packages the extension: one zip per platform and one with all three, each checked with Blender's `extension validate`. It runs on a push that touches the add-on, the kernel build, the tests or the packaging, or by hand (workflow_dispatch). Each built module is cached under a key made of what it is built from (`kernel_build/`, the USD BRep commit, pybind11, Eigen and the workflow's `KERNEL_CACHE` number), so a push that changes only Python skips the kernel builds (the Windows one alone takes about 50 minutes) and goes straight to the tests. Bump `KERNEL_CACHE` when a build step in the workflow changes, or run it by hand with **rebuild_kernel** ticked to build from scratch. The project has to be a GitHub repository for this; `.gitignore` keeps `third_party/`, build trees and the built modules out of it.
 
 **Release:** run the workflow by hand with **release** ticked (Actions > Kernel > Run workflow), or push a tag `v<version>`. Once the tests pass on all three systems, the zips are published as the GitHub Release `v<version>`, with the version from `blender_manifest.toml` (raise it first). It's a pre-release unless the commit is on `main`. A release that already exists gets its zips replaced.
 

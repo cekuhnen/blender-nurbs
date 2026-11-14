@@ -43,6 +43,7 @@ endif()
 set(ROOT ${CMAKE_CURRENT_LIST_DIR}/..)
 set(USD_BREP ${ROOT}/third_party/usd-brep/source CACHE PATH "usd-brep/source")
 set(PYBIND11_INCLUDE ${ROOT}/third_party/pybind11_pkg/pybind11/include CACHE PATH "pybind11 headers")
+set(EIGEN_INCLUDE ${ROOT}/third_party/eigen CACHE PATH "Eigen 3.4 headers (sparse solvers for the add-on)")
 set(ADDON_KERNEL_DIR ${ROOT}/blender_nurbs/kernel CACHE PATH "Where to copy the built module")
 
 # --- Python 3.13 (Blender 5.x): headers, extension suffix, and on Windows the
@@ -132,7 +133,7 @@ target_link_libraries(smlib_static PUBLIC smlib_core)
 
 add_library(_omni_solid MODULE ${SMPY_SRC} ${CMAKE_CURRENT_LIST_DIR}/ext/SmPyBlenderExt.cpp)
 target_include_directories(_omni_solid PRIVATE
-  ${USD_BREP}/SmPyLib/src ${PYBIND11_INCLUDE} ${BLENDER_PYTHON_INCLUDE})
+  ${USD_BREP}/SmPyLib/src ${PYBIND11_INCLUDE} ${BLENDER_PYTHON_INCLUDE} ${EIGEN_INCLUDE})
 target_link_libraries(_omni_solid PRIVATE smlib_static)
 target_compile_options(_omni_solid PRIVATE ${MODULE_OPTS})
 # Own module name + own pybind11 internals, so this kernel can share a Blender
@@ -143,6 +144,7 @@ target_compile_definitions(_omni_solid PRIVATE
 set_target_properties(_omni_solid PROPERTIES OUTPUT_NAME _nproto_kernel PREFIX "" SUFFIX "${PY_SUFFIX}")
 if(APPLE)
   target_link_options(_omni_solid PRIVATE -undefined dynamic_lookup)
+  target_link_libraries(_omni_solid PRIVATE "-framework Accelerate")   # supernodal sparse LDL^T
 elseif(WIN32)
   target_link_libraries(_omni_solid PRIVATE ${PY_IMPLIB})          # python313.lib
 endif()
