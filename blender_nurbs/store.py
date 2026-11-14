@@ -1082,6 +1082,8 @@ def _corner_normals(brep, pts, nrm, tris):
                 N_ = tri_n[ks]
                 if (N_ @ N_.T).min() < cos_c:
                     crease[v] = True
+    if crease.any():
+        crease = _true_creases(brep, P, crease)
     if not crease.any():
         return None
     from .square import _foot
@@ -1147,6 +1149,87 @@ def _corner_normals(brep, pts, nrm, tris):
                 n = tri_n[k]
             loops.append(tuple(n))
     return loops
+
+
+def _may_fold(surf):
+    """Whether a face's surface can have a crease inside: a knot as multiple
+    as the degree (a rational circle's are too, though it is smooth there)."""
+    _, ext = _k()
+    try:
+        d = ext.surface_cvs(surf)
+    except Exception:
+        return True
+    for key, p in (("knots_u", d["degree_u"]), ("knots_v", d["degree_v"])):
+        k = np.asarray(d[key], float)
+        inner = k[(k > k[0]) & (k < k[-1])]
+        if len(inner) and np.unique(inner, return_counts=True)[1].max() >= p:
+            return True
+    return False
+
+
+def _true_creases(brep, P, crease, band=0.01, m=7):
+    """The crease vertices the B-rep confirms. A thin triangle on a curved
+    face can lean far off the surface, so the triangle test also flags smooth
+    places: along finely sampled edges, by a SubD body's sliver knots (the
+    jack: 330-880 vertices, none a crease). A vertex within band of an edge's
+    length from it stays a crease only when that edge's two faces bend by
+    more than CREASE_DEG at one of m points along it; a vertex away from
+    every edge only when some face can fold inside. Anything unsure keeps
+    the triangles' verdict."""
+    sm, _ = _k()
+    cos_c = np.cos(np.radians(CREASE_DEG))
+    S, B, sharp_rows = [], [], []
+    for e in brep.edges():
+        try:
+            t0, t1 = e.parameter_range()
+            pts = np.array([e.point_at(t0 + (t1 - t0) * i / 119) for i in range(120)], float)
+        except Exception:
+            try:  # some edges (e.g. fillet rails) only evaluate through their curve
+                c = e.curve()
+                t0, t1 = c.parameter_range()
+                pts = np.array([c.evaluate(t0 + (t1 - t0) * i / 119) for i in range(120)], float)
+            except Exception:
+                return crease
+        fs = e.faces()
+        sharp = len(fs) > 2
+        if len(fs) == 2:
+            try:
+                ss = [f.surface() for f in fs]
+                for p in pts[np.linspace(2, 117, m).astype(int)]:
+                    ns = []
+                    for f, s in zip(fs, ss):
+                        w = sm.surface_closest_point(s, tuple(map(float, p)))[1][0]
+                        uv = (float(w.x), float(w.y)) if hasattr(w, "x") else (float(w[0]), float(w[1]))
+                        n = np.array(f.outward_normal_at_uv(*uv), float)
+                        ns.append(n / (np.linalg.norm(n) or 1.0))
+                    if ns[0] @ ns[1] < cos_c:
+                        sharp = True
+                        break
+            except Exception:
+                sharp = True
+        L = float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
+        S.append(pts)
+        B.append(np.full(len(pts), band * L))
+        sharp_rows.append(np.full(len(pts), sharp))
+    if not S:
+        return crease
+    S, B, sharp_rows = np.vstack(S), np.concatenate(B), np.concatenate(sharp_rows)
+    cand = np.nonzero(crease)[0]
+    Q = P[cand]
+    k = nearest_rows(S, Q)
+    near_any = np.linalg.norm(Q - S[k], axis=1) <= B[k]
+    near_sharp = np.zeros(len(cand), bool)
+    if sharp_rows.any():
+        Ss, Bs = S[sharp_rows], B[sharp_rows]
+        k = nearest_rows(Ss, Q)
+        near_sharp = np.linalg.norm(Q - Ss[k], axis=1) <= Bs[k]
+    keep = near_sharp.copy()
+    inner = ~near_any
+    if inner.any() and any(_may_fold(f.surface()) for f in brep.faces()):
+        keep |= inner
+    out = np.zeros_like(crease)
+    out[cand[keep]] = True
+    return out
 
 
 def _crease_normal(sm, faces, fi, surf_cache, flat_n, p, tri_n):

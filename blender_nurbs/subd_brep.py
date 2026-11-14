@@ -454,12 +454,14 @@ def derivs(net, ku, kv, u, v, ders):
     from 1D bases (no dense rows)."""
     Bu = {a: basis(ku, u, a) for a in {a for a, _ in ders}}
     Bv = {b: basis(kv, v, b) for b in {b for _, b in ders}}
-    return {(a, b): np.einsum("ti,tj,ijc->tc", Bu[a], Bv[b], net, optimize=True) for a, b in ders}
+    X = {a: np.tensordot(B, net, axes=(1, 0)) for a, B in Bu.items()}      # (t, nv, 3); no einsum path search
+    return {(a, b): np.einsum("tj,tjc->tc", Bv[b], X[a]) for a, b in ders}  # (it was 40% of einsum's time)
 
 
 SIDE_UV = (lambda t: (t, 0 * t), lambda t: (1 + 0 * t, t), lambda t: (1 - t, 1 + 0 * t), lambda t: (0 * t, 1 - t))
 INWARD = ((0, 1), (-1, 0), (0, -1), (1, 0))
 ALONG = ((1, 0), (0, 1), (-1, 0), (0, -1))
+NEAR_SIDE = (lambda m: m[:, :3], lambda m: m[-3:, :], lambda m: m[:, -3:], lambda m: m[:3, :])   # a net's 3 rows by side k
 
 
 def _clamping(N):
@@ -922,12 +924,17 @@ class Converter:
         L = int(round(math.log2(spans)))
         nets = self.natural(L)
         self.deviation, self.zone, self.joint_err = 0.0, 0.0, 0.0
+        todo = set()
         if self.irr:
+            before = [n.copy() for n in nets]
             nets = self.joints(nets, g2)
+            todo = self.moved_edges(nets, before)
         knots = list(self.fk)
-        st = {"normal": max((j for j, _ in self.edge_jumps(nets, knots, CHECK_ENDS).values()), default=0.0),
-              "normal_all": max((j for j, _ in self.edge_jumps(nets, knots).values()), default=0.0),
-              "curvature": max((j for j, _ in self.curvature_jumps(nets, knots).values()), default=0.0) if g2 else None,
+        ends, every = self.edge_jumps(nets, knots, CHECK_ENDS, edges=todo, also_ends=True)
+        st = {"normal": max((j for j, _ in ends.values()), default=0.0),
+              "normal_all": max((j for j, _ in every.values()), default=0.0),
+              "curvature": max((j for j, _ in self.curvature_jumps(nets, knots, edges=todo).values()), default=0.0)
+              if g2 else None,
               "spans": 2 ** L, "sliver": SLIVER_KNOT if self.irr else 0.0, "zone": self.zone,
               "deviation": self.deviation, "joins": self.joint_err,
               "cvs": sum(n.shape[0] * n.shape[1] for n in nets), "star_points": len(self.irr)}
@@ -986,14 +993,15 @@ class Converter:
             self._arc[key] = np.interp(np.linspace(skip, 1 - skip, n) * d[-1], d, t)
         return self._arc[key]
 
-    def curvature_jumps(self, nets, knots, samples=81):
-        """Per smooth edge, the largest difference of the two faces' curvature
-        across it, as a fraction of the larger of the edge's largest curvature
-        and the faces' (as Continuity Check judges G2), and where (t)."""
+    def curvature_jumps(self, nets, knots, samples=81, edges=None):
+        """Per smooth edge (or those in edges), the largest difference of the
+        two faces' curvature across it, as a fraction of the larger of the
+        edge's largest curvature and the faces' (as Continuity Check judges
+        G2), and where (t)."""
         kmax = {}
         out = {}
         for e, uses in self.edges.items():
-            if len(uses) != 2 or e in self.sharp:
+            if len(uses) != 2 or e in self.sharp or (edges is not None and e not in edges):
                 continue
             f0, k0, fl0 = uses[0]
             t = self._by_length(nets[f0], *knots[f0], k0, fl0, samples, CHECK_ENDS)
@@ -1012,17 +1020,32 @@ class Converter:
             out[e] = (float(rel.max()), float(t[rel.argmax()]))
         return out
 
-    def edge_jumps(self, nets, knots, skip=0.0):
-        """Per smooth edge, the largest angle (degrees) between its faces' normals, and where (t);
-        skip: leave that much of each end out (as Continuity Check does)."""
-        out = {}
+    def moved_edges(self, nets, before):
+        """The smooth edges worth checking after the joins: those at an
+        irregular vertex or with a CV the joins moved within three rows of
+        them (all a curvature across an edge depends on). Everywhere else two
+        faces share the subdivided cage's rows and join exactly, by
+        construction (measured: 1e-6 degrees, 1e-9 in G2)."""
+        moved = [np.any(a != b, axis=2) for a, b in zip(nets, before)]
+        return {e for e, uses in self.edges.items() if len(uses) == 2 and e not in self.sharp
+                and (e[0] in self.irr or e[1] in self.irr or any(NEAR_SIDE[k](moved[f]).any() for f, k, _ in uses))}
+
+    def edge_jumps(self, nets, knots, skip=0.0, edges=None, also_ends=False):
+        """Per smooth edge (or those in edges), the largest angle (degrees)
+        between its faces' normals, and where (t); skip: leave that much of
+        each end out (as Continuity Check does). also_ends: (skipping, and
+        right to the corners) from one evaluation."""
+        out, out_all = {}, {}
         ends = 2.0 ** -np.arange(2, 16)
         t_all = np.unique(np.r_[np.linspace(0.0, 1.0, 81), ends, 1 - ends, 1.5 * ends, 1 - 1.5 * ends])   # by the corners too
         for e, uses in self.edges.items():
-            if len(uses) != 2 or e in self.sharp:
+            if len(uses) != 2 or e in self.sharp or (edges is not None and e not in edges):
                 continue
             f0, k0, fl0 = uses[0]
             t = self._by_length(nets[f0], *knots[f0], k0, fl0, 81, skip) if skip else t_all
+            n_skip = len(t)
+            if also_ends:
+                t = np.r_[t, t_all]
             ns = []
             for f, k, flip in uses:
                 u, v = SIDE_UV[k](1 - t if flip else t)
@@ -1032,8 +1055,12 @@ class Converter:
                 n = np.cross(T, iu * D[(1, 0)] + iv * D[(0, 1)])
                 ns.append(n / np.maximum(np.linalg.norm(n, axis=1), 1e-300)[:, None])
             ang = np.degrees(np.arccos(np.clip(np.abs((ns[0] * ns[1]).sum(1)), -1, 1)))
-            out[e] = (float(ang.max()), float(t[ang.argmax()]))
-        return out
+            a, ta = ang[:n_skip], t[:n_skip]
+            out[e] = (float(a.max()), float(ta[a.argmax()]))
+            if also_ends:
+                a, ta = ang[n_skip:], t[n_skip:]
+                out_all[e] = (float(a.max()), float(ta[a.argmax()]))
+        return (out, out_all) if also_ends else out
 
 
 def _length(context, x):
@@ -1052,7 +1079,7 @@ def convert(context, obj, angle_tol=0.05, spans=None, g2=False, curv_tol=0.02):
     patches = [{"net": [list(map(float, c)) for c in net.reshape(-1, 3)], "ku": list(map(float, ku)),
                 "kv": list(map(float, kv))} for net, (ku, kv) in zip(nets, knots)]
     tol = 1e-5 * conv.size
-    info, breps = jobs.run("mesh_to_brep", {}, ["base", "result"], xform=None, faces=[], cylinders=[], fillets=[],
+    info, breps = jobs.run("mesh_to_brep", {}, ["result"], xform=None, faces=[], cylinders=[], fillets=[],
                            sweeps=[], patches=patches, tol=tol)
     new = store.new_object_text(context, obj.name + " BREP", breps["result"], Matrix(M))
     for coll in obj.users_collection:

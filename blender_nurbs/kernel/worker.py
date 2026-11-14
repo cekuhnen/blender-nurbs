@@ -1586,7 +1586,8 @@ def job_mesh_to_brep(job):
     loop, then holes) sewn into a body, cylinders added and holes cut
     ({origin, axis, r, h, cut}), then each fillet group ({r, mids}, the sharp
     edges' midpoints) rounded, the largest radius first. Built in world space;
-    "base" (before the fillets) and "result" written in job['xform']'s space."""
+    "base" (before the fillets, if asked for) and "result" written in job['xform']'s space;
+    the volume only with job["volume"]."""
     np = _np()
     tol = float(job.get("tol", 1e-6))
     body = None
@@ -1660,12 +1661,15 @@ def job_mesh_to_brep(job):
         body = r
         done.append(g)
     xf = job.get("xform")
-    save(to_local(base, xf), job["out"]["base"])
+    if "base" in job["out"]:                  # (SubD to BREP has no fillets: it asks for the result only)
+        save(to_local(base, xf), job["out"]["base"])
     save(to_local(body, xf), job["out"]["result"])
-    try:
-        volume = abs(float(body.volume(1e-6))) if solid else 0.0
-    except Exception:
-        volume = 0.0
+    volume = None                             # only on request: it took 0.1-0.25 s of a SubD body's 0.3 s here
+    if job.get("volume") and solid:
+        try:
+            volume = abs(float(body.volume(1e-6)))
+        except Exception:
+            volume = 0.0
     return {"solid": solid and bool(body.is_manifold_solid()), "faces": body.face_count(), "volume": volume,
             "filleted": done, "failed": failed}
 

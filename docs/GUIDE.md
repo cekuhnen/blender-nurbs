@@ -506,7 +506,10 @@ before its Subdivision Surface modifier), with **one face per cage face**.
 * **Light:** the jack is 2,790 CVs in G1 (4 spans), 6,006 in G2 (8 spans); the boot 2,466 and 5,330.
 * **Close to the SubD surface:** exactly on it away from the star points; next to them within about 0.5 % of the
   model's size in G1 and 0.25 % in G2 (Spans 16 brings it closer).
-* **Speed:** about 0.3 s for the jack's nets; with the body and its display mesh about 1 s.
+* **Speed:** the jack about 0.95 s, the boot about 0.7 s (G1 or G2): 0.2-0.3 s for the nets, 0.15 s for the kernel
+  to build the body, the rest for the display mesh (mostly its tessellation, which follows the display settings, not
+  the CV count). The continuity in the summary is measured only on the edges the star points' joins touched; the
+  others join exactly by construction.
 * **It asks first:** a dialog with **Continuity** (G1 or G2), **Spans** (Auto: 4 for G1, 8 for G2; or 4, 8, 16),
   **Angle**, **Curvature %** (G2) and **Hide Meshes** (the SubD objects stay, hidden in the viewport and in renders);
   **Convert** runs it. The same settings stay in the Adjust Last Operation panel afterwards.
