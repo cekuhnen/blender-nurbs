@@ -223,6 +223,9 @@ def _draw():
     if _grid_shader is not False and (v is None or v.show_fine_grid):
         _draw_fine_grid_safe(ctx)           # under everything
         gpu.state.depth_test_set('LESS_EQUAL')
+    from . import workplanes
+    workplanes.draw_grid_safe(ctx)          # the active work plane's grid, under everything too
+    gpu.state.depth_test_set('LESS_EQUAL')
     from . import diagnostics
     if v is not None:
         diagnostics.draw_zebra(ctx)          # under the edges
@@ -318,6 +321,11 @@ def _draw():
 
     # pick highlights (world-space polylines)
     gpu.state.depth_test_set('NONE')
+    from . import workplanes
+    try:
+        workplanes.draw_active_marker(ctx)     # the active work plane's axes
+    except Exception as exc:
+        print("NURBS work plane:", exc)
     for i, pl in enumerate(pick_overlay["picked"]):
         _draw_lines(_lines_from_polylines([pl], _IDENT), COL_PICKS[min(i, 2)], 4.0)
     if pick_overlay["hover"]:

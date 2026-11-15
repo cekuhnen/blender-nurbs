@@ -721,7 +721,7 @@ def draw_display_toggles(layout, v, icons_only=False):
 class VIEW3D_PT_nproto_display(_SidePanel, bpy.types.Panel):
     """What the viewport shows of NURBS objects (also as icons in the 3D view header)"""
     bl_label = "Display"
-    bl_order = 7
+    bl_order = 8
 
     @classmethod
     def poll(cls, context):
@@ -744,7 +744,7 @@ class VIEW3D_PT_nproto_display(_SidePanel, bpy.types.Panel):
 class VIEW3D_PT_nproto_history(_SidePanel, bpy.types.Panel):
     """Construction history: on / off, live update, pause, clean up"""
     bl_label = "History"
-    bl_order = 8
+    bl_order = 9
     bl_options = {'DEFAULT_CLOSED'}
 
     @classmethod

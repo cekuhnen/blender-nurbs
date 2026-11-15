@@ -4088,7 +4088,8 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "cycle_continuity", "de
               "restore_inputs", "sync_feature", "tab_edit", "continuity", "continuity_clear", "section_add", "section_orient",
               "section_targets", "section_curves", "section_remove", "subsel_picker", "bake_feature", "delete_feature",
               "curve_degree", "fix_clip_start", "delete_faces"}
-_all_tools = {"nproto." + n for n in dir(bpy.ops.nproto) if n not in _not_tools}
+_all_tools = {"nproto." + n for n in dir(bpy.ops.nproto)
+              if n not in _not_tools and not n.startswith("workplane_")}   # the Work Planes panel's own
 _tool_ops = [o_ for o_ in _in_panels if o_ not in ("nproto.add_primitive", "nproto.boolean")] + ["nproto.boolean"]
 _bool_ops = sorted(e["props"].get("operation") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r
                    if e.get("op") == "nproto.boolean")
@@ -7616,9 +7617,63 @@ check("Free view: the sketch lies on the world floor through the origin (whereve
 _fc = {"u": np.array([1.0, 0, 0]), "v": np.array([0, 0.6, 0.8]), "c": np.array([0.13, 0.2, 0.4])}
 _fa = {"u": np.array([1.0, 0, 0]), "v": np.array([0, 1.0, 0]), "c": np.array([0.13, 0.2, 0.4])}
 check("Ctrl grid origin: a slanted face's centre; a level face's, and no face, the world origin",
-      np.allclose(_dt.SketchMixin._grid_origin(np.ones(3), _fc), _fc["c"])
-      and np.allclose(_dt.SketchMixin._grid_origin(np.ones(3), _fa), 0)
-      and np.allclose(_dt.SketchMixin._grid_origin(np.ones(3), None), 0))
+      np.allclose(f._grid_origin(ctx, np.ones(3), _fc), _fc["c"])
+      and np.allclose(f._grid_origin(ctx, np.ones(3), _fa), 0)
+      and np.allclose(f._grid_origin(ctx, np.ones(3), None), 0))
+
+# --- An active work plane: sketches lie exactly on it, Ctrl snaps to its own grid, X / Y / Z lock to its axes,
+#     a face lying in it uses its axes and grid; seen edge-on the World's planes stand in
+from blender_nurbs import workplanes as _wpk
+_stK = ctx.scene.nproto_workplanes
+_frK = _wpk.frame_from_points((0.2, 0.1, 0.3), (1.2, 0.1, 0.6), (0.2, 1.1, 0.9))
+_wK = _wpk.add_plane(ctx.scene, "Tilted", _frK)
+_wK.auto_spacing, _wK.spacing, _wK.major = False, 0.025, 4
+_frK = _wpk.frame_of(_wK)                                   # as stored (Euler round trip)
+_Rm = np.array(_Eu(_wK.rotation, 'XYZ').to_matrix(), float)
+_orth = np.abs(np.array([_frK[1], _frK[2], _frK[3]]) @ np.array([_frK[1], _frK[2], _frK[3]]).T - np.eye(3)).max()
+check("work plane: its axes are orthonormal in double precision (1e-15) and match Blender's XYZ Euler",
+      _orth < 1e-14 and np.allclose(_Rm, np.array([_frK[1], _frK[2], _frK[3]]).T, atol=1e-6), f"{_orth:.1e}")
+_OK, _xK, _yK, _nK = _frK
+f = _fake(_dt.NPROTO_OT_draw_line, polyline=False, start_mode="FREE", line_mode="EDGE")
+f._edit, f._lines, f._start, f._lock, f._start_refs = None, [], None, None, None
+f._reset_typing()
+f.sketch_start(fcv)
+_plK = f._view_plane(fcv)
+_exact_plane = all(np.allclose(a_, b_, atol=1e-12) for a_, b_ in zip(_plK, (_OK, _nK, _xK, _yK)))
+_offs, _grid_ok = [], True
+for _m in ((561, 437), (300, 700), (820, 150), (512.3, 498.7)):
+    _P0, _ = f.pick_point(fcv, _ev('MOUSEMOVE', _m, 'NOTHING'))
+    _Pc, _ = f.pick_point(fcv, _ev('MOUSEMOVE', _m, 'NOTHING', ctrl=True))
+    _st = f._grid_step(fcv, _Pc, _xK, _yK)
+    _offs += [abs(float((_P0 - _OK) @ _nK)), abs(float((_Pc - _OK) @ _nK))]
+    _cx, _cy = float((_Pc - _OK) @ _xK) / _st, float((_Pc - _OK) @ _yK) / _st
+    _grid_ok &= abs(_cx - round(_cx)) < 1e-6 and abs(_cy - round(_cy)) < 1e-6 \
+        and any(abs(_st - l_) < 1e-12 for l_ in _wpk.fixed_levels(_wK.spacing, 4))
+f._lock = "X"
+_PXk, _ = f.pick_point(fcv, _ev('MOUSEMOVE', (600, 450), 'NOTHING'))
+f._lock = None
+_dX = _PXk - _OK
+_xlock = np.linalg.norm(_dX - float(_dX @ _xK) * _xK) < 1e-9
+_faceK = {"n": -_nK, "P": _OK + 0.3 * _xK - 0.2 * _yK, "u": _yK, "v": _xK, "c": _OK + 0.3 * _xK, "size": 1.0}
+_faceOff = dict(_faceK, P=_faceK["P"] + 0.01 * _nK)
+_onw = f._on_work(fcv, _faceK) and not f._on_work(fcv, _faceOff)
+f._face_hover = _faceK
+f._plane = None
+f.fix_plane(fcv, _faceK["P"])
+_fixed = all(np.allclose(a_, b_, atol=1e-12) for a_, b_ in zip(f._plane, (_OK, _nK, _xK, _yK))) \
+    and np.allclose(f._grid_origin(fcv, f._plane[0], _faceK), _OK)
+f._face_hover, f._plane = None, None
+f.sketch_end(fcv)
+# edge-on: looking along the plane's X (the normal is square to the view)
+_Re = _Mx((tuple(_yK), tuple(_nK), tuple(-_xK))).transposed()      # view x = plane Y, view y = normal, looking along X
+_ple = f._view_plane(_FCtxView(_Re), None)
+_edge = not np.allclose(abs(float(_ple[1] @ _nK)), 1.0)
+_stK.planes.clear(); _stK.active = -1; _stK.index = 0
+check("work plane sketching: the drawing plane is exactly the work plane; points (Ctrl or not) lie on it, Ctrl on "
+      "its own grid (spacing 0.025, major 4); an X lock runs along its X from its origin; a face in it uses its "
+      "axes and grid, a face 0.01 off does not; seen edge-on the World's planes stand in",
+      _exact_plane and max(_offs) < 1e-12 and _grid_ok and _xlock and _onw and _fixed and _edge,
+      f"plane {_exact_plane} off {max(_offs):.1e} grid {_grid_ok} xlock {_xlock} face {_onw} {_fixed} edge {_edge}")
 
 # --- Ctrl step in a close perspective view: from the projection's derivative (a whole-unit step went behind
 #     the camera and gave 1 m), the fewer pixels per unit of the plane's two axes
@@ -8149,5 +8204,148 @@ check("analysis quality: Medium on the defaults, Fine 0.5 / 2.5 deg, a hand-set 
       _a0 == 'MEDIUM' and _a1 == ('FINE', 0.5, 0.0002, 2.5, 0.001) and _a2 == 'CUSTOM'
       and _a3 == ('FAST', 2.0, 10.0) and "analysis_quality" in _pz and _nf[0] < _nf[1]
       and _vA.analysis_quality == 'MEDIUM', f"{_a0} {_a1} {_a2} {_a3} tris fast/fine {_nf}")
+
+# --- Work planes: named frames saved with the scene; placed from the world, cursor, selection, 3 points
+from blender_nurbs import workplanes as _wp
+_fr = _wp.frame_from_points((1, 2, 3), (3, 2, 3), (1, 5, 7))
+check("work plane: 3 points give an orthonormal frame (X to B, Y towards C, normal X x Y)",
+      _fr is not None and np.allclose(_fr[1], (1, 0, 0)) and np.allclose(_fr[2], (0, 0.6, 0.8))
+      and np.allclose(_fr[3], (0, -0.8, 0.6)) and _wp.frame_from_points((0, 0, 0), (1, 0, 0), (2, 0, 0)) is None,
+      str(_fr))
+_ff = _wp.face_frame((0, 0, 0), (0, 0, 2), [(0, 0, 0), (0, 1, 0), (3, 1, 0), (3, 0, 0)])
+check("work plane: a face's X runs along its longest edge, its normal is the face's",
+      np.allclose(abs(_ff[1][0]), 1) and np.allclose(_ff[3], (0, 0, 1)), str(_ff))
+_scW = ctx.scene
+_stW = _scW.nproto_workplanes
+_stW.planes.clear(); _stW.active = -1
+check("work plane: the World is active by default (active_frame None)", _wp.active_frame(_scW) is None)
+for _src in ("WORLD_XY", "WORLD_XZ", "WORLD_YZ", "CURSOR"):
+    bpy.ops.nproto.workplane_add(source=_src)
+_names = [p_.name for p_ in _stW.planes]
+_fz = _wp.frame_of(_stW.planes[1])
+check("work plane: Top / Front / Right / Cursor added, the last one active; Front's normal is -Y",
+      _names == ["Top", "Front", "Right", "Cursor"] and _stW.active == 3 and np.allclose(_fz[3], (0, -1, 0), atol=1e-6)
+      and np.allclose(_fz[2], (0, 0, 1), atol=1e-6), f"{_names} {_stW.active}")
+bpy.ops.nproto.workplane_add(source="WORLD_XY")
+check("work plane: names stay unique (Top.001)", _stW.planes[-1].name == "Top.001")
+# a rotated object: Selection in Object Mode takes its axes
+bpy.ops.mesh.primitive_plane_add(size=2, location=(1, 2, 3), rotation=(0.3, -0.2, 0.7))
+_pl = ctx.active_object
+bpy.ops.nproto.workplane_add(source="SELECTION")
+_fo = _wp.active_frame(_scW)
+_Mo = np.array(_pl.matrix_world)
+check("work plane: Selection (Object Mode) = the active object's origin and axes",
+      _stW.planes[_stW.active].name == _pl.name and np.allclose(_fo[0], (1, 2, 3), atol=1e-6)
+      and np.allclose(_fo[3], _Mo[:3, 2], atol=1e-6) and np.allclose(_fo[1], _Mo[:3, 0], atol=1e-6))
+# Edit Mode: the selected face (centre, normal), then three vertices
+bpy.ops.object.mode_set(mode='EDIT')
+bpy.ops.mesh.select_all(action='SELECT')
+bpy.ops.nproto.workplane_add(source="SELECTION")
+_fe = _wp.active_frame(_scW)
+bpy.ops.object.mode_set(mode='OBJECT')
+check("work plane: Selection (Edit Mode, one face) = the face's centre and normal",
+      _stW.planes[_stW.active].name == "Face" and np.allclose(_fe[0], (1, 2, 3), atol=1e-5)
+      and np.allclose(_fe[3], _Mo[:3, 2], atol=1e-5), str(_fe))
+# turning it over / about its normal keeps the origin and stays right-handed
+_i0 = _stW.active; _stW.index = _i0
+_b0 = _wp.frame_of(_stW.planes[_i0])
+bpy.ops.nproto.workplane_turn(action="FLIP"); _b1 = _wp.frame_of(_stW.planes[_i0])
+bpy.ops.nproto.workplane_turn(action="ROT90"); _b2 = _wp.frame_of(_stW.planes[_i0])
+check("work plane: Flip reverses the normal, Rotate 90 turns X onto Y, origin kept",
+      np.allclose(_b1[3], -_b0[3], atol=1e-6) and np.allclose(_b2[1], _b1[2], atol=1e-6)
+      and np.allclose(_b2[0], _b0[0]) and np.allclose(np.cross(_b2[1], _b2[2]), _b2[3], atol=1e-6))
+# list bookkeeping: deleting / moving keeps the same plane active
+_stW.active = 2; _stW.index = 0
+bpy.ops.nproto.workplane_remove()
+_a_rm = _stW.planes[_stW.active].name
+_stW.index = _stW.active
+bpy.ops.nproto.workplane_move(direction="UP")
+_a_mv = (_stW.planes[_stW.active].name, _stW.active)
+_stW.index = _stW.active
+bpy.ops.nproto.workplane_remove()
+check("work plane: delete / move keep the active plane; deleting it makes the World active",
+      _a_rm == "Right" and _a_mv == ("Right", 0) and _stW.active == -1, f"{_a_rm} {_a_mv} {_stW.active}")
+# saved with the .blend
+_stW.active = 1
+_keep = [(p_.name, tuple(round(c_, 6) for c_ in p_.origin), tuple(round(c_, 6) for c_ in p_.rotation)) for p_ in _stW.planes]
+_wpf = os.path.join(tempfile.mkdtemp(), "wp.blend")
+bpy.ops.wm.save_as_mainfile(filepath=_wpf, copy=True)
+with bpy.data.libraries.load(_wpf) as (_src_, _dst_):
+    _dst_.scenes = [_scW.name]
+_sc2 = _dst_.scenes[0]
+_got = [(p_.name, tuple(round(c_, 6) for c_ in p_.origin), tuple(round(c_, 6) for c_ in p_.rotation))
+        for p_ in _sc2.nproto_workplanes.planes]
+check("work plane: planes and the active one are saved in the .blend",
+      _got == _keep and _sc2.nproto_workplanes.active == 1, f"{len(_got)} planes")
+bpy.data.scenes.remove(_sc2)
+_pwp = _draw(_wp.VIEW3D_PT_nproto_workplanes)
+check("work plane: the panel draws (World, list, add menu, origin / rotation)",
+      any(e.get("menu") == "NPROTO_MT_workplane_add" for e in _pwp) and any(e.get("prop") == "origin" for e in _pwp))
+_stW.planes.clear(); _stW.active = -1; _stW.index = 0
+bpy.data.objects.remove(_pl)
+
+# --- Work plane grids: levels, the endless grid's square, Blender's floor hidden and put back
+check("work plane grid: fixed spacing levels (0.25, major 4)", _wp.fixed_levels(0.25, 4, 4) == [0.25, 1.0, 4.0, 16.0])
+check("work plane grid: patch sizes round up to 1 / 2 / 5 x 10^k",
+      [_wp.patch_size(e_) for e_ in (0.7, 1.0, 3.0, 7.9)] == [1.0, 2.0, 5.0, 10.0])
+check("work plane grid: a face patch covers the face from its origin",
+      abs(_wp.covering_half(_wp.WORLD["XY"], [(3, -1, 0), (-0.5, 2, 0)]) - 3.0) < 1e-12)
+_sqp = _wp.endless_square((2, 3, 5), (0, 0, -1), True, 0, 0, 1000.0, 100.0, 4.0, 1000.0)
+_sqf = _wp.endless_square((2, 3, 5), (0, 0, -1), True, 0, 0, 1000.0, 0.01, 4.0, 1000.0)
+_sqo = _wp.endless_square((0, 0, 5), (0, -0.6, -0.8), False, 3, 2, 0, 1.0, 4.0, 1000.0)
+check("work plane grid: endless square around the eye (perspective), none when too far, the view's foot (ortho)",
+      _sqp == (2.0, 3.0, 1000.0) and _sqf is None and np.allclose(_sqo[:2], (0, -3.75))
+      and _wp.endless_square((0, 0, 5), (0, -1, 0), False, 3, 2, 0, 1.0, 4.0, 1000.0) is None, f"{_sqp} {_sqf} {_sqo}")
+_ovs = [ov_ for _, ov_ in _wp._views()]
+_before = [[getattr(ov_, p_) for p_ in _wp.FLOOR_PROPS] for ov_ in _ovs]
+bpy.ops.nproto.workplane_add(source="WORLD_XZ")
+_wpE = _stW.planes[_stW.active]
+_patch_shows = all(ov_.show_floor == b_[0] for ov_, b_ in zip(_ovs, _before))
+_wpE.grid = "ENDLESS"
+_hid = all(not any(getattr(ov_, p_) for p_ in _wp.FLOOR_PROPS) for ov_ in _ovs) and _wp.FLOOR_STASH in _scW
+bpy.ops.nproto.workplane_activate(index=-1)
+_back = [[getattr(ov_, p_) for p_ in _wp.FLOOR_PROPS] for ov_ in _ovs]
+bpy.ops.nproto.workplane_activate(index=_stW.planes.find(_wpE.name))
+_hid2 = not any(ov_.show_floor for ov_ in _ovs)
+_wpE.grid = "PATCH"
+_back2 = [[getattr(ov_, p_) for p_ in _wp.FLOOR_PROPS] for ov_ in _ovs]
+check("work plane grid: Endless hides Blender's floor in every 3D view; the World or a Patch puts it back as it was",
+      len(_ovs) > 0 and _patch_shows and _hid and _back == _before and _hid2 and _back2 == _before
+      and _wp.FLOOR_STASH not in _scW, f"{len(_ovs)} views")
+_lv = _wp.plane_levels(ctx, _wpE, None)
+_wpE.auto_spacing = False; _wpE.spacing = 0.05; _wpE.major = 5
+check("work plane grid: Auto follows the scene's units (metric: um, mm, cm, 10 cm ...); fixed uses the plane's spacing",
+      np.allclose(_lv[:4], [1e-6, 1e-3, 1e-2, 1e-1]) and np.allclose(_wp.plane_levels(ctx, _wpE, None)[:3], [0.05, 0.25, 1.25]), f"{_lv[:4]}")
+_pwg = _draw(_wp.VIEW3D_PT_nproto_workplanes)
+check("work plane grid: the panel offers grid kind, spacing and major lines",
+      all(any(e.get("prop") == k_ for e in _pwg) for k_ in ("grid", "auto_spacing", "spacing", "major")))
+_stW.planes.clear(); _stW.active = -1; _stW.index = 0
+
+# --- Look at a work plane: the view turns square onto it (X right, Y up), its centre moved onto the plane
+_frV = _wp.frame_from_points((1, 2, 3), (2, 2, 3.5), (1, 3, 3))
+_Rv, _cv = _wp.plan_view(_frV, (5, 5, 5))
+_Rb, _ = _wp.plan_view(_frV, (5, 5, 5), "BOTTOM")
+check("work plane view: plan rotation is the plane's axes (behind: Y and normal reversed), centre on the plane",
+      np.allclose(_Rv, np.column_stack(_frV[1:])) and np.allclose(_Rb[:, 2], -_frV[3])
+      and np.allclose(_Rb[:, 0], _frV[1]) and abs(float((_cv - _frV[0]) @ _frV[3])) < 1e-12
+      and abs(np.linalg.det(_Rb) - 1) < 1e-12)
+_v3 = next((a_ for w_ in bpy.context.window_manager.windows for a_ in w_.screen.areas if a_.type == 'VIEW_3D'), None)
+_wpV = _wp.add_plane(ctx.scene, "Look", _frV)
+_pv = ctx.preferences.view.smooth_view
+ctx.preferences.view.smooth_view = 0
+_r3 = _v3.spaces.active.region_3d if _v3 else None
+if _r3 is not None:
+    _r3.view_perspective = 'PERSP'
+    with ctx.temp_override(area=_v3, region=next(r_ for r_ in _v3.regions if r_.type == 'WINDOW'), space_data=_v3.spaces.active):
+        _rr = bpy.ops.nproto.workplane_view()
+    _Rq = np.array(_r3.view_rotation.to_matrix(), float)
+    _okv = _rr == {'FINISHED'} and np.allclose(_Rq, np.column_stack(_frV[1:]), atol=1e-6) \
+        and abs(float((np.array(_r3.view_location) - _frV[0]) @ _frV[3])) < 1e-5 \
+        and _r3.view_perspective == ('ORTHO' if ctx.preferences.inputs.use_auto_perspective else 'PERSP')
+else:
+    _okv = False
+ctx.preferences.view.smooth_view = _pv
+_stW.planes.clear(); _stW.active = -1; _stW.index = 0
+check("work plane view: Look at turns a 3D view onto the active plane (orthographic with Auto Perspective)", _okv)
 
 print("ALL OK" if ok else "SOME FAILED")

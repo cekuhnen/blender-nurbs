@@ -429,14 +429,16 @@ def plane_axes(vec):
     return [e1, np.cross(vec, e1)]
 
 
-def axis_lock_point(lock, base, ray, snapped=None, plane_point=None, step=None, vec=None):
+def axis_lock_point(lock, base, ray, snapped=None, plane_point=None, step=None, vec=None, others=None):
     """The point for an axis lock ('X' / 'Y' / 'Z': along that world axis from
     base; '-X' / '-Y' / '-Z': in the plane through base of the other two;
     'T' / '-T': along / normal to `vec`, the tangent of an edge or the normal of
     a face). ray = (origin, direction) under the mouse. A snapped point is
     projected onto the line / plane, so the result lines up with it.
     plane_point (the drawing plane under the mouse) stands in when the lock
-    plane is seen edge-on. step: grid increment for the offsets from base (Ctrl)."""
+    plane is seen edge-on. step: grid increment for the offsets from base (Ctrl),
+    along `others` (the two directions spanning the lock plane; default
+    plane_axes(vec)) -- a work plane's axes keep the steps on its grid."""
     vec = AXES[lock[-1]] if vec is None else np.asarray(vec, float) / (np.linalg.norm(vec) or 1.0)
     base = np.asarray(base, float)
     if lock[0] != "-":
@@ -456,7 +458,7 @@ def axis_lock_point(lock, base, ray, snapped=None, plane_point=None, step=None, 
     off = P - base
     off -= float(off @ vec) * vec
     if step:
-        for e in plane_axes(vec):
+        for e in (plane_axes(vec) if others is None else others):
             c = float(off @ e)
             off += (round(c / step) * step - c) * e
     return base + off
@@ -524,6 +526,7 @@ NUMPAD_CHARS = {f"NUMPAD_{i}": str(i) for i in range(10)} | {
     "NUMPAD_PERIOD": ".", "NUMPAD_MINUS": "-", "NUMPAD_PLUS": "+", "NUMPAD_SLASH": "/", "NUMPAD_ASTERIX": "*"}
 GUIDE_PX = 6.0          # a smart guide snaps within this many pixels
 EDGE_ON_DEG = 12.0      # a free view this close to level with the floor draws on an upright world plane
+WORK_EDGE_ON_DEG = 1.0  # a work plane seen this close to edge-on: the World's planes stand in
 GUIDE_LABEL = {"align": "Aligned", "tangent": "Tangent", "extend": "Extension", "perp": "Perpendicular",
                "parallel": "Parallel"}
 COL_GUIDE = (0.75, 0.75, 0.75, 0.9)
@@ -717,8 +720,42 @@ class SketchMixin:
         return np.array([event.mouse_x - region.x, event.mouse_y - region.y], float)
 
     # -- drawing plane ----------------------------------------------------
-    def _view_plane(self, context, through):
-        """The drawing plane where no flat face chose one: in a Top / Front /
+    def _work(self, context):
+        """The active work plane's frame (O, x, y, n), or None (the World)."""
+        from . import workplanes
+        return workplanes.active_frame(context.scene)
+
+    def _axes(self, context):
+        """{X, Y, Z}: the directions the X / Y / Z keys lock to -- the active
+        work plane's X, Y and normal, else the world's."""
+        wf = self._work(context)
+        if wf is None:
+            return AXES
+        return {"X": np.asarray(wf[1], float), "Y": np.asarray(wf[2], float), "Z": np.asarray(wf[3], float)}
+
+    def _base(self, context):
+        """Where the X / Y / Z locks start before the first point: the work
+        plane's origin, else the world's."""
+        wf = self._work(context)
+        return np.zeros(3) if wf is None else np.asarray(wf[0], float)
+
+    def _on_work(self, context, f):
+        """Does the flat face f lie in the active work plane? (Drawing on it
+        then uses the work plane's axes and grid, not the face's.)"""
+        wf = self._work(context)
+        if wf is None or f is None:
+            return False
+        n = np.asarray(wf[3], float)
+        tol = 1e-4 * max(float(f.get("size", 1.0)), 1e-9) + 1e-9
+        return abs(abs(float(np.asarray(f["n"], float) @ n)) - 1.0) < 1e-6 \
+            and abs(float((np.asarray(f["P"], float) - wf[0]) @ n)) <= tol
+
+    def _view_plane(self, context, through=None):
+        """The drawing plane where no flat face chose one: the active work
+        plane (through `through` when given -- a point snapped off it gives
+        the parallel plane through that point -- else exactly the work
+        plane), unless it is seen edge-on (within WORK_EDGE_ON_DEG). With
+        the World active: in a Top / Front /
         Side view that view's grid plane; in any other view (perspective or
         turned) the world's XY plane -- the floor grid -- or, seen nearly
         edge-on (within EDGE_ON_DEG), whichever of the world's XZ / YZ planes
@@ -727,6 +764,12 @@ class SketchMixin:
         cursor to the view when it is placed, which tilted the sketch)."""
         rv3d = self._win(context)[1]
         vdir = np.array(rv3d.view_rotation @ Vector((0.0, 0.0, -1.0)), float)
+        wf = self._work(context)
+        if wf is not None and abs(float(vdir @ wf[3])) >= math.sin(math.radians(WORK_EDGE_ON_DEG)):
+            O = wf[0] if through is None else np.asarray(through, float)
+            return np.asarray(O, float), np.asarray(wf[3], float), np.asarray(wf[1], float), np.asarray(wf[2], float)
+        if through is None:
+            through = np.zeros(3)
         axis = int(np.argmax(np.abs(vdir)))
         if not rv3d.is_perspective and abs(abs(vdir[axis]) - 1.0) < 1e-4:
             n = np.zeros(3)
@@ -746,11 +789,15 @@ class SketchMixin:
             u = np.cross(v, n)
         return np.asarray(through, float), n, u, v
 
-    @staticmethod
-    def _grid_origin(O, face=None):
-        """Where Ctrl's grid lines cross on a plane through O: the world origin
-        when its axes are world axes (the grid Blender draws), else -- a
-        slanted face -- the face's centre, so the grid sits square on it."""
+    def _grid_origin(self, context, O, face=None):
+        """Where Ctrl's grid lines cross on a plane through O: the active work
+        plane's origin (its grid) -- also on a face lying in it --, the world
+        origin when the plane's axes are world axes (the grid Blender draws),
+        else -- a slanted face -- the face's centre, so the grid sits square
+        on it."""
+        wf = self._work(context)
+        if wf is not None and (face is None or self._on_work(context, face)):
+            return np.asarray(wf[0], float)
         if face is None:
             return np.zeros(3)
         aligned = lambda a: float(np.abs(np.asarray(a, float)).max()) > 1 - 1e-9
@@ -800,8 +847,13 @@ class SketchMixin:
             return 1.0
         us = context.scene.unit_settings
         ov = getattr(getattr(context.area, "spaces", None) and context.area.spaces.active, "overlay", None)
-        steps = grid_steps(us.system, us.scale_length or 1.0, getattr(ov, "grid_scale", 1.0) or 1.0,
-                           getattr(ov, "grid_subdivisions", 10) or 10)
+        from . import workplanes
+        wp = workplanes.active_plane(context.scene)
+        if wp is not None:                  # the levels the work plane's grid draws
+            steps = workplanes.plane_levels(context, wp, ov)
+        else:
+            steps = grid_steps(us.system, us.scale_length or 1.0, getattr(ov, "grid_scale", 1.0) or 1.0,
+                               getattr(ov, "grid_subdivisions", 10) or 10)
         return visible_grid_step(steps, ppu)
 
     def pick_point(self, context, event, extra=(), prev=None):
@@ -1034,7 +1086,12 @@ class SketchMixin:
             return
         f = getattr(self, "_face_hover", None)
         if f is not None and all(self.on_face(f, Q) for Q in (P, *on)):
-            self._plane = (np.asarray(P, float), f["n"], f["u"], f["v"])
+            if self._on_work(context, f):            # the face lies in the work plane: its axes and grid
+                wf = self._work(context)
+                self._plane = (np.asarray(wf[0], float), np.asarray(wf[3], float),
+                               np.asarray(wf[1], float), np.asarray(wf[2], float))
+            else:
+                self._plane = (np.asarray(P, float), f["n"], f["u"], f["v"])
             self._plane_face = f
         elif self._plane is None or getattr(self, "_plane_face", None) is not None:
             self._plane = self._view_plane(context, P)
@@ -1048,10 +1105,12 @@ class SketchMixin:
         shown = self._shown_face()
         if shown is not None and shown.get("snap"):     # a mesh face's corners and edge middles (the squares) snap
             extra = list(extra) + list(shown["snap"])
-        if f is not None:                               # before the first point: on the flat face under the mouse
+        if f is not None and self._on_work(context, f):  # a face in the work plane: exactly the work plane
+            plane = self._view_plane(context)
+        elif f is not None:                             # before the first point: on the flat face under the mouse
             plane = (f["P"], f["n"], f["u"], f["v"])
         else:
-            plane = self._plane or self._view_plane(context, np.zeros(3))
+            plane = self._plane or self._view_plane(context)
         O, n, u, v = plane
         el = getattr(self, "_edge_lock", None)
         k = self._snaps.line_index(*el) if el else None
@@ -1064,7 +1123,8 @@ class SketchMixin:
             # world axis lock (X / Y / Z) or plane lock (Shift+X / Y / Z), from
             # the previous point, or from the world origin for the first one; a
             # direction taken from a line (A) only once there is a previous point
-            base = prev if prev is not None else np.zeros(3)
+            base = prev if prev is not None else self._base(context)
+            axes = self._axes(context)
             hit = None if free else self._snaps.pick(self._view(context), mouse, extra, edges=False,
                                                      segments=self.drawn_segments())
             region, rv3d = self._win(context)
@@ -1072,15 +1132,16 @@ class SketchMixin:
                    np.array(view3d_utils.region_2d_to_vector_3d(region, rv3d, Vector(mouse)), float))
             step = self._grid_step(context, base, u, v) if event.ctrl and hit is None else None
             vec = getattr(self, "_tvec", None) if lock[-1] == "T" else getattr(self, "_avec", None) \
-                if lock == "A" else None
+                if lock == "A" else axes[lock[-1]]
+            others = [axes[k] for k in "XYZ" if k != lock[-1]] if lock[-1] in "XYZ" else None
             if hit is None and not free and not event.ctrl and lock[0] != "-":
-                along = AXES.get(lock, vec)
+                along = vec
                 if along is not None and np.linalg.norm(along) > 1e-12:
                     g = self._guide_snap(context, mouse, prev, plane, along=(base, np.asarray(along, float)))
                     if g is not None:
                         return self._guided(g)
             P = axis_lock_point(lock, base, ray, None if hit is None else hit[0],
-                                self._ray_point(context, Vector(mouse), plane), step, vec)
+                                self._ray_point(context, Vector(mouse), plane), step, vec, others)
             return P, None
         axis = None
         if prev is not None:
@@ -1135,7 +1196,7 @@ class SketchMixin:
         elif event.ctrl:
             st = self._grid_step(context, P, u, v)
             face = f if f is not None else (getattr(self, "_plane_face", None) if self._plane is not None else None)
-            g0 = self._grid_origin(O, face)           # the world grid, or a slanted face's own
+            g0 = self._grid_origin(context, O, face)  # the work plane's / world grid, or a slanted face's own
             x, y = float((P - O) @ u), float((P - O) @ v)
             ox, oy = float((O - g0) @ u), float((O - g0) @ v)
             x = round((x + ox) / st) * st - ox
@@ -1186,7 +1247,8 @@ class SketchMixin:
         lk = getattr(self, "_lock", None)
         out = []
         if lk and (lk[-1] in "XYZT" or (lk == "A" and prev is not None)):
-            base = np.asarray(prev if prev is not None else np.zeros(3), float)
+            base = np.asarray(prev if prev is not None else self._base(context), float)
+            axes = self._axes(context)
             rv3d = self._win(context)[1]
             big = 50.0 * max(float(getattr(rv3d, "view_distance", 10.0)), 1e-3)
             if lk == "A":
@@ -1197,7 +1259,7 @@ class SketchMixin:
                 cols = [COL_TANGENT] * len(dirs)
             else:
                 ks = "XYZ".replace(lk[-1], "") if lk[0] == "-" else lk
-                dirs, cols = [AXES[k] for k in ks], [AXIS_COL[k] for k in ks]
+                dirs, cols = [axes[k] for k in ks], [AXIS_COL[k] for k in ks]
             for e, c in zip(dirs, cols):
                 out.append(([Vector(base - big * e), Vector(base + big * e)], c))
         draw.sketch_overlay["axes"] = out
@@ -1749,7 +1811,7 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
             d = math.cos(math.radians(A)) * u + math.sin(math.radians(A)) * v
         elif getattr(self, "_lock", None) in ('X', 'Y', 'Z', 'T', 'A'):
             d = {'T': np.asarray(getattr(self, "_tvec", u), float),
-                 'A': np.asarray(getattr(self, "_avec", u), float)}.get(self._lock, AXES.get(self._lock))
+                 'A': np.asarray(getattr(self, "_avec", u), float)}.get(self._lock, self._axes(context).get(self._lock))
             d = d / (np.linalg.norm(d) or 1.0)
             if P is not None and float((P - self._start) @ d) < 0:
                 d = -d
@@ -1987,12 +2049,12 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
         if c is None:
             return
         P = self._ray_point(context, Vector(self._mouse(context, event)),
-                            self._plane or self._view_plane(context, np.zeros(3)))
+                            self._plane or self._view_plane(context))
         t = linesolve.nearest_t(c, P if P is not None else c.W[0]) if not c.straight else c.t0
         if kind == "parallel":
             d = c.at(t)[2]
         else:
-            plane = self._plane or self._view_plane(context, np.zeros(3))
+            plane = self._plane or self._view_plane(context)
             d = linesolve.side_direction(c, t, plane[1])
         if d is None or np.linalg.norm(d) <= 1e-12:
             return
