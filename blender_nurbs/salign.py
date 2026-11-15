@@ -499,7 +499,7 @@ def parse_picks(picks):
     The first pick names the surface; another of its edges adds an edge; a
     pick on any other object is the target of the edge before it."""
     if not picks:
-        raise ValueError("pick an edge of the surface to align")
+        raise ValueError("pick an edge of an untrimmed surface first")
     obj = picks[0][0]
     out = []
     for o, r in picks:
@@ -513,27 +513,16 @@ def parse_picks(picks):
     return obj, [tuple(x) for x in out]
 
 
-class NPROTO_OT_surface_align(PickMixin, bpy.types.Operator):
-    """Align boundary edges of an untrimmed surface G0 / G1 / G2 to the surfaces they
-    touch (moves only the CV rows at those edges). Pick one or more edges of the
-    surface (Enter to finish); picking another surface's edge right after one sets
-    its target, otherwise the touching edge is found"""
-    bl_idname = "nproto.surface_align"
-    bl_label = "Surface Align"
-    bl_options = {'REGISTER', 'UNDO'}
+class EdgePicking(PickMixin):
+    """Picking for Surface Align and Match Surface: edges of one untrimmed
+    surface, each optionally followed by its target (another object's edge
+    or a curve); an edge without one gets the edge or curve touching it."""
 
     pick_min = 1
     pick_max = 32
     finish_on_min = False
     extra_help = ("   Click ON a surface near its edge = that edge; then click the neighbour across it "
                   "= its target (optional)")
-    inputs: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
-    cont_U0: _cont_prop("U0")
-    cont_U1: _cont_prop("U1")
-    cont_V0: _cont_prop("V0")
-    cont_V1: _cont_prop("V1")
-    tangent: FloatProperty(name="Tangent", default=1.0, min=0.05, soft_max=3.0,
-                           description="Scale of the cross tangent at the aligned edges (G1 / G2)")
 
     def invoke(self, context, event):
         if not _kernel_ok(self):
@@ -566,10 +555,11 @@ class NPROTO_OT_surface_align(PickMixin, bpy.types.Operator):
         context.area.tag_redraw()
         return cur
 
-    def _jobs(self, context):
+    def picked_jobs(self, context, verb="aligned"):
+        """(surface, [(edge, (target obj, ref), continuity)]) from the picks."""
         obj, edges = parse_picks(_decode_inputs(self.inputs))
         if not store.is_natural(obj) or store.get_brep(obj).face_count() != 1:
-            raise ValueError(f"{obj.name} is trimmed: only untrimmed single surfaces can be aligned "
+            raise ValueError(f"{obj.name} is trimmed: only untrimmed single surfaces can be {verb} "
                              "(Refit to Trim first)")
         cands = None
         jobs_ = []
@@ -582,6 +572,27 @@ class NPROTO_OT_surface_align(PickMixin, bpy.types.Operator):
                     raise ValueError(f"no surface edge or curve touches {e}: pick its target right after the edge")
             jobs_.append((e, tgt, getattr(self, "cont_" + e)))
         return obj, jobs_
+
+
+class NPROTO_OT_surface_align(EdgePicking, bpy.types.Operator):
+    """Align boundary edges of an untrimmed surface G0 / G1 / G2 to the surfaces they
+    touch (moves only the CV rows at those edges). Pick one or more edges of the
+    surface (Enter to finish); picking another surface's edge right after one sets
+    its target, otherwise the touching edge is found"""
+    bl_idname = "nproto.surface_align"
+    bl_label = "Surface Align"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    inputs: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    cont_U0: _cont_prop("U0")
+    cont_U1: _cont_prop("U1")
+    cont_V0: _cont_prop("V0")
+    cont_V1: _cont_prop("V1")
+    tangent: FloatProperty(name="Tangent", default=1.0, min=0.05, soft_max=3.0,
+                           description="Scale of the cross tangent at the aligned edges (G1 / G2)")
+
+    def _jobs(self, context):
+        return self.picked_jobs(context, "aligned")
 
     def draw(self, context):
         lay = self.layout

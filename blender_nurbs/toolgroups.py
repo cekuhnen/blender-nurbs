@@ -86,7 +86,8 @@ GROUPS = (
         ("Shape", (
             (_t("nproto.edit_cvs", icon='EDITMODE_HLT'), _t("nproto.flip_normal", icon='NORMALS_FACE')),
             (_t("nproto.rebuild_surface", icon='MOD_REMESH'), _t("nproto.extend", icon='FULLSCREEN_ENTER')),
-            (_t("nproto.surface_align", icon='SNAP_EDGE'), _t("nproto.refit_trim", icon='MOD_LATTICE')),
+            (_t("nproto.surface_align", icon='SNAP_EDGE'), _t("nproto.match_surface", icon='SNAP_FACE')),
+            (_t("nproto.refit_trim", icon='MOD_LATTICE'),),
         )),
         ("Trim and Join", (
             (_t("nproto.trim", icon='MOD_BOOLEAN'), _t("nproto.split", icon='MOD_EDGESPLIT'),

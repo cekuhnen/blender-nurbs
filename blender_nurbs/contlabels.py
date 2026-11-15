@@ -20,6 +20,7 @@ from mathutils import Vector
 from . import features, store
 
 OPS = ("square", "loft", "loft_rails", "blend_curve", "patch")
+STACK_OPS = ("surface_align", "match_surface")   # history steps with a label per edge
 ORDER = ("FREE", "G0", "G1", "G2")
 SHORT = {"FREE": "Free", "G0": "G0", "G1": "G1", "G2": "G2"}
 RADIUS_PX = 13.0
@@ -46,7 +47,7 @@ def _compute(obj):
         entries = features.stack(obj)
     except Exception:
         return out
-    if not any(e["op"] == "surface_align" for e in entries):
+    if not any(e["op"] in STACK_OPS for e in entries):
         return out
     from . import geom, store
     from mathutils import Vector
@@ -54,7 +55,7 @@ def _compute(obj):
     M = geom.world_matrix(obj)
     at = 0.3 if out else 0.5          # off the middle when the base feature has labels there too
     for k, e in enumerate(entries):
-        if e["op"] != "surface_align":
+        if e["op"] not in STACK_OPS:
             continue
         for i, (edge, (src, ref)) in enumerate(zip(e["params"]["edges"], e["inputs"])):
             pts = geom.boundary_points(surf, edge, 21)
@@ -402,7 +403,8 @@ def has_labels(obj):
     h = obj.get(features.PROP_HIST)
     if bool(h) and any(f'"op": "{op}"' in str(h) for op in OPS):
         return True
-    return '"surface_align"' in str(obj.get(features.PROP_STACK, ""))
+    st = str(obj.get(features.PROP_STACK, ""))
+    return any(f'"{op}"' in st for op in STACK_OPS)
 
 
 def visible_label_objects(context):
@@ -549,7 +551,7 @@ class NPROTO_OT_cycle_continuity(bpy.types.Operator):
                 if area.type == 'VIEW_3D':
                     area.tag_redraw()
             return {'FINISHED'}
-        if L["param"].startswith("stack:"):              # a Surface Align step: edit it in place
+        if L["param"].startswith("stack:"):              # a Surface Align / Match step: edit it in place
             _, k, i = L["param"].split(":")
             entries = features.stack(obj)
             entries[int(k)]["params"]["cont"][int(i)] = new

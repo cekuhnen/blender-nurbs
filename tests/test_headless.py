@@ -3196,6 +3196,191 @@ check("continuity check: unaligned edge FAILS G2, aligned label holds (no red ri
       f"{_before_chk['text']} | {_lab and _lab[0]['check']}")
 _lab_l = _cl.labels(bpy.data.objects["SA_S"]) if "SA_S" in bpy.data.objects else []
 
+# --- Match Surface (edge rows set from the target's CV rows: exact G0 / G1 / G2) ---
+from blender_nurbs import match as _ma
+ctx.scene.nproto_settings.construction_history = True
+_mrng = np.random.default_rng(5)
+def _mk(name, G, Uu, Uv, du=3, dv=3):
+    pts = [tuple(map(float, G[i, j])) for i in range(G.shape[0]) for j in range(G.shape[1])]
+    return store.new_object(ctx, name, ext.surface_from_cvs(du, dv, pts, list(Uu), list(Uv)))
+def _mgrid(o):
+    d = ext.surface_cvs(store.get_surfaces(o)[0])
+    return np.array(d["points"], float).reshape(d["count_u"], d["count_v"], 3), d
+def _msplit(G, U, t, axis, p=3):
+    """Cut a CV grid at knot t of one axis: two exact pieces (knots 0..1 each)."""
+    Gt = G if axis == 0 else G.transpose(1, 0, 2)
+    U = list(U)
+    while U.count(t) < p:
+        Gt, U = _sa.insert_knot(Gt, U, p, t)
+    k = max(i for i, x in enumerate(U) if x == t) - p
+    a, b = Gt[:k + 1], Gt[k:]
+    Ua, Ub = [x / t for x in U[:k + p + 1]] + [1.0], [0.0] + [(x - t) / (1 - t) for x in U[k + 1:]]
+    if axis == 1:
+        a, b = a.transpose(1, 0, 2), b.transpose(1, 0, 2)
+    return (np.ascontiguousarray(a), Ua), (np.ascontiguousarray(b), Ub)
+def _exact(m, lv=2):
+    """Exact as far as Continuity Check can tell (its own floor: ~1e-11 gaps, ~1e-6 deg)."""
+    return m is not None and m["gap"] < 1e-9 and (lv < 1 or m["angle"] < 1e-5) and (lv < 2 or m["curv"] < 1e-6)
+def _mmeas(*a):
+    try:
+        return _ma.measure(*a)
+    except ValueError:              # Continuity Check: "the edges don't meet"
+        return None
+# one surface cut in 2 x 2 at u = v = 0.5: the top-right piece S, perturbed, against its neighbours
+_mn = 7
+_mX, _mY = np.meshgrid(np.linspace(300, 304, _mn), np.linspace(0, 4, _mn), indexing="ij")
+_mG = np.stack([_mX, _mY, 0.4 * np.sin(0.8 * (_mX - 300)) * np.cos(0.6 * _mY) + 0.05 * _mrng.standard_normal(_mX.shape)], 2)
+_mU = geom.clamped_uniform_knots(_mn, 3)
+(_mL, _mUL), (_mR, _mUR) = _msplit(_mG, _mU, 0.5, 0)
+(_mL0, _), (_mL1, _mVL1) = _msplit(_mL, _mU, 0.5, 1)
+(_mR0, _mVR0), (_mR1, _mVR1) = _msplit(_mR, _mU, 0.5, 1)
+maL = _mk("MA_L", _mL1, _mUL, _mVL1)          # left of S, across its U0
+maB = _mk("MA_B", _mR0, _mUR, _mVR0)          # below S, across its V0
+_mP = _mR1.copy(); _mP[0] += 0.02 * _mrng.standard_normal(_mP[0].shape); _mP[1:3] += 0.12 * _mrng.standard_normal(_mP[1:3].shape)
+maS = _mk("MA_S", _mP, _mUR, _mVR1)
+_m0 = _mmeas(maS, "U0", maL, "U1")
+r = bpy.ops.nproto.match_surface(inputs=ins((maS, "U0")), cont_U0="G2")      # the target is found by itself
+_m1 = _ma.measure(maS, "U0", maL, "U1")
+_mg, _md = _mgrid(maS)
+_hull = max(np.linalg.norm(np.cross(_mg[1, j] - _mg[0, j], _mL1[-1, j] - _mL1[-2, j])) for j in range(_mg.shape[1]))
+check("match surface: same layout, G2 to the touching edge -- exact (Continuity Check), row 0 IS the target's row, "
+      "only rows 0-2 move, CV hull lines straight across",
+      r == {'FINISHED'} and not _exact(_m0) and _exact(_m1) and (_md["count_u"], _md["count_v"]) == _mP.shape[:2]
+      and np.abs(_mg[0] - _mL1[-1]).max() < 1e-12 and np.abs(_mg[3:] - _mP[3:]).max() < 1e-12 and _hull < 1e-12
+      and [e["op"] for e in features.stack(maS)] == ["match_surface"] and store.is_natural(maS), f"{_m0} -> {_m1}")
+# history: the target moves, the edge follows; its label steps G2 -> G0 and back to G2
+maL.location.z += 0.3; ctx.view_layer.update(); features.rebuild(maS, ctx)
+_m2 = _ma.measure(maS, "U0", maL, "U1")
+maL.location.z = 0.0; ctx.view_layer.update(); features.rebuild(maS, ctx)      # (exactly: -= 0.3 leaves float32 dust)
+_cl._cache.clear()
+_mlab = _cl.labels(maS)
+_r1 = bpy.ops.nproto.cycle_continuity(obj_name=maS.name, index=0) if _mlab else None
+_cl._cache.clear()
+_mlab2 = _cl.labels(maS)
+_r2 = bpy.ops.nproto.cycle_continuity(obj_name=maS.name, index=0, step=-1) if _mlab2 else None   # back from G0 to G2
+_cl._cache.clear()
+_mlab3 = _cl.labels(maS)
+check("match surface: history -- moving the target matches again; its edge label holds and steps G2 -> G0 -> G2",
+      _exact(_m2) and len(_mlab) == 1 and _mlab[0]["value"] == "G2" and _mlab[0]["check"]["ok"]
+      and _r1 == {'FINISHED'} and _mlab2[0]["value"] == "G0" and _r2 == {'FINISHED'} and _mlab3[0]["value"] == "G2"
+      and _exact(_ma.measure(maS, "U0", maL, "U1")), f"{_m2} {[(L['value'], L['check']) for L in _mlab + _mlab2 + _mlab3]}")
+# two edges meeting at a corner: both exact, and the cut-out piece comes back CV for CV
+features.remove_step(maS, 0); features.rebuild(maS, ctx, force=True)
+_mP2 = _mR1.copy(); _mP2[:3] += 0.1 * _mrng.standard_normal(_mP2[:3].shape); _mP2[:, :3] += 0.1 * _mrng.standard_normal(_mP2[:, :3].shape)
+maS2 = _mk("MA_S2", _mP2, _mUR, _mVR1)
+r = bpy.ops.nproto.match_surface(inputs=ins((maS2, "U0"), (maL, "U1"), (maS2, "V0"), (maB, "V1")), cont_U0="G2", cont_V0="G2")
+_mg2, _ = _mgrid(maS2)
+check("match surface: two edges at a corner (a 2 x 2 split), G2 both -- exact, the corner block is the original's CVs",
+      r == {'FINISHED'} and _exact(_ma.measure(maS2, "U0", maL, "U1")) and _exact(_ma.measure(maS2, "V0", maB, "V1"))
+      and np.abs(_mg2[:3, :3] - _mR1[:3, :3]).max() < 1e-10, f"{np.abs(_mg2[:3, :3] - _mR1[:3, :3]).max():.2e}")
+# the target's parameter runs the other way along the edge
+maR = _mk("MA_Rev", _mL1[:, ::-1].copy(), _mUL, [1 - x for x in reversed(_mVL1)])
+maR.location.y = 10; ctx.view_layer.update()
+maS3 = _mk("MA_S3", _mP, _mUR, _mVR1); maS3.location.y = 10; ctx.view_layer.update()
+r = bpy.ops.nproto.match_surface(inputs=ins((maS3, "U0"), (maR, "U1")), cont_U0="G2")
+check("match surface: a target running the other way (reversed parameter) -- turned round, exact",
+      r == {'FINISHED'} and _exact(_ma.measure(maS3, "U0", maR, "U1")), f"{_ma.measure(maS3, 'U0', maR, 'U1')}")
+# different layouts along the edge: target degree 5 with its own knots, surface cubic with 4 CVs
+_tX, _tY = np.meshgrid(np.linspace(318, 320, 6), np.linspace(0, 2, 8), indexing="ij")
+maT5 = _mk("MA_T5", np.stack([_tX, _tY, 0.2 * np.sin(1.3 * _tY) + 0.05 * (_tX - 320) * _tY], 2), geom.clamped_uniform_knots(6, 3),
+           [0.0] * 6 + [0.3, 0.55] + [1.0] * 6, 3, 5)
+_sX, _sY = np.meshgrid(np.linspace(320, 322, 5), np.linspace(0, 2, 4), indexing="ij")
+maS5 = _mk("MA_S5", np.stack([_sX, _sY, 0.1 * _mrng.standard_normal(_sX.shape)], 2), geom.clamped_uniform_knots(5, 3),
+           geom.clamped_uniform_knots(4, 3))
+_before5 = _mgrid(maS5)[0].copy()
+r = bpy.ops.nproto.match_surface(inputs=ins((maS5, "U0"), (maT5, "U1")), cont_U0="G2")
+_g5, _d5 = _mgrid(maS5)
+check("match surface: different degree and knots along the edge -- made one exactly (degree 3 -> 5, the target's knots), "
+      "exact G2", r == {'FINISHED'} and _d5["degree_v"] == 5 and _d5["count_v"] == 8 and _d5["count_u"] == 5
+      and np.allclose(_d5["knots_v"], [0.0] * 6 + [0.3, 0.55] + [1.0] * 6) and _exact(_ma.measure(maS5, "U0", maT5, "U1")),
+      f"{_d5['degree_v']} {_d5['count_v']} {_d5['knots_v']} {_ma.measure(maS5, 'U0', maT5, 'U1')}")
+# a curve as the target: G0, row 0 = the curve's CVs
+maC = nurbs("MA_C", [(330 + 0.8 * i, -0.2, 0.3 * math.sin(i)) for i in range(6)])
+_cX, _cY = np.meshgrid(np.linspace(330, 334, 4), np.linspace(0, 2, 5), indexing="ij")
+maSC = _mk("MA_SC", np.stack([_cX, _cY, np.zeros_like(_cX)], 2), geom.clamped_uniform_knots(4, 3), geom.clamped_uniform_knots(5, 3))
+r = bpy.ops.nproto.match_surface(inputs=ins((maSC, "V0"), (maC, "S0")), cont_V0="G2")
+_gc, _ = _mgrid(maSC)
+_crow = np.array(ext.curve_cvs(features.input_curve(maC, "S0"))["points"], float)
+check("match surface: a curve as the target -- G0, the edge row is the curve's CVs",
+      r == {'FINISHED'} and _ma.measure(maSC, "V0", maC, "S0")["gap"] < 1e-9 and np.abs(_gc[:, 0] - _crow).max() < 1e-12,
+      f"{_ma.measure(maSC, 'V0', maC, 'S0')}")
+# Closest Points: the edge runs along the middle part of a longer target edge
+_lX, _lY = np.meshgrid(np.linspace(340, 346, 6), np.linspace(-2, 0, 4), indexing="ij")
+maTL = _mk("MA_TL", np.stack([_lX, _lY, 0.3 * np.sin(0.5 * (_lX - 340)) + 0.1 * _lY ** 2], 2), geom.clamped_uniform_knots(6, 3),
+           geom.clamped_uniform_knots(4, 3))
+_mX2, _mY2 = np.meshgrid(np.linspace(342, 344.5, 5), np.linspace(0.05, 2, 4), indexing="ij")
+maSM = _mk("MA_SM", np.stack([_mX2, _mY2, 0.1 + np.zeros_like(_mX2)], 2), geom.clamped_uniform_knots(5, 3), geom.clamped_uniform_knots(4, 3))
+r = bpy.ops.nproto.match_surface(inputs=ins((maSM, "V0"), (maTL, "V1")), cont_V0="G2", ends="CLOSEST")
+_e = np.array(geom.boundary_points(store.get_surfaces(maSM)[0], "V0", 3), float)
+check("match surface: Closest Points -- part of a longer target edge, cut out exactly; G2 exact",
+      r == {'FINISHED'} and _exact(_ma.measure(maSM, "V0", maTL, "V1")) and abs(_e[0][0] - 342) < 0.05 and abs(_e[-1][0] - 344.5) < 0.05,
+      f"{_ma.measure(maSM, 'V0', maTL, 'V1')} {_e[[0, -1], 0]}")
+# Keep Other End: a 4-row patch matched G2 keeps its far edge's position and tangent (rows inserted)
+_kX, _kY = np.meshgrid(np.linspace(352, 354, 4), np.linspace(0, 2, 4), indexing="ij")
+maT4 = _mk("MA_T4", np.stack([_kX - 2, _kY, 0.1 * np.cos(_kY)], 2), geom.clamped_uniform_knots(4, 3), geom.clamped_uniform_knots(4, 3))
+maS4 = _mk("MA_S4", np.stack([_kX, _kY, 0.2 * _mrng.standard_normal(_kX.shape)], 2), geom.clamped_uniform_knots(4, 3),
+           geom.clamped_uniform_knots(4, 3))
+_far = lambda o: np.array([np.r_[store.get_surfaces(o)[0].evaluate(1.0, v), store.get_surfaces(o)[0].derivatives(1.0, v)[1]]
+                           for v in np.linspace(0, 1, 7)], float)
+_f0 = _far(maS4)
+r = bpy.ops.nproto.match_surface(inputs=ins((maS4, "U0"), (maT4, "U1")), cont_U0="G2", keep="G1")
+check("match surface: Keep Other End = Tangent -- rows inserted, the far edge keeps position and tangent, G2 exact",
+      r == {'FINISHED'} and _mgrid(maS4)[1]["count_u"] == 5 and np.abs(_far(maS4) - _f0).max() < 1e-10
+      and _exact(_ma.measure(maS4, "U0", maT4, "U1")), f"{np.abs(_far(maS4) - _f0).max():.2e}")
+# degree 1 across: raised for G2
+maP1 = _mk("MA_P1", np.stack([_kX[[0, -1]] - 4, _kY[[0, -1]], 0.5 + np.zeros((2, 4))], 2), [0, 0, 1, 1], geom.clamped_uniform_knots(4, 3), 1, 3)
+r = bpy.ops.nproto.match_surface(inputs=ins((maP1, "U1"), (maT4, "U0")), cont_U1="G2")
+check("match surface: degree 1 across -- raised to 2 for G2, exact", r == {'FINISHED'} and _mgrid(maP1)[1]["degree_u"] == 2
+      and _exact(_ma.measure(maP1, "U1", maT4, "U0")), f"{_mgrid(maP1)[1]['degree_u']} {_ma.measure(maP1, 'U1', maT4, 'U0')}")
+# trimmed target: a side along its surface's CV net is exact; a trim curve is refused with the reason
+_tXX, _tYY = np.meshgrid(np.linspace(360, 364, 6), np.linspace(0, 2, 5), indexing="ij")
+_tG = np.stack([_tXX, _tYY, 0.2 * np.sin(_tXX - 360) + 0.1 * _tYY ** 2], 2)
+_tU, _tV = geom.clamped_uniform_knots(6, 3), geom.clamped_uniform_knots(5, 3)
+_tbase = ext.surface_from_cvs(3, 3, [tuple(map(float, _tG[i, j])) for i in range(6) for j in range(5)], _tU, _tV)
+_tcrv = lambda s_: ext.curve_from_cvs(3, [tuple(map(float, q)) for q in s_["P"]], [float(k) for k in s_["knots"]], None)
+_trow = lambda P_, U_: {"deg": 3, "knots": U_, "P": P_, "D": None, "DD": None}
+_tloop = [_tcrv(geom.sub_side(_trow(_tG[:, 0], _tU), 0.0, 0.6)),
+          _kl().create_curve_interp_points([tuple(_tbase.evaluate(0.6 - 0.2 * t, t)) for t in np.linspace(0, 1, 12)]),
+          _tcrv(geom.reverse_side(geom.sub_side(_trow(_tG[:, -1], _tU), 0.0, 0.4))), _tcrv(geom.reverse_side(_trow(_tG[0], _tV)))]
+maTT = store.new_object(ctx, "MA_TT", _kl().trim_surface_with_3d_curves(_tbase, [4], _tloop))
+_tedges = store.display(maTT)["edges"]
+_tnear = lambda q_: "E%d" % min(range(len(_tedges)), key=lambda i: np.linalg.norm(np.array(_tedges[i][len(_tedges[i]) // 2]) - np.array(q_)))
+_tside, _ttrim = _tnear(_tbase.evaluate(0.3, 0.0)), _tnear(_tbase.evaluate(0.5, 0.5))
+_xe = float(_tbase.evaluate(0.6, 0.0)[0])
+_sXX, _sYY = np.meshgrid(np.linspace(360, _xe, 5), np.linspace(-1.5, 0, 4), indexing="ij")
+_sG = np.stack([_sXX, _sYY, 0.1 * _mrng.standard_normal(_sXX.shape)], 2)
+maST = _mk("MA_ST", _sG, geom.clamped_uniform_knots(5, 3), geom.clamped_uniform_knots(4, 3))
+r = bpy.ops.nproto.match_surface(inputs=ins((maST, "V1"), (maTT, _tside)), cont_V1="G2")
+maST2 = _mk("MA_ST2", _sG, geom.clamped_uniform_knots(5, 3), geom.clamped_uniform_knots(4, 3))
+r2 = bpy.ops.nproto.match_surface(inputs=ins((maST2, "V1"), (maTT, _ttrim)), cont_V1="G2")
+try:
+    _ma.match_text(maST2, maST2[store.PROP_BREP], [("V1", (maTT, _ttrim), "G2")]); _why = ""
+except _ma.MatchError as exc:
+    _why = str(exc)
+check("match surface: a trimmed face's side along its CV net -- exact; its trim curve is refused (says why, points to Surface Align)",
+      not store.is_natural(maTT) and r == {'FINISHED'} and _exact(_ma.measure(maST, "V1", maTT, _tside))
+      and r2 == {'CANCELLED'} and "trim curve" in _why and "Surface Align" in _why and _mgrid(maST2)[0].tolist() == _sG.tolist(),
+      f"{_tside} {_ttrim} {_ma.measure(maST, 'V1', maTT, _tside)} {_why}")
+# Average Both: the two move to meet halfway (different layouts), history of both removed
+_aX, _aY = np.meshgrid(np.linspace(370, 372, 5), np.linspace(0, 3, 6), indexing="ij")
+maA = _mk("MA_A", np.stack([_aX, _aY, 0.3 * (_aX - 370) + 0.1 * np.sin(_aY)], 2), geom.clamped_uniform_knots(5, 3), geom.clamped_uniform_knots(6, 3))
+_bX, _bY = np.meshgrid(np.linspace(372.2, 374, 4), np.linspace(0, 3, 4), indexing="ij")
+maBB = _mk("MA_BB", np.stack([_bX, _bY, -0.2 * (_bX - 372.2) + 0.8 + 0.05 * _bY], 2), geom.clamped_uniform_knots(4, 3), geom.clamped_uniform_knots(4, 3))
+features.push_step(maA, "flip_normal", [], {}); features.rebuild(maA, ctx, force=True)          # some history to remove
+_ea0 = np.array(geom.boundary_points(store.get_surfaces(maA)[0], "U1", 7)); _eb0 = np.array(geom.boundary_points(store.get_surfaces(maBB)[0], "U0", 7))
+r = bpy.ops.nproto.match_surface(inputs=ins((maBB, "U0"), (maA, "U1")), cont_U0="G2", average=True)
+_ea1 = np.array(geom.boundary_points(store.get_surfaces(maA)[0], "U1", 7))
+check("match surface: Average Both -- both surfaces move to meet halfway, exact G2, no history left",
+      r == {'FINISHED'} and _exact(_ma.measure(maBB, "U0", maA, "U1")) and np.abs(_ea1 - 0.5 * (_ea0[:, :] + _eb0)).max() < 1e-9
+      and np.abs(_ea1 - _ea0).max() > 0.1 and not features.has_history(maA) and not features.has_history(maBB),
+      f"{_ma.measure(maBB, 'U0', maA, 'U1')} {np.abs(_ea1 - 0.5 * (_ea0 + _eb0)).max():.2e}")
+# a target built from the surface (history) would loop: refused; the operator is undoable
+r = bpy.ops.nproto.match_surface(inputs=ins((maS3, "U0"), (maR, "U1")), cont_U0="G1")      # (MA_S3 is built from MA_Rev)
+r2 = bpy.ops.nproto.match_surface(inputs=ins((maR, "U1"), (maS3, "U0")), cont_U1="G1")
+check("match surface: matching a target that is built from the surface is refused (history loop); the command is undoable",
+      r == {'FINISHED'} and r2 == {'CANCELLED'} and 'UNDO' in bpy.types.NPROTO_OT_match_surface.bl_options
+      and features.depends_on(maS3, maR), f"{r} {r2}")
+
 # --- Boundary: exact Coons edges, degree / spans ------------------------------
 _bx = 40.0
 bdB = nurbs("BD_B", [(_bx + 0, 0, 0), (_bx + 1, -0.2, 0.3), (_bx + 2, 0.3, -0.2), (_bx + 2.5, -0.1, 0.4), (_bx + 3, 0, 0)])

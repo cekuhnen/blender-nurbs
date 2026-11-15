@@ -368,7 +368,7 @@ def draw_steps(box, obj, only=None, bare=False):
 
 
 STEP_ICON = {"edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
-             "flip_normal": 'NORMALS_FACE', "surface_align": 'SNAP_EDGE', "extend_surface": 'FULLSCREEN_ENTER',
+             "flip_normal": 'NORMALS_FACE', "surface_align": 'SNAP_EDGE', "match_surface": 'SNAP_FACE', "extend_surface": 'FULLSCREEN_ENTER',
              "rebuild_surface": 'MOD_REMESH', "refit_trim": 'MOD_LATTICE'}
 
 

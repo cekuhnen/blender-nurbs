@@ -295,7 +295,7 @@ class NprotoView(bpy.types.PropertyGroup):
                                              "Ctrl snaps to the lines you see. Blender's Floor overlay hides them too")
     show_cont_labels: BoolProperty(name="Feature Labels", default=True,
                                    description="The continuity each feature was BUILT with: Free / G0 / G1 / G2 labels on the "
-                                               "edges of selected Square, Loft, Loft Rails, Blend Curve, Patch and Surface Align "
+                                               "edges of selected Square, Loft, Loft Rails, Blend Curve, Patch, Surface Align and Match Surface "
                                                "features. Click a label to change the setting (Ctrl+click steps back; the feature "
                                                "rebuilds); a red ring means the result misses it. To MEASURE any edge, use "
                                                "Analyze > Continuity Check", update=lambda s, c: _redraw_views(c))
