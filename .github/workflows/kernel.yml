@@ -13,6 +13,11 @@
 # push that changes only Python reuses it and skips the build (the Windows build
 # alone takes about 50 minutes). Bump KERNEL_CACHE when a build step below
 # changes; run by hand with "rebuild_kernel" ticked to build from scratch.
+#
+# Blender cache: each test runner downloads Blender BLENDER_VERSION once and keeps
+# it in the cache; packaging runs after the tests and reuses the Linux one. Only a
+# new BLENDER_VERSION downloads again (download.blender.org at times refuses
+# downloads with a 403; the download retries a few times before giving up).
 
 name: Kernel
 
@@ -175,16 +180,35 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { name: "${{ matrix.kernel }}", path: blender_nurbs/kernel }
+      - name: Blender ${{ env.BLENDER_VERSION }} from the cache
+        id: blender
+        uses: actions/cache/restore@v4
+        with:
+          path: .blender
+          key: blender-${{ env.BLENDER_VERSION }}-${{ matrix.blender }}
+      - name: Download Blender ${{ env.BLENDER_VERSION }}
+        if: steps.blender.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          f="blender-$BLENDER_VERSION-${{ matrix.blender }}"
+          mkdir -p .blender
+          curl -sSfL --retry 5 --retry-delay 30 --retry-all-errors -o ".blender/$f" \
+               "https://download.blender.org/release/Blender$BLENDER_SERIES/$f"
+      - name: Keep the download in the cache
+        if: steps.blender.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .blender
+          key: ${{ steps.blender.outputs.cache-primary-key }}
       - name: Blender ${{ env.BLENDER_VERSION }}
         shell: bash
         run: |
           f="blender-$BLENDER_VERSION-${{ matrix.blender }}"
-          curl -sSfLO "https://download.blender.org/release/Blender$BLENDER_SERIES/$f"
           case "$f" in
-            *.dmg)    hdiutil attach -quiet -nobrowse -mountpoint /tmp/bl "$f"
+            *.dmg)    hdiutil attach -quiet -nobrowse -mountpoint /tmp/bl ".blender/$f"
                       echo "BLENDER=/tmp/bl/Blender.app/Contents/MacOS/Blender" >> "$GITHUB_ENV" ;;
-            *.zip)    unzip -q "$f"; echo "BLENDER=$PWD/${f%.zip}/blender.exe" >> "$GITHUB_ENV" ;;
-            *.tar.xz) tar xf "$f"; echo "BLENDER=$PWD/${f%.tar.xz}/blender" >> "$GITHUB_ENV"
+            *.zip)    unzip -q ".blender/$f"; echo "BLENDER=$PWD/${f%.zip}/blender.exe" >> "$GITHUB_ENV" ;;
+            *.tar.xz) tar xf ".blender/$f"; echo "BLENDER=$PWD/${f%.tar.xz}/blender" >> "$GITHUB_ENV"
                       sudo apt-get update -qq
                       sudo apt-get install -y -qq libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 \
                            libsm6 libgl1 libegl1 libwayland-client0 libwayland-cursor0 libdecor-0-0 ;;
@@ -196,8 +220,9 @@ jobs:
           grep -E "^FAIL" test.log || true
           grep -q "^ALL OK" test.log
 
+  # After the tests, so the Linux test job has put Blender in the cache.
   package:
-    needs: [build-macos, build-windows, build-linux]
+    needs: [test]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -205,11 +230,23 @@ jobs:
         with: { pattern: "kernel-*", path: blender_nurbs/kernel, merge-multiple: true }
       - name: Zips (one per platform, one with all three)
         run: python3 tools/package_extension.py --split
+      - name: Blender ${{ env.BLENDER_VERSION }} from the cache
+        id: blender
+        uses: actions/cache/restore@v4
+        with:
+          path: .blender
+          key: blender-${{ env.BLENDER_VERSION }}-linux-x64.tar.xz
+      - name: Download Blender ${{ env.BLENDER_VERSION }}
+        if: steps.blender.outputs.cache-hit != 'true'
+        run: |
+          f="blender-$BLENDER_VERSION-linux-x64.tar.xz"
+          mkdir -p .blender
+          curl -sSfL --retry 5 --retry-delay 30 --retry-all-errors -o ".blender/$f" \
+               "https://download.blender.org/release/Blender$BLENDER_SERIES/$f"
       - name: Check the zips with Blender
         run: |
           f="blender-$BLENDER_VERSION-linux-x64.tar.xz"
-          curl -sSfLO "https://download.blender.org/release/Blender$BLENDER_SERIES/$f"
-          tar xf "$f"
+          tar xf ".blender/$f"
           sudo apt-get update -qq
           sudo apt-get install -y -qq libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 \
                libsm6 libgl1 libegl1 libwayland-client0 libwayland-cursor0 libdecor-0-0
