@@ -3946,10 +3946,10 @@ finally:
 check("UI: Active Object panel shows for a NURBS object, hides with nothing active; Analyze and Settings draw",
       _side_err is None and _shown and _hidden and store.is_nurbs(_act), f"{_side_err} active={_act and _act.name}")
 _tog = ["show_edges", "show_cvs", "show_cont_labels", "show_fine_grid"]
-check("UI: Settings split -- Display (the four toggles, then the four tessellation values right under them, "
-      "no sub-panel), History; the toggles also sit as icons in the 3D view header",
+check("UI: Settings split -- Display (the four toggles, then the quality preset and the four tessellation "
+      "values right under them, no sub-panel), History; the toggles also sit as icons in the 3D view header",
       _side_err is None and [e["prop"] for e in _rest[1] if "prop" in e] == _tog + [
-          "chord_tolerance", "angle_tolerance", "edge_angle_tolerance", "max_edge_rel"]
+          "display_quality", "chord_tolerance", "angle_tolerance", "edge_angle_tolerance", "max_edge_rel"]
       and "construction_history" in [e.get("prop") for e in _rest[2]]
       and [e["prop"] for e in _hrec if e.get("prop") in _tog] == _tog
       and not hasattr(_ui, "VIEW3D_PT_nproto_tessellation"), str(_hrec))
@@ -7824,5 +7824,145 @@ _sdr["the operator converts the selected SubD meshes, hides them and selects the
 _sdr["the operator needs a mesh selected (not a NURBS body)"] = not bpy.ops.nproto.subd_to_brep.poll()
 for k_, v_ in _sdr.items():
     check("SubD to BREP: " + k_, v_)
+
+# -- Analysis meshes: zebra / draft / matcap / curvature map on their own mesh, built in numpy from the
+#    control nets (surfeval, anamesh) -- exact normals and curvatures at every vertex, fast
+from blender_nurbs import anamesh as _am, surfeval as _se, diagnostics as _dgA, square as _sqA
+import time as _tmA
+_cubeA = next(o_ for o_ in _sel if store.get_brep(o_).face_count() == 6)
+_torA = next(o_ for o_ in _sel if store.get_brep(o_).face_count() == 48)
+bpy.ops.nproto.add_primitive(kind="SPHERE", radius=2.0, degree="0"); _sphA = ctx.active_object
+bpy.ops.nproto.add_primitive(kind="CYLINDER", radius=1.0, height=2.0, degree="0", caps=True); _cylA = ctx.active_object
+bpy.ops.curve.primitive_bezier_circle_add(radius=1.0, location=(0, 0, 0)); _ccA = ctx.active_object
+bpy.ops.object.select_all(action='DESELECT'); _ccA.select_set(True)
+bpy.ops.nproto.planar(); _plA = ctx.active_object
+def _diagA(o_):
+    bb_ = store.get_brep(o_).bounding_box()
+    return float(np.linalg.norm(np.array(bb_[1]) - np.array(bb_[0])))
+# the evaluator is the kernel's surface: points and first derivatives to round-off, second derivatives
+# as the finite differences give them
+_e1, _e2 = 0.0, 0.0
+for _o in (_cubeA, _sphA, _plA, _cylA):
+    _dA = _diagA(_o)
+    for _f in store.get_brep(_o).faces():
+        _s = _f.surface(); _E = _se.Surf(_s)
+        (_u0, _u1), (_v0, _v1) = _s.u_domain(), _s.v_domain()
+        _rg = np.random.default_rng(7)
+        _uu = np.r_[_u0, _u1, _rg.uniform(_u0, _u1, 10)]; _vv = np.r_[_v1, _v0, _rg.uniform(_v0, _v1, 10)]
+        _D = _E.at(_uu, _vv, 2); _G = _E.grid(_uu, _vv, 1)
+        for _i in range(len(_uu)):
+            _pt, _su, _sv = (np.array(x_) for x_ in _s.derivatives(float(_uu[_i]), float(_vv[_i])))
+            _sc = np.linalg.norm(_su) + np.linalg.norm(_sv) + 1e-9 * _dA
+            _e1 = max(_e1, np.linalg.norm(_D[0, 0][_i] - _pt) / _dA, np.linalg.norm(_G[0, 0][_i, _i] - _pt) / _dA,
+                      (np.linalg.norm(_D[1, 0][_i] - _su) + np.linalg.norm(_D[0, 1][_i] - _sv)) / _sc,
+                      (np.linalg.norm(_G[1, 0][_i, _i] - _su) + np.linalg.norm(_G[0, 1][_i, _i] - _sv)) / _sc)
+            if _i >= 2 and _o is _sphA:
+                _, _, _suu, _suv, _svv = _sqA._second(_s, float(_uu[_i]), float(_vv[_i]))
+                _e2 = max(_e2, (np.linalg.norm(_D[2, 0][_i] - _suu) + np.linalg.norm(_D[1, 1][_i] - _suv)
+                                + np.linalg.norm(_D[0, 2][_i] - _svv)) / (np.linalg.norm(_suu) + np.linalg.norm(_svv)))
+check("analysis mesh: the numpy evaluator is the kernel's surface (points / first derivatives to 1e-9, "
+      "second derivatives as finite differences)", _e1 < 1e-9 and _e2 < 1e-4, f"first {_e1:.1e}, second {_e2:.1e}")
+_fl = {n_: [w_ for _, w_, _ in _am._faces(store.get_brep(o_), None, _diagA(o_), None)]
+       for n_, o_ in (("cube", _cubeA), ("torus", _torA), ("planar", _plA))}
+check("analysis mesh: SubD faces are meshed as untrimmed (u, v) grids, a planar circle as a trimmed face",
+      all(_fl["cube"]) and all(_fl["torus"]) and not any(_fl["planar"]), str({k_: sum(v_) for k_, v_ in _fl.items()}))
+# area: the mesh covers each body (a flat face with a curved outline too, the planar circle)
+_ar = {}
+for _n, _o in (("cube", _cubeA), ("torus", _torA), ("sphere", _sphA), ("cylinder", _cylA), ("planar", _plA)):
+    _zP, _zN, _zT = _dgA.zebra_mesh(_o, 1.0, 0.0005)
+    _zP = np.asarray(_zP, float)
+    _ma = 0.5 * np.linalg.norm(np.cross(_zP[_zT[:, 1]] - _zP[_zT[:, 0]], _zP[_zT[:, 2]] - _zP[_zT[:, 0]]), axis=1).sum()
+    _ar[_n] = abs(_ma - store.get_brep(_o).area(1e-7)) / store.get_brep(_o).area(1e-7)
+check("analysis mesh: covers the exact faces (area within 0.1 %, a planar circle's curved outline included)",
+      max(_ar.values()) < 1e-3, " ".join(f"{k_} {v_:.1e}" for k_, v_ in _ar.items()))
+# outward normals and convex curvature on a closed solid, whatever each face's parameter direction
+_zP, _zN, _zT = _dgA.zebra_mesh(_cylA, 1.0, 0.0005)
+_zP, _zN = np.asarray(_zP, float), np.asarray(_zN, float)
+_out = np.sum(_zN * (_zP - _zP.mean(axis=0)), axis=1)
+_cP, _cN, _cT, _cV = _dgA.face_curvature_mesh(_cylA, 5.0, 0.002)
+_cN = np.asarray(_cN, float)
+_lat, _cap = np.abs(_cN[:, 2]) < 0.05, np.abs(_cN[:, 2]) > 0.999
+_sP, _sN, _sT, _sV = _dgA.face_curvature_mesh(_sphA, 5.0, 0.002)
+check("analysis mesh: a capped cylinder's normals all point out; mean curvature +0.5 on its side (convex), "
+      "0 on its caps; a sphere r=2: +0.5 and Gaussian 0.25 at every vertex, the poles too",
+      _out.min() > 0 and _lat.any() and _cap.any() and np.abs(_cV["MEAN"][_lat] - 0.5).max() < 1e-3
+      and np.abs(_cV["MEAN"][_cap]).max() < 1e-6 and np.abs(_sV["MEAN"] - 0.5).max() < 1e-3
+      and np.abs(_sV["GAUSS"] - 0.25).max() < 1e-3,
+      f"min n.(p - c) {_out.min():.3f}; side H {_cV['MEAN'][_lat].min():.4f}..{_cV['MEAN'][_lat].max():.4f}; "
+      f"sphere H {_sV['MEAN'].min():.4f}..{_sV['MEAN'].max():.4f}")
+# stripes: the normals turn by no more than the tolerance along any mesh edge, no folded triangles
+_zP, _zN, _zT = _dgA.zebra_mesh(_cubeA, 1.0, 0.0005)
+_zP, _zN = np.asarray(_zP, float), np.asarray(_zN, float)
+_eang = np.degrees(np.arccos(np.clip(np.concatenate([np.sum(_zN[_zT[:, i]] * _zN[_zT[:, j]], axis=1)
+                                                     for i, j in ((0, 1), (1, 2), (2, 0))]), -1, 1)))
+_fn = np.cross(_zP[_zT[:, 1]] - _zP[_zT[:, 0]], _zP[_zT[:, 2]] - _zP[_zT[:, 0]])
+_ar_ = np.linalg.norm(_fn, axis=1); _ok_ = _ar_ > 1e-3 * np.median(_ar_)
+_cos = np.sum(_fn * (_zN[_zT[:, 0]] + _zN[_zT[:, 1]] + _zN[_zT[:, 2]]), axis=1)[_ok_] / (
+    _ar_[_ok_] * np.linalg.norm((_zN[_zT[:, 0]] + _zN[_zT[:, 1]] + _zN[_zT[:, 2]])[_ok_], axis=1))
+check("analysis mesh: SubD cube at 1 deg -- normals within 1.6 deg along every mesh edge (p99.9: a grid cell's "
+      "diagonal, its sides within 1 deg each), none folded",
+      float(np.percentile(_eang, 99.9)) < 1.6 and int(np.sum(_cos < 0.3)) == 0,
+      f"p99.9 {np.percentile(_eang, 99.9):.2f} deg, max {_eang.max():.2f}, folded {int(np.sum(_cos < 0.3))}, {len(_zT)} tris")
+# speed: well ahead of the kernel's tessellation at the same fineness; a second quality reuses the face set-up
+_am._prep.clear()
+_t0 = _tmA.perf_counter(); _zt1 = _dgA.zebra_mesh(_torA, 1.0, 0.0005); _t_new = _tmA.perf_counter() - _t0
+_t0 = _tmA.perf_counter(); _zt2 = _dgA.zebra_mesh(_torA, 2.0, 0.0005); _t_again = _tmA.perf_counter() - _t0
+_t0 = _tmA.perf_counter(); _kt = store._tessellate(store.get_brep(_torA), 0.0005, 1.0); _t_kern = _tmA.perf_counter() - _t0
+check("analysis mesh: a 48-face SubD torus at 1 deg builds in well under a second, 5x+ faster than the kernel's "
+      "mesh as fine; another quality reuses the per-face set-up (faster again, fewer triangles at 2 deg)",
+      _t_new < 1.0 and _t_kern > 5 * _t_new and _t_again < _t_new and len(_zt2[2]) < len(_zt1[2])
+      and _am._prep[_torA.session_uid][0] == _torA.get(store.PROP_REV, 0),
+      f"new {_t_new * 1000:.0f} ms ({len(_zt1[2])} tris), again at 2 deg {_t_again * 1000:.0f} ms, "
+      f"kernel {_t_kern * 1000:.0f} ms ({len(_kt[2])} tris)")
+print(f"   zebra mesh, SubD torus: {_t_new * 1000:.0f} ms, kernel at the same angle {_t_kern * 1000:.0f} ms")
+# quality presets: Display (four tessellation values, one retessellation) and Analysis (zebra / curvature)
+_sA = ctx.scene.nproto_settings
+_vA = ctx.window_manager.nproto_view
+_calls = []
+_orig_rt = store.retessellate
+store.retessellate = lambda o_, c_=None: _calls.append(o_.name)
+try:
+    _q0 = _sA.display_quality
+    _sA.display_quality = 'FAST'
+    _q1 = (_sA.display_quality, round(_sA.angle_tolerance, 4), round(_sA.chord_tolerance, 6),
+           round(_sA.edge_angle_tolerance, 4), round(_sA.max_edge_rel, 4), len(_calls), len(set(_calls)))
+    _orig_rt(_cubeA, ctx); _tri_fast = len(_cubeA.data.polygons)
+    _sA.angle_tolerance = 7.0
+    _q2 = _sA.display_quality
+    _sA.display_quality = 'CUSTOM'
+    _q3 = round(_sA.angle_tolerance, 4)
+    _sA.display_quality = 'MEDIUM'
+    _q4 = (_sA.display_quality, round(_sA.angle_tolerance, 4), round(_sA.chord_tolerance, 6))
+finally:
+    store.retessellate = _orig_rt
+    for k_ in ("chord_tolerance", "angle_tolerance", "edge_angle_tolerance", "max_edge_rel"):
+        _sA.property_unset(k_)
+_orig_rt(_cubeA, ctx); _tri_med = len(_cubeA.data.polygons)
+_nn = sum(1 for o_ in ctx.scene.objects if store.is_nurbs(o_))
+check("display quality: Medium on the defaults; Fast sets the four values with one retessellation of each body "
+      "(fewer triangles); a hand-set value reads Custom, choosing Custom changes nothing; Medium restores the defaults",
+      _q0 == 'MEDIUM' and _q1 == ('FAST', 10.0, 0.001, 3.0, 0.05, _nn, _nn) and _tri_fast < _tri_med
+      and _q2 == 'CUSTOM' and _q3 == 7.0 and _q4 == ('MEDIUM', 5.0, 0.0005),
+      f"{_q0} {_q1} (of {_nn}) tris fast {_tri_fast} medium {_tri_med} {_q2} {_q3} {_q4}")
+try:
+    _a0 = _vA.analysis_quality
+    _vA.analysis_quality = 'FINE'
+    _a1 = (_vA.analysis_quality, round(_vA.zebra_angle, 4), round(_vA.zebra_chord, 6), round(_vA.curv_angle, 4),
+           round(_vA.curv_chord, 6))
+    _vA.zebra_angle = 0.7
+    _a2 = _vA.analysis_quality
+    _vA.analysis_quality = 'FAST'
+    _a3 = (_vA.analysis_quality, round(_vA.zebra_angle, 4), round(_vA.curv_angle, 4))
+    _vA.show_zebra = True
+    _pz = [e["prop"] for e in _draw(_ui.VIEW3D_PT_nproto_analyze_side) if "prop" in e]
+finally:
+    for k_ in ("zebra_angle", "zebra_chord", "curv_angle", "curv_chord", "show_zebra"):
+        _vA.property_unset(k_)
+_nf = len(_dgA.zebra_mesh(_cubeA, 2.0, 0.001)[2]), len(_dgA.zebra_mesh(_cubeA, 0.5, 0.0002)[2])
+check("analysis quality: Medium on the defaults, Fine 0.5 / 2.5 deg, a hand-set value reads Custom, Fast 2 / 10 deg; "
+      "the Analyze panel offers it (Fast meshes fewer triangles than Fine)",
+      _a0 == 'MEDIUM' and _a1 == ('FINE', 0.5, 0.0002, 2.5, 0.001) and _a2 == 'CUSTOM'
+      and _a3 == ('FAST', 2.0, 10.0) and "analysis_quality" in _pz and _nf[0] < _nf[1]
+      and _vA.analysis_quality == 'MEDIUM', f"{_a0} {_a1} {_a2} {_a3} tris fast/fine {_nf}")
 
 print("ALL OK" if ok else "SOME FAILED")

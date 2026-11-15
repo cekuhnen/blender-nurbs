@@ -10,7 +10,9 @@
 * Zebra stripes on NURBS surfaces: reflection stripes computed per pixel by a
   small GPU shader (any shading mode, materials untouched). Stripes run
   vertically or horizontally on screen. G0 -> stripes break, G1 -> stripes
-  kink, G2 -> stripes flow smoothly across an edge.
+  kink, G2 -> stripes flow smoothly across an edge. Zebra, draft angle,
+  matcaps and the curvature map draw on their own fine mesh with the exact
+  normal (and curvatures) at every vertex (anamesh.py).
 """
 
 import bpy
@@ -19,7 +21,7 @@ import numpy as np
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 
-from . import geom, store
+from . import anamesh, geom, store
 
 # One look for every comb (curve comb, Continuity Check, Dynamic Section,
 # Surface Combs), Alias-style: green hairs, magenta envelope; red marks hairs
@@ -497,22 +499,16 @@ def _get_shader():
 
 
 def zebra_mesh(obj, angle_deg, chord_rel):
-    """Fine tessellation of the exact B-rep (local space): points, EXACT surface
-    normals at every vertex, triangle indices. Independent of the display mesh,
-    whose coarse triangles would bend stripes / colours at edges."""
-    pts, nrm, polys = store._tessellate(store.get_brep(obj), chord_rel, angle_deg, natural=store.is_natural(obj))
-    return np.asarray(pts, np.float32), np.asarray(nrm, np.float32), _tris(polys)
-
-
-def _tris(polys):
-    if isinstance(polys, np.ndarray) and polys.ndim == 2 and polys.shape[1] == 3:
-        return polys.astype(np.int32)
-    tris = []
-    for f in polys:
-        f = [int(x) for x in f]
-        for k in range(1, len(f) - 1):
-            tris.append((f[0], f[k], f[k + 1]))
-    return np.asarray(tris, np.int32)
+    """Fine mesh of the exact B-rep (local space): points, EXACT outward
+    surface normals at every vertex, triangle indices. Independent of the
+    display mesh, whose coarse triangles would bend stripes / colours at
+    edges. Built in numpy from the control nets (anamesh): ~0.1 s for a
+    SubD body where the kernel's tessellation at this fineness took seconds."""
+    R = anamesh.body_mesh(store.get_brep(obj), angle_deg, chord_rel, natural=store.is_natural(obj),
+                          key=(obj.session_uid, obj.get(store.PROP_REV, 0)))
+    if R is None:
+        return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.float32), np.zeros((0, 3), np.int32)
+    return R[0], R[1], R[2]
 
 
 def _zebra_batch(obj, shader, angle_deg, chord_rel):
@@ -567,50 +563,17 @@ def curvatures_at(surf, u, v):
 
 
 def face_curvature_mesh(obj, angle_deg, chord_rel):
-    """Per-face fine tessellation with the exact curvatures at every vertex
-    (local space). Returns P, N, T, values dict {GAUSS, MEAN, MAX, MIN}."""
-    from .kernel import load
-    from .square import _foot
-    ext = load().blender_ext
-    text = obj[store.PROP_BREP]
-    brep = store.get_brep(obj)
-    nf = brep.face_count()
-    Ps, Ns, Ts, Vs = [], [], [], {k: [] for k in CURV_KINDS}
-    base = 0
-    for fi in range(nf):
-        if nf == 1:
-            single = brep
-        else:
-            single = store.brep_from_text(text)
-            ext.delete_faces(single, [f for i, f in enumerate(single.faces()) if i != fi])
-        face = single.faces()[0]
-        surf = face.surface()
-        P, N, polys = store._tessellate(single, chord_rel, angle_deg)
-        T = _tris(polys)
-        # signs relative to the face's OUTWARD normal (convex = positive mean
-        # curvature everywhere, whatever the surface's parameter direction)
-        sgn = 1.0
-        try:
-            uv = _foot(surf, np.array(face.interior_point(), float))
-            _, su, sv = surf.derivatives(*uv)
-            sgn = 1.0 if float(np.cross(su, sv) @ np.array(face.outward_normal_at_uv(*uv), float)) >= 0 else -1.0
-        except Exception:
-            pass
-        vals = []
-        for uv in store.surface_feet(surf, P).tolist():
-            K, H, k1, k2 = curvatures_at(surf, *uv)
-            # outward normal: curvature towards the inside is positive (convex > 0)
-            H, k1, k2 = -sgn * H, -sgn * k2, -sgn * k1
-            vals.append((K, H, k1, k2))
-        vals = np.array(vals) if vals else np.zeros((0, 4))
-        Ps.append(np.asarray(P, np.float32))
-        Ns.append(np.asarray(N, np.float32))
-        Ts.append(T + base)
-        for k, col in zip(CURV_KINDS, range(4)):
-            Vs[k].append(vals[:, col] if len(vals) else np.zeros(0))
-        base += len(P)
-    return (np.vstack(Ps), np.vstack(Ns), np.vstack(Ts) if Ts else np.zeros((0, 3), np.int32),
-            {k: np.concatenate(v) for k, v in Vs.items()})
+    """Fine mesh with the exact curvatures at every vertex (local space), from
+    the surfaces' exact second derivatives. Returns P, N, T, values dict
+    {GAUSS, MEAN, MAX, MIN}; signs relative to the face's outward normal
+    (convex = positive mean curvature, whatever the surface's parameter
+    direction)."""
+    R = anamesh.body_mesh(store.get_brep(obj), angle_deg, chord_rel, curv=True, natural=store.is_natural(obj),
+                          key=(obj.session_uid, obj.get(store.PROP_REV, 0)))
+    if R is None:
+        return (np.zeros((0, 3), np.float32), np.zeros((0, 3), np.float32), np.zeros((0, 3), np.int32),
+                {k: np.zeros(0, np.float32) for k in CURV_KINDS})
+    return R
 
 
 def _curv_data(obj, angle_deg, chord_rel):

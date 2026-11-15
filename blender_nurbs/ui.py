@@ -8,13 +8,86 @@ from . import features, store
 from .kernel import load as load_kernel
 
 
+_applying_preset = [False]      # a preset sets several tolerances: one retessellation, not one per value
+
+
 def _retess(self, context):
-    for o in context.scene.objects:
+    if _applying_preset[0]:
+        return
+    scene = self.id_data if isinstance(getattr(self, "id_data", None), bpy.types.Scene) else context.scene
+    for o in scene.objects:
         if store.is_nurbs(o):
             try:
                 store.retessellate(o, context)
             except Exception as exc:
                 print("NURBS retessellate:", o.name, exc)
+
+
+# Quality presets: Fast / Medium / Fine set several tolerances at once; the
+# enum is worked out from the values (Custom when they were set by hand), so
+# it never disagrees with them -- also in files made before it existed.
+# Medium is the defaults.
+QUALITY_NAMES = ("FAST", "MEDIUM", "FINE", "CUSTOM")
+DISPLAY_QUALITY = {
+    "FAST": {"chord_tolerance": 0.001, "angle_tolerance": 10.0, "edge_angle_tolerance": 3.0, "max_edge_rel": 1.0 / 20.0},
+    "MEDIUM": {"chord_tolerance": 0.0005, "angle_tolerance": 5.0, "edge_angle_tolerance": 2.0, "max_edge_rel": 1.0 / 30.0},
+    "FINE": {"chord_tolerance": 0.0002, "angle_tolerance": 2.5, "edge_angle_tolerance": 1.0, "max_edge_rel": 1.0 / 50.0},
+}
+ANALYSIS_QUALITY = {
+    "FAST": {"zebra_angle": 2.0, "zebra_chord": 0.001, "curv_angle": 10.0, "curv_chord": 0.004},
+    "MEDIUM": {"zebra_angle": 1.0, "zebra_chord": 0.0005, "curv_angle": 5.0, "curv_chord": 0.002},
+    "FINE": {"zebra_angle": 0.5, "zebra_chord": 0.0002, "curv_angle": 2.5, "curv_chord": 0.001},
+}
+
+
+def _preset_of(group, presets):
+    """Index (into QUALITY_NAMES) of the preset whose values the group has."""
+    for i, name in enumerate(QUALITY_NAMES[:3]):
+        if all(abs(getattr(group, k) - x) <= 1e-5 * abs(x) + 1e-12 for k, x in presets[name].items()):
+            return i
+    return 3
+
+
+def _apply_preset(group, presets, value):
+    name = QUALITY_NAMES[value]
+    if name not in presets:
+        return False                 # Custom: keep the values as they are
+    _applying_preset[0] = True
+    try:
+        for k, x in presets[name].items():
+            setattr(group, k, x)
+    finally:
+        _applying_preset[0] = False
+    return True
+
+
+def _set_display_quality(self, value):
+    if _apply_preset(self, DISPLAY_QUALITY, value):
+        _retess(self, bpy.context)
+
+
+def _set_analysis_quality(self, value):
+    if _apply_preset(self, ANALYSIS_QUALITY, value):
+        _redraw_views(bpy.context)
+
+
+def _quality_items(what, numbers):
+    def fmt(name):
+        return ", ".join(numbers(name))
+    return [("FAST", "Fast", f"{what}: coarser, quickest to build ({fmt('FAST')})", 0),
+            ("MEDIUM", "Medium", f"{what}: the defaults ({fmt('MEDIUM')})", 1),
+            ("FINE", "Fine", f"{what}: finer, slower to build ({fmt('FINE')})", 2),
+            ("CUSTOM", "Custom", "Tolerances set by hand (below)", 3)]
+
+
+_DISPLAY_ITEMS = _quality_items(
+    "Display mesh", lambda n: (f"angle {DISPLAY_QUALITY[n]['angle_tolerance']:g}°",
+                               f"chord {DISPLAY_QUALITY[n]['chord_tolerance']:g}",
+                               f"edges {DISPLAY_QUALITY[n]['edge_angle_tolerance']:g}°",
+                               f"max edge 1/{round(1 / DISPLAY_QUALITY[n]['max_edge_rel'])}"))
+_ANALYSIS_ITEMS = _quality_items(
+    "Analysis mesh", lambda n: (f"zebra / draft / matcap {ANALYSIS_QUALITY[n]['zebra_angle']:g}°",
+                                f"curvature {ANALYSIS_QUALITY[n]['curv_angle']:g}°"))
 
 
 def _redraw_views(context):
@@ -123,6 +196,12 @@ class NprotoSettings(bpy.types.PropertyGroup):
         name="Angle Tolerance", default=5.0, min=2.0, max=45.0, update=_retess,
         description="Max angle between neighbouring facets (degrees). Lower is smoother highlights on curved "
                     "faces and more triangles there (flat faces stay a few triangles)")
+    display_quality: EnumProperty(
+        name="Display Quality", items=_DISPLAY_ITEMS,
+        get=lambda self: _preset_of(self, DISPLAY_QUALITY), set=_set_display_quality,
+        description="How finely surfaces are meshed for display -- sets the four tolerances below at once. "
+                    "Fast rebuilds quickest after every edit; the analysis overlays (zebra, curvature) have "
+                    "their own mesh and quality")
 
 
 class NprotoView(bpy.types.PropertyGroup):
@@ -149,8 +228,16 @@ class NprotoView(bpy.types.PropertyGroup):
     curv_min: FloatProperty(update=_rd, name="Min", default=-1.0)
     curv_max: FloatProperty(update=_rd, name="Max", default=1.0)
     curv_bands: FloatProperty(update=_rd, name="Contours", default=10.0, min=0.0, max=50.0, description="Contour lines (0 = off)")
-    curv_angle: FloatProperty(update=_rd, name="Curvature Quality °", default=5.0, min=0.5, max=15.0)
-    curv_chord: FloatProperty(update=_rd, name="Curvature Chord", default=0.002, min=0.0001, max=0.02, precision=4)
+    curv_angle: FloatProperty(update=_rd, name="Curvature Quality °", default=5.0, min=0.5, max=15.0,
+                              description="Angle tolerance of the curvature map's own mesh (degrees)")
+    curv_chord: FloatProperty(update=_rd, name="Curvature Chord", default=0.002, min=0.0001, max=0.02, precision=4,
+                              description="Chord tolerance of the curvature map's mesh, relative to the object size")
+    analysis_quality: EnumProperty(
+        name="Analysis Quality", items=_ANALYSIS_ITEMS,
+        get=lambda self: _preset_of(self, ANALYSIS_QUALITY), set=_set_analysis_quality,
+        description="How finely the zebra, draft angle, matcap and curvature map overlays mesh the exact surfaces "
+                    "(their own mesh, exact normals and curvatures at every vertex) -- sets their Quality and "
+                    "Chord at once")
     matcap_style: EnumProperty(update=_rd, name="Matcap", items=[
         # fixed numbers: Blender stores the number, and 1 was the old Red style
         ("HIGHLIGHT", "Highlight", "Dark material with one bright highlight band (fixed to the view)", 0),
@@ -366,6 +453,7 @@ def draw_analyze(col, context):
         if v.env_coat:
             _draw_env(col, v, material=False)
     if v.show_zebra or v.show_draft or v.show_curvature or v.show_matcap:
+        col.row(align=True).prop(v, "analysis_quality", expand=True)
         row = col.row(align=True)
         row.prop(v, "zebra_opacity", slider=True)
         sp = context.space_data
@@ -645,6 +733,7 @@ class VIEW3D_PT_nproto_display(_SidePanel, bpy.types.Panel):
         # how finely surfaces are meshed for display (not their exact shape), right under the toggles
         s = context.scene.nproto_settings
         col = self.layout.column(align=True)
+        col.row(align=True).prop(s, "display_quality", expand=True)
         col.prop(s, "chord_tolerance")
         col.prop(s, "angle_tolerance")
         col.prop(s, "edge_angle_tolerance")
