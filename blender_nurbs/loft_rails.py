@@ -118,16 +118,54 @@ def _curve_layout(kc):
     return p, [k for k in inner if 1e-9 < k < 1 - 1e-9]
 
 
-def build(inputs, p):
-    m = int(p.get("samples", 48))
-    raw = [sample_side(o, r, m) for o, r in inputs]
-    for sd, (o, r) in zip(raw, inputs):
+def chained_side(side, m):
+    """One Square Side along a Loft side of one or more pieces end to end
+    (features.chain_side): each piece sampled by its share of the length,
+    the samples joined, the parameter t by arc length over the whole side."""
+    chain = features.chain_side(side)
+    if len(chain) == 1:
+        o, r, _ = chain[0]
+        sd = sample_side(o, r, m)
         sd.src = (o.name, r)
         if sd.knots is None and not features.is_surface_edge(r):
             sd.degree, sd.knots = _curve_layout(features.input_curve(o, r))
+        return sd
+    lens = features._piece_lengths(chain)
+    total = m + len(chain) - 1
+    counts = [max(6, int(round(total * L / (sum(lens) or 1.0)))) for L in lens]
+    parts = []
+    for (o, r, rev), c in zip(chain, counts):
+        sd = sample_side(o, r, c)
+        parts.append(sd.reversed() if rev else sd)
+    cat = lambda k: None if getattr(parts[0], k) is None else np.concatenate(
+        [getattr(parts[0], k)] + [getattr(pt, k)[1:] for pt in parts[1:]])
+    P = cat("P")
+    t = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))])
+    t /= t[-1] or 1.0
+    out = Side(P, cat("B"), cat("N"), cat("K"), t, cat("D2"))
+    out.Q, out.Nout = cat("Q"), cat("Nout")
+    out.src = (chain[0][0].name, chain[0][1])
+    return out
+
+
+EVEN_NET_REF = 0.25     # Even Net: share of the boolean-sum net's bending kept as the fairness target
+
+
+def build(inputs, p):
+    m = int(p.get("samples", 48))
+    groups = features.loft_sides(inputs, p) if p.get("sides") else [[x] for x in inputs]
+    raw = [chained_side(g, m) for g in groups]
     size = float(np.linalg.norm(np.ptp(np.vstack([s.P for s in raw]), axis=0))) or 1.0
     tol = TOUCH_REL * size * 10
-    prof_idx, rail_idx = classify(raw, tol)
+    if p.get("rails") is not None:
+        # Loft: the rails are the last groups picked as rails
+        nr = int(p["rails"])
+        if nr > 2:
+            raise RuntimeError("at most two rails")
+        prof_idx, rail_idx = list(range(len(raw) - nr)), list(range(len(raw) - nr, len(raw)))
+    else:
+        prof_idx, rail_idx = classify(raw, tol)
+    first_prof = prof_idx[0] if prof_idx else 0
     if len(prof_idx) < 2:
         raise RuntimeError("Loft with rails needs at least two profiles")
     profs = [raw[i] for i in prof_idx]
@@ -178,6 +216,12 @@ def build(inputs, p):
     if any(b - a < 1e-3 for a, b in zip(v[:-1], v[1:])):
         raise RuntimeError("two profiles meet the rails at the same place")
 
+    if p.get("rails") is not None and prof_idx and prof_idx[0] != first_prof:
+        # Loft's side A is the profile picked first: it keeps A's settings
+        # though the rail runs from the other one
+        p = dict(p)
+        p["lr_start"], p["lr_end"] = p.get("lr_end", "G0"), p.get("lr_start", "G0")
+        p["lw_start"], p["lw_end"] = p.get("lw_end", 1.0), p.get("lw_start", 1.0)
     # sides: bottom = first profile, top = last profile (both along +u)
     square.EXTRA_G0[:] = []
     if len(rails) == 2:
@@ -224,6 +268,16 @@ def build(inputs, p):
         conts[1] = conts[3] = "G0"
     weights = [float(p.get(f"lw_{n}", 1.0)) for n in names]
     ks = [CONT[c] if sd.has_surface and not sd.free else 0 for c, sd in zip(conts, sides)]
+    ease = float(p.get("lr_ease", 0.0) or 0.0)
+    square.EASE_G2.clear()
+    if ease > 0 and len(rails) == 2:
+        square.EASE_G2.update({0: ease, 2: ease})       # the end profiles, toward the rails
+    fair_ref = square.FAIR_REF
+    if p.get("lr_even"):
+        # Even Net: fair mostly toward even CV spacing, a quarter toward the
+        # boolean-sum net's shape (keeps the CV lines straight where the
+        # boundaries are, e.g. across a flat strip between the rails)
+        square.FAIR_REF = EVEN_NET_REF
     try:
         surf, info = _solve(sides, ks, weights, int(p.get("lr_degree", 0) or 0),
                             int(p.get("lr_spans_u", 0)), int(p.get("lr_spans_v", 0)), profs[1:-1],
@@ -231,6 +285,8 @@ def build(inputs, p):
         surf = square._orient_like_neighbours(surf, sides)
     finally:
         square.EXTRA_G0[:] = []
+        square.EASE_G2.clear()
+        square.FAIR_REF = fair_ref
     info["edge_sides"] = {n: bool(sd.has_surface and not sd.free) for n, sd in zip(names, sides)}
     info["profiles"] = len(profs)
     info["rails"] = len(rails)

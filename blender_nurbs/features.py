@@ -215,6 +215,476 @@ def _same_layout(sa, sb):
             and np.allclose(sa["knots"], sb["knots"], atol=1e-9))
 
 
+# --------------------------------------------------------------------------
+# Loft sides: one or more edges / curves joined end to end
+# --------------------------------------------------------------------------
+
+def loft_sides(inputs, p):
+    """The inputs grouped into loft sides: p["sides"] holds how many inputs
+    (in order) each side takes; without it every input is a side of its own."""
+    groups = p.get("sides") or []
+    if not groups or sum(int(g) for g in groups) != len(inputs) or any(int(g) < 1 for g in groups):
+        return [[x] for x in inputs]
+    out, i = [], 0
+    for g in groups:
+        out.append(list(inputs[i:i + int(g)]))
+        i += int(g)
+    return out
+
+
+def _curve_ends(c):
+    t0, t1 = c.parameter_range()
+    return np.array(c.evaluate(t0), float), np.array(c.evaluate(t1), float)
+
+
+def chain_side(side):
+    """The pieces of a side in order along it: [(obj, ref, reversed)], each
+    piece's end on the next one's start. Raises when they do not touch."""
+    if len(side) == 1:
+        return [(side[0][0], side[0][1], False)]
+    kinds = {is_surface_edge(r) and o.type != 'CURVE' for o, r in side}
+    if len(kinds) > 1:
+        raise ValueError("a loft side is either surface edges or curves, not both")
+    ends = [_curve_ends(input_curve(o, r)) for o, r in side]
+    allp = np.vstack([e for pair in ends for e in pair])
+    tol = 1e-4 * (float(np.linalg.norm(np.ptp(allp, axis=0))) or 1.0)
+
+    def partner(q, skip):
+        return min((float(np.linalg.norm(q - e)), j) for j, pair in enumerate(ends) if j != skip for e in pair)
+
+    start, rev = 0, False
+    for j, (a, b) in enumerate(ends):        # an open chain starts at a free end
+        if partner(a, j)[0] > tol:
+            start, rev = j, False
+            break
+        if partner(b, j)[0] > tol:
+            start, rev = j, True
+            break
+    order = [(start, rev)]
+    used = {start}
+    cur = ends[start][0 if rev else 1]
+    while len(used) < len(side):
+        d, j, r = min((float(np.linalg.norm(cur - e)), j, k == 1)
+                      for j, pair in enumerate(ends) if j not in used for k, e in enumerate(pair))
+        if d > tol:
+            raise ValueError("the edges of a loft side must touch end to end")
+        order.append((j, r))
+        used.add(j)
+        cur = ends[j][0 if r else 1]
+    return [(side[j][0], side[j][1], r) for j, r in order]
+
+
+def side_curve(side):
+    """One exact kernel curve along a whole loft side (world space)."""
+    sm, ext = _k()
+    chain = chain_side(side)
+    if len(chain) == 1:
+        o, r, _ = chain[0]
+        return input_curve(o, r)
+    items, speeds, prev_w = [], [], None
+    for o, r, rev in chain:
+        c = input_curve(o, r)
+        if rev:
+            c = geom.reverse_curve(c)
+        d = ext.curve_cvs(c)
+        P = np.array(d["points"], float)
+        w = np.array(d["weights"], float) if d.get("weights") else np.ones(len(P))
+        if prev_w is not None and w[0] > 0:
+            w = w * (prev_w / w[0])            # same weight at the joint (a rational curve is unchanged)
+        prev_w = w[-1]
+        items.append((int(d["degree"]), d["knots"], np.c_[P * w[:, None], w]))
+        speeds.append(geom.end_speeds(int(d["degree"]), d["knots"], P))
+    q, U, A = geom.concat_arrays(items, geom.speed_widths(speeds))
+    W = A[:, 3]
+    P = A[:, :3] / W[:, None]
+    Wl = None if np.allclose(W, 1.0, atol=1e-12) else [float(x) for x in W]
+    return ext.curve_from_cvs(int(q), [tuple(map(float, x)) for x in P], [float(k) for k in U], Wl)
+
+
+JOINT_EPS = 0.02     # a crease joint is blended over this share of each piece next to it
+LOFT_NOTES = []      # what the last loft build wants the user to know (creased joints)
+
+
+def _localise_end(s, at_end, eps=JOINT_EPS):
+    """Insert a knot eps from one end of an exact side, so its end CV rows
+    (the joint's, to be averaged with the next piece's) only reach that far."""
+    from .kernel.classa import insert_knot
+    keys, A = geom._side_array(s)
+    U = [float(k) for k in s["knots"]]
+    p = int(s["deg"])
+    t = 1.0 - eps if at_end else eps
+    inner = U[p + 1:-p - 1]
+    near = (inner[-1] if at_end else inner[0]) if inner else (0.0 if at_end else 1.0)
+    if (at_end and near >= t) or (not at_end and near <= t):
+        return s                     # a knot already that close
+    A, U = insert_knot(A, U, p, t)
+    return geom._side_from(keys, p, U, np.asarray(A, float))
+
+
+def side_exact(side):
+    """Exact rows of a whole loft side ({"deg", "knots", "P", "D", "DD"}, see
+    exact_side) with the pieces joined end to end, or None. The cross
+    derivatives of each piece are scaled by a constant (a reparameterisation
+    of its face: G1 / G2 stay exact) so they meet at the joints. Where they
+    cannot meet (the faces are creased there, or their curvature jumps) the
+    joint's rows are averaged over a short stretch (JOINT_EPS of each piece):
+    the loft holds exactly along everything else. "creases" lists those
+    joints as (angle in degrees, point)."""
+    chain = chain_side(side)
+    sides = []
+    for o, r, rev in chain:
+        s = exact_side(o, r)
+        if s is None:
+            return None
+        sides.append(geom.reverse_side(s) if rev else s)
+    if len(sides) == 1:
+        sides[0]["creases"] = []
+        return sides[0]
+    has_d = sides[0]["D"] is not None
+    if has_d != all(s["D"] is not None for s in sides):
+        return None
+    has_dd = has_d and all(s["DD"] is not None for s in sides)
+    creases = []
+    scales = [1.0]
+    bad = [False] * (len(sides) - 1)
+    for i, (s0, s1) in enumerate(zip(sides[:-1], sides[1:])):
+        if not has_d:
+            break
+        a, b = scales[-1] * s0["D"][-1], s1["D"][0]
+        na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+        if na < 1e-15 or nb < 1e-15:
+            return None
+        c = na / nb
+        scales.append(c)
+        cosang = float(np.dot(a, b)) / (na * nb)
+        if cosang < np.cos(1e-4):
+            bad[i] = True
+            creases.append((float(np.degrees(np.arccos(max(-1.0, min(1.0, cosang))))), s0["P"][-1].copy()))
+        elif has_dd:
+            dda, ddb = scales[-2] ** 2 * s0["DD"][-1], c ** 2 * s1["DD"][0]
+            ref = max(float(np.linalg.norm(dda)), float(np.linalg.norm(ddb)), na * na * 1e-9)
+            if float(np.linalg.norm(dda - ddb)) > 1e-6 * ref:
+                bad[i] = True          # curvature jumps here: G2 is local to each piece
+    sides = [dict(s) for s in sides]
+    for i, flag in enumerate(bad):
+        if flag:
+            sides[i] = _localise_end(sides[i], True)
+            sides[i + 1] = _localise_end(sides[i + 1], False)
+    keys = ["P"] + (["D"] if has_d else []) + (["DD"] if has_dd else [])
+    items, speeds = [], []
+    for s, k in zip(sides, scales):
+        cols = [s["P"]] + ([k * s["D"]] if has_d else []) + ([k * k * s["DD"]] if has_dd else [])
+        items.append((s["deg"], s["knots"], np.hstack(cols)))
+        speeds.append(geom.end_speeds(s["deg"], s["knots"], s["P"]))
+    q, U, A = geom.concat_arrays(items, geom.speed_widths(speeds))
+    out = geom._side_from(keys, q, U, A)
+    out["creases"] = creases
+    return out
+
+
+def _piece_lengths(chain):
+    lens = []
+    for o, r, _ in chain:
+        P = geom.sample_curve(input_curve(o, r), 16)
+        lens.append(float(np.sum(np.linalg.norm(np.diff(P, axis=0), axis=1))))
+    return lens
+
+
+def side_sample_count(side, n):
+    """Samples a side wants: n along its longest piece, the others by length."""
+    chain = chain_side(side)
+    if len(chain) == 1:
+        return n
+    lens = _piece_lengths(chain)
+    big = max(lens) or 1.0
+    return sum(max(8, int(round(n * L / big))) for L in lens) - (len(lens) - 1)
+
+
+def side_samples(side, n):
+    """EdgeSample along a whole loft side, exactly n samples: the pieces'
+    samples end to end, each piece getting its share by length."""
+    chain = chain_side(side)
+    if len(chain) == 1:
+        o, r, _ = chain[0]
+        return input_samples(o, r, n)
+    lens = _piece_lengths(chain)
+    k = len(chain)
+    total = n + k - 1                       # joints are sampled twice, then dropped once
+    tot_len = sum(lens) or 1.0
+    counts = [max(4, int(round(total * L / tot_len))) for L in lens]
+    counts[int(np.argmax(lens))] += total - sum(counts)
+    if min(counts) < 2:
+        raise ValueError("too few samples for this loft side: raise Samples")
+    parts = []
+    for (o, r, rev), m in zip(chain, counts):
+        es = input_samples(o, r, m)
+        parts.append(es.reversed() if rev else es)
+    cat = lambda key: None if getattr(parts[0], key) is None else np.vstack(
+        [getattr(parts[0], key)] + [getattr(e, key)[1:] for e in parts[1:]])
+    P, D, DD = cat("P"), cat("D"), cat("DD")
+    if D is not None:
+        # A trimmed edge's samples carry the unit direction across the edge,
+        # square to the edge's tangent -- taken from its neighbouring samples,
+        # one-sided at its ends. Where two edges meet that leaves a kink in
+        # the row (each end leans its own way: the spoon's two halves 1.2°
+        # apart) and the fit wobbled through it. Square them again to the
+        # tangent of the whole side (second order, across the joints): same
+        # tangent plane, no kink. (Natural edges carry the face's own
+        # derivative, which G2 pairs with its second one: left as it is.)
+        Dn = np.linalg.norm(D, axis=1)
+        if np.allclose(Dn, 1.0, atol=1e-6):
+            s = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))])
+            if np.all(np.diff(s) > 0):
+                T = np.gradient(P, s, axis=0, edge_order=2)
+                T /= np.linalg.norm(T, axis=1, keepdims=True)
+                D = D - np.sum(D * T, axis=1, keepdims=True) * T
+                D /= np.linalg.norm(D, axis=1, keepdims=True)
+    joints = list(np.cumsum([m - 1 for m in counts])[:-1])
+    return geom.EdgeSample(P, D, DD, [int(j) for j in joints])
+
+
+# --------------------------------------------------------------------------
+# Match Edges: a G1 / G2 side whose loft carries on the source's own edges
+# --------------------------------------------------------------------------
+
+def _edge_end_frame(e, at_end, M):
+    """(point, unit tangent arriving at that end, curvature vector) of a B-rep
+    edge's end, world space: the edge as it comes into the end point."""
+    t0, t1 = e.parameter_range()
+    h = 1e-3 * (t1 - t0)
+    R, T = M[:3, :3], M[:3, 3]
+    pt = lambda t: R @ np.array(e.point_at(t), float) + T
+    if at_end:
+        p0, p1, p2 = pt(t1), pt(t1 - h), pt(t1 - 2 * h)
+        d1 = (3 * p0 - 4 * p1 + p2) / (2 * h)             # d/dt, forward = arriving
+    else:
+        p0, p1, p2 = pt(t0), pt(t0 + h), pt(t0 + 2 * h)
+        d1 = -(-3 * p0 + 4 * p1 - p2) / (2 * h)           # -d/dt: arriving at the start
+    d2 = (p0 - 2 * p1 + p2) / (h * h)
+    sp = float(np.linalg.norm(d1)) or 1.0
+    tan = d1 / sp
+    kvec = (d2 - (d2 @ tan) * tan) / (sp * sp)            # curvature vector (either way round)
+    return p0, tan, kvec
+
+
+def edge_into_corner(obj, corner, side_pts, outward, tol):
+    """The source's own edge that runs into a corner of a loft side (the rim
+    of a cut spoon at the end of its cut): (unit tangent arriving at the
+    corner, curvature vector), or None. Boundary edges (one face) not on the
+    side, whose way on from the corner leaves the face (outward > 0)."""
+    try:
+        edges = store.get_brep(obj).edges()
+    except Exception:
+        return None
+    M = np.array(geom.world_matrix(obj), float)
+    best = None
+    for e in edges:
+        try:
+            if len(e.faces()) != 1:
+                continue
+            t0, t1 = e.parameter_range()
+            for at_end in (False, True):
+                q, tan, kvec = _edge_end_frame(e, at_end, M)
+                if float(np.linalg.norm(q - corner)) > tol:
+                    continue
+                mid = M[:3, :3] @ np.array(e.point_at(0.5 * (t0 + t1)), float) + M[:3, 3]
+                if float(np.min(np.linalg.norm(side_pts - mid, axis=1))) <= tol:
+                    continue                       # a piece of the side itself
+                go = float(tan @ outward)
+                if go > 0.05 and (best is None or go > best[0]):
+                    best = (go, tan, kvec)
+        except Exception:
+            continue
+    return None if best is None else (best[1], best[2])
+
+
+MATCH_MAX_DEG = 75.0     # the cross direction leans at most this far towards an edge
+
+
+MATCH_FADE = 0.3        # the edges' bend fades out over this share of the side from each corner
+MATCH_LEAN_FADE = 1.0   # the lean fades out over this share (1: straight from one corner's lean to the other's)
+
+
+def match_edges_samples(side, n, g2=False, lean_scale=1.0, bend_scale=1.0):
+    """EdgeSample of a surface side whose cross direction follows the
+    source's own edges at the side's corners: at each corner it is the
+    direction the edge running into it carries on in, and in between it
+    leans from one to the other (in the tangent plane: G1 holds). The
+    second row is the source's normal curvature in that direction; with g2
+    the corners also take the edges' bend, so the loft's outline carries on
+    each edge in curvature. None when the side is not surface edges or
+    nothing leans (the plain side is then used)."""
+    from .square import sample_side
+    chain = chain_side(side)
+    if any(not (is_surface_edge(r) and o.type != 'CURVE') for o, r, _ in chain):
+        return None
+    if len(chain) == 1:
+        counts = [n]
+    else:
+        lens = _piece_lengths(chain)
+        total = n + len(chain) - 1
+        counts = [max(4, int(round(total * L / (sum(lens) or 1.0)))) for L in lens]
+        counts[int(np.argmax(lens))] += total - sum(counts)
+    parts = []
+    for (o, r, rev), m in zip(chain, counts):
+        sd = sample_side(o, r, m)
+        if sd.Q is None or sd.N is None or sd.B is None:
+            return None
+        arr = [np.asarray(sd.P, float), np.asarray(sd.N, float), np.asarray(sd.Q, float), np.asarray(sd.B, float)]
+        parts.append([a[::-1] for a in arr] if rev else arr)
+    P, N, Q, B = (np.concatenate([parts[0][k]] + [pt[k][1:] for pt in parts[1:]]) for k in range(4))
+    s_ = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))])
+    if not np.all(np.diff(s_) > 0):
+        return None
+    L = float(s_[-1])
+    T = np.gradient(P, s_, axis=0, edge_order=2)
+    T /= np.linalg.norm(T, axis=1, keepdims=True)
+    N = N / np.linalg.norm(N, axis=1, keepdims=True)
+    b = np.cross(N, T)
+    b /= np.linalg.norm(b, axis=1, keepdims=True)
+    b[np.sum(b * B, axis=1) < 0] *= -1.0                  # outward, as the source says
+    tol = 1e-4 * (float(np.linalg.norm(np.ptp(P, axis=0))) or 1.0)
+    lim = np.tan(np.radians(MATCH_MAX_DEG))
+    lean, bend = [0.0, 0.0], [np.zeros(3), np.zeros(3)]
+    for k, i in ((0, 0), (1, len(P) - 1)):
+        hit = edge_into_corner(chain[0 if k == 0 else -1][0], P[i], P, b[i], tol)
+        if hit is None:
+            continue
+        w, kvec = hit
+        w = w - (w @ N[i]) * N[i]                          # in the tangent plane (it is, up to the fit)
+        if w @ b[i] <= 1e-6:
+            continue
+        lean[k] = float(np.clip((w @ T[i]) / (w @ b[i]), -lim, lim))
+        g = kvec - (kvec @ N[i]) * N[i]                    # the edge's bend within the surface
+        wu = w / np.linalg.norm(w)
+        bend[k] = g - (g @ wu) * wu
+    size = float(np.linalg.norm(np.ptp(P, axis=0))) or 1.0
+    bent = g2 and max(float(np.linalg.norm(bend[0])), float(np.linalg.norm(bend[1]))) * size > 1e-3
+    if max(abs(lean[0]), abs(lean[1])) < 1e-3 and not bent:
+        return None                           # square already (a rim square to the side): the plain rows
+    if not g2:
+        bend = [np.zeros(3), np.zeros(3)]
+    t = s_ / L
+    lean = [lean_scale * x for x in lean]
+    if MATCH_LEAN_FADE >= 1.0:
+        lam = (1 - t) * lean[0] + t * lean[1]
+    else:
+        fa_ = np.clip(1.0 - t / MATCH_LEAN_FADE, 0.0, 1.0) ** 2
+        fb_ = np.clip(1.0 - (1.0 - t) / MATCH_LEAN_FADE, 0.0, 1.0) ** 2
+        lam = fa_ * lean[0] + fb_ * lean[1]
+    W = b + lam[:, None] * T
+    W /= np.linalg.norm(W, axis=1, keepdims=True)
+    # second derivative for a unit-speed cross direction W: its normal part is
+    # the source's normal curvature in W (G2); the part in the tangent plane is
+    # free -- the corners' edges' bend, fading in between
+    kn = np.einsum("ij,ijk,ik->i", W, Q, W)
+    DD = kn[:, None] * N
+    if g2:
+        # only near the corners: the outline takes the edge's bend there, the
+        # rows in between are left to the surface (faded in across the whole
+        # side, a spoon's tight rims pulled the middle rows over each other)
+        fa = np.clip(1.0 - t / MATCH_FADE, 0.0, 1.0) ** 2
+        fb = np.clip(1.0 - (1.0 - t) / MATCH_FADE, 0.0, 1.0) ** 2
+        G = bend_scale * (fa[:, None] * bend[0] + fb[:, None] * bend[1])
+        G = G - np.sum(G * N, axis=1, keepdims=True) * N
+        G = G - np.sum(G * W, axis=1, keepdims=True) * W
+        DD = DD + G
+    joints = list(np.cumsum([m - 1 for m in counts])[:-1])
+    es = geom.EdgeSample(P, W, DD, [int(j) for j in joints])
+    es.leans = (float(np.degrees(np.arctan(lean[0]))), float(np.degrees(np.arctan(lean[1]))))
+    es.N = N
+    es.scales = (lean_scale, bend_scale)
+    es.redo = lambda m: match_edges_samples(side, m, False, lean_scale, bend_scale)
+    return es
+
+
+def surface_flow_samples(side, n, lean_scale=1.0):
+    """EdgeSample of a surface side whose cross direction runs along the
+    source's own parameter lines across the edge (Align to Surface): the
+    face's iso direction that crosses the edge, in its tangent plane, with
+    the face's normal curvature in it. None when every piece is an
+    untrimmed edge (its exact rows run along those lines already) or the
+    side is not surface edges."""
+    from .square import sample_side, _foot
+    chain = chain_side(side)
+    if any(not (is_surface_edge(r) and o.type != 'CURVE') for o, r, _ in chain):
+        return None
+    if all(is_edge_ref(r) for _, r, _ in chain):
+        return None
+    if len(chain) == 1:
+        counts = [n]
+    else:
+        lens = _piece_lengths(chain)
+        total = n + len(chain) - 1
+        counts = [max(4, int(round(total * L / (sum(lens) or 1.0)))) for L in lens]
+        counts[int(np.argmax(lens))] += total - sum(counts)
+    parts = []
+    for (o, r, rev), m in zip(chain, counts):
+        sd = sample_side(o, r, m)
+        if sd.Q is None or sd.N is None or sd.B is None:
+            return None
+        b_ = store.get_brep(o)
+        surf = (b_.edges()[int(r[1:])].faces()[0] if is_brep_edge_ref(r) else b_.faces()[0]).surface()
+        M = np.array(geom.world_matrix(o), float)
+        R, Ri, T = M[:3, :3], np.linalg.inv(M[:3, :3]), M[:3, 3]
+        Pw = np.asarray(sd.P, float)
+        Nw = np.asarray(sd.N, float)
+        Bw = np.asarray(sd.B, float)
+        Wd, prev = [], None
+        for q, nq, bq in zip(Pw, Nw, Bw):
+            prev = _foot(surf, Ri @ (q - T), prev)
+            _, su, sv = surf.derivatives(*prev)
+            su, sv = R @ np.array(su, float), R @ np.array(sv, float)
+            bu = abs(su @ bq) / (np.linalg.norm(su) or 1.0)
+            bv = abs(sv @ bq) / (np.linalg.norm(sv) or 1.0)
+            d = su if bu >= bv else sv
+            if d @ bq < 0:
+                d = -d
+            nn = nq / (np.linalg.norm(nq) or 1.0)
+            d = d - (d @ nn) * nn
+            Wd.append(d / (np.linalg.norm(d) or 1.0))
+        arr = [Pw, Nw, np.asarray(sd.Q, float), np.array(Wd)]
+        parts.append([a[::-1] for a in arr] if rev else arr)
+    P, N, Q, W = (np.concatenate([parts[0][k]] + [pt[k][1:] for pt in parts[1:]]) for k in range(4))
+    N = N / np.linalg.norm(N, axis=1, keepdims=True)
+    # the surface's flow, smoothed: its lines can fan out right at a corner
+    # (a spoon's, 16° to 43° within the last sample) -- rows cannot follow
+    # that; a cubic in arc length through the lean keeps the flow and drops
+    # the fan. Eased towards square by lean_scale.
+    s_ = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))])
+    T = np.gradient(P, s_, axis=0, edge_order=2)
+    T /= np.linalg.norm(T, axis=1, keepdims=True)
+    b = np.cross(N, T)
+    b /= np.linalg.norm(b, axis=1, keepdims=True)
+    b[np.sum(b * W, axis=1) < 0] *= -1.0
+    lim = np.tan(np.radians(MATCH_MAX_DEG))
+    lam = np.clip(np.sum(W * T, axis=1) / np.maximum(np.sum(W * b, axis=1), 1e-6), -lim, lim)
+    tt = s_ / (s_[-1] or 1.0)
+    if len(P) >= 8:
+        lam = np.polyval(np.polyfit(tt, lam, 3), tt)
+    W = b + (lean_scale * lam)[:, None] * T
+    W /= np.linalg.norm(W, axis=1, keepdims=True)
+    kn = np.einsum("ij,ijk,ik->i", W, Q, W)
+    joints = list(np.cumsum([m - 1 for m in counts])[:-1])
+    es = geom.EdgeSample(P, W, kn[:, None] * N, [int(j) for j in joints])
+    es.N = N
+    es.redo = lambda m: surface_flow_samples(side, m, lean_scale)
+    return es
+
+
+EDGE_MODES = ("FREE", "EDGES", "SURFACE")
+
+
+def side_edge_modes(p):
+    """Each side's edge mode: FREE (square to the side, or along an
+    untrimmed face's own lines), EDGES (Align Edges: carry on the surface's
+    edges at the corners), SURFACE (Align to Surface: along the face's own
+    lines across the side). Lofts made with the older Match Edges switch
+    align edges on both sides."""
+    old = "EDGES" if p.get("match_edges") else "FREE"
+    return tuple(p.get(k) if p.get(k) in EDGE_MODES else old for k in ("edges_a", "edges_b"))
+
+
 def input_samples(obj, ref, n):
     if is_edge_ref(ref):
         surf = store.get_surfaces(obj)[0]
@@ -259,24 +729,135 @@ def split_folds(g, rows=None):
     return store.brep_from_text(breps["joined"])
 
 
+def loft_rail_count(inputs, p):
+    """How many of the Loft's side groups (the last ones) are rails."""
+    n = int(p.get("rails", 0) or 0)
+    return n if 0 < n < len(loft_sides(inputs, p)) - 1 else 0
+
+
 @builder("loft")
 def build_loft(inputs, p):
+    LAST_SPANS[0] = None
+    if loft_rail_count(inputs, p):
+        return _build_loft_with_rails(inputs, p)
     g = _build_loft(inputs, p)
     if _is_skin(inputs, p):
         # through curve sections: sections with corners give folds -> faces.
         # A G1 / G2 blend between two edges is never split (a fold there would
         # be a defect, not hidden as a polysurface)
-        g = split_folds(g, _section_rows(g, inputs))
+        g = split_folds(g, _section_rows(g, inputs, p))
+    elif p.get("fit") == "SPANS" and p.get("span_faces") and LAST_SPANS[0]:
+        g = split_spans(g, inputs, p)
     return g
 
 
-def _section_rows(g, inputs):
+LAST_SPANS = [None]      # how many Bezier spans the last loft build made (None: not a span fit)
+
+
+def _build_loft_with_rails(inputs, p):
+    """Loft with guide curves: the profiles (side groups) and the rails (the
+    last `rails` groups) go to Loft Rails' solver -- with two rails the four
+    sides of a Square-style net, each surface edge among them G0 / G1 / G2
+    with its weight; one rail is a guide the surface passes through. Loft's
+    side A / B settings are the first / last profile's; rail A / B take
+    cont_ra / cont_rb and their weights tan_ra / tan_rb."""
+    from . import loft_rails
+    LOFT_NOTES.clear()
+    q = {"sides": p.get("sides"), "rails": loft_rail_count(inputs, p),
+         "lr_start": p.get("cont_a", "G0"), "lr_end": p.get("cont_b", "G0"),
+         "lr_ra": p.get("cont_ra", "G0"), "lr_rb": p.get("cont_rb", "G0"),
+         "lw_start": float(p.get("tan_a", 1.0)), "lw_end": float(p.get("tan_b", 1.0)),
+         "lw_ra": float(p.get("tan_ra", 1.0)), "lw_rb": float(p.get("tan_rb", 1.0)),
+         "samples": max(int(p.get("samples", 24)), 48), "lr_degree": 0,
+         "lr_ease": float(p.get("corner_ease", 0.0) or 0.0), "lr_even": bool(p.get("even_net"))}
+    # the solver's Auto accepts itself by its own, looser measure (a G2 spoon
+    # edge 15 % off by the labels' check at 6 x 8 CVs): take Auto when the
+    # labels hold, else the lightest uniform net of more spans that holds
+    groups = loft_sides(inputs, p)
+    nr = q["rails"]
+    profs, rails = groups[:len(groups) - nr], groups[len(groups) - nr:]
+    checks = [(profs[0], p.get("cont_a", "G0")), (profs[-1], p.get("cont_b", "G0"))]
+    if nr == 2:
+        checks += [(rails[0], p.get("cont_ra", "G0")), (rails[1], p.get("cont_rb", "G0"))]
+    else:
+        checks += [(rails[0], "G0")]                   # a guide: the loft passes through it
+    sides_, conts_ = [c[0] for c in checks], [c[1] for c in checks]
+    eases = loft_rail_eases(inputs, p)
+    degs = (5,) if "G2" in conts_ else (3, 5)
+    tries = [None] + sorted(((d, sp, sp) for d in degs for sp in RAIL_SPANS), key=lambda t: (t[0] + t[1], t[0]))
+    # set by hand (Patch Quad Sided's Degree / Spans): that net only, or the
+    # lightest that holds with the rest left to the search
+    fd, fu, fv = (int(p.get(k, 0) or 0) for k in ("rail_degree", "rail_spans_u", "rail_spans_v"))
+    if fd or fu or fv:
+        ds = (fd,) if fd else degs
+        su = (fu,) if fu else RAIL_SPANS
+        sv = (fv,) if fv else RAIL_SPANS
+        tries = sorted({(d, a, b) for d in ds for a in su for b in sv}, key=lambda t: (t[0] + t[1] + t[2], t[0]))
+    best = None
+    for tr in tries:
+        spans = None if tr is None else tr[1]
+        qq = dict(q) if tr is None else dict(q, lr_degree=tr[0], lr_spans_u=tr[1], lr_spans_v=tr[2])
+        try:
+            g = loft_rails.build(inputs, qq)
+        except RuntimeError:
+            continue
+        worst, what = _verify_sides(g, sides_, conts_, eases)
+        notes = list(loft_rails.LAST_INFO.get("corner_notes", []))
+        if best is None or worst < best[0] - 1e-9:
+            best = (worst, g, what, notes, spans)
+        if worst <= 1.0:
+            best = (worst, g, what, notes, spans)
+            break
+    if best is None:
+        raise RuntimeError("the loft with rails could not be built")
+    worst, g, what, notes, spans = best
+    LOFT_NOTES.extend(notes)
+    LAST_EASES.clear()
+    LAST_EASES.update(eases)
+    if p.get("span_faces"):
+        g = split_spans(g, inputs, p, both=True)
+    if worst > 1.0:
+        LOFT_NOTES.append(f"{what} -- past the continuity tolerance with up to {RAIL_SPANS[-1]} spans"
+                          + (" (the corners' tangent planes differ)" if notes else ""))
+    return g
+
+
+RAIL_SPANS = (4, 6, 8, 10, 12)
+LAST_EASES = {}                     # the last loft with rails' eased corner zones (for the labels)     # loft with rails: the span counts tried after Auto, lightest first
+
+
+def split_spans(g, inputs, p, both=False):
+    """A span-fitted loft as one Bezier patch per span (both: across the
+    profiles too -- a loft with rails), joined into a body (oriented first:
+    run() turns only a single surface the right way)."""
+    sm, _ = _k()
+    if not isinstance(g, sm.Surface):
+        return g
+    flip = edge_vote(g, inputs) < 0
+    if p.get("flip_normal"):
+        flip = not flip
+    if flip:
+        from .square import reverse_u
+        g = reverse_u(g)
+    pieces = geom.split_uv_spans(g) if both else geom.split_v_spans(g)
+    if len(pieces) < 2:
+        return g
+    from . import jobs
+    ident = {"loc": [0.0, 0.0, 0.0], "axis": [0.0, 0.0, 1.0], "angle": 0.0, "scale": [1.0, 1.0, 1.0]}
+    objs = {f"s{i}": (store.brep_to_text(store.to_brep(pc)), ident) for i, pc in enumerate(pieces)}
+    b = store.to_brep(g).bounding_box()
+    diag = float(np.linalg.norm(np.array(b[1], float) - np.array(b[0], float))) or 1.0
+    _, breps = jobs.run("join", objs, ["joined"], order=list(objs), into="s0", tolerance=1e-6 * diag)
+    return store.brep_from_text(breps["joined"])
+
+
+def _section_rows(g, inputs, p=None):
     """The u values where a loft surface holds its sections (None if not found)."""
     sm, _ = _k()
     try:
         rows = []
-        for o, r in inputs:
-            P = geom.sample_curve(input_curve(o, r), 5)[1:4]
+        for side in loft_sides(inputs, p or {}):
+            P = geom.sample_curve(side_curve(side), 5)[1:4]
             us = []
             for q in P:
                 uv = sm.surface_closest_point(g, tuple(map(float, q)))[1][0]
@@ -290,23 +871,28 @@ def _section_rows(g, inputs):
 def _is_skin(inputs, p):
     any_edge = any(is_surface_edge(r) for _, r in inputs)
     smooth = p.get("cont_a", "G0") != "G0" or p.get("cont_b", "G0") != "G0"
-    return bool(p.get("closed")) or len(inputs) > 2 or not (any_edge or smooth)
+    return bool(p.get("closed")) or len(loft_sides(inputs, p)) > 2 or not (any_edge or smooth)
 
 
 def _build_loft(inputs, p):
     sm, _ = _k()
+    LOFT_NOTES.clear()
     if len(inputs) < 2:
         raise ValueError("Loft needs at least two inputs")
     any_edge = any(is_surface_edge(r) for _, r in inputs)
     smooth = p.get("cont_a", "G0") != "G0" or p.get("cont_b", "G0") != "G0"
 
+    sides = loft_sides(inputs, p)
+    if len(sides) < 2:
+        raise ValueError("Loft needs at least two sides")
     closed = bool(p.get("closed"))
-    if closed and len(inputs) < 3:
+    if closed and len(sides) < 3:
         raise ValueError("a closed loft needs at least 3 sections")
-    if closed or len(inputs) > 2 or not (any_edge or smooth):
+    if closed or len(sides) > 2 or not (any_edge or smooth):
         # Plain skin through curves: exact, done by the kernel (closed: our
-        # periodic skin, smooth across the seam).
-        curves = [input_curve(o, r) for o, r in inputs]
+        # periodic skin, smooth across the seam). A side of several edges is
+        # one curve through them all.
+        curves = [side_curve(sd) for sd in sides]
         if closed:
             curves = [curves[i] for i in geom.ring_order(curves)]
         if p.get("auto_align", True):
@@ -338,17 +924,29 @@ def _build_loft(inputs, p):
 
     # Two inputs with G1/G2 to surfaces: sampled blend surface.
     n = int(p.get("samples", 24))
-    a = input_samples(*inputs[0], n)
-    b = input_samples(*inputs[1], n)
+    if p.get("fit") == "SPANS":
+        n = max(n, SPAN_MIN_SAMPLES)
+    if side_edge_modes(p) != ("FREE", "FREE"):
+        g = _build_matched(sides, n, p)
+        if g is not None:
+            return g
+    n = max(side_sample_count(sides[0], n), side_sample_count(sides[1], n))
+    a = side_samples(sides[0], n)
+    b = side_samples(sides[1], n)
     if p.get("auto_align", True) and geom.should_flip(a.P, b.P):
         b = b.reversed()
     if p.get("flip_b"):
         b = b.reversed()
     # exact: both inputs on the same layout along the edge -> keep it (a line stays a line)
     try:
-        sa, sb = exact_side(*inputs[0]), exact_side(*inputs[1])
+        sa, sb = side_exact(sides[0]), side_exact(sides[1])
     except Exception:
         sa = sb = None
+    for nm, sd, cont in (("A", sa, p.get("cont_a", "G0")), ("B", sb, p.get("cont_b", "G0"))):
+        if sd is not None and cont != "G0" and sd.get("creases"):
+            worst = max(a for a, _ in sd["creases"])
+            LOFT_NOTES.append(f"side {nm}: its faces meet at {worst:.2g}° at a joint -- "
+                              f"the loft is {cont} along the edges except right at that joint")
     if sa is not None and sb is not None:
         if np.linalg.norm(sb["P"][0] - b.P[0]) > np.linalg.norm(sb["P"][-1] - b.P[0]):
             sb = geom.reverse_side(sb)           # follow the samples' orientation (auto align / flip)
@@ -370,6 +968,280 @@ def _build_loft(inputs, p):
     deg_in = max((s["deg"] for s in (sa, sb) if s is not None), default=3)
     if sa is None or sb is None:
         deg_in = max(deg_in, 3)
+    g = _sampled_blend(a, b, p, deg_in)
+    if deg_in == 3 and any(is_surface_edge(r) for _, r in inputs) and \
+            ("G1" in (p.get("cont_a"), p.get("cont_b")) or "G2" in (p.get("cont_a"), p.get("cont_b"))):
+        # held as the labels check it, else with more samples
+        if _verify_sides(g, sides, (p.get("cont_a", "G0"), p.get("cont_b", "G0")))[0] > 1.0:
+            g2 = _build_matched(sides, int(p.get("samples", 24)) * 2, p, force=True)
+            if g2 is not None:
+                g = g2
+    return g
+
+
+MATCH_MAX_SAMPLES = 200
+SPAN_MAX_SAMPLES = 1000   # Bezier spans: the samples only feed the fit (CVs come from the tolerance)
+
+
+def _build_matched(sides, n, p, force=False):
+    """Match Edges: the cross direction follows the source's edges at the
+    corners (sampled -- the exact rows hold the square direction only).
+    The direction turns along the side, so the fit is checked between its
+    samples and the samples doubled until G1 holds there (a short wide side
+    held G1 at 49 Samples, not at 24). None when no side has anything to
+    match."""
+    conts = (p.get("cont_a", "G0"), p.get("cont_b", "G0"))
+    modes = side_edge_modes(p)
+    best = None
+    m = n
+    while True:
+        LOFT_NOTES.clear()
+        k = max(side_sample_count(sides[0], m), side_sample_count(sides[1], m))
+        plain = [side_samples(sides[0], k), side_samples(sides[1], k)]
+        ma, mb = (_matched_side(sides[i], k, conts[i], p.get("tan_" + "ab"[i], 1.0), p.get("cur_" + "ab"[i], 0.0),
+                                plain, conts, "AB"[i], modes[i]) for i in (0, 1))
+        if ma is None and mb is None and not force:
+            return best[1] if best else None
+        a = ma if ma is not None else plain[0]
+        b = mb if mb is not None else plain[1]
+        if p.get("auto_align", True) and geom.should_flip(a.P, b.P):
+            b = b.reversed()
+        if p.get("flip_b"):
+            b = b.reversed()
+        g = _sampled_blend(a, b, p, 3)
+        worst, what = _verify_sides(g, sides, conts)
+        if best is None or worst < best[0]:
+            best = (worst, g, list(LOFT_NOTES), what)
+        cap = SPAN_MAX_SAMPLES if p.get("fit") == "SPANS" else MATCH_MAX_SAMPLES
+        if worst <= 1.0 or 2 * k > cap:
+            break
+        m *= 2
+    LOFT_NOTES[:] = best[2]
+    if best[0] > 1.0:
+        LOFT_NOTES.append(f"{best[3]} at {k} samples -- past the continuity tolerance")
+    return best[1]
+
+
+def ease_zones(side, frac, note="eased at the corner (Ease Corners)", ends=(0, 1)):
+    """{(object name, ref): [(end 0/1, share of that piece, note)]} for a
+    loft side eased over `frac` of its length toward its ends (both, or those
+    in `ends`): the first and last pieces of a chained side carry the side's ends."""
+    if frac <= 0:
+        return {}
+    chain = chain_side(side)
+    lens = _piece_lengths(chain)
+    L = sum(lens) or 1.0
+    out = {}
+    for k, ((o, r, rev), Lp) in enumerate(zip(chain, lens)):
+        f = min(1.0, frac * L / (Lp or 1.0))
+        zones = []
+        if k == 0 and 0 in ends:
+            zones.append((1 if rev else 0, f, note))
+        if k == len(chain) - 1 and 1 in ends:
+            zones.append((0 if rev else 1, f, note))
+        if zones:
+            out[(o.name, r)] = zones
+    return out
+
+
+CORNER_ZONE = 0.1       # share of a profile, toward a corner no surface can hold G1 at, that is not held to G1 / G2
+
+
+def _side_end(side, end, m=65):
+    """(point, unit normal or None, unit tangent pointing into the side) at a
+    side's start (end 0) or finish (end 1), in world space."""
+    from .square import sample_side
+    chain = chain_side(side)
+    o, r, rev = chain[0] if end == 0 else chain[-1]
+    sd = sample_side(o, r, m)
+    first = (end == 0) != rev                   # the side's end is this piece's first sample
+    P = np.asarray(sd.P, float)
+    i, j = (0, 1) if first else (-1, -2)
+    t = P[j] - P[i]
+    t /= np.linalg.norm(t) or 1.0
+    n = None
+    if sd.has_surface and sd.N is not None:
+        n = np.asarray(sd.N[i], float)
+        n = n / (np.linalg.norm(n) or 1.0)
+    return P[i], n, t
+
+
+def loft_rail_eases(inputs, p):
+    """{(object name, ref): ease zones} of a loft with two rails' profiles:
+    a G2 profile eased toward both rails by Ease Corners, and every G1 / G2
+    profile end where no surface can hold it -- the rail leaves the profile's
+    tangent plane there (or, a G1 / G2 rail, its own surface's normal differs)
+    by more than the labels' angle tolerance. Those corners are left out of
+    the check over CORNER_ZONE of the profile rather than chased with more CVs."""
+    if loft_rail_count(inputs, p) != 2:
+        return {}
+    from . import contlabels
+    tol_a = contlabels._tols()[0]
+    groups = loft_sides(inputs, p)
+    profs, rails = groups[:-2], groups[-2:]
+    out = {}
+
+    def add(zs):
+        for key, lst in zs.items():
+            out.setdefault(key, []).extend(lst)
+
+    frac = float(p.get("corner_ease", 0.0) or 0.0)
+    rail_ends = []
+    for rail, rc in zip(rails, (p.get("cont_ra", "G0"), p.get("cont_rb", "G0"))):
+        for e in (0, 1):
+            try:
+                rail_ends.append((_side_end(rail, e), rc))
+            except Exception:
+                pass
+    for side, cont in ((profs[0], p.get("cont_a", "G0")), (profs[-1], p.get("cont_b", "G0"))):
+        if cont not in ("G1", "G2"):
+            continue
+        if cont == "G2" and frac > 0:
+            add(ease_zones(side, frac))
+        L = sum(_piece_lengths(chain_side(side))) or 1.0
+        for e in (0, 1):
+            try:
+                P, n, _ = _side_end(side, e)
+            except Exception:
+                continue
+            if n is None or not rail_ends:
+                continue
+            (Q, m, t), rc = min(rail_ends, key=lambda x: float(np.linalg.norm(x[0][0] - P)))
+            if np.linalg.norm(Q - P) > 1e-3 * L:
+                continue
+            deg = float(np.degrees(np.arcsin(min(1.0, abs(float(t @ n))))))
+            what = f"the rail leaves {deg:.2g}° off the tangent plane"
+            if rc in ("G1", "G2") and m is not None:
+                dn = float(np.degrees(np.arccos(min(1.0, abs(float(n @ m))))))
+                if dn > deg:
+                    deg, what = dn, f"the rail's surface is {dn:.2g}° off the tangent plane"
+            if deg > tol_a:
+                add(ease_zones(side, CORNER_ZONE, f"{what} at this corner: no surface is {cont} there",
+                               ends=(e,)))
+    return out
+
+
+def _verify_sides(g, sides, conts, eases=None):
+    """How a loft holds its sides, measured as the labels measure it
+    (contlabels.measure: the gap along every edge or curve of a side -- G0
+    included -- and for G1 / G2 the angle and curvature straight across it,
+    between the samples the fit went through): (worst value over its
+    tolerance, what it was). <= 1 holds."""
+    from types import SimpleNamespace
+    from mathutils import Matrix
+    from . import contlabels
+    tol_a, tol_c = contlabels._tols()
+    shim = SimpleNamespace(matrix_basis=Matrix.Identity(4), parent=None)     # the loft is in world space
+    try:
+        brep = store.to_brep(g)
+    except Exception:
+        return 0.0, ""
+    worst, what = 0.0, ""
+    for side, cont in zip(sides, conts):
+        k = geom.CONT_ORDER.get(cont, 0)
+        for o, r in side:
+            edge = is_surface_edge(r) and o.type != 'CURVE'
+            kk = k if edge else 0                      # a curve holds position only
+            try:
+                res = contlabels.measure(shim, o, r, kk, brep=brep, ease=(eases or {}).get((o.name, r)))
+                L = _piece_lengths([(o, r, False)])[0] or 1.0
+            except Exception:
+                continue
+            q = res["gap"] / max(contlabels.TOL_GAP_REL * L, 1e-15)
+            if q > worst:
+                worst, what = q, f"{o.name} {r}: gap {res['gap']:.2g}"
+            if kk == 0:
+                continue
+            if res.get("eased"):
+                # holds everywhere outside the eased corner zones (measure says
+                # "eased" only then): that is what was asked for
+                res = dict(res, angle=0.0, curv=0.0)
+            for val, tol, name in ((res["angle"], tol_a, f"G1 {res['angle']:.2g}°"),
+                                   (res["curv"] if k >= 2 else 0.0, tol_c, f"G2 {100 * res['curv']:.2g}%")):
+                q = val / max(tol, 1e-12)
+                if q > worst:
+                    worst, what = q, f"{o.name} {r}: {name}"
+    return worst, what
+
+
+ROW_SPACING_MIN = 0.05   # a CV row keeps at least this share of the edge's spacing (else the fit wobbles)
+
+
+def _rows_cross(es, cont, tangent, curvature, n_deg, scale):
+    """Do the side's CV rows cross over one another along the side, or come
+    so close to it (squeezed under ROW_SPACING_MIN of the edge's spacing)
+    that the fit through them wobbles?"""
+    rows = geom._side_rows(es, cont, tangent, curvature, n_deg, scale)
+    d0 = np.diff(rows[0], axis=0)
+    dd = np.sum(d0 * d0, axis=1)
+    return any(np.any(np.sum(np.diff(R, axis=0) * d0, axis=1) < ROW_SPACING_MIN * dd) for R in rows[1:])
+
+
+def _matched_side(side, n, cont, tangent, curvature, plain, conts, name, mode="EDGES"):
+    """The samples of one side in its edge mode: Align Edges eased (the
+    edges' bend, then their lean, scaled back) until its rows do not cross;
+    Align to Surface as it is (square to the side when its rows would
+    cross). None for a G0 or Free side, or one with nothing to align."""
+    if cont == "G0" or mode == "FREE":
+        return None
+    ka, kb = (geom.CONT_ORDER[c] for c in conts)
+    n_deg = 1 + ka + kb
+    scale = float(np.mean(np.linalg.norm(plain[0].P - plain[1].P[::(1 if not geom.should_flip(
+        plain[0].P, plain[1].P) else -1)], axis=1))) or 1.0
+    if mode == "SURFACE":
+        for f in (1.0, 0.75, 0.5, 0.25):
+            es = surface_flow_samples(side, n, f)
+            if es is None:
+                return None
+            if not _rows_cross(es, cont, tangent, curvature, n_deg, scale):
+                if f != 1.0:
+                    LOFT_NOTES.append(f"side {name}: the surface's lines followed only {int(round(100 * f))} % "
+                                      f"-- fully, its CV rows would cross (lower Tangent {name} to follow them fully)")
+                return es
+        LOFT_NOTES.append(f"side {name}: along the surface its CV rows would cross -- square to the side")
+        return None
+    steps = [(1.0, 1.0), (1.0, 0.5), (1.0, 0.25), (1.0, 0.0), (0.75, 0.0), (0.5, 0.0), (0.25, 0.0)]
+    for lean_s, bend_s in steps:
+        es = match_edges_samples(side, n, cont == "G2", lean_s, bend_s)
+        if es is None:
+            return None
+        if not _rows_cross(es, cont, tangent, curvature, n_deg, scale):
+            if (lean_s, bend_s) != (1.0, 1.0):
+                what = "the edges' curvature" if lean_s == 1.0 else "the edges' direction"
+                LOFT_NOTES.append(f"side {name}: {what} matched only {int(round(100 * (bend_s if lean_s == 1.0 else lean_s)))} % "
+                                  f"-- fully, its CV rows would cross (lower Tangent {name} to match it fully)")
+            return es
+    LOFT_NOTES.append(f"side {name}: the edges could not be matched without crossing CV rows -- square to the side")
+    return None
+
+
+SPAN_MIN_SAMPLES = 120   # Bezier spans: samples along a side at least (cheap; spans come from tolerance)
+
+
+def _sampled_blend(a, b, p, deg_in):
+    """The sampled G0 / G1 / G2 blend between two sides' samples. Fit
+    "SPANS": a few Bezier spans of one degree, knots placed by tolerance
+    (geom.blend_loft_spans). Otherwise a least-squares net; a chained side
+    is then fitted piece by piece between its joints (a piece needs 4
+    samples at least, else its joint is left to the fit)."""
+    if p.get("fit") == "SPANS":
+        from . import contlabels
+        tol_a, tol_c = contlabels._tols()
+        g, nspans, worst = geom.blend_loft_spans(
+            a, b, sorted(set(a.joints) | set(b.joints)), p.get("cont_a", "G0"), p.get("cont_b", "G0"),
+            p.get("tan_a", 1.0), p.get("tan_b", 1.0), p.get("cur_a", 0.0), p.get("cur_b", 0.0),
+            degree=int(p.get("span_degree", 5)), tol_angle=tol_a, tol_curv=tol_c, tol_gap_rel=contlabels.TOL_GAP_REL)
+        LAST_SPANS[0] = nspans
+        return g
+    breaks, last = [], 0
+    for j in sorted(set(a.joints) | set(b.joints)):
+        if j - last >= 3 and len(a.P) - 1 - j >= 3:
+            breaks.append(j)
+            last = j
+    if breaks:
+        return geom.blend_loft_pieces(a, b, breaks, p.get("cont_a", "G0"), p.get("cont_b", "G0"),
+                                      p.get("tan_a", 1.0), p.get("tan_b", 1.0),
+                                      p.get("cur_a", 0.0), p.get("cur_b", 0.0), degree_v=deg_in)
     return geom.blend_loft(a, b,
                            p.get("cont_a", "G0"), p.get("cont_b", "G0"),
                            p.get("tan_a", 1.0), p.get("tan_b", 1.0),

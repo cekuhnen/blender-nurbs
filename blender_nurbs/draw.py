@@ -10,7 +10,7 @@ from . import store
 _handle = None
 _handle_px = None
 _label_cache = {}
-pick_overlay = {"hover": None, "picked": []}  # filled by the modal pick operator
+pick_overlay = {"hover": None, "picked": [], "colors": []}  # filled by the modal pick operator
 # filled by the sketch tools (CV Curve / Line): world-space polylines and points
 sketch_overlay = {"curves": [], "hull": [], "cvs": [], "snap": None, "snap_label": None, "axes": [],
                   "refs": [], "cursor": None, "comb": None, "guides": [], "face": [], "face_pts": []}
@@ -33,7 +33,7 @@ ghost = {"name": None}
 COL_HOVER = (1.0, 0.95, 0.2, 1.0)
 # the curve a drawing tool is making: as thin as the curvature comb outline
 SKETCH_W = 1.5
-COL_PICKS = [(0.1, 0.8, 1.0, 1.0), (1.0, 0.25, 0.6, 1.0), (0.3, 1.0, 0.4, 1.0)]
+COL_PICKS = [(0.1, 0.8, 1.0, 1.0), (1.0, 0.25, 0.6, 1.0), (0.3, 1.0, 0.4, 1.0), (1.0, 0.75, 0.1, 1.0)]  # last: Loft rails
 
 
 def _lines_from_polylines(polys, M, bias=None):
@@ -326,8 +326,13 @@ def _draw():
         workplanes.draw_active_marker(ctx)     # the active work plane's axes
     except Exception as exc:
         print("NURBS work plane:", exc)
-    for i, pl in enumerate(pick_overlay["picked"]):
-        _draw_lines(_lines_from_polylines([pl], _IDENT), COL_PICKS[min(i, 2)], 4.0)
+    cols = pick_overlay.get("colors") or []
+    if len(cols) != len(pick_overlay["picked"]):
+        cols = [min(i, 2) for i in range(len(pick_overlay["picked"]))]
+    else:
+        cols = [c % len(COL_PICKS) for c in cols]     # Loft: one colour per side
+    for pl, c in zip(pick_overlay["picked"], cols):
+        _draw_lines(_lines_from_polylines([pl], _IDENT), COL_PICKS[c], 4.0)
     if pick_overlay["hover"]:
         _draw_lines(_lines_from_polylines([pick_overlay["hover"]], _IDENT), COL_HOVER, 4.0)
     so = sketch_overlay
@@ -576,8 +581,11 @@ void main()
 
 # params: (base -- the finest level Blender draws itself, fade px, extra line
 # half width, emphasis shade); eye: (the eye point, or the view direction when
-# orthographic; perspective?). Levels, blending and the fade towards edge-on
-# as Blender's grid shader.
+# orthographic; perspective?); rim: (centre x, y, radius -- 0: none) of the
+# fade towards the edge (perspective: a circle round the eye, so the grid ends
+# as far straight ahead as off to the sides -- the square it is drawn on would
+# reach 1.4x further along its diagonals). Levels, blending and the fade
+# towards edge-on as Blender's grid shader.
 _GRID_FRAG = """
 float grid_line(vec2 co, vec2 fw, float s)
 {
@@ -626,6 +634,9 @@ void main()
   float a = 1.0 - abs(vv.z);
   a *= a;
   c.a *= 1.0 - a * a;
+  if (rim.z > 0.0) {
+    c.a *= 1.0 - smoothstep(0.6 * rim.z, rim.z, length(co - rim.xy));
+  }
   fragColor = c;
 }
 """
@@ -643,6 +654,7 @@ def _fine_grid_shader():
             info.push_constant('VEC4', "steps")
             info.push_constant('VEC4', "params")
             info.push_constant('VEC4', "eye")
+            info.push_constant('VEC4', "rim")
             info.vertex_in(0, 'VEC3', "pos")
             info.vertex_out(iface)
             info.fragment_out(0, 'VEC4', "fragColor")
@@ -726,6 +738,7 @@ def _draw_fine_grid(ctx):
     sh.uniform_float("steps", tuple(float(v) for v in levels))
     sh.uniform_float("params", (float(base), float(GRID_FADE_PX), max(0.0, pix - 1.0) * 0.5, shade))
     sh.uniform_float("eye", (float(e.x), float(e.y), float(e.z), persp))
+    sh.uniform_float("rim", (float(x), float(y), float(R) if rv3d.is_perspective else 0.0, 0.0))
     batch.draw(sh)
     gpu.state.depth_mask_set(mask)
 

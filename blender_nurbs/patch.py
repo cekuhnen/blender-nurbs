@@ -24,7 +24,7 @@ import numpy as np
 
 from . import features, geom
 
-CONT = {"G0": 0, "G1": 1, "G2": 2}
+CONT = {"G0": 0, "G1": 1, "G2": 2, "FREE": 0}     # Free: Quad Sided only (the trimmed fill holds it G0)
 
 
 def _k():
@@ -1893,8 +1893,194 @@ def lightest(sides, sc, deg, fair, idx, cap, **kw):
     return best
 
 
+# --------------------------------------------------------------------------
+# Quad Sided: four sides (whole edges between the corners) -> one untrimmed
+# surface on Loft with rails' solver (Square's net, the labels' check, the
+# lightest net that holds, Ease Corners / Even Net)
+# --------------------------------------------------------------------------
+
+QUAD_EASE = 0.15        # Ease Corners default (share of a G2 side eased toward its corners)
+QUAD_DESC = ("One untrimmed four-sided surface whose edges are the opening's four sides (whole edges between "
+             "the corners; a side may run over several edges), instead of a larger surface trimmed to the loop. "
+             "The lightest net at which every edge holds its continuity")
+QUAD_EASE_DESC = ("Quad Sided: G2 eases off over this share of a side toward its corners (a neighbour whose "
+                  "curvature runs wild at a corner is not chased there: a much lighter net). 0: G2 all along")
+QUAD_DEG = [("0", "Auto", "The lightest that holds (the neighbours' own layout first)"),
+            ("3", "3", "Cubic"), ("5", "5", "Quintic (G2 needs 5)")]
+QUAD_DEG_DESC = "Quad Sided: degree of the surface (Auto: the lightest net that holds, 5 where an edge is G2)"
+QUAD_SPANS_DESC = "Quad Sided: spans this way (0 = Auto: the fewest at which every edge holds)"
+RETRIM_DESC = ("Quad Sided: a side that is the trim curve of a planar face becomes one clean curve in the "
+               "matched layout, and that face is re-trimmed to it (keeps the patch light)")
+RETRIM_MOVE_DESC = ("Re-trim: how far the planar face's edge may move, in % of the patch size (larger = lighter "
+                    "net, e.g. single span)")
+QUAD_EVEN_DESC = ("Quad Sided: space the CVs evenly (a cleaner, more regular net; G1 can need a few more CVs). "
+                  "Off: the net follows the edges' own layout")
+QUAD_SNAP = 0.03        # a corner this close (share of the loop's length) to where two edges meet snaps there
+
+
+def quad_corners(sides, order, p):
+    """Side positions (in loop order) that start each of the four sides: the
+    corners (set by hand or automatic) snapped to where edges meet. Raises
+    when a corner lies inside an edge or the loop has fewer than four edges."""
+    if len(sides) == 3:
+        return [0, 1, 2]                 # three edges: a three-sided patch (one corner collapses to a point)
+    if len(sides) < 3:
+        raise ValueError("Quad Sided needs three or more edges around the opening")
+    J = junctions(sides, order)
+    _, cum = _flat_loop(sides)
+    L = cum[-1] or 1.0
+    if len(sides) == 4:
+        return [0, 1, 2, 3]
+
+    def along(i, j):
+        d = abs(cum[i] - cum[j])
+        return min(d, L - d)
+    fixed = corner_loop_indices(sides, order, p.get("pt_corners") or [])
+    idx = corners(sides, fixed=fixed)[0]
+    pos = []
+    for i in idx:
+        s = min(range(len(J)), key=lambda k: along(i, J[k]))
+        if along(i, J[s]) > QUAD_SNAP * L:
+            if i in fixed:
+                raise ValueError("a corner set by hand lies inside an edge: Quad Sided needs its corners where "
+                                 "two edges meet (click a dot at a joint)")
+            pos = None
+            break
+        pos.append(s)
+    if pos is None or len(set(pos)) < 4:
+        # the automatic corners: the four joints where the loop turns most
+        P, _ = _flat_loop(sides)
+        M = len(P)
+        def turn(i):
+            a, b = P[i] - P[(i - 2) % M], P[(i + 2) % M] - P[i]
+            return float(np.arccos(np.clip(a @ b / ((np.linalg.norm(a) * np.linalg.norm(b)) or 1.0), -1, 1)))
+        pos = sorted(range(len(J)), key=lambda k: -turn(J[k]))[:4]
+    return sorted(set(pos))
+
+
+def quad_plan(inputs, p):
+    """(loft inputs, loft params, side positions of the corners, sides, order)
+    of a Quad Sided patch: the four sides as Loft with rails' groups -- the
+    pair with the higher continuity as its profiles (Ease Corners eases
+    those), the other pair its rails. Per side: the highest continuity of its
+    surface edges, the mean tension as its weight."""
+    if guide_indices(p):
+        raise ValueError("Quad Sided takes no guide curves (remove them, or switch Quad Sided off)")
+    sides, order, _, gap, size = loop_sides(inputs, p)
+    if gap > 1e-3 * size:
+        raise RuntimeError(f"the picked edges don't form a closed loop (gap {gap:.3g})")
+    cs = quad_corners(sides, order, p)
+    n, nc = len(order), len(cs)
+    groups = [[order[(cs[q] + j) % n] for j in range(((cs[(q + 1) % nc] - cs[q]) % n) or n)] for q in range(nc)]
+    conts = p.get("cont", [])
+    tension = [float(x) for x in p.get("pt_tension", [])]
+
+    def cont_of(g):
+        """The side's highest continuity among its surface edges; Free when every piece is Free."""
+        if all(k < len(conts) and conts[k] == "FREE" for k, _ in g):
+            return "FREE"
+        best = "G0"
+        for k, _ in g:
+            o, r = inputs[k]
+            c = conts[k] if k < len(conts) else "G1"
+            if features.is_surface_edge(r) and o.type != 'CURVE' and CONT.get(c, 0) > CONT[best]:
+                best = c
+        return best
+    if nc == 3 or any(cont_of(g) == "FREE" for g in groups) or p.get("pt_retrim"):
+        # three sides, Free sides or re-trimmed planar neighbours: Square's own net
+        return None, {"groups": groups, "conts": [cont_of(g) for g in groups],
+                      "weights": [float(np.mean([tension[k] if k < len(tension) else 1.0 for k, _ in g]))
+                                  for g in groups]}, cs, sides, order
+
+    def weight(g):
+        return float(np.mean([tension[k] if k < len(tension) else 1.0 for k, _ in g]))
+    gc = [CONT[cont_of(g)] for g in groups]
+    if gc[1] + gc[3] > gc[0] + gc[2]:
+        groups, cs = groups[1:] + groups[:1], cs[1:] + cs[:1]
+    a, ra, b, rb = groups
+    li = [tuple(inputs[k]) for g in (a, b, ra, rb) for k, _ in g]
+    lp = {"sides": [len(a), len(b), len(ra), len(rb)], "rails": 2,
+          "cont_a": cont_of(a), "cont_b": cont_of(b), "cont_ra": cont_of(ra), "cont_rb": cont_of(rb),
+          "tan_a": weight(a), "tan_b": weight(b), "tan_ra": weight(ra), "tan_rb": weight(rb),
+          "samples": 24, "corner_ease": float(p.get("pt_quad_ease", QUAD_EASE)),
+          "even_net": bool(p.get("pt_even", False)),
+          "rail_degree": int(p.get("pt_quad_degree", 0) or 0),
+          "rail_spans_u": int(p.get("pt_quad_spans_u", 0) or 0), "rail_spans_v": int(p.get("pt_quad_spans_v", 0) or 0)}
+    return li, lp, cs, sides, order
+
+
+def quad_eases(inputs, p):
+    """{input index: ease zones} of a Quad Sided patch (Loft with rails' zones,
+    by input)."""
+    li, lp, _, _, _ = quad_plan(inputs, p)
+    if li is None:
+        return {}                        # Square's net: its corners are eased inside the solver
+    z = features.loft_rail_eases(li, lp)
+    out = {}
+    for k, (o, r) in enumerate(inputs):
+        if (o.name, r) in z:
+            out[k] = z[(o.name, r)]
+    return out
+
+
+def _quad_square(inputs, p, plan):
+    """Square's own net for a Quad Sided patch with three sides (one corner
+    collapsed to a point), Free sides (no condition: the edge follows from the
+    others) or Re-trim Planar Targets. A side may run over several edges."""
+    from . import square as sq
+    from .loft_rails import chained_side
+    m = 48
+    raw = [chained_side([tuple(inputs[k]) for k, _ in g], m) for g in plan["groups"]]
+    conts, weights = list(plan["conts"]), list(plan["weights"])
+    if len(raw) == 3:
+        loop = [raw[0]]
+        for sd in raw[1:]:
+            end = loop[-1].P[-1]
+            loop.append(sd if np.linalg.norm(sd.P[0] - end) <= np.linalg.norm(sd.P[-1] - end) else sd.reversed())
+        raw = loop + [sq.Side(np.repeat(loop[0].P[0][None, :], m, axis=0))]
+        conts.append("G0")
+        weights.append(1.0)
+    sides, idx = sq.order_sides(raw)
+    d_ = int(p.get("pt_quad_degree", 0) or 0)
+    surf, inf = sq.square_surface(sides, [conts[i] for i in idx], [weights[i] for i in idx], (d_, d_),
+                                  int(p.get("pt_quad_spans_u", 0) or 0), int(p.get("pt_quad_spans_v", 0) or 0),
+                                  match=True, retrim=bool(p.get("pt_retrim")),
+                                  max_move=float(p.get("pt_retrim_move", 5.0)) / 100.0)
+    surf = sq._orient_like_neighbours(surf, sides)
+    inf["corner_notes"] = list(sq.LAST_NOTES)
+    sq.LAST_INFO.clear()
+    sq.LAST_INFO.update(inf)
+    return surf
+
+
+def _build_quad(inputs, p):
+    li, lp, cs, sides, order = quad_plan(inputs, p)
+    sm, ext = _k()
+    if li is None:
+        g = _quad_square(inputs, p, lp)
+        from . import square as sq
+        notes = list(sq.LAST_INFO.get("corner_notes", []))
+    else:
+        g = features._build_loft_with_rails(li, lp)
+        if features.edge_vote(g, li) < 0:              # face the way the neighbours face
+            from .square import reverse_u
+            g = reverse_u(g)
+        notes = list(features.LOFT_NOTES)
+    d = ext.surface_cvs(g)
+    J = junctions(sides, order)
+    info.clear()
+    info.update(cvs=(int(d["count_u"]), int(d["count_v"])), degree=int(d["degree_u"]), sides=len(order), guides=0,
+                method="quad sided", guide_dev=0.0, quad=True, notes=notes)
+    info["corners"] = loop_points(sides, order, [J[c] for c in cs])
+    info["junctions"] = loop_points(sides, order, J)
+    info["manual"] = bool(p.get("pt_corners"))
+    return g
+
+
 @features.builder("patch")
 def build_patch(inputs, p):
+    if p.get("pt_quad"):
+        return _build_quad(inputs, p)
     sm, ext = _k()
     conts = [CONT.get(c, 1) for c in p.get("cont", ["G1"] * len(inputs))]
     while len(conts) < len(inputs):
@@ -2050,24 +2236,46 @@ def draw_settings(lay, data, edges, inf, all_prop, obj=None, h=None):
     """A Patch's settings, laid out the same in the Feature panel (data: the
     object's feature settings; obj, h given) and in the Patch operator's redo
     panel (data: the operator)."""
+    quad = bool(getattr(data, "pt_quad", False))
+    lay.prop(data, "pt_quad", toggle=True, icon='MESH_PLANE')
     col = lay.column(align=True)
-    row = col.row(align=True)
-    row.prop(data, "pt_cvs", text="CVs U")
-    row.prop(data, "pt_cvs_v", text="CVs V")
-    row = col.row(align=True)
-    row.prop(data, "pt_auto_cvs", toggle=True)
-    row.prop(data, "pt_degree")
-    row = col.row(align=True)
-    row.prop(data, "pt_fair")
-    row.prop(data, "pt_surface_fair", text="On Surface", toggle=True)
+    if quad:
+        row = col.row(align=True)
+        row.prop(data, "pt_quad_degree")
+        row = col.row(align=True)
+        row.prop(data, "pt_quad_spans_u", text="Spans U")
+        row.prop(data, "pt_quad_spans_v", text="Spans V")
+        col.prop(data, "pt_quad_ease")
+        col.prop(data, "pt_even")
+        if hasattr(data, "pt_retrim"):
+            # the operator only (as Square's): re-trimming edits the neighbouring
+            # faces once, when the patch is made -- not something a rebuild repeats
+            col.prop(data, "pt_retrim")
+            sub_ = col.row()
+            sub_.active = bool(data.pt_retrim)
+            sub_.prop(data, "pt_retrim_move")
+    else:
+        row = col.row(align=True)
+        row.prop(data, "pt_cvs", text="CVs U")
+        row.prop(data, "pt_cvs_v", text="CVs V")
+        row = col.row(align=True)
+        row.prop(data, "pt_auto_cvs", toggle=True)
+        row.prop(data, "pt_degree")
+        row = col.row(align=True)
+        row.prop(data, "pt_fair")
+        row.prop(data, "pt_surface_fair", text="On Surface", toggle=True)
     waiting = obj is not None and features.pending(obj)
     if inf.get("cvs"):
         txt = f"{inf['cvs'][0]} x {inf['cvs'][1]} CVs · degree {inf.get('degree', '?')}"
         if waiting:
             txt += " · waiting for Rebuild"
+        elif quad and inf.get("quad"):
+            txt += " · untrimmed (lightest that holds)"
         elif data.pt_auto_cvs:
             txt += " (lightest that holds)"
         lay.label(text=txt, icon='MESH_GRID')
+        for nt in (inf.get("notes") or []) if quad and not waiting else []:
+            lay.label(text=nt[:120], icon='INFO')
 
     def cells(layout):
         sp = layout.split(factor=0.4, align=True)
@@ -2160,6 +2368,15 @@ class NPROTO_OT_patch(PickMixin, bpy.types.Operator):
                            description="Weight of the bending energy: higher = calmer, fuller surface; "
                                        "lower = follows the edges' tangents more tightly")
     pt_surface_fair: BoolProperty(name="Fair on Surface", default=True, description=SURFACE_FAIR_DESC)
+    pt_quad: BoolProperty(name="Quad Sided", default=False, description=QUAD_DESC, options={'SKIP_SAVE'})
+    pt_quad_ease: FloatProperty(name="Ease Corners", default=QUAD_EASE, min=0.0, max=0.5, subtype='FACTOR',
+                                description=QUAD_EASE_DESC)
+    pt_even: BoolProperty(name="Even Net", default=False, description=QUAD_EVEN_DESC)
+    pt_quad_degree: EnumProperty(name="Degree", items=QUAD_DEG, default="0", description=QUAD_DEG_DESC)
+    pt_retrim: BoolProperty(name="Re-trim Planar Targets", default=False, description=RETRIM_DESC)
+    pt_retrim_move: FloatProperty(name="Max Edge Move %", default=5.0, min=0.01, max=20.0, description=RETRIM_MOVE_DESC)
+    pt_quad_spans_u: IntProperty(name="Spans U", default=0, min=0, max=32, description=QUAD_SPANS_DESC)
+    pt_quad_spans_v: IntProperty(name="Spans V", default=0, min=0, max=32, description=QUAD_SPANS_DESC)
     pt_tension_all: FloatProperty(name="Tension", default=1.0, min=0.25, max=4.0, soft_min=0.5, soft_max=2.0,
                                   description="Tension of every edge at once: how far each edge's direction carries "
                                               "into the patch (stiffer = more, softer = less against bending next to "
@@ -2170,6 +2387,12 @@ class NPROTO_OT_patch(PickMixin, bpy.types.Operator):
             return {'CANCELLED'}
         if self.default_cont == "MIXED":
             self.default_cont = "AUTO"
+        crv = [o for o in context.selected_objects if o.type == 'CURVE']
+        if len(crv) in (3, 4) and len(crv) == len(context.selected_objects) and not event.alt:
+            # three / four curves selected (as Square took them): fill them at once
+            from .ops import _encode_inputs
+            self.inputs = _encode_inputs([(o, "S0") for o in crv])
+            return self.execute(context)
         return self.start_picking(context, event)
 
     def closes_loop(self):
@@ -2232,6 +2455,26 @@ class NPROTO_OT_patch(PickMixin, bpy.types.Operator):
         self.last_conts = ",".join(e.cont for e in self.edges)
         return conts, tens
 
+    def _retrim_targets(self, context, obj, ins, params):
+        """Re-trim Planar Targets (as Square): each planar face whose trim edge
+        became a clean curve is re-trimmed to it, and the patch's history points
+        at the new edges (the faces themselves lose their history)."""
+        from . import square as _sq
+        clean = list(_sq.LAST_INFO.get("clean_edges", []))
+        if not clean:
+            return ins
+        fixed = {}
+        for c in clean:
+            tgt = bpy.data.objects[c["src"][0]]
+            features.clear_history(tgt)
+            fixed[tuple(c["src"])] = _sq.retrim_planar(tgt, c["src"][1], c["cvs"], c["knots"], c["degree"])
+            self.report({'INFO'}, f"{tgt.name}: re-trimmed to the patch's edge (edge moved up to {c['deviation']:.1e})")
+        ins = [(o, fixed.get((o.name, r), r)) for o, r in ins]
+        params["pt_retrim"] = False                   # done: the faces now carry the clean edges
+        if features.history_enabled(context):
+            features.record(obj, "patch", ins, params)
+        return ins
+
     def execute(self, context):
         from .ops_sweep import _new_surface
         from .contlabels import measure
@@ -2242,6 +2485,12 @@ class NPROTO_OT_patch(PickMixin, bpy.types.Operator):
             if len(ins) < 2:
                 raise ValueError("pick the edges around the opening")
             guides = split_loop(ins)
+            loop_ = [k for k in range(len(ins)) if k not in guides]
+            if [e.index for e in self.edges] != loop_ and len(loop_) == 4 and not guides \
+                    and not self.properties.is_property_set("pt_quad"):
+                # four edges: one untrimmed surface inside them (as Square made). Three
+                # stay the trimmed fill: a collapsed corner can't hold G1 / G2 well
+                self.pt_quad = True
             conts, tens = self._edge_settings(ins, guides)
             params = {"cont": conts, "pt_cvs": self.pt_cvs, "pt_cvs_v": self.pt_cvs_v, "pt_degree": self.pt_degree,
                       "pt_fair": self.pt_fair, "pt_method": "QUAD", "pt_guides": guides}
@@ -2251,9 +2500,20 @@ class NPROTO_OT_patch(PickMixin, bpy.types.Operator):
                 params["pt_auto_cvs"] = True
             if not self.pt_surface_fair:
                 params["pt_surface_fair"] = False
+            if self.pt_quad:
+                params.update({"pt_quad": True, "pt_quad_ease": float(self.pt_quad_ease), "pt_even": bool(self.pt_even),
+                               "pt_quad_degree": int(self.pt_quad_degree), "pt_quad_spans_u": self.pt_quad_spans_u,
+                               "pt_quad_spans_v": self.pt_quad_spans_v})
+                if self.pt_retrim:
+                    params.update({"pt_retrim": True, "pt_retrim_move": float(self.pt_retrim_move)})
             if any(abs(t - 1.0) > 1e-6 for t in tens):
                 params["pt_tension"] = tens
+            if self.pt_quad and self.pt_retrim:
+                from . import square as _sq
+                _sq.LAST_INFO.clear()
             obj = _new_surface(context, "Patch", "patch", ins, params)
+            if self.pt_quad and self.pt_retrim:
+                ins = self._retrim_targets(context, obj, ins, params)
             store_info(obj)
             self._conts = conts
         except Exception as exc:
@@ -2261,7 +2521,12 @@ class NPROTO_OT_patch(PickMixin, bpy.types.Operator):
             return {'CANCELLED'}
         eased, zones = [], {}
         try:
-            for k, lst in sorted(input_eases(ins, conts, p=params).items()):
+            if self.pt_quad:
+                for k, lst in sorted(quad_eases(ins, params).items()):
+                    zones[k] = lst
+                    eased += [f"{ins[k][0].name} {ins[k][1]}: {nt}" for _, _, nt in lst
+                              if "Ease Corners" not in nt]
+            for k, lst in sorted(input_eases(ins, conts, p=params).items()) if not self.pt_quad else ():
                 for end, f, j, kind, deg, _ in lst:
                     why = f"tangent planes differ {deg:.2g}°" if kind == "G1" else "curvatures differ"
                     eased.append(f"{ins[k][0].name} {ins[k][1]} {kind} toward {ins[j][0].name} {ins[j][1]} ({why})")
@@ -2286,7 +2551,8 @@ class NPROTO_OT_patch(PickMixin, bpy.types.Operator):
             cnt = {k: sum(1 for i, c in enumerate(conts) if c == k and i not in guides) for k in ("G2", "G1", "G0")}
             self.report({'INFO'}, f"Patch: {len(ins) - len(guides)} edges hold their continuity ("
                         + ", ".join(f"{v} {k}" for k, v in cnt.items() if v) + ")" + gnote
-                        + f", {info['cvs'][0]} x {info['cvs'][1]} CVs" + note)
+                        + f", {info['cvs'][0]} x {info['cvs'][1]} CVs" + (" untrimmed" if self.pt_quad else "")
+                        + note)
         _select_only(context, [obj])
         return {'FINISHED'}
 

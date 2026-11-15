@@ -143,7 +143,8 @@ eL = max(("U0","U1"), key=lambda w: np.mean([p[2] for p in geom.boundary_points(
 uL = sL.u_domain()[1] - 2e-3 if eL == "U1" else sL.u_domain()[0] + 2e-3
 res = {}
 for cont in ("G1", "G2"):
-    bpy.ops.nproto.loft(inputs=ins((L, eL), (top, "S0")), cont_a=cont, tan_a=1.0)
+    bpy.ops.nproto.loft(inputs=ins((L, eL), (top, "S0")), cont_a=cont, tan_a=1.0,
+                        edges_a="FREE", edges_b="FREE")        # measured along the loft's u lines: square to the edge
     blend = ctx.active_object; sbl = store.get_surfaces(blend)[0]
     ks = []; kb = []
     for v in (0.3, 0.5, 0.7):
@@ -3636,7 +3637,7 @@ _cc_ref = {}
 for o_, r_ in _cin:
     _cc_ref[o_.name] = r_
 _ccn = [_strips[i].name for i in range(4)]
-r = bpy.ops.nproto.patch(inputs=ins(*_cin), default_cont="G1")
+r = bpy.ops.nproto.patch(inputs=ins(*_cin), default_cont="G1", pt_quad=False)    # the trimmed fill
 ptCC = ctx.active_object
 _cl._cache.clear()
 _ccl = _cl.labels(ptCC)
@@ -4087,7 +4088,8 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "cycle_continuity", "de
               "patch_auto_corners", "patch_corner", "patch_remove_guide", "rebuild", "rebuild_waiting", "remove_step",
               "restore_inputs", "sync_feature", "tab_edit", "continuity", "continuity_clear", "section_add", "section_orient",
               "section_targets", "section_curves", "section_remove", "subsel_picker", "bake_feature", "delete_feature",
-              "curve_degree", "fix_clip_start", "delete_faces"}
+              "curve_degree", "fix_clip_start", "delete_faces",
+              "square"}     # Square: merged into Patch (Quad Sided); kept for older files, off the menus
 _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto)
               if n not in _not_tools and not n.startswith("workplane_")}   # the Work Planes panel's own
 _tool_ops = [o_ for o_ in _in_panels if o_ not in ("nproto.add_primitive", "nproto.boolean")] + ["nproto.boolean"]
@@ -5874,7 +5876,7 @@ for _nm, _p_, _side, _e in (("whole side", _pe, _near_side(_pe, lambda m: abs(m.
     _lay = set()
     for _smp in (5, 9, 24):
         r = bpy.ops.nproto.loft(inputs=json.dumps([[_p_.name, _side], [_tbw.name, _e]]), cont_a="G2", cont_b="G2",
-                                samples=_smp)
+                                samples=_smp, edges_a="FREE", edges_b="FREE")     # the square rows: exact
         _lo = ctx.active_object
         _d = ext.surface_cvs(store.get_surfaces(_lo)[0])
         _lay.add((_d["degree_v"], _d["count_v"], tuple(round(k_, 9) for k_ in _d["knots_v"])))
@@ -8320,6 +8322,614 @@ _pwg = _draw(_wp.VIEW3D_PT_nproto_workplanes)
 check("work plane grid: the panel offers grid kind, spacing and major lines",
       all(any(e.get("prop") == k_ for e in _pwg) for k_ in ("grid", "auto_spacing", "spacing", "major")))
 _stW.planes.clear(); _stW.active = -1; _stW.index = 0
+
+# --- Loft: a side of several edges end to end (chained sides, tangent chain picking)
+from blender_nurbs import ops as _lc_ops, contcheck as _lc_cc
+from blender_nurbs.kernel.classa import insert_knot as _lc_ins
+_lcO = np.array([0.0, 300.0, 50.0])
+_lcG = np.zeros((4, 4, 3))
+for i_ in range(4):
+    for j_ in range(4):
+        _lcG[i_, j_] = _lcO + (i_ * 1.0, j_ * 1.2, 0.3 * np.sin(i_ + 0.7 * j_) + 0.15 * i_ * j_)
+_lcK = [0, 0, 0, 0, 1, 1, 1, 1]
+def _lc_surf(Gr):
+    return ext.surface_from_cvs(3, 3, [tuple(map(float, q)) for q in Gr.reshape(-1, 3)], _lcK, _lcK)
+_lcW = store.new_object(ctx, "LcWhole", _lc_surf(_lcG))
+_lcR = []
+for i_ in range(4):                          # split along v at 0.4, exactly
+    P_, U_ = _lcG[i_], list(map(float, _lcK))
+    for _ in range(3):
+        P_, U_ = _lc_ins(np.asarray(P_, float), U_, 3, 0.4)
+    _lcR.append(np.asarray(P_, float))
+_lcR = np.array(_lcR)
+_lcA = store.new_object(ctx, "LcHalfA", _lc_surf(_lcR[:, :4]))
+_lcB = store.new_object(ctx, "LcHalfB", _lc_surf(_lcR[:, 3:]))
+_lcT = store.new_object(ctx, "LcTarget", ext.surface_from_cvs(1, 1, [tuple(map(float, _lcO + q)) for q in
+                        [(5, -0.5, 1.0), (5, 4.0, 1.0), (7, -0.5, 1.0), (7, 4.0, 1.0)]], [0, 0, 1, 1], [0, 0, 1, 1]))
+
+def _lc_cont(src, loft_obj):
+    best = None
+    for e_ in ("U0", "U1", "V0", "V1"):
+        try:
+            r_ = _lc_cc.analyze({"a": (src.name, "U1", None), "b": (loft_obj.name, e_, None)}, 24)
+        except Exception:
+            continue
+        if best is None or r_["gap"].max() < best["gap"].max():
+            best = r_
+    return best
+
+_lc_res = []
+for _cont in ("G0", "G1", "G2"):
+    for _ord in ([(_lcA, "U1"), (_lcB, "U1")], [(_lcB, "U1"), (_lcA, "U1")]):
+        _lo = store.new_object(ctx, "LcLoft", features.run("loft", _ord + [(_lcT, "U0")],
+                                                            {"cont_a": _cont, "sides": [2, 1]}))
+        for _h in (_lcA, _lcB):
+            b_ = _lc_cont(_h, _lo)
+            k_ = {"G0": 0, "G1": 1, "G2": 2}[_cont]
+            _lc_res.append(b_ is not None and b_["gap"].max() < 1e-7 and (k_ < 1 or b_["ang"].max() < 1e-4)
+                           and (k_ < 2 or b_["crel"].max() < 1e-4))
+        bpy.data.objects.remove(_lo)
+_lc_ref = features.run("loft", [(_lcW, "U1"), (_lcT, "U0")], {})
+_lc_got = features.run("loft", [(_lcA, "U1"), (_lcB, "U1"), (_lcT, "U0")], {"sides": [2, 1]})
+_lc_d = max(np.linalg.norm(np.array(_lc_ref.evaluate(u_, v_), float) - np.array(_lc_got.evaluate(u_, v_), float))
+            for u_ in np.linspace(0, 1, 7) for v_ in np.linspace(0, 1, 7)) \
+    if all(hasattr(g_, "evaluate") for g_ in (_lc_ref, _lc_got)) else -1
+check("loft chained side: two half-edges as one side are G0 / G1 / G2 exact to both faces, either pick order; "
+      "G0 is the whole edge's loft", all(_lc_res) and 0 <= _lc_d < 1e-9, f"{_lc_res} dev {_lc_d:.1e}")
+check("loft chained side: without sides three inputs are still three sections",
+      features.run("loft", [(_lcA, "U1"), (_lcB, "U1"), (_lcT, "U0")], {}) is not None)
+try:
+    features.chain_side([(_lcA, "U1"), (_lcT, "U0")]); _lc_ref_ok = False
+except ValueError:
+    _lc_ref_ok = True
+check("loft chained side: edges that do not touch are refused as one side", _lc_ref_ok)
+
+# a body of the two faces: its B-rep edges, found by tangent chain from one click
+_lcobjs = {f"s{i_}": (store.brep_to_text(store.to_brep(store.get_surfaces(o_)[0])),
+                      {"loc": [0.0, 0.0, 0.0], "axis": [0.0, 0.0, 1.0], "angle": 0.0, "scale": [1.0, 1.0, 1.0]})
+           for i_, o_ in enumerate((_lcA, _lcB))}
+_, _lcbr = jobs.run("join", _lcobjs, ["joined"], order=list(_lcobjs), into="s0", tolerance=1e-7)
+_lcJ = store.new_object(ctx, "LcBody", store.brep_from_text(_lcbr["joined"]))
+_lcE = []
+for i_, e_ in enumerate(store.get_brep(_lcJ).edges()):
+    t0_, t1_ = e_.parameter_range()
+    if len(e_.faces()) == 1 and all(abs(e_.point_at(t_)[0] - 3.0) < 1e-6 for t_ in (t0_, 0.5 * (t0_ + t1_), t1_)):
+        _lcE.append(f"E{i_}")
+_lcC = [c_ for c_ in _lc_ops._pick_candidates(ctx) if c_[0] in (_lcJ, _lcT)]
+_lcby = {(c_[0].name, c_[1]): c_ for c_ in _lcC}
+_lcCh = _lc_ops.tangent_chain(_lcby[(_lcJ.name, _lcE[-1])], _lcC, 2.0) if len(_lcE) == 2 else []
+_lcSo = _lc_ops.group_into_sides([_lcby[(_lcJ.name, _lcE[0])], _lcby[(_lcJ.name, _lcE[1])], _lcby[(_lcT.name, "U0")]]) \
+    if len(_lcE) == 2 else []
+_lc_body = []
+if len(_lcE) == 2:
+    _lo = store.new_object(ctx, "LcLoftBody", features.run("loft", [(_lcJ, _lcE[1]), (_lcJ, _lcE[0]), (_lcT, "U0")],
+                                                           {"cont_a": "G2", "sides": [2, 1]}))
+    for _h in (_lcA, _lcB):
+        b_ = _lc_cont(_h, _lo)
+        _lc_body.append(b_ is not None and b_["gap"].max() < 1e-7 and b_["ang"].max() < 1e-4 and b_["crel"].max() < 1e-4)
+    bpy.data.objects.remove(_lo)
+check("loft chained side: a body's two edges -- one click chains both (tangent), they group as one side, "
+      "the G2 loft is exact to both faces",
+      {c_[1] for c_ in _lcCh} == set(_lcE) and len(_lcCh) == 2 and _lcSo == [0, 0, 1] and _lc_body == [True, True]
+      and len(_lc_ops.tangent_chain(_lcby[(_lcT.name, "U0")], _lcC, 2.0)) == 1, f"{_lcE} {_lcSo} {_lc_body}")
+
+# faces creased at the joint: exact along each face, blended only next to the joint, and reported
+_lcRb = _lcR[:, 3:].copy()
+_lcRb[:3, :, 2] += 0.4 * np.array([3, 2, 1])[:, None] / 3
+_lcK2 = store.new_object(ctx, "LcTilted", _lc_surf(_lcRb))
+_lcSx = features.side_exact([(_lcA, "U1"), (_lcK2, "U1")])
+features.LOFT_NOTES.clear()
+_lo = store.new_object(ctx, "LcLoftCrease", features.run("loft", [(_lcA, "U1"), (_lcK2, "U1"), (_lcT, "U0")],
+                                                         {"cont_a": "G1", "sides": [2, 1]}))
+_lc_cr = []
+for _h in (_lcA, _lcK2):
+    b_ = _lc_cont(_h, _lo)
+    far_ = np.linalg.norm((b_["P"] - _lcSx["creases"][0][1])[:, :2], axis=1) > 0.05 * 3.6
+    _lc_cr.append(b_["gap"].max() < 1e-7 and b_["ang"][far_].max() < 1e-4)
+check("loft chained side: faces creased at the joint -- G1 exact along both away from it, the crease reported",
+      len(_lcSx["creases"]) == 1 and _lc_cr == [True, True] and any("joint" in n_ for n_ in features.LOFT_NOTES),
+      f"{_lc_cr} {features.LOFT_NOTES}")
+
+# trimmed edges as one side (a spoon cut across two faces): the unit cross
+# directions of trim edges lean at their ends; joined they kinked and the G1
+# loft folded back over the faces
+# a bowl (z = c (y - y0)^2 across, the low line at the halves' joint, as a spoon)
+from math import comb as _comb
+_bv = np.linspace(0, 1, 4)
+_bM = np.array([[_comb(3, k_) * t_ ** k_ * (1 - t_) ** (3 - k_) for k_ in range(4)] for t_ in _bv])
+_bz = np.linalg.solve(_bM, 0.05 * (3.6 * _bv - 1.44) ** 2)
+_bG = np.array([[_lcO + (i_ * 1.0, j_ * 1.2, _bz[j_] + 0.03 * i_) for j_ in range(4)] for i_ in range(4)])
+_bR = []
+for i_ in range(4):
+    P_, U_ = _bG[i_], list(map(float, _lcK))
+    for _ in range(3):
+        P_, U_ = _lc_ins(np.asarray(P_, float), U_, 3, 0.4)
+    _bR.append(np.asarray(P_, float))
+_bR = np.array(_bR)
+_lcA = store.new_object(ctx, "LcBowlA", _lc_surf(_bR[:, :4]))
+_lcB = store.new_object(ctx, "LcBowlB", _lc_surf(_bR[:, 3:]))
+_lcW1, _lcW2 = _lcO + (2.3, -1.0, -2.0), _lcO + (2.7, 5.0, -2.0)
+_lcWl = bpy.data.curves.new("LcWallLn", 'CURVE'); _lcWl.dimensions = '3D'
+_sp = _lcWl.splines.new('POLY'); _sp.points.add(1)
+_sp.points[0].co = (*_lcW1, 1.0); _sp.points[1].co = (*_lcW2, 1.0)
+_lcWo = bpy.data.objects.new("LcWallLn", _lcWl); ctx.collection.objects.link(_lcWo)
+bpy.ops.nproto.extrude(inputs=ins((_lcWo, "S0")), distance=6.0, direction="Z"); _lcWall = ctx.active_object
+_lcWall.name = "LcWall"
+_lcTr = []
+for _h in (_lcA, _lcB):
+    _hs = store.get_surfaces(_h)[0]
+    _ref = tuple(float(x) for x in _hs.evaluate(0.3, 0.5))
+    bpy.ops.object.select_all(action='DESELECT')
+    _r = bpy.ops.nproto.trim(target=_h.name, cutters=json.dumps([[_lcWall.name, "SURF"]]), ref_point=_ref,
+                             normal=(0, 0, 1), action="KEEP")
+    _cut = None
+    _wn = np.cross(_lcW2 - _lcW1, (0, 0, 1.0)); _wn /= np.linalg.norm(_wn)
+    for i_, e_ in enumerate(store.get_brep(_h).edges()):
+        t0_, t1_ = e_.parameter_range()
+        if all(abs(float(np.dot(np.array(e_.point_at(t_), float) - _lcW1, _wn))) < 1e-4
+               for t_ in np.linspace(t0_, t1_, 5)):
+            _cut = f"E{i_}"
+    _lcTr.append((_r, _cut))
+_lc_trim_ok = all(r_ == {'FINISHED'} and c_ is not None for r_, c_ in _lcTr)
+_lc_tr_res = "trim failed"
+if _lc_trim_ok:
+    _side = [(_lcA, _lcTr[0][1]), (_lcB, _lcTr[1][1])]
+    _g = features.run("loft", _side + [(_lcT, "U0")], {"cont_a": "G1", "sides": [2, 1]})
+    _lo = store.new_object(ctx, "LcLoftTrim", _g)
+    _s = _g if hasattr(_g, "u_domain") else store.to_brep(_g).faces()[0].surface()
+    (_u0, _u1), (_v0, _v1) = _s.u_domain(), _s.v_domain()
+    _N = np.array([[np.cross(*_s.derivatives(_u0 + (_u1 - _u0) * a_, _v0 + (_v1 - _v0) * b_)[1:])
+                    for b_ in np.linspace(0, 1, 61)] for a_ in np.linspace(0, 1, 31)])
+    _N /= np.linalg.norm(_N, axis=2, keepdims=True)
+    _turn = min(float(np.min(np.sum(_N[1:] * _N[:-1], axis=2))), float(np.min(np.sum(_N[:, 1:] * _N[:, :-1], axis=2))))
+    _spread = float(np.degrees(np.arccos(np.clip(_turn, -1, 1))))      # largest turn between neighbouring samples
+    _angs = []
+    for _h, (_, _cut) in zip((_lcA, _lcB), _lcTr):
+        e_ = store.get_brep(_h).edges()[int(_cut[1:])]; t0_, t1_ = e_.parameter_range()
+        _mid = list(e_.point_at(0.5 * (t0_ + t1_)))
+        best = None
+        for ee_ in ("U0", "U1", "V0", "V1"):
+            try:
+                r_ = _lc_cc.analyze({"a": (_h.name, _cut, _mid), "b": (_lo.name, ee_, None)}, 24)
+            except Exception:
+                continue
+            if best is None or r_["gap"].max() < best["gap"].max():
+                best = r_
+        _angs.append(float(np.median(best["ang"])) if best is not None else 99.0)
+        _angs.append(float(best["ang"][2:-2].max()) if best is not None else 99.0)
+    _lc_tr_res = (_spread, _angs)
+check("loft chained side: two trimmed edges meeting mid-side (a cut spoon) -- the G1 loft does not fold "
+      "and holds G1 along both cuts", _lc_trim_ok and _lc_tr_res[0] < 20 and max(_lc_tr_res[1]) < 0.05,
+      f"{_lcTr} {_lc_tr_res}")
+
+# Match Edges: at the corners of a side the loft carries on the source's own
+# edges (a cut spoon's rims, curving in towards the cut): its outline leaves
+# along them, with G2 in their curvature too; G1 / G2 to the faces still hold
+_mO = _lcO + np.array([0.0, 20.0, 0.0])
+_mf = [1.0, 0.95, 0.75, 0.55]                                   # the bowl narrows: its rims curve in
+_mz = np.linalg.solve(_bM, 0.05 * (3.6 * _bv - 1.8) ** 2)
+_mG = np.array([[_mO + (i_ * 1.0, 1.8 + _mf[i_] * (j_ * 1.2 - 1.8), _mz[j_] + 0.03 * i_) for j_ in range(4)]
+                for i_ in range(4)])
+_mR = []
+for i_ in range(4):
+    P_, U_ = _mG[i_], list(map(float, _lcK))
+    for _ in range(3):
+        P_, U_ = _lc_ins(np.asarray(P_, float), U_, 3, 0.5)
+    _mR.append(np.asarray(P_, float))
+_mR = np.array(_mR)
+_mA = store.new_object(ctx, "LcSpoonA", _lc_surf(_mR[:, :4]))
+_mB = store.new_object(ctx, "LcSpoonB", _lc_surf(_mR[:, 3:]))
+_mT = store.new_object(ctx, "LcHandle", ext.surface_from_cvs(1, 1, [tuple(map(float, _mO + q)) for q in
+                       [(5, 1.0, 0.3), (5, 2.6, 0.3), (7, 1.0, 0.3), (7, 2.6, 0.3)]], [0, 0, 1, 1], [0, 0, 1, 1]))
+_mW1, _mW2 = _mO + (2.4, -1.0, -2.0), _mO + (2.6, 5.0, -2.0)
+_mWl = bpy.data.curves.new("LcMWallLn", 'CURVE'); _mWl.dimensions = '3D'
+_sp = _mWl.splines.new('POLY'); _sp.points.add(1)
+_sp.points[0].co = (*_mW1, 1.0); _sp.points[1].co = (*_mW2, 1.0)
+_mWo = bpy.data.objects.new("LcMWallLn", _mWl); ctx.collection.objects.link(_mWo)
+bpy.ops.nproto.extrude(inputs=ins((_mWo, "S0")), distance=6.0, direction="Z"); _mWall = ctx.active_object
+_mWall.name = "LcMWall"
+_mn = np.cross(_mW2 - _mW1, (0, 0, 1.0)); _mn /= np.linalg.norm(_mn)
+_mCut = []
+for _h in (_mA, _mB):
+    bpy.ops.object.select_all(action='DESELECT')
+    _r = bpy.ops.nproto.trim(target=_h.name, cutters=json.dumps([[_mWall.name, "SURF"]]),
+                             ref_point=tuple(float(x) for x in store.get_surfaces(_h)[0].evaluate(0.3, 0.5)),
+                             normal=(0, 0, 1), action="KEEP")
+    _c = None
+    for i_, e_ in enumerate(store.get_brep(_h).edges()):
+        t0_, t1_ = e_.parameter_range()
+        if all(abs(float(np.dot(np.array(e_.point_at(t_), float) - _mW1, _mn))) < 1e-4 for t_ in np.linspace(t0_, t1_, 5)):
+            _c = f"E{i_}"
+    _mCut.append(_c if _r == {'FINISHED'} else None)
+
+def _lc_frame(f, t, h):
+    p_ = [np.array(f(t + k_ * h), float) for k_ in (0, 1, 2, 3)]
+    d1_ = (-11 * p_[0] + 18 * p_[1] - 9 * p_[2] + 2 * p_[3]) / (6 * h)
+    d2_ = (2 * p_[0] - 5 * p_[1] + 4 * p_[2] - p_[3]) / (h * h)
+    T_ = d1_ / np.linalg.norm(d1_)
+    return T_, (d2_ - (d2_ @ T_) * T_) / (d1_ @ d1_)
+_lc_me = {}
+if None not in _mCut:
+    _mside = [(_mA, _mCut[0]), (_mB, _mCut[1])]
+    _sdP = features.side_samples(_mside, 47).P
+    for _cont in ("G1", "G2"):
+        for _me in (False, True):
+            _g = features.run("loft", _mside + [(_mT, "U0")], {"cont_a": _cont, "sides": [2, 1], "match_edges": _me})
+            _s = _g if hasattr(_g, "u_domain") else store.to_brep(_g).faces()[0].surface()
+            (_u0, _u1), (_v0, _v1) = _s.u_domain(), _s.v_domain()
+            _row = []
+            for _k, _c in enumerate((_sdP[0], _sdP[-1])):
+                _o = features.chain_side(_mside)[0 if _k == 0 else -1][0]
+                _rim = features.edge_into_corner(_o, _c, _sdP, np.array([1.0, 0, 0]), 1e-5)
+                _hit = None
+                for _vv in (_v0, _v1):
+                    for _uu, _du in ((_u0, 1e-3 * (_u1 - _u0)), (_u1, -1e-3 * (_u1 - _u0))):
+                        if np.linalg.norm(np.array(_s.evaluate(_uu, _vv)) - _c) < 1e-5:
+                            _hit = _lc_frame(lambda t_: _s.evaluate(t_, _vv), _uu, _du)
+                if _rim is None or _hit is None:
+                    _row.append(None)
+                    continue
+                _row.append((round(float(np.degrees(np.arccos(min(1.0, abs(float(_hit[0] @ _rim[0])))))), 3),
+                             round(float(np.linalg.norm(_hit[1] - _rim[1])) * 3.6, 4)))     # curvature gap x size
+            _lo = store.new_object(ctx, "LcLoftMatch", _g)
+            _worst = []
+            for _h, _cut in zip((_mA, _mB), _mCut):
+                e_ = store.get_brep(_h).edges()[int(_cut[1:])]; t0_, t1_ = e_.parameter_range()
+                best = None
+                for ee_ in ("U0", "U1", "V0", "V1"):
+                    try:
+                        r_ = _lc_cc.analyze({"a": (_h.name, _cut, list(e_.point_at(0.5 * (t0_ + t1_)))),
+                                             "b": (_lo.name, ee_, None)}, 24)
+                    except Exception:
+                        continue
+                    if best is None or r_["gap"].max() < best["gap"].max():
+                        best = r_
+                _worst.append((round(float(best["ang"][2:-2].max()), 4), round(float(best["crel"][2:-2].max()), 4)))
+            bpy.data.objects.remove(_lo)
+            _lc_me[(_cont, _me)] = (_row, _worst)
+_ok_me = bool(_lc_me) and all(r_ is not None for v_ in _lc_me.values() for r_ in v_[0])
+if _ok_me:
+    _ok_me = (min(a_ for a_, _ in _lc_me[("G1", False)][0]) > 5.0               # square: the outline kinks at the rims
+              and all(a_ < 0.5 for k_ in (("G1", True), ("G2", True)) for a_, _ in _lc_me[k_][0])
+              and all(c_ < 0.05 for _, c_ in _lc_me[("G2", True)][0])         # G2: the rims' curvature carries on
+              and all(a_ < 0.05 for v_ in _lc_me.values() for a_, _ in v_[1])
+              and all(c_ < 0.01 for _, c_ in _lc_me[("G2", True)][1]))
+check("loft Match Edges: the outline leaves a cut spoon along its rims (G2: in their curvature), "
+      "G1 / G2 to both faces hold; square, it kinks there", _ok_me, f"{_mCut} {_lc_me}")
+
+# the same loft at 24 and at 49 Samples (G2 held only at 49 once: the fit is
+# checked between its samples now), and Align to Surface: along the faces' lines
+def _lc_grid(g_):
+    s_ = g_ if hasattr(g_, "u_domain") else store.to_brep(g_).faces()[0].surface()
+    (a0_, a1_), (b0_, b1_) = s_.u_domain(), s_.v_domain()
+    return np.array([s_.evaluate(a0_ + (a1_ - a0_) * x_, b0_ + (b1_ - b0_) * y_)
+                     for x_ in np.linspace(0, 1, 9) for y_ in np.linspace(0, 1, 17)], float)
+_lc_ss = {}
+if None not in _mCut:
+    for _mode in ("EDGES", "SURFACE", "FREE"):
+        _gg = [features.run("loft", _mside + [(_mT, "U0")], {"cont_a": "G2", "sides": [2, 1], "edges_a": _mode,
+                                                               "edges_b": "FREE", "samples": _n}) for _n in (24, 49)]
+        _lo = store.new_object(ctx, "LcLoftMode", _gg[0])
+        _wst = []
+        for _h, _cut in zip((_mA, _mB), _mCut):
+            e_ = store.get_brep(_h).edges()[int(_cut[1:])]; t0_, t1_ = e_.parameter_range()
+            best = None
+            for ee_ in ("U0", "U1", "V0", "V1"):
+                try:
+                    r_ = _lc_cc.analyze({"a": (_h.name, _cut, list(e_.point_at(0.5 * (t0_ + t1_)))),
+                                         "b": (_lo.name, ee_, None)}, 24)
+                except Exception:
+                    continue
+                if best is None or r_["gap"].max() < best["gap"].max():
+                    best = r_
+            _wst.append((round(float(best["ang"][2:-2].max()), 3), round(float(best["crel"][2:-2].max()), 4)))
+        bpy.data.objects.remove(_lo)
+        _lc_ss[_mode] = (float(np.abs(_lc_grid(_gg[0]) - _lc_grid(_gg[1])).max()), _wst, _lc_grid(_gg[0]))
+_ok_ss = len(_lc_ss) == 3 and all(v_[0] < 2e-3 * 3.6 for v_ in _lc_ss.values()) \
+    and all(a_ < 0.1 and c_ < 0.01 for v_ in _lc_ss.values() for a_, c_ in v_[1]) \
+    and float(np.abs(_lc_ss["SURFACE"][2] - _lc_ss["FREE"][2]).max()) > 1e-3 \
+    and float(np.abs(_lc_ss["SURFACE"][2] - _lc_ss["EDGES"][2]).max()) > 1e-3
+check("loft edge modes: Align Edges / Align to Surface / Free -- three different lofts, each G2 to both faces "
+      "and the same at 24 and 49 Samples", _ok_ss,
+      f"{ {k_: (round(v_[0], 5), v_[1]) for k_, v_ in _lc_ss.items()} }")
+
+# Bezier spans: a few spans of one degree, knots where continuity needs them --
+# lighter than the least-squares net, symmetric on a symmetric side, the same
+# at any Samples, held as the labels check it; Split into Faces: one per span
+from blender_nurbs import contlabels as _lc_cl
+from types import SimpleNamespace as _NS
+_lc_sp = {}
+if None not in _mCut:
+    for _fit in ("SPANS", "DENSE"):
+        for _n in (6, 49):
+            _pp = {"cont_a": "G2", "cont_b": "G2", "sides": [2, 1], "edges_a": "EDGES", "edges_b": "FREE",
+                   "samples": _n, "fit": _fit}
+            _g = features.run("loft", _mside + [(_mT, "U0")], _pp)
+            _d = ext.surface_cvs(_g)
+            _G = np.array(_d["points"]).reshape(_d["count_u"], _d["count_v"], 3) - _mO
+            _asym = float(np.abs(_G - _G[:, ::-1] * np.array([1, -1, 1]) - np.array([0, 3.6, 0])).max())
+            _lo = store.new_object(ctx, "LcLoftSpan", _g)
+            _hold = all(_lc_cl.measure(_lo, _h, _c, 2)["ok"] for _h, _c in zip((_mA, _mB), _mCut))
+            bpy.data.objects.remove(_lo)
+            _lc_sp[(_fit, _n)] = (_d["count_v"], round(_asym, 6), _hold, features.LAST_SPANS[0])
+    _gf = features.run("loft", _mside + [(_mT, "U0")], {"cont_a": "G2", "cont_b": "G2", "sides": [2, 1],
+                                                         "edges_a": "EDGES", "fit": "SPANS", "span_faces": True})
+    _lc_sp["faces"] = (len(store.to_brep(_gf).faces()) if not hasattr(_gf, "faces") else len(_gf.faces()),
+                       features.LAST_SPANS[0])
+_ok_sp = bool(_lc_sp) and _lc_sp[("SPANS", 6)][:3] == _lc_sp[("SPANS", 49)][:3] \
+    and _lc_sp[("SPANS", 6)][0] < _lc_sp[("DENSE", 49)][0] \
+    and _lc_sp[("SPANS", 6)][2] and _lc_sp[("SPANS", 49)][2] and _lc_sp["faces"][0] == _lc_sp["faces"][1] > 1
+check("loft Bezier spans: fewer CVs than the fitted net, the same at 6 and 49 Samples, G2 held as "
+      "the labels check it; Split into Faces gives one face per span", _ok_sp, f"{_lc_sp}")
+
+# Loft with rails (guide curves): a smooth surface cut into 3 x 3 patches with
+# the middle one taken out -- left / right edges the profiles, bottom / top the
+# rails. G1 / G2 along all four (the rails' solver) gives the middle back.
+from blender_nurbs import contlabels as _rl_cl
+_rO = np.array([40.0, 300.0, 0.0])
+_rG = np.array([[_rO + (i_ * 1.0, j_ * 1.0, 0.25 * np.sin(1.1 * i_ + 0.4) * np.cos(0.8 * j_) + 0.05 * i_ * j_)
+                 for j_ in range(4)] for i_ in range(4)])
+def _rl_split(P_, ts_):
+    A_, U_ = np.asarray(P_, float), list(map(float, _lcK))
+    for t_ in ts_:
+        for _ in range(3):
+            A_, U_ = _lc_ins(A_, U_, 3, t_)
+            A_ = np.asarray(A_, float)
+    return [A_[3 * k_:3 * k_ + 4] for k_ in range(len(ts_) + 1)]
+_rrows = [_rl_split(_rG[i_], [1 / 3, 2 / 3]) for i_ in range(4)]
+_rpat = {}
+for kv_ in range(3):
+    _blk = np.array([_rrows[i_][kv_] for i_ in range(4)])
+    _cols = [_rl_split(_blk[:, j_], [1 / 3, 2 / 3]) for j_ in range(4)]
+    for ku_ in range(3):
+        _rpat[(ku_, kv_)] = np.array([_cols[j_][ku_] for j_ in range(4)]).transpose(1, 0, 2)
+_rL, _rR = store.new_object(ctx, "RlL", _lc_surf(_rpat[(0, 1)])), store.new_object(ctx, "RlR", _lc_surf(_rpat[(2, 1)]))
+_rB, _rT = store.new_object(ctx, "RlB", _lc_surf(_rpat[(1, 0)])), store.new_object(ctx, "RlT", _lc_surf(_rpat[(1, 2)]))
+_rC = _lc_surf(_rpat[(1, 1)])
+_rins = [(_rL, "U1"), (_rR, "U0"), (_rB, "V1"), (_rT, "V0")]
+_rres = {}
+for _c in ("G1", "G2"):
+    _g = features.run("loft", _rins, {"cont_a": _c, "cont_b": _c, "cont_ra": _c, "cont_rb": _c,
+                                      "sides": [1, 1, 1, 1], "rails": 2})
+    _lo = store.new_object(ctx, "RlLoft", _g)
+    _s = store.get_brep(_lo).faces()[0].surface()
+    _smk = _kl()
+    def _rl_d(q_):
+        w_ = _smk.surface_closest_point(_s, tuple(map(float, q_)))[1][0]
+        return float(np.linalg.norm(np.array(_s.evaluate(float(w_.x), float(w_.y))) - q_))
+    _dev = max(_rl_d(np.array(_rC.evaluate(a_, b_), float)) for a_ in np.linspace(0, 1, 7) for b_ in np.linspace(0, 1, 7))
+    _ok = [_rl_cl.measure(_lo, o_, r_, int(_c[1]))["ok"] for o_, r_ in _rins]
+    _rres[_c] = (round(_dev, 7), _ok, ext.surface_cvs(_s)["count_u"])
+    bpy.data.objects.remove(_lo)
+_g = features.run("loft", _rins[:3], {"cont_a": "G1", "cont_b": "G1", "sides": [1, 1, 1], "rails": 1})
+_lo = store.new_object(ctx, "RlGuide", _g)
+_guide = (_rl_cl.measure(_lo, _rB, "V1", 0)["ok"], [_rl_cl.measure(_lo, o_, r_, 1)["ok"] for o_, r_ in _rins[:2]])
+bpy.data.objects.remove(_lo)
+check("loft with rails: G1 / G2 along both profiles and both rails holds and gives the middle patch back; "
+      "one rail is a guide the loft passes through",
+      all(v_[0] < 1e-5 and all(v_[1]) for v_ in _rres.values()) and _guide[0] and all(_guide[1]), f"{_rres} {_guide}")
+# the operator: rails in the history, labels on both profiles and both rails
+for o_ in list(ctx.selected_objects):
+    o_.select_set(False)
+_r = bpy.ops.nproto.loft(inputs=ins(*_rins), sides="[1, 1, 1, 1]", rails=2, cont_a="G2", cont_b="G2",
+                         cont_ra="G2", cont_rb="G2")
+_lo = ctx.active_object
+_hp = features.history(_lo)["params"]
+from blender_nurbs import contlabels as _cl_mod
+_labs = _cl_mod._compute_base(_lo)
+check("loft with rails: the operator records the rails, and labels sit on both profiles and both rails",
+      _r == {'FINISHED'} and _hp.get("rails") == 2 and _hp.get("cont_ra") == "G2"
+      and sorted(L_["param"] for L_ in _labs) == ["cont_a", "cont_b", "cont_ra", "cont_rb"],
+      f"{_r} {_hp.get('rails')} {[L_['param'] for L_ in _labs]}")
+bpy.data.objects.remove(_lo)
+# picking: R switches to rails; rails come after the profiles whatever the order
+from types import SimpleNamespace as _NSr
+_Lr = _lc_ops.NPROTO_OT_loft
+_rc = _lc_ops._pick_candidates(ctx)
+_rby = {(c_[0].name, c_[1]): c_ for c_ in _rc}
+_f = _NSr(_side_of=[], _new_side=False, _picks=[], _cands_by_key=_rby, chain='SINGLE', chain_angle=2.0,
+          _cands=_rc, _rail_groups=set(), _rail_mode=False, rails=0, sides="")
+for nm_ in ("after_pick", "after_unpick", "pick_count", "_recolour", "tool_key", "pick_state", "expand_pick", "_label"):
+    setattr(_f, nm_, getattr(_Lr, nm_).__get__(_f))
+def _rclick(key_):
+    grp_ = _f.expand_pick(_rby[key_])
+    _f._picks += [(c_[0], c_[1]) for c_ in grp_]
+    _f.after_pick(grp_, _NSr(shift=False))
+_rclick(("RlL", "U1"))
+_f.tool_key(None, _NSr(type='R', value='PRESS'))
+_rclick(("RlB", "V1")); _rclick(("RlT", "V0"))
+_f.tool_key(None, _NSr(type='R', value='PRESS'))
+_cnt_before = _f.pick_count()
+_rclick(("RlR", "U0"))
+_so = list(_f._side_of)
+_rails = sorted(_f._rail_groups)
+_order = sorted(range(len(_so)), key=lambda i_: (_so[i_] in _f._rail_groups, _so[i_], i_))
+check("loft picking: R picks rails (their own colour), back to profiles; the loft finishes at two profiles "
+      "and lists the rails after them",
+      _cnt_before == 1 and _f.pick_count() == 2 and len(_rails) == 2
+      and [(_f._picks[i_][0].name, _f._picks[i_][1]) for i_ in _order] == [("RlL", "U1"), ("RlR", "U0"), ("RlB", "V1"), ("RlT", "V0")]
+      and _lc_ops.draw.pick_overlay["colors"] == [0, 3, 3, 1], f"{_so} {_rails} {_lc_ops.draw.pick_overlay['colors']}")
+# Ease Corners / Split into Faces with rails: one Bezier face per span both
+# ways, the labels still hold (eased toward the rails); a chained side's zones
+# sit on its first and last pieces, scaled to each piece's length
+_ge = features.run("loft", _rins, {"cont_a": "G2", "cont_b": "G2", "cont_ra": "G2", "cont_rb": "G2",
+                                   "sides": [1, 1, 1, 1], "rails": 2, "corner_ease": 0.15, "span_faces": True})
+_se = _ge if hasattr(_ge, "faces") else store.to_brep(_ge)
+_lo = store.new_object(ctx, "RlFaces", _ge)
+_eok = [(lambda r_: r_["ok"] or r_.get("eased"))(_rl_cl.measure(_lo, o_, r_, 2)) for o_, r_ in _rins]
+bpy.data.objects.remove(_lo)
+_z = features.ease_zones([(_lcA, "U1"), (_lcB, "U1")], 0.1)
+check("loft with rails: Ease Corners and Split into Faces -- one face per span, labels hold; a chained "
+      "side's corner zones on its end pieces", len(_se.faces()) >= 1 and all(_eok)
+      and sorted(_z) == sorted([(_lcA.name, "U1"), (_lcB.name, "U1")])
+      and all(len(v_) == 1 and 0.1 < v_[0][1] < 0.3 for v_ in _z.values()),
+      f"faces {len(_se.faces())} {_eok} {_z}")
+# G1 profiles, G0 rail curves that leave the profiles' tangent planes at the
+# corners: no surface is G1 there, so those ends are eased (orange labels)
+# instead of chased with CVs -- the same net as when they meet in the plane
+_rcv = []
+for v_ in (0.0, 1.0):
+    _pts = [np.array(_rC.evaluate(a_, v_), float) + (0, 0, 0.12 * np.sin(np.pi * a_)) for a_ in np.linspace(0, 1, 6)]
+    _rcv.append(nurbs(f"RlRail{int(v_)}", [tuple(map(float, q_)) for q_ in _pts]))
+_cins = _rins[:2] + [(c_, "S0") for c_ in _rcv]
+_cp = {"cont_a": "G1", "cont_b": "G1", "sides": [1, 1, 1, 1], "rails": 2, "corner_ease": 0.15}
+_cz = features.loft_rail_eases(_cins, _cp)
+_gc = features.run("loft", _cins, _cp)
+_lo = store.new_object(ctx, "RlTilt", _gc)
+_cm = [_rl_cl.measure(_lo, o_, r_, 1, ease=_cz.get((o_.name, r_))) for o_, r_ in _rins[:2]]
+_cn = ext.surface_cvs(store.get_brep(_lo).faces()[0].surface())["count_u"]
+bpy.data.objects.remove(_lo)
+_cz0 = features.loft_rail_eases(_rins, dict(_cp, cont_ra="G0", cont_rb="G0"))
+check("loft with rails: G1 profiles whose rails leave their tangent planes are eased at those corners "
+      "(none where the rails stay in them), labels hold there",
+      sorted(_cz) == sorted([(o_.name, r_) for o_, r_ in _rins[:2]])
+      and all(len(v_) == 2 and all("no surface is G1" in z_[2] for z_ in v_) for v_ in _cz.values())
+      and not _cz0 and all(m_["ok"] or m_.get("eased") for m_ in _cm),
+      f"{_cz} {_cz0} {[m_['text'][:60] for m_ in _cm]} CVs {_cn}")
+for o_ in _rcv:
+    bpy.data.objects.remove(o_)
+# Patch, Quad Sided: the same four-sided hole gives one untrimmed surface
+# (Loft with rails' solver), G2 all round, the middle patch back
+from blender_nurbs import patch as _pq
+for o_ in list(ctx.selected_objects):
+    o_.select_set(False)
+_r = bpy.ops.nproto.patch(inputs=ins(_rins[0], _rins[2], _rins[1], _rins[3]), default_cont="G2")  # 4 edges: Quad Sided
+_po = ctx.active_object
+_ps = store.get_brep(_po).faces()[0].surface()
+_smq = _kl()
+def _pq_d(q_):
+    w_ = _smq.surface_closest_point(_ps, tuple(map(float, q_)))[1][0]
+    return float(np.linalg.norm(np.array(_ps.evaluate(float(w_.x), float(w_.y))) - q_))
+_pdev = max(_pq_d(np.array(_rC.evaluate(a_, b_), float)) for a_ in np.linspace(0, 1, 7) for b_ in np.linspace(0, 1, 7))
+_plabs = _rl_cl.labels(_po)
+_pph = features.history(_po)["params"]
+check("patch: four edges start as Quad Sided -- one untrimmed surface inside them, G2 on every edge, the middle patch back",
+      _r == {'FINISHED'} and store.is_natural(_po) and len(store.get_brep(_po).faces()) == 1 and _pdev < 1e-4
+      and _pph.get("pt_quad") is True and _pq.info.get("quad") and len(_plabs) == 4
+      and all(L_["check"] and L_["check"]["ok"] for L_ in _plabs),
+      f"dev {_pdev:.1e} {[(L_['name'], (L_['check'] or {}).get('text', '')[:50]) for L_ in _plabs]}")
+# the Feature panel switches it off and on again (a rebuild each time)
+_pg = _po.nproto_feature
+_fui.sync_from_history(_po)
+_pg.pt_quad = False
+_tr = not store.is_natural(_po) and features.history(_po)["params"]["pt_quad"] is False
+_pg.pt_quad = True
+check("patch Quad Sided: the Feature panel turns it off (trimmed fill) and on (untrimmed) again",
+      features.history(_po)["params"]["pt_quad"] is True and store.is_natural(_po) and _tr)
+# the Feature panel draws a Quad Sided patch (every property it shows exists there)
+class _LayQ:
+    def __getattr__(self, n_):
+        def f_(*a_, **k_):
+            if n_ in ("prop", "prop_enum") and len(a_) > 1 and isinstance(a_[1], str):
+                getattr(a_[0], a_[1])
+            return _LayQ()
+        return f_
+    def __setattr__(self, n_, v_):
+        pass
+try:
+    _pq.draw_settings(_LayQ(), _pg, _pg.pt_edges, _pq.patch_info(_po), "pt_cont_all", obj=_po,
+                      h=features.history(_po))
+    _dq = ""
+except Exception as exc_:
+    _dq = repr(exc_)
+check("patch Quad Sided: the Feature panel draws (Re-trim only in the operator's panel)", not _dq, _dq)
+# Degree / Spans by hand (as Square had): that net exactly
+_pg.pt_quad_degree = "5"
+_pg.pt_quad_spans_u, _pg.pt_quad_spans_v = 3, 2
+_pd = ext.surface_cvs(store.get_brep(_po).faces()[0].surface())
+check("patch Quad Sided: Degree 5, Spans 3 x 2 set by hand give that net",
+      sorted((_pd["count_u"], _pd["count_v"])) == [7, 8] and _pd["degree_u"] == 5, (_pd["count_u"], _pd["count_v"]))
+bpy.data.objects.remove(_po)
+# three edges (as Square's three-sided patch): one corner collapses to a point,
+# still one untrimmed surface on them
+def _rc_line(a_, b_, n_=6):
+    return [tuple(map(float, np.array(_rC.evaluate(*a_), float) * (1 - t_) + np.array(_rC.evaluate(*b_), float) * t_))
+            for t_ in np.linspace(0, 1, n_)]
+_t3 = [nurbs("RlTri0", [tuple(map(float, _rC.evaluate(a_, 0.0))) for a_ in np.linspace(0, 1, 6)]),
+       nurbs("RlTri1", _rc_line((1, 0), (0, 1))),
+       nurbs("RlTri2", [tuple(map(float, _rC.evaluate(0.0, 1 - a_))) for a_ in np.linspace(0, 1, 6)])]
+for o_ in list(ctx.selected_objects):
+    o_.select_set(False)
+_r = bpy.ops.nproto.patch(inputs=ins(*[(c_, "S0") for c_ in _t3]), default_cont="G0", pt_quad=True)
+_po = ctx.active_object
+_tl = _rl_cl.labels(_po)
+check("patch Quad Sided on three edges: a three-sided untrimmed surface (one corner a point), edges held",
+      _r == {'FINISHED'} and features.history(_po)["params"].get("pt_quad") is True and store.is_natural(_po)
+      and len(store.get_brep(_po).faces()) == 1 and len(_tl) == 3 and all(L_["check"]["ok"] for L_ in _tl),
+      [(L_["name"], L_["check"]["text"][:40]) for L_ in _tl])
+bpy.data.objects.remove(_po)
+for o_ in _t3:
+    bpy.data.objects.remove(o_)
+# a Free edge (as Square's): no condition there, the other edges still G2
+_gf = features.run("patch", _rins, {"cont": ["G2", "G2", "G2", "FREE"], "pt_quad": True})
+_lo = store.new_object(ctx, "RlFree", _gf)
+_fm = [_rl_cl.measure(_lo, o_, r_, 2) for o_, r_ in _rins[:3]]
+_fl = [L_ for L_ in _rl_cl.labels(_lo)]
+bpy.data.objects.remove(_lo)
+_lo = store.new_object(ctx, "RlFreeOp", _gf)
+features.record(_lo, "patch", _rins, {"cont": ["G2", "G2", "G2", "FREE"], "pt_quad": True})
+_fl = _rl_cl.labels(_lo)
+bpy.data.objects.remove(_lo)
+check("patch Quad Sided: a Free edge has no condition, the other three hold G2, its label offers Free",
+      all(m_["ok"] for m_ in _fm) and any(L_["value"] == "FREE" and "FREE" in L_["values"] for L_ in _fl),
+      [m_["text"][:50] for m_ in _fm])
+# Re-trim Planar Targets on: Square's net (nothing planar to re-trim here), still G1 all round
+_gr = features.run("patch", _rins, {"cont": ["G1"] * 4, "pt_quad": True, "pt_retrim": True})
+_lo = store.new_object(ctx, "RlRetrim", _gr)
+_rm = [_rl_cl.measure(_lo, o_, r_, 1) for o_, r_ in _rins]
+bpy.data.objects.remove(_lo)
+check("patch Quad Sided with Re-trim Planar Targets: Square's net, G1 on every edge", all(m_["ok"] for m_ in _rm),
+      [m_["text"][:50] for m_ in _rm])
+# Even Net: fair toward even CV spacing -- labels still hold, the solver's
+# fairness reference is put back afterwards
+from blender_nurbs import square as _sq_en
+_ge = features.run("loft", _rins, {"cont_a": "G2", "cont_b": "G2", "cont_ra": "G1", "cont_rb": "G1",
+                                   "sides": [1, 1, 1, 1], "rails": 2, "even_net": True})
+_lo = store.new_object(ctx, "RlEven", _ge)
+_em = [_rl_cl.measure(_lo, o_, r_, c_) for (o_, r_), c_ in zip(_rins, (2, 2, 1, 1))]
+_eP = np.array(ext.surface_cvs(store.get_brep(_lo).faces()[0].surface())["points"], float)
+bpy.data.objects.remove(_lo)
+check("loft with rails: Even Net holds G2 / G1 and leaves the solver's fairness as it was",
+      all(m_["ok"] for m_ in _em) and _sq_en.FAIR_REF == "x0" and np.isfinite(_eP).all(),
+      [m_["text"][:50] for m_ in _em])
+for o_ in (_rL, _rR, _rB, _rT):
+    bpy.data.objects.remove(o_)
+
+# the operator: sides kept in the history, a rebuild keeps them
+_r = bpy.ops.nproto.loft(inputs=ins((_lcA, "U1"), (_lcB, "U1"), (_lcT, "U0")), sides="[2, 1]", cont_a="G1")
+_lh = features.history(ctx.active_object)
+check("loft chained side: the operator lofts with sides and the history keeps them",
+      _r == {'FINISHED'} and _lh["params"].get("sides") == [2, 1] and _lc_ops.side_counts([0, 0, 1, 1, 1]) == [2, 3])
+# Surface Align to a side of two edges (a G1 loft raised to G2): the touching chain is found (in order
+# along the edge), kept in the step's history, and both pieces hold G2
+from blender_nurbs import salign as _sa_ch
+_hA = store.new_object(ctx, "LcAlA", _lc_surf(_lcR[:, :4]))      # the two halves of one smooth surface
+_hB = store.new_object(ctx, "LcAlB", _lc_surf(_lcR[:, 3:]))
+_lgo = store.new_object(ctx, "LcAlignMe", features.run("loft", [(_hA, "U1"), (_hB, "U1"), (_lcT, "U0")],
+                                                       {"cont_a": "G1", "sides": [2, 1]}))
+_cands = [c_ for c_ in _sa_ch._pick_candidates(ctx) if c_[0] in (_hA, _hB, _lcT)]
+_che = {e_: _sa_ch.find_neighbour(_lgo, e_, _cands, chains=True) for e_ in ("U0", "U1", "V0", "V1")}
+_che = {e_: t_ for e_, t_ in _che.items() if isinstance(t_, list)}
+_ce = next(iter(_che), None)
+_okc = False
+if _ce:
+    for o_ in list(ctx.selected_objects):
+        o_.select_set(False)
+    # picked by hand: the edge, then both pieces (out of order) as its target
+    _rr = bpy.ops.nproto.surface_align(inputs=ins((_lgo, _ce), (_hB, "U1"), (_hA, "U1")), **{"cont_" + _ce: "G2"})
+    _st = features.stack(_lgo)[-1]
+    _mm = [_rl_cl.measure(_lgo, o_, r_, 2) for o_, r_ in _che[_ce]]
+    _okc = _rr == {'FINISHED'} and _st["params"].get("targets") == [2] and len(_st["inputs"]) == 2 \
+        and all(m_["ok"] for m_ in _mm)
+check("surface align: an edge along two edges aligns G2 to the chain of both (history keeps it, both hold)",
+      len(_che) == 1 and {n_ for n_, _ in [(o_.name, r_) for o_, r_ in _che[_ce]]} == {_hA.name, _hB.name} and _okc,
+      f"{ {e_: [(o_.name, r_) for o_, r_ in t_] for e_, t_ in _che.items()} } "
+      + ("" if not _ce else str([m_["text"][:60] for m_ in _mm])))
+for o_ in (_lgo, _hA, _hB):
+    bpy.data.objects.remove(o_)
+for o_ in [o_ for o_ in bpy.data.objects if o_.name.startswith(("Lc", "Loft")) and o_.name not in ("Loft",)]:
+    if o_.name.startswith("Lc") or o_ is ctx.active_object:
+        bpy.data.objects.remove(o_)
 
 # --- Look at a work plane: the view turns square onto it (X right, Y up), its centre moved onto the plane
 _frV = _wp.frame_from_points((1, 2, 3), (2, 2, 3.5), (1, 3, 3))

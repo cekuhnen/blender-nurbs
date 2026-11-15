@@ -22,7 +22,9 @@ DIR_ITEMS = [("NORMAL", "Curve Normal", "")] + AXIS_ITEMS + [("VECTOR", "Vector"
 
 # which settings each feature shows (in this order)
 FIELDS = {
-    "loft": ["closed", "cont_a", "tan_a", "cur_a", "cont_b", "tan_b", "cur_b", "auto_align", "flip_b", "ruled", "samples", "flip_normal"],
+    "loft": ["closed", "cont_a", "tan_a", "cur_a", "cont_b", "tan_b", "cur_b", "auto_align", "flip_b", "ruled", "samples",
+             "edges_a", "edges_b", "fit", "span_degree", "span_faces", "cont_ra", "tan_ra", "cont_rb", "tan_rb", "corner_ease", "even_net",
+             "flip_normal"],
     "blend_curve": ["cont_a", "w_a", "c_a", "flip_a", "cont_b", "w_b", "c_b", "flip_b"],
     "extrude": ["distance", "direction", "dir_vec", "tilt", "tilt_azimuth", "draft", "draft_flip", "symmetric"],
     "revolve": ["angle", "axis", "pivot", "seam_angle"],
@@ -37,7 +39,8 @@ FIELDS = {
     "join_curves": ["jc_mode", "tolerance", "jc_degree", "jc_cvs"],
     "sweep": ["samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height", "flip_normal"],
     "pipe": ["radius", "samples"],
-    "patch": ["pt_cvs", "pt_cvs_v", "pt_auto_cvs", "pt_degree", "pt_fair", "pt_surface_fair"],
+    "patch": ["pt_cvs", "pt_cvs_v", "pt_auto_cvs", "pt_degree", "pt_fair", "pt_surface_fair", "pt_quad",
+              "pt_quad_ease", "pt_even", "pt_quad_degree", "pt_quad_spans_u", "pt_quad_spans_v"],
     "dome": ["dome_layout", "dome_cont", "dome_height", "dome_fullness", "dome_cvs"],
     "boundary": ["bd_exact", "sq_degree_u", "sq_degree_v", "sq_spans_u", "sq_spans_v", "samples", "flip_normal"],
     "square": ["e0", "w0", "e1", "w1", "e2", "w2", "e3", "w3", "sq_match", "sq_degree_u", "sq_degree_v", "sq_spans_u", "sq_spans_v"],
@@ -80,7 +83,7 @@ def _on_change(self, context):
     params = dict(h["params"])
     for name in FIELDS.get(h["op"], []):
         v = getattr(self, name)
-        if name in ("degree", "square_degree", "sq_degree_u", "sq_degree_v", "lr_degree"):
+        if name in ("degree", "square_degree", "sq_degree_u", "sq_degree_v", "lr_degree", "pt_quad_degree"):
             v = int(v)
         elif hasattr(v, "__len__") and not isinstance(v, str):
             v = [float(x) for x in v]          # vectors: plain lists in the history JSON
@@ -127,7 +130,8 @@ def cont_all(p, ins):
     conts, guides = p.get("cont", []), set(p.get("pt_guides", []))
     vals = {conts[k] for k, (o, r) in enumerate(ins) if k < len(conts) and k not in guides
             and features.is_surface_edge(r) and o.type != 'CURVE'}
-    return vals.pop() if len(vals) == 1 else "MIXED"
+    v = vals.pop() if len(vals) == 1 else "MIXED"
+    return v if v in ("G0", "G1", "G2") else "MIXED"          # Free isn't an "All edges" choice
 
 
 def _sync_patch_edges(obj, p):
@@ -141,7 +145,7 @@ def _sync_patch_edges(obj, p):
         for it in pg.pt_edges:
             if it.index < n:
                 if not it.curve:
-                    it.cont = conts[it.index] if conts[it.index] in ("G0", "G1", "G2") else "G0"
+                    it.cont = conts[it.index] if conts[it.index] in ("FREE", "G0", "G1", "G2") else "G0"
                 it.tension = float(tens[it.index])
         pg.pt_cont_all = cont_all(p, features.history(obj)["inputs"])
     finally:
@@ -216,7 +220,9 @@ def _on_patch_all_tension(self, context):
     _sync_patch_edges(obj, p)
 
 
-PATCH_CONT = [("G0", "G0", "Position only"), ("G1", "G1", "Tangent to the neighbouring surface"),
+PATCH_CONT = [("FREE", "Free", "Quad Sided: no condition at all, the edge follows from the other sides "
+                                "(the trimmed fill holds it G0)"),
+              ("G0", "G0", "Position only"), ("G1", "G1", "Tangent to the neighbouring surface"),
               ("G2", "G2", "Curvature-continuous to the neighbouring surface")]
 PATCH_ALL = [("AUTO", "Auto", "G2 where the fill meets the neighbour roughly tangentially (G1 where a corner "
                               "makes curvature impossible), G0 where the neighbour stands across it and on curves"),
@@ -257,6 +263,12 @@ class NprotoFeature(bpy.types.PropertyGroup):
                                  description="How far the rim's direction carries into the dome", **_F())
     cont_a: EnumProperty(name="Continuity A", items=CONT_ITEMS, **_F())
     cont_b: EnumProperty(name="Continuity B", items=CONT_ITEMS, **_F())
+    cont_ra: EnumProperty(name="Rail A", items=CONT_ITEMS, **_F())
+    cont_rb: EnumProperty(name="Rail B", items=CONT_ITEMS, **_F())
+    tan_ra: FloatProperty(name="Rail A Weight", min=0.05, soft_max=3.0, **_F())
+    tan_rb: FloatProperty(name="Rail B Weight", min=0.05, soft_max=3.0, **_F())
+    corner_ease: FloatProperty(name="Ease Corners", min=0.0, max=0.5, subtype='FACTOR', **_F())
+    even_net: BoolProperty(name="Even Net", **_F())
     tan_a: FloatProperty(name="Tangent A", min=0.0, soft_max=3.0, **_F())
     tan_b: FloatProperty(name="Tangent B", min=0.0, soft_max=3.0, **_F())
     cur_a: FloatProperty(name="Curvature A", soft_min=-2.0, soft_max=2.0, **_F())
@@ -268,6 +280,16 @@ class NprotoFeature(bpy.types.PropertyGroup):
     flip_a: BoolProperty(name="Flip A", **_F())
     flip_b: BoolProperty(name="Flip B", **_F())
     auto_align: BoolProperty(name="Auto Align", **_F())
+    edges_a: EnumProperty(name="Edges A", items=[("FREE", "Free Edges", "Square to the side"),
+                                                 ("EDGES", "Align Edges", "Carry on the surface's edges at the corners"),
+                                                 ("SURFACE", "Align to Surface", "Along the surface's own lines")], **_F())
+    fit: EnumProperty(name="Fit", items=[("SPANS", "Bezier Spans", "A few Bezier spans, knots where needed"),
+                                         ("DENSE", "Fitted", "A least-squares net through the samples")], **_F())
+    span_degree: IntProperty(name="Span Degree", min=3, max=9, **_F())
+    span_faces: BoolProperty(name="Split into Faces", **_F())
+    edges_b: EnumProperty(name="Edges B", items=[("FREE", "Free Edges", "Square to the side"),
+                                                 ("EDGES", "Align Edges", "Carry on the surface's edges at the corners"),
+                                                 ("SURFACE", "Align to Surface", "Along the surface's own lines")], **_F())
     ruled: BoolProperty(name="Ruled", **_F())
     symmetric: BoolProperty(name="Symmetric", **_F())
     caps: BoolProperty(name="Caps (solid)", **_F())
@@ -344,6 +366,13 @@ class NprotoFeature(bpy.types.PropertyGroup):
     pt_degree: IntProperty(name="Degree", min=2, max=5, **_F())
     pt_fair: FloatProperty(name="Fairness", min=0.0, soft_max=20.0, **_F())
     pt_surface_fair: BoolProperty(name="Fair on Surface", default=True, description=SURFACE_FAIR_DESC, **_F())
+    pt_quad: BoolProperty(name="Quad Sided", description="One untrimmed four-sided surface on the opening's four "
+                          "sides, instead of a larger surface trimmed to the loop", **_F())
+    pt_quad_ease: FloatProperty(name="Ease Corners", min=0.0, max=0.5, subtype='FACTOR', **_F())
+    pt_even: BoolProperty(name="Even Net", **_F())
+    pt_quad_degree: EnumProperty(name="Degree", items=[("0", "Auto", ""), ("3", "3", ""), ("5", "5", "")], **_F())
+    pt_quad_spans_u: IntProperty(name="Spans U", min=0, max=32, **_F())
+    pt_quad_spans_v: IntProperty(name="Spans V", min=0, max=32, **_F())
     sq_spans_u: IntProperty(name="Spans U", min=0, max=32, **_F())
     sq_spans_v: IntProperty(name="Spans V", min=0, max=32, **_F())
     lr_start: EnumProperty(name="Start Profile", items=[("G0", "G0", ""), ("G1", "G1", ""), ("G2", "G2", "")], **_F())
@@ -386,10 +415,25 @@ def sync_from_history(obj):
                 params.setdefault(k_, v_)
         if h["op"] in features.ORIENT_OPS:
             params.setdefault("flip_normal", False)
+        if h["op"] == "loft":                    # older lofts: square to the side, or the Match Edges switch
+            old = "EDGES" if params.get("match_edges") else "FREE"
+            params.setdefault("edges_a", old)
+            params.setdefault("edges_b", old)
+            params.setdefault("fit", "DENSE")                       # older lofts: the least-squares net
+            for k_, v_ in (("cont_ra", "G0"), ("cont_rb", "G0"), ("tan_ra", 1.0), ("tan_rb", 1.0), ("corner_ease", 0.0), ("even_net", False)):
+                params.setdefault(k_, v_)
+            params.setdefault("span_degree", 5)
+            params.setdefault("span_faces", False)
         if h["op"] == "patch":                                     # older patches: square nets, fixed size
             params.setdefault("pt_cvs_v", params.get("pt_cvs", 20))
             params.setdefault("pt_auto_cvs", False)
             params.setdefault("pt_surface_fair", True)           # on unless switched off
+            params.setdefault("pt_quad", False)
+            params.setdefault("pt_quad_ease", 0.15)
+            params.setdefault("pt_even", False)
+            params.setdefault("pt_quad_degree", 0)
+            params.setdefault("pt_quad_spans_u", 0)
+            params.setdefault("pt_quad_spans_v", 0)
             pg.pt_edges.clear()
             tens = params.get("pt_tension", [])
             conts = params.get("cont", [])
@@ -401,7 +445,7 @@ def sync_from_history(obj):
                 it.index, it.label = i, f"{src.name} {ref}"
                 it.curve = not (features.is_surface_edge(ref) and src.type != 'CURVE')
                 c_ = conts[i] if i < len(conts) else "G0"
-                it.cont = "G0" if it.curve or c_ not in ("G0", "G1", "G2") else c_
+                it.cont = "G0" if it.curve or c_ not in ("FREE", "G0", "G1", "G2") else c_
                 it.tension = float(tens[i]) if i < len(tens) else 1.0
             pg.pt_cont_all = cont_all(params, h["inputs"])
             vals = {round(float(tens[i]), 9) if i < len(tens) else 1.0 for i in range(len(h["inputs"])) if i not in guides}
@@ -411,7 +455,8 @@ def sync_from_history(obj):
                 continue
             v = params[name]
             try:
-                setattr(pg, name, str(v) if name in ("degree", "square_degree", "sq_degree_u", "sq_degree_v", "lr_degree") else v)
+                setattr(pg, name, str(v) if name in ("degree", "square_degree", "sq_degree_u", "sq_degree_v", "lr_degree",
+                                                    "pt_quad_degree") else v)
             except (TypeError, ValueError):
                 pass
     finally:
@@ -526,6 +571,14 @@ def draw_feature(layout, context):
                         continue
                     if op == "loft_rails" and pg.lr_mode == "CENTRELINE" and name != "lr_mode":
                         continue
+                    if op == "loft":
+                        nr_ = int(h["params"].get("rails", 0) or 0)
+                        if name in ("cont_ra", "tan_ra", "cont_rb", "tan_rb", "corner_ease") and nr_ != 2 or \
+                                name == "even_net" and not nr_:
+                            continue                     # no rails (one rail is a guide: position only)
+                        if nr_ and name in ("edges_a", "edges_b", "fit", "span_degree", "cur_a",
+                                            "cur_b", "auto_align", "flip_b", "ruled", "closed"):
+                            continue                     # the rails' solver: not used
                     if op == "loft_rails" and name.startswith("lr_") and name[3:] in ("start", "end", "ra", "rb"):
                         r_ = col.row(align=True)
                         r_.label(text=pg.bl_rna.properties[name].name)
@@ -624,7 +677,7 @@ def _draw_patch(box, obj, pg, h):
     conts = p.get("cont", [])
     loop = [k for k in range(len(h["inputs"])) if k not in set(p.get("pt_guides", []))]
     if [e.index for e in pg.pt_edges] != loop or pg.pt_cont_all != cont_all(p, h["inputs"]) or any(
-            not e.curve and e.index < len(conts) and e.cont != (conts[e.index] if conts[e.index] in ("G0", "G1", "G2")
+            not e.curve and e.index < len(conts) and e.cont != (conts[e.index] if conts[e.index] in ("FREE", "G0", "G1", "G2")
                                                                 else "G0") for e in pg.pt_edges):
         _defer_sync(obj.name)          # rows from before they carried continuity (or out of step)
     _pt.draw_settings(box, pg, pg.pt_edges, _pt.patch_info(obj), "pt_cont_all", obj=obj, h=h)

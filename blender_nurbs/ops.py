@@ -186,9 +186,24 @@ class PickMixin:
     def closes_loop(self):
         return False
 
+    def pick_count(self):
+        """How many inputs count toward pick_min (Loft: its sides)."""
+        return len(self._picks)
+
+    def after_pick(self, group, event):
+        """Called with the candidates one click added."""
+
+    def after_unpick(self, n):
+        """Called after Backspace took back the last n picks."""
+
+    def tool_key(self, context, event):
+        """A key of the tool's own while picking: True when handled."""
+        return False
+
     def _status(self, context):
-        n = len(self._picks)
-        state = [f"pick input {n + 1}", "Enter to finish" if n >= self.pick_min else ""]
+        n = self.pick_count()
+        state = [self.pick_state() if hasattr(self, "pick_state") else f"pick input {n + 1}",
+                 "Enter to finish" if n >= self.pick_min else ""]
         ties = getattr(self, "_ties", [])
         if len(ties) > 1:
             cur = ties[self._cycle % len(ties)]
@@ -198,7 +213,7 @@ class PickMixin:
     def pick_rows(self):
         """The picking keys for the hint panel (hints.py), plus the tool's own
         (extra_keys: [(keys, text)]) and its advice (extra_help)."""
-        n = len(getattr(self, "_picks", []))
+        n = (self.pick_count() if hasattr(self, "pick_count") else len(self._picks)) if hasattr(self, "_picks") else 0
         rows = [("Pick", [hints.key("Shift+LMB", "keep picking"),
                           hints.key("Tab", "cycle overlapping", on=True if len(getattr(self, "_ties", [])) > 1 else None),
                           hints.key("Backspace", "undo"),
@@ -265,6 +280,7 @@ class PickMixin:
                 return self._finish(context)
         self._ties, self._tie_key, self._cycle = [], None, 0
         draw.pick_overlay["picked"] = []
+        draw.pick_overlay["colors"] = []
         draw.pick_overlay["hover"] = None
         context.window_manager.modal_handler_add(self)
         self._status(context)
@@ -272,6 +288,7 @@ class PickMixin:
 
     def _end(self, context):
         draw.pick_overlay["picked"] = []
+        draw.pick_overlay["colors"] = []
         draw.pick_overlay["hover"] = None
         hints.clear(context)
 
@@ -279,6 +296,10 @@ class PickMixin:
         if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM'}:
             return {'PASS_THROUGH'}
         if self.hints_key(context, event):
+            return {'RUNNING_MODAL'}
+        if event.value == 'PRESS' and self.tool_key(context, event):
+            self._status(context)
+            context.area.tag_redraw()
             return {'RUNNING_MODAL'}
         if event.type == 'INBETWEEN_MOUSEMOVE':
             return {'PASS_THROUGH'}       # not used here; a gizmo drag needs them unhandled
@@ -315,21 +336,24 @@ class PickMixin:
                     draw.pick_overlay["picked"].append(c[2])
                 if group:
                     self._groups.append(len(group))
+                    self.after_pick(group, event)
                 context.area.tag_redraw()
                 if self.closes_loop() and not (event.shift and getattr(self, "shift_extends", False)):
                     return self._finish(context)
                 if len(self._picks) >= self.pick_max or (
-                        self.finish_on_min and len(self._picks) >= self.pick_min and not event.shift):
+                        self.finish_on_min and self.pick_count() >= self.pick_min and not event.shift):
                     return self._finish(context)
                 self._status(context)
         elif event.type == 'BACK_SPACE' and event.value == 'PRESS' and self._picks:
-            for _ in range(self._groups.pop() if self._groups else 1):
+            n = self._groups.pop() if self._groups else 1
+            for _ in range(n):
                 self._picks.pop()
                 draw.pick_overlay["picked"].pop()
+            self.after_unpick(n)
             self._status(context)
             context.area.tag_redraw()
         elif event.type in {'RET', 'NUMPAD_ENTER', 'SPACE'} and event.value == 'PRESS':
-            if len(self._picks) >= self.pick_min:
+            if self.pick_count() >= self.pick_min:
                 return self._finish(context)
         elif event.type in {'ESC', 'RIGHTMOUSE'} and event.value == 'PRESS':
             self._end(context)
@@ -411,17 +435,134 @@ def loft_selection_order(sel, active=None, closed=False):
     return sel
 
 
+def _is_curve_cand(c):
+    return c[0].type == 'CURVE'
+
+
+def _poly_ends(pts):
+    """((start point, outward direction), (end point, outward direction)) of a
+    pick polyline; directions from three points (second order)."""
+    P = [Vector(p) for p in pts]
+    if len(P) < 3:
+        d = (P[-1] - P[0]).normalized()
+        return (P[0], -d), (P[-1], d)
+    f0 = -3 * P[0] + 4 * P[1] - P[2]
+    fe = 3 * P[-1] - 4 * P[-2] + P[-3]
+    return (P[0], -f0.normalized()), (P[-1], fe.normalized())
+
+
+def _touch_tol(polys):
+    pts = [Vector(p) for pl in polys for p in (pl[0], pl[-1])]
+    lo = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+    hi = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+    return max(1e-3 * (hi - lo).length, 1e-7)
+
+
+def tangent_chain(hit, cands, max_deg=2.0):
+    """The candidates that continue `hit` tangentially (within max_deg) at
+    either end, end to end, the same kind (surface edges / curves): the
+    whole smooth run of edges one click on a side means."""
+    chain = [hit]
+    keyof = lambda c: (c[0].name, c[1])
+    used = {keyof(hit)}
+    kind = _is_curve_cand(hit)
+    pool = [c for c in cands if _is_curve_cand(c) == kind and len(c[2]) > 1]
+    tol = _touch_tol([c[2] for c in pool] or [hit[2]])
+    cos_max = np.cos(np.radians(max_deg))
+    ends = {k: _poly_ends(c[2]) for c in pool for k in [keyof(c)]}
+    for side in (1, 0):                       # grow past the end, then past the start
+        cur = ends[keyof(hit)][side]
+        while True:
+            best = None
+            for c in pool:
+                k = keyof(c)
+                if k in used:
+                    continue
+                for j, (q, out) in enumerate(ends[k]):
+                    if (q - cur[0]).length > tol:
+                        continue
+                    cosang = float(cur[1].dot(-out))      # the next piece goes on the way this one went
+                    if cosang >= cos_max and (best is None or cosang > best[0]):
+                        best = (cosang, c, j)
+            if best is None:
+                break
+            _, c, j = best
+            used.add(keyof(c))
+            if side == 1:
+                chain.append(c)
+            else:
+                chain.insert(0, c)
+            cur = ends[keyof(c)][1 - j]          # carry on from its far end
+    return chain
+
+
+def touches(polys_a, polys_b):
+    """Does an end of one polyline in polys_b meet an end of one in polys_a?"""
+    if not polys_a or not polys_b:
+        return False
+    tol = _touch_tol(list(polys_a) + list(polys_b))
+    ea = [Vector(p) for pl in polys_a for p in (pl[0], pl[-1])]
+    return any((Vector(q) - e).length <= tol for pl in polys_b for q in (pl[0], pl[-1]) for e in ea)
+
+
+def group_into_sides(cands):
+    """Side index of each candidate (in order): one joins the side before it
+    when it touches it end to end and is the same kind; otherwise it starts
+    a new side."""
+    out = []
+    for i, c in enumerate(cands):
+        if out:
+            cur = [cands[j] for j in range(i) if out[j] == out[-1]]
+            if _is_curve_cand(cur[0]) == _is_curve_cand(c) and touches([x[2] for x in cur], [c[2]]):
+                out.append(out[-1])
+                continue
+        out.append(out[-1] + 1 if out else 0)
+    return out
+
+
+def side_counts(side_of):
+    counts = []
+    for i, s in enumerate(side_of):
+        if i == 0 or s != side_of[i - 1]:
+            counts.append(0)
+        counts[-1] += 1
+    return counts
+
+
+EDGE_ITEMS = [
+    ("FREE", "Free Edges", "The loft leaves the side square to it (an untrimmed edge: along its face's own lines)",
+     'MOD_CURVE', 0),
+    ("EDGES", "Align Edges", "At the side's corners the loft carries on the surface's own edges, so its outline "
+     "flows out of them (G2: in their curvature too)", 'MOD_SIMPLEDEFORM', 1),
+    ("SURFACE", "Align to Surface", "The loft carries on the surface's own parameter lines across the side",
+     'SURFACE_NSURFACE', 2),
+]
+
+CHAIN_ITEMS = [("TANGENT", "Tangent Chain", "A click picks the edge and every edge that continues it tangentially"),
+               ("SINGLE", "Single Edge", "A click picks just that edge (Shift+click more edges that touch it)")]
+
+
 class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
-    """Loft a surface between curves or surface edges (G0 / G1 / G2)"""
+    """Loft a surface between curves or surface edges (G0 / G1 / G2). A side
+    can be several edges end to end: picked edges that touch form one side
+    (Tangent Chain picks a smooth run of edges with one click)"""
     bl_idname = "nproto.loft"
     bl_label = "Loft"
     bl_options = {'REGISTER', 'UNDO'}
 
     accepts_picks = True
     pick_min = 2
-    pick_max = 32
+    pick_max = 64
+    extra_keys = (("C", "tangent chain on / off"), ("N", "start the next side"), ("R", "pick rails / profiles"))
+    extra_help = "(edges that touch end to end make one side; R: up to two rails, guide curves along the loft)"
 
     inputs: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    sides: StringProperty(options={'HIDDEN', 'SKIP_SAVE'},
+                          description="How many inputs each side takes, in order (JSON list)")
+    chain: EnumProperty(name="Pick", items=CHAIN_ITEMS, default="TANGENT",
+                        description="What one click on an edge picks")
+    chain_angle: FloatProperty(name="Chain Angle", default=2.0, min=0.01, max=30.0,
+                               description="Tangent Chain: edges meeting within this angle (degrees) are one run")
     use_selection: BoolProperty(name="Use Selection", default=False, options={'SKIP_SAVE'},
                                 description="Loft the selected curves instead of picking")
     cont_a: EnumProperty(name="Continuity A", items=CONT_ITEMS, default="G0")
@@ -441,6 +582,34 @@ class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
                                      "round, the seam included (3 or more sections)")
     samples: IntProperty(name="Samples", default=24, min=6, max=200,
                          description="Samples along the edges for G1/G2 lofts")
+    fit: EnumProperty(name="Fit", items=[
+        ("SPANS", "Bezier Spans", "G1 / G2 to trimmed edges: a few Bezier spans of one degree, knots where the "
+         "continuity needs them (light, symmetric nets)"),
+        ("DENSE", "Fitted", "G1 / G2 to trimmed edges: a least-squares net through the samples (many CVs)")],
+        default="SPANS")
+    span_degree: IntProperty(name="Span Degree", default=5, min=3, max=9,
+                             description="Bezier Spans: degree along the sides")
+    span_faces: BoolProperty(name="Split into Faces", default=False,
+                             description="Bezier Spans: one Bezier patch per span, joined into one body")
+    edges_a: EnumProperty(name="Edges A", items=EDGE_ITEMS, default="EDGES",
+                          description="G1 / G2: which way the loft leaves side A")
+    edges_b: EnumProperty(name="Edges B", items=EDGE_ITEMS, default="EDGES",
+                          description="G1 / G2: which way the loft leaves side B")
+    rails: IntProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=0,
+                       description="How many of the last sides are rails")
+    cont_ra: EnumProperty(name="Rail A", items=CONT_ITEMS, default="G0",
+                          description="Continuity along rail A where it is a surface edge")
+    cont_rb: EnumProperty(name="Rail B", items=CONT_ITEMS, default="G0",
+                          description="Continuity along rail B where it is a surface edge")
+    tan_ra: FloatProperty(name="Weight A", default=1.0, min=0.05, soft_max=3.0, description="Rail A: how hard it holds")
+    tan_rb: FloatProperty(name="Weight B", default=1.0, min=0.05, soft_max=3.0, description="Rail B: how hard it holds")
+    corner_ease: FloatProperty(name="Ease Corners", default=0.15, min=0.0, max=0.5, subtype='FACTOR',
+                               description="With two rails: G2 at the profiles eases off over this share of each "
+                                           "profile toward the rails (a source whose curvature runs wild at the "
+                                           "corner is not chased there: a much lighter net). 0: G2 all along")
+    even_net: BoolProperty(name="Even Net", default=False,
+                           description="With rails: space the CVs evenly (a cleaner, more regular net; G1 can "
+                                       "need a few more CVs). Off: the net follows the boundaries' own layout")
 
     def invoke(self, context, event):
         if not _kernel_ok(self):
@@ -449,23 +618,158 @@ class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
         if self.use_selection or (len(sel) >= 2 and not event.alt):
             sel = loft_selection_order(sel, context.active_object, self.closed)
             self.inputs = _encode_inputs([(o, "S0") for o in sel])
+            self.sides = ""
             return self.execute(context)
+        self._side_of, self._new_side = [], False
+        self.rails = 0
         return self.start_picking(context, event)
 
+    # --- picking: sides of one or more edges --------------------------------
+
+    def expand_pick(self, cand):
+        if self.chain == 'TANGENT':
+            have = {(o.name, r) for o, r in getattr(self, "_picks", [])}
+            return [c for c in tangent_chain(cand, self._cands, self.chain_angle) if (c[0].name, c[1]) not in have]
+        return [cand]
+
+    def pick_count(self):
+        so = getattr(self, "_side_of", None)
+        if not so:
+            return len(self._picks)
+        return len({g for g in so if g not in getattr(self, "_rail_groups", set())})     # profiles
+
+    def _label(self, group):
+        rails = getattr(self, "_rail_groups", set())
+        so = getattr(self, "_side_of", [])
+        groups = sorted(set(so) | {group})
+        if group in rails:
+            return f"rail {'AB'[min([g for g in groups if g in rails].index(group), 1)]}"
+        return f"side {'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[min([g for g in groups if g not in rails].index(group), 25)]}"
+
+    def pick_state(self):
+        so = getattr(self, "_side_of", [])
+        rail = getattr(self, "_rail_mode", False)
+        mode = "Tangent Chain" if self.chain == 'TANGENT' else "Single Edge"
+        if not so or self._new_side:
+            nxt = (so[-1] + 1) if so else 0
+            if rail:
+                self._rail_groups.add(nxt)
+                lab = self._label(nxt)
+                self._rail_groups.discard(nxt)
+                return f"{lab}: pick its edges · R: back to profiles"
+            return f"{self._label(nxt)}: pick its edges" + (" · R: rails" if so else "")
+        side = so[-1]
+        n = sum(1 for s in so if s == side)
+        return f"{self._label(side)}: {n} edge{'s' if n > 1 else ''} · {mode}" + \
+            (" · R: back to profiles" if rail else " · R: rails")
+
+    def _recolour(self):
+        rails = getattr(self, "_rail_groups", set())
+        profs = sorted({g for g in self._side_of if g not in rails})
+        draw.pick_overlay["colors"] = [3 if g in rails else profs.index(g) % 3 for g in self._side_of]
+
+    def after_pick(self, group, event):
+        so = self._side_of
+        rail = getattr(self, "_rail_mode", False)
+        if not so:
+            side = 0
+        elif self._new_side or ((so[-1] in self._rail_groups) != rail):
+            side = so[-1] + 1                      # a new side (or rail / profile mode changed)
+        else:
+            done = len(self._picks) - len(group)
+            cur = [self._cands_by_key[(o.name, r)] for (o, r), s in zip(self._picks[:done], so) if s == so[-1]]
+            same = cur and _is_curve_cand(cur[0]) == _is_curve_cand(group[0])
+            side = so[-1] if same and touches([c[2] for c in cur], [c[2] for c in group]) else so[-1] + 1
+        so.extend([side] * len(group))
+        if rail:
+            self._rail_groups.add(side)
+        self._new_side = False
+        self._recolour()
+
+    def after_unpick(self, n):
+        del self._side_of[len(self._side_of) - n:]
+        self._rail_groups &= set(self._side_of)
+        self._new_side = False
+        self._recolour()
+
+    def tool_key(self, context, event):
+        if getattr(event, "ctrl", False) or getattr(event, "oskey", False) or getattr(event, "alt", False):
+            return False
+        if event.type == 'N' and getattr(self, "_side_of", None):
+            self._new_side = True
+            return True
+        if event.type == 'C':
+            self.chain = 'SINGLE' if self.chain == 'TANGENT' else 'TANGENT'
+            return True
+        if event.type == 'R':
+            self._rail_mode = not getattr(self, "_rail_mode", False)
+            self._new_side = bool(self._side_of)
+            return True
+        return False
+
+    def start_picking(self, context, event=None):
+        self._side_of, self._new_side = [], False
+        self._rail_groups, self._rail_mode = set(), False
+        self._cands_by_key = {}
+        r = super().start_picking(context, event)
+        self._cands_by_key = {(c[0].name, c[1]): c for c in getattr(self, "_cands", [])}
+        return r
+
+    def picked_inputs(self, context):
+        pre = super().picked_inputs(context)
+        if pre:
+            byref = {(c[0].name, c[1]): c for c in self._cands}
+            self._side_of = group_into_sides([byref[(o.name, r)] for o, r in pre])
+            if len(set(self._side_of)) < 2:
+                self._side_of = list(range(len(pre)))     # one run of touching edges: each its own section
+        return pre
+
+    def _finish(self, context):
+        so = getattr(self, "_side_of", [])
+        rails = getattr(self, "_rail_groups", set())
+        if so and len(so) == len(self._picks) and rails:
+            # profiles first, then the rails (in the order picked)
+            order = sorted(range(len(so)), key=lambda i: (so[i] in rails, so[i], i))
+            self._picks = [self._picks[i] for i in order]
+            so = [so[i] for i in order]
+            self._side_of = so
+        self.rails = len(rails)
+        self.sides = json.dumps(side_counts(so)) if so and len(so) == len(self._picks) else ""
+        return super()._finish(context)
+
+    def _side_counts(self):
+        try:
+            v = json.loads(self.sides) if self.sides else []
+        except ValueError:
+            v = []
+        return [int(x) for x in v]
+
     def _params(self):
-        return {k: getattr(self, k) for k in (
+        p = {k: getattr(self, k) for k in (
             "cont_a", "cont_b", "tan_a", "tan_b", "cur_a", "cur_b",
-            "auto_align", "flip_b", "ruled", "closed", "samples")}
+            "auto_align", "flip_b", "ruled", "closed", "samples", "edges_a", "edges_b",
+            "fit", "span_degree", "span_faces")}
+        counts = self._side_counts()
+        if counts and (any(c > 1 for c in counts) or self.rails):
+            p["sides"] = counts
+        if self.rails:
+            p.update({"rails": int(self.rails), "cont_ra": self.cont_ra, "cont_rb": self.cont_rb,
+                      "tan_ra": self.tan_ra, "tan_rb": self.tan_rb, "corner_ease": self.corner_ease,
+                      "even_net": self.even_net})
+        return p
 
     def execute(self, context):
         if not _kernel_ok(self):
             return {'CANCELLED'}
         try:
             inputs = _decode_inputs(self.inputs)
+            features.LOFT_NOTES.clear()
             obj = _make_result(context, "Loft", "loft", inputs, self._params())
         except Exception as exc:
             self.report({'ERROR'}, f"Loft failed: {exc}")
             return {'CANCELLED'}
+        for note in features.LOFT_NOTES:
+            self.report({'WARNING'}, note)
         _select_only(context, [obj])
         return {'FINISHED'}
 
@@ -475,27 +779,82 @@ class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
             refs = [r for _, r in json.loads(self.inputs or "[]")]
         except ValueError:
             refs = []
-        two = len(refs) == 2
-        for side, ref in zip("ab", refs[:2] if two else []):
+        counts = self._side_counts()
+        if not counts or sum(counts) != len(refs):
+            counts = [1] * len(refs)
+        firsts = [sum(counts[:i]) for i in range(len(counts))]
+        nr = self.rails if 0 < self.rails < len(counts) - 1 else 0
+        nprof = len(counts) - nr
+        two = nprof == 2
+        shown = [(0, firsts[0], counts[0]), (1, firsts[nprof - 1], counts[nprof - 1])] if (two or nr) else []
+        for side, i0, k in (("ab"[j], i0, k) for j, i0, k in shown):
+            ref = refs[i0]
             box = lay.box()
             edge = features.is_surface_edge(ref)
-            box.label(text=f"Input {side.upper()}: " + (("trimmed edge" if features.is_brep_edge_ref(ref) else
-                                                          "surface edge") if edge else "curve"))
+            what = (("trimmed edge" if features.is_brep_edge_ref(ref) else "surface edge") if edge else "curve")
+            box.label(text=f"Input {side.upper()}: " + (f"{k} {what}s" if k > 1 else what))
             col = box.column(align=True)
             col.enabled = edge
-            col.prop(self, f"cont_{side}", text="")
             row = col.row(align=True)
-            row.prop(self, f"tan_{side}", text="Tangent")
-            row.prop(self, f"cur_{side}", text="Curvature")
+            row.prop(self, f"cont_{side}", text="")
+            if not nr:
+                sub = row.row(align=True)
+                sub.active = getattr(self, f"cont_{side}") != "G0"
+                sub.prop(self, f"edges_{side}", text="")
+            row = col.row(align=True)
+            row.prop(self, f"tan_{side}", text="Weight" if nr else "Tangent")
+            if not nr:
+                row.prop(self, f"cur_{side}", text="Curvature")
+        for j in range(nr):
+            i0, k = firsts[nprof + j], counts[nprof + j]
+            ref = refs[i0]
+            box = lay.box()
+            edge = features.is_surface_edge(ref)
+            what = (("trimmed edge" if features.is_brep_edge_ref(ref) else "surface edge") if edge else "curve")
+            box.label(text=f"Rail {'AB'[j]}: " + (f"{k} {what}s" if k > 1 else what) +
+                      ("" if nr == 2 else " (a guide: the loft passes through it)"))
+            row = box.row(align=True)
+            row.enabled = edge and nr == 2
+            row.prop(self, f"cont_r{'ab'[j]}", text="")
+            row.prop(self, f"tan_r{'ab'[j]}", text="Weight")
+        if nr:
+            col = lay.column()
+            row = col.row()
+            row.active = nr == 2 and "G2" in (self.cont_a, self.cont_b)
+            row.prop(self, "corner_ease")
+            col.prop(self, "even_net")
+            col.prop(self, "span_faces")
+            col.prop(self, "samples")
+            row = col.row(align=True)
+            row.prop(self, "chain", text="Pick")
+            sub = row.row(align=True)
+            sub.active = self.chain == 'TANGENT'
+            sub.prop(self, "chain_angle", text="°")
+            return
         col = lay.column()
         row = col.row()
-        row.active = len(refs) >= 3
+        row.active = len(counts) >= 3
         row.prop(self, "closed")
         col.prop(self, "auto_align")
         col.prop(self, "flip_b")
         if two and not any(features.is_surface_edge(r) for r in refs):
             col.prop(self, "ruled")
+        sampled = any(features.is_surface_edge(r) for r in refs) and {self.cont_a, self.cont_b} != {"G0"}
+        row = col.row(align=True)
+        row.active = sampled
+        row.prop(self, "fit", text="")
+        sub = row.row(align=True)
+        sub.active = sampled and self.fit == "SPANS"
+        sub.prop(self, "span_degree", text="Degree")
+        row = col.row()
+        row.active = sampled and self.fit == "SPANS"
+        row.prop(self, "span_faces")
         col.prop(self, "samples")
+        row = col.row(align=True)
+        row.prop(self, "chain", text="Pick")
+        sub = row.row(align=True)
+        sub.active = self.chain == 'TANGENT'
+        sub.prop(self, "chain_angle", text="°")
 
 
 # --------------------------------------------------------------------------

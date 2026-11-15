@@ -57,13 +57,21 @@ def _compute(obj):
     for k, e in enumerate(entries):
         if e["op"] not in STACK_OPS:
             continue
-        for i, (edge, (src, ref)) in enumerate(zip(e["params"]["edges"], e["inputs"])):
+        # a target may be a chain of edges (Surface Align along several trimmed edges)
+        counts = e["params"].get("targets") or [1] * len(e["params"]["edges"])
+        groups, j = [], 0
+        for n_ in counts:
+            groups.append([tuple(x) for x in e["inputs"][j:j + n_]])
+            j += n_
+        for i, (edge, grp) in enumerate(zip(e["params"]["edges"], groups)):
+            src, ref = grp[0]
             pts = geom.boundary_points(surf, edge, 21)
             vals = ["G0", "G1", "G2"] if features.is_surface_edge(ref) and src.type != 'CURVE' else ["G0"]
             cur = e["params"]["cont"][i]
             out.append({"pos": M @ Vector(pts[int(round(at * 20))]), "param": f"stack:{k}:{i}",
                         "value": cur if cur in vals else vals[0], "values": vals,
-                        "name": f"{edge} → {src.name} {ref}", "src": (src, ref)})
+                        "name": f"{edge} → " + " + ".join(f"{o_.name} {r_}" for o_, r_ in grp),
+                        "src": (src, ref), "more": grp[1:]})
     return out
 
 
@@ -87,13 +95,19 @@ def _compute_base(obj):
         guides = set(p.get("pt_guides", []))
         for i, (src, ref) in enumerate(ins):
             g = i in guides
-            vals = ["G0"] if g else _edge_values(src, ref)          # Patch: G0 / G1 / G2; guides: G0
+            vals = ["G0"] if g else _edge_values(src, ref, with_free=bool(p.get("pt_quad")))  # Quad Sided: Free too
             cur = "G0" if g else (conts[i] if i < len(conts) else "G0")
             out.append({"pos": _mid(src, ref), "param": f"pc:{i}", "value": cur if cur in vals else vals[0],
                         "values": vals, "name": f"{src.name} {ref}" + (" (guide)" if g else ""), "src": (src, ref),
                         "guide": g, "tension": float(tens[i]) if i < len(tens) and not g else 1.0})
     elif op == "loft":
-        for (src, ref), param in ((ins[0], "cont_a"), (ins[-1], "cont_b")):
+        groups = features.loft_sides(ins, p)
+        nr = features.loft_rail_count(ins, p)
+        profs, rails = groups[:len(groups) - nr], groups[len(groups) - nr:]
+        roles = [(profs[0][0], "cont_a"), (profs[-1][0], "cont_b")]
+        if nr == 2:                       # a single rail is a guide: position only, no label
+            roles += [(rails[0][0], "cont_ra"), (rails[1][0], "cont_rb")]
+        for (src, ref), param in roles:
             vals = _edge_values(src, ref)
             cur = p.get(param, "G0")
             out.append({"pos": _mid(src, ref), "param": param, "value": cur if cur in vals else vals[0],
@@ -133,6 +147,31 @@ def _compute_base(obj):
     return out
 
 
+def _loft_eases(obj, out):
+    """{label index: ease zones} for a loft with rails: G2 profiles eased
+    toward the rails by Ease Corners, and G1 / G2 profile ends where the rail
+    leaves the profile's tangent plane (see features.loft_rail_eases), like a
+    Patch's conflicting corners."""
+    h = features.history(obj)
+    if not h or h.get("op") != "loft":
+        return {}
+    p = h["params"]
+    ins = h["inputs"]
+    try:
+        zones = features.loft_rail_eases(ins, p)
+    except Exception as exc:
+        print("NURBS loft eases:", exc)
+        return {}
+    res = {}
+    for i, L in enumerate(out):
+        if L["param"] not in ("cont_a", "cont_b") or L.get("value") not in ("G1", "G2"):
+            continue
+        z = zones.get((L["src"][0].name, L["src"][1]))
+        if z:
+            res[i] = z
+    return res
+
+
 def _patch_eases(obj, out):
     """({label index: ease zones} for a Patch's edge labels (see measure),
     [corner marks]): a mark is {"pos", "text"} at every corner where an edge's
@@ -140,9 +179,18 @@ def _patch_eases(obj, out):
     h = features.history(obj)
     if not h or h.get("op") != "patch" or not any(L["param"].startswith("pc:") for L in out):
         return {}, []
+    ins = h["inputs"]
+    if h["params"].get("pt_quad"):                   # Quad Sided: Loft with rails' zones, no corner marks
+        try:
+            from .patch import quad_eases
+            zq = quad_eases(ins, h["params"])
+        except Exception as exc:
+            print("NURBS patch eases:", exc)
+            return {}, []
+        return {i: zq[int(L["param"][3:])] for i, L in enumerate(out)
+                if L["param"].startswith("pc:") and int(L["param"][3:]) in zq}, []
     try:
         from .patch import input_eases
-        ins = h["inputs"]
         conts = h["params"].get("cont", [])
         res = input_eases(ins, conts, p=h["params"])
     except Exception as exc:
@@ -233,6 +281,7 @@ def labels(obj):
         print("NURBS continuity labels:", obj.name, exc)
         out = []
     eases, marks = _patch_eases(obj, out)
+    eases.update(_loft_eases(obj, out))
     _marks[obj.session_uid] = (key, marks)
     waiting = features.pending(obj)          # Pause Rebuild: the geometry is older than these settings
     base = None
@@ -250,6 +299,12 @@ def labels(obj):
                 own = not str(L.get("param", "")).startswith("stack:")    # the feature's label, not a step's
                 L["check"] = measure(obj, *L["src"], ORDER.index(L["value"]) - 1, ease=eases.get(i), skip_near=skip,
                                      brep=base if own else None)
+                for o_, r_ in L.get("more") or ():           # the rest of a chained target: the worst counts
+                    c2 = measure(obj, o_, r_, ORDER.index(L["value"]) - 1, brep=base if own else None)
+                    c1 = L["check"]
+                    worse = c1 if not c1["ok"] else c2
+                    L["check"] = dict(worse, gap=max(c1["gap"], c2["gap"]), angle=max(c1["angle"], c2["angle"]),
+                                      curv=max(c1["curv"], c2["curv"]))
             except Exception as exc:
                 print("NURBS continuity check:", obj.name, L["name"], exc)
     _cache[obj.session_uid] = (key, out)
@@ -491,12 +546,37 @@ class NPROTO_OT_cycle_continuity(bpy.types.Operator):
             return False
         old = getattr(op.properties, param)
         new = next_value(L["values"], L["value"], self.step)
+        before = set(bpy.data.objects.keys())
         try:
             setattr(op.properties, param, new)
             done = 'FINISHED' in bpy.ops.ed.undo_redo()
         except Exception as exc:
             print("NURBS continuity: redo of the last operator failed, editing the history", exc)
             done = False
+        if done:
+            # A redo undoes the newest undo step and runs the operator again. When
+            # that step was not the feature's own (something pushed one after it),
+            # the feature stays and the redo makes a second one beside it: a copy
+            # in the Outliner, both drawn in the same place. Then the copy goes and
+            # the history is edited instead (the feature rebuilds in place).
+            made = [n_ for n_ in bpy.data.objects.keys() if n_ not in before]
+            if made and self.obj_name in bpy.data.objects:
+                for n_ in made:
+                    o_ = bpy.data.objects.get(n_)
+                    if o_ is None:
+                        continue
+                    data = o_.data
+                    bpy.data.objects.remove(o_)
+                    if data is not None and data.users == 0 and isinstance(data, bpy.types.Mesh):
+                        bpy.data.meshes.remove(data)
+                keep = bpy.data.objects.get(self.obj_name)
+                for o_ in context.selected_objects:
+                    o_.select_set(False)
+                keep.select_set(True)
+                context.view_layer.objects.active = keep
+                print(f"NURBS continuity: the redo left {self.obj_name} in place and made {made}: removed, "
+                      f"editing the history instead")
+                done = False
         if not done:
             try:
                 setattr(op.properties, param, old)

@@ -462,6 +462,7 @@ def _blend_grid(first_rows, last_rows, n_cvs, gre):
 
 
 CORNER_FADE = 0.5          # fraction of a side over which a corner-limited condition comes back
+EASE_G2 = {}               # {side index: share} -- G2 eased toward both ends of that side (set around a build)
 CORNER_G1_DEG = 1.0        # neighbour normals further apart than this: no common tangent plane
 CORNER_G2_REL = 0.05       # curvature mismatch (vs the largest curvature involved) that G2 can't bridge
 
@@ -552,6 +553,16 @@ def corner_fades(sides, ks):
             sd.fade1 = np.minimum(sd.fade1, ramp)
         if c < 2:
             sd.fade2 = np.minimum(sd.fade2, ramp)
+    # eased on request (Loft with rails' Ease Corners): G2 toward both ends of
+    # these sides, over the given share -- a source whose curvature runs wild
+    # right at a corner (a spoon's rim) is not chased there
+    for i, frac in EASE_G2.items():
+        if frac <= 0 or i >= len(sides) or ks[i] < 2:
+            continue
+        sd = sides[i]
+        for t in (sd.t, 1.0 - sd.t):
+            x = np.clip(t / frac, 0.0, 1.0)
+            sd.fade2 = np.minimum(sd.fade2, x * x * (3.0 - 2.0 * x))
     return conflicts
 
 
@@ -904,6 +915,7 @@ G2_PASSES = 12
 PREF_NATURAL = True
 W_G0, W_G1, W_G2, W_PREF1, W_PREF2, W_FILL = 1e3, 1e3, 1e2, 0.1, 0.03, 1e-3
 W_FAIR, FAIR_REF = 1.0, "x0"   # net fairness vs the boolean-sum net (stops inner rows crossing; exact cases stay exact)
+                                # FAIR_REF "zero": even spacing; a number: that share of the boolean-sum net's bending
 FAIR_STEPS = (1.0, 10.0, 100.0, 1e3, 1e4, 1e5)   # fairness raised until the net is clean
 NET_EXT_MAX = 1.5                         # CV net extent vs the boundary's, above = blown up
 
@@ -1053,7 +1065,8 @@ def _ls_solve(X0, sides, ks, weights, prefs, Uu, p, Uv, q, size):
             for j in range(nv):
                 for di, dj in ((1, 0), (0, 1)):
                     if i - di >= 0 and i + di < nu and j - dj >= 0 and j + dj < nv:
-                        ref = X0[i - di, j - dj] - 2 * X0[i, j] + X0[i + di, j + dj] if FAIR_REF == "x0" else np.zeros(3)
+                        ref = (X0[i - di, j - dj] - 2 * X0[i, j] + X0[i + di, j + dj]) * \
+                            (1.0 if FAIR_REF == "x0" else 0.0 if FAIR_REF == "zero" else float(FAIR_REF))
                         for c in range(3):
                             fair_rows.append(len(rows))
                             add([(var(i - di, j - dj, c), 1.0), (var(i, j, c), -2.0), (var(i + di, j + dj, c), 1.0)],

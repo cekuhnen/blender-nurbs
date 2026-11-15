@@ -588,6 +588,67 @@ def compatible_sides(sa, sb, tol=1e-9):
     return _side_from(ka, q, U, A2), _side_from(kb, q, U, B2)
 
 
+def raise_array(p, U, A, q):
+    """A clamped B-spline (CV array, any columns) raised from degree p to q,
+    exactly (Bezier pieces elevated, knots at full multiplicity)."""
+    from .kernel.classa import bezier_pieces
+    from .curvejoin import elevate
+    A = np.asarray(A, float)
+    if p >= q:
+        return p, [float(k) for k in U], A
+    br = sorted(set(float(k) for k in U))
+    pieces = [elevate(np.asarray(s_, float), q) for s_ in bezier_pieces(A, U, p)]
+    A = np.vstack([pieces[0]] + [s_[1:] for s_ in pieces[1:]])
+    return q, [br[0]] * (q + 1) + [k for k in br[1:-1] for _ in range(q)] + [br[-1]] * (q + 1), A
+
+
+def concat_arrays(items, widths):
+    """Clamped B-splines joined end to end into ONE (exact): items [(degree,
+    knots, CV array)] whose last CV meets the next one's first (they are
+    averaged), widths the share of 0..1 each gets. Joints are knots of full
+    multiplicity (C0 in the parameter; the geometry is as smooth as the
+    pieces meet). Returns (degree, knots, array)."""
+    q = max(int(p) for p, _, _ in items)
+    tot = float(sum(widths)) or 1.0
+    widths = [w / tot for w in widths]
+    knots, rows, s = [0.0] * (q + 1), None, 0.0
+    for (p, U, A), w in zip(items, widths):
+        U = [float(k) for k in U]
+        a, b = U[0], U[-1]
+        U = [(k - a) / (b - a) for k in U]
+        _, U, A = raise_array(int(p), U, A, q)
+        if rows is None:
+            rows = A
+        else:
+            rows = np.vstack([rows[:-1], 0.5 * (rows[-1] + A[0]), A[1:]])
+            knots += [s] * q
+        knots += [s + w * k for k in U[q + 1:-q - 1]]
+        s += w
+    knots += [1.0] * (q + 1)
+    return q, knots, rows
+
+
+def end_speeds(p, U, P):
+    """|dC/dt| at the start and the end of a clamped B-spline on 0..1 (CVs P)."""
+    U = [float(k) for k in U]
+    a, b = U[0], U[-1]
+    U = [(k - a) / (b - a) for k in U]
+    s0 = p / ((U[p + 1] - U[1]) or 1.0) * float(np.linalg.norm(P[1] - P[0]))
+    n = len(P) - 1
+    s1 = p / ((U[n + p] - U[n]) or 1.0) * float(np.linalg.norm(P[n] - P[n - 1]))
+    return s0, s1
+
+
+def speed_widths(speeds):
+    """Parameter widths for pieces joined end to end so the speed along the
+    joined curve does not jump at a joint (C1 where the pieces are tangent):
+    speeds [(start, end)] of each piece on its own 0..1."""
+    w = [1.0]
+    for (_, e), (s, _) in zip(speeds[:-1], speeds[1:]):
+        w.append(w[-1] * (s / e) if e > 1e-15 and s > 1e-15 else w[-1])
+    return w
+
+
 def sub_side(s, lo, hi):
     """The stretch lo..hi (0..1 along the edge) of an exact loft side, exactly
     (knot insertion), with its knots mapped back to 0..1."""
@@ -722,10 +783,12 @@ class EdgeSample:
     """Samples along a loft input: positions P, outward cross tangent D,
     outward cross second derivative DD (None for plain curves)."""
 
-    def __init__(self, P, D=None, DD=None):
+    def __init__(self, P, D=None, DD=None, joints=None):
         self.P = P
         self.D = D
         self.DD = DD
+        self.joints = list(joints or [])     # sample indices where the pieces of a chained side meet
+        self.N = None                        # the source's unit normals, when known (Align Edges / Surface)
 
     @property
     def has_surface(self):
@@ -733,7 +796,16 @@ class EdgeSample:
 
     def reversed(self):
         r = lambda a: None if a is None else a[::-1].copy()
-        return EdgeSample(self.P[::-1].copy(), r(self.D), r(self.DD))
+        n = len(self.P)
+        out = EdgeSample(self.P[::-1].copy(), r(self.D), r(self.DD), sorted(n - 1 - j for j in self.joints))
+        out.N = r(self.N)
+        return out
+
+    def piece(self, i0, i1):
+        c = lambda a: None if a is None else a[i0:i1 + 1].copy()
+        out = EdgeSample(c(self.P), c(self.D), c(self.DD))
+        out.N = c(self.N)
+        return out
 
 
 def sample_surface_edge(surface, which, matrix, n):
@@ -813,7 +885,7 @@ def _side_rows(es, cont, tangent, curvature, n_deg, scale):
     return rows
 
 
-def _difference_rows(rows_a, rows_b, tol, size):
+def _difference_rows(rows_a, rows_b, tol, size, normals=(None, None)):
     """Side rows [R0, R1, R2] as [R0, R1 - R0, R2 - 2 R1 + R0] (b's reversed,
     as in the surface) and a tolerance for each: for an edge row tol, at most
     1e-5 of that edge's length (the continuity check allows a gap of 1e-4 of
@@ -826,7 +898,7 @@ def _difference_rows(rows_a, rows_b, tol, size):
         if len(R) > 2:
             out.append(R[2] - 2 * R[1] + R[0])
         return out
-    def tols(F):
+    def tols(F, N):
         if tol is None:
             return [None] * len(F)
         edge = float(np.sum(np.linalg.norm(np.diff(F[0], axis=0), axis=1)))
@@ -834,10 +906,16 @@ def _difference_rows(rows_a, rows_b, tol, size):
         if len(F) > 1:
             t.append(max(1e-4 * float(np.median(np.linalg.norm(F[1], axis=1))), 1e-7 * size))
         if len(F) > 2:
-            t.append(max(1e-3 * float(np.max(np.linalg.norm(F[2], axis=1))), 1e-7 * size))
+            # 0.1 % of the curvature row -- of its part along the normal when the
+            # normals are known: a part in the tangent plane (Align Edges' bend
+            # towards the corners) does not change the curvature, and measured
+            # with it the curvature was fitted 10x looser (4.5 % off there)
+            big = np.abs(np.sum(F[2] * N, axis=1)) if N is not None and len(N) == len(F[2]) else \
+                np.linalg.norm(F[2], axis=1)
+            t.append(max(1e-3 * float(np.max(big)), 1e-7 * size))
         return t
     Fa, Fb = side(rows_a), side(rows_b)
-    ta, tb = tols(Fa), tols(Fb)
+    ta, tb = tols(Fa, normals[0]), tols(Fb, normals[1])
     F = Fa + Fb[::-1]
     t = ta + tb[::-1]
     return F, (None if tol is None else t)
@@ -855,15 +933,264 @@ def _undifference_rows(G, na, nb):
     return side(G[:na]) + side(G[na:][::-1])[::-1]
 
 
+def blend_loft_pieces(a, b, breaks, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.0, cur_a=0.0, cur_b=0.0,
+                      degree_v=3):
+    """blend_loft fitted piece by piece between the sample indices `breaks`
+    (where the edges of a chained side meet) and joined there into one
+    surface: one fit across a joint, where the trim curves of two faces meet
+    with a slight kink, needed ten times the CVs and put knots so close the
+    CVs flew off (a folded loft). Every piece uses the whole loft's scale, so
+    the rows meet at the joints (the fit pins its end samples)."""
+    _, ext = _k()
+    scale = float(np.mean(np.linalg.norm(a.P - b.P, axis=1))) or 1.0
+    idx = [0] + list(breaks) + [len(a.P) - 1]
+    items, widths, nu, deg_u, knots_u = [], [], None, None, None
+    for i0, i1 in zip(idx[:-1], idx[1:]):
+        g = blend_loft(a.piece(i0, i1), b.piece(i0, i1), cont_a, cont_b, tan_a, tan_b, cur_a, cur_b,
+                       degree_v=degree_v, scale=scale)
+        d = ext.surface_cvs(g)
+        nu, nv = d["count_u"], d["count_v"]
+        deg_u, knots_u = d["degree_u"], d["knots_u"]
+        G = np.array(d["points"], float).reshape(nu, nv, 3)
+        items.append((d["degree_v"], d["knots_v"], G.transpose(1, 0, 2).reshape(nv, 3 * nu)))
+        seg = lambda P: float(np.sum(np.linalg.norm(np.diff(P[i0:i1 + 1], axis=0), axis=1)))
+        widths.append(0.5 * (seg(a.P) + seg(b.P)) or 1.0)
+    q, U, A = concat_arrays(items, widths)
+    G = A.reshape(len(A), nu, 3).transpose(1, 0, 2)
+    pts = [tuple(map(float, x)) for x in G.reshape(-1, 3)]
+    return ext.surface_from_cvs(int(deg_u), int(q), pts, [float(k) for k in knots_u], [float(k) for k in U])
+
+
+SPAN_MAX = 32          # Bezier spans: at most this many along the side
+
+
+def _pinned_fit(params, B, U, p, n_cvs, pins):
+    """Least squares on a given knot vector, with the CVs `pins` {cv index:
+    sample index} held on their samples (the ends, the side's joints)."""
+    A = interp_matrix(params, U, p, n_cvs)
+    X = np.zeros((n_cvs, B.shape[1]))
+    fixed = sorted(pins)
+    for c in fixed:
+        X[c] = B[pins[c]]
+    free = [c for c in range(n_cvs) if c not in pins]
+    if free:
+        R = B - A[:, fixed] @ X[fixed]
+        X[free] = np.linalg.lstsq(A[:, free], R, rcond=None)[0]
+    return X, A
+
+
+def _knot_vector(p, inner):
+    """Clamped knot vector on 0..1 from {value: multiplicity}."""
+    U = [0.0] * (p + 1)
+    for t in sorted(inner):
+        U += [t] * inner[t]
+    return U + [1.0] * (p + 1)
+
+
+def blend_loft_spans(a, b, breaks, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.0, cur_a=0.0, cur_b=0.0,
+                     degree=5, tol_angle=0.1, tol_curv=0.05, tol_gap_rel=1e-4, scale=None):
+    """The G0 / G1 / G2 blend between two sides' samples as a few Bezier
+    spans of one degree along the side, not a dense least-squares net.
+    Knots go where they are needed, not where the samples are: full
+    multiplicity at the side's joints `breaks` (sample indices -- the faces
+    there meet as they meet), then a G2 (C2) knot in the middle of every span
+    that does not hold, until each holds half the labels' tolerances (gap,
+    angle, curvature, as contlabels measures them). Symmetric sides give
+    symmetric knots. Returns (surface, number of spans, worst error over its
+    tolerance)."""
+    _, ext = _k()
+    ka = CONT_ORDER[cont_a] if a.has_surface else 0
+    kb = CONT_ORDER[cont_b] if b.has_surface else 0
+    n_deg = 1 + ka + kb
+    if scale is None:
+        scale = float(np.mean(np.linalg.norm(a.P - b.P, axis=1))) or 1.0
+    rows_a = _side_rows(a, cont_a, tan_a, cur_a, n_deg, scale)
+    rows_b = _side_rows(b, cont_b, tan_b, cur_b, n_deg, scale)
+    rows = rows_a + rows_b[::-1]
+    allp = np.vstack(rows)
+    size = float(np.linalg.norm(allp.max(axis=0) - allp.min(axis=0))) or 1.0
+    F, _ = _difference_rows(rows_a, rows_b, None, size)
+    q = max(int(degree), 3)
+    N = len(rows[0])
+
+    # what each fitted row is, and how far it may stray (half the labels' tolerances)
+    def kinds(n_rows, normals):
+        return [("edge", None), ("tan", None), ("curv", normals)][:n_rows]
+    kk = kinds(len(rows_a), getattr(a, "N", None)) + kinds(len(rows_b), getattr(b, "N", None))[::-1]
+    tols = []
+    for Fi, (kind, nrm) in zip(F, kk):
+        if kind == "edge":
+            L = float(np.sum(np.linalg.norm(np.diff(Fi, axis=0), axis=1)))
+            tols.append(np.full(N, max(0.5 * tol_gap_rel * L, 1e-9 * size)))
+        elif kind == "tan":
+            tols.append(np.maximum(np.tan(np.radians(0.5 * tol_angle)) * np.linalg.norm(Fi, axis=1), 1e-9 * size))
+        else:
+            big = np.abs(np.sum(Fi * nrm, axis=1)) if nrm is not None and len(nrm) == N else np.linalg.norm(Fi, axis=1)
+            tols.append(np.full(N, max(0.5 * tol_curv * float(np.max(big)), 1e-9 * size)))
+    params = row_params(rows)
+    B = np.hstack(F)
+    joints = sorted({int(j) for j in breaks if 0 < j < N - 1})
+    # G2 sides that know their normals: the edge row must also bend like the
+    # source along the edge -- a loft leaving at a lean measures its curvature
+    # straight across partly along the edge (lean^2), and a span within 5 um
+    # of a trim curve can still bend 10 % differently
+    bend_checks = []
+    for es, rows_s, kidx in ((a, rows_a, 0), (b, rows_b, len(F) - 1)):
+        Ns = getattr(es, "N", None)
+        if Ns is None or len(rows_s) < 3 or len(Ns) != N:
+            continue
+        Ns = Ns if kidx == 0 else Ns          # rows_b's samples run as a's (reversed with them)
+        P0 = rows_s[0]
+        Pt = np.gradient(P0, params, axis=0, edge_order=2)
+        Ptt = np.gradient(Pt, params, axis=0, edge_order=2)
+        k_src = np.sum(Ptt * Ns, axis=1) / np.maximum(np.sum(Pt * Pt, axis=1), 1e-30)
+        k_ref = max(float(np.max(np.abs(np.sum(F[kidx + (2 if kidx == 0 else -2)] * Ns, axis=1)))) /
+                    max((scale / n_deg) ** 2 / (n_deg - 1) * n_deg, 1e-30), float(np.max(np.abs(k_src))), 1e-9)
+        # and the tangent row must turn along the edge as the source's normal
+        # does (the mixed curvature: how the loft's normal turns along the edge,
+        # times the lean, is part of the curvature straight across)
+        tidx = kidx + 1 if kidx == 0 else kidx - 1
+        F1 = F[tidx]
+        m_src = np.sum(np.gradient(F1, params, axis=0, edge_order=2) * Ns, axis=1) / \
+            np.maximum(np.linalg.norm(F1, axis=1) * np.linalg.norm(Pt, axis=1), 1e-30)
+        bend_checks.append((kidx, Ns, k_src, 0.25 * tol_curv * k_ref, tidx, m_src))
+    h = 1e-4
+    # the lightest first: cubic spans with knots only at the joints (a straight
+    # edge stays 4 CVs); the span degree, splitting as needed, when they do not hold
+    for q, may_split in (((3, False), (q, True)) if q > 3 else ((q, True),)):
+        inner = {float(params[j]): q for j in joints}
+        res = _span_fit(q, inner, may_split, params, B, F, N, tols, joints, bend_checks)
+        if res[3] <= 1.0 or may_split:
+            break
+    U, X, inner, worst = res
+    G = _undifference_rows([X[:, 3 * i:3 * i + 3] for i in range(len(F))], len(rows_a), len(rows_b))
+    pts = [tuple(map(float, x)) for R in G for x in R]
+    knots_u = [0.0] * (n_deg + 1) + [1.0] * (n_deg + 1)
+    srf = ext.surface_from_cvs(n_deg, q, pts, knots_u, [float(k) for k in U])
+    return srf, len(sorted({0.0, 1.0, *inner})) - 1, worst
+
+
+def _span_fit(q, inner, may_split, params, B, F, N, tols, joints, bend_checks):
+    """The span loop of blend_loft_spans: fit on the knots `inner`, then split
+    every span out of tolerance (when may_split), until all hold. Returns
+    (knots, CV array, inner knots, worst error over its tolerance)."""
+    h = 1e-4
+    worst = None
+    for _ in range(4 * SPAN_MAX):
+        U = _knot_vector(q, inner)
+        n_cvs = len(U) - q - 1
+        A = interp_matrix(params, U, q, n_cvs)
+        pins = {0: 0, n_cvs - 1: N - 1}
+        for j in joints:                         # the CV the joint's sample sits on
+            c = int(np.argmax(A[j]))
+            if A[j, c] > 1.0 - 1e-9:
+                pins[c] = j
+        X, A = _pinned_fit(params, B, U, q, n_cvs, pins)
+        err = (A @ X - B).reshape(N, len(F), 3)
+        ratio = np.max(np.stack([np.linalg.norm(err[:, i], axis=1) / tols[i] for i in range(len(F))]), axis=0)
+        if bend_checks:
+            tp, tm = np.clip(params + h, 0.0, 1.0), np.clip(params - h, 0.0, 1.0)
+            Ap, Am = interp_matrix(tp, U, q, n_cvs), interp_matrix(tm, U, q, n_cvs)
+            for kidx, Ns, k_src, ktol, tidx, m_src in bend_checks:
+                Xe = X[:, 3 * kidx:3 * kidx + 3]
+                Pp, P0f, Pm = Ap @ Xe, A @ Xe, Am @ Xe
+                dt = (tp - tm)[:, None]
+                Pt = (Pp - Pm) / np.where(dt > 0, dt, 1.0)
+                Ptt = (Pp - 2 * P0f + Pm) / (h * h)
+                inner_ = (tp - params > 0.5 * h) & (params - tm > 0.5 * h)
+                k_fit = np.sum(Ptt * Ns, axis=1) / np.maximum(np.sum(Pt * Pt, axis=1), 1e-30)
+                Xt = X[:, 3 * tidx:3 * tidx + 3]
+                F1f = A @ Xt
+                dF1 = (Ap @ Xt - Am @ Xt) / np.where(dt > 0, dt, 1.0)
+                m_fit = np.sum(dF1 * Ns, axis=1) / np.maximum(np.linalg.norm(F1f, axis=1) * np.linalg.norm(Pt, axis=1), 1e-30)
+                r_ = np.where(inner_, np.maximum(np.abs(k_fit - k_src), np.abs(m_fit - m_src)) / ktol, 0.0)
+                for j in joints:                   # a joint's two sides bend as their faces do
+                    r_[max(j - 1, 0):j + 2] = 0.0
+                ratio = np.maximum(ratio, r_)
+        worst = float(ratio.max())
+        if worst <= 1.0 or not may_split:
+            break
+        # split every span that does not hold, in its middle (C2) -- if it
+        # still has samples enough for its new CVs
+        edges_ = sorted({0.0, 1.0, *inner})
+        spans_ = list(zip(edges_[:-1], edges_[1:]))
+        r_span = {sp: float(ratio[(params >= sp[0]) & (params <= sp[1])].max()) for sp in spans_}
+        todo = {sp for sp in spans_ if r_span[sp] > 1.0}
+        for lo, hi in list(todo):                 # its mirror too, when close (symmetric sides stay symmetric)
+            mir = min(spans_, key=lambda sp: abs(sp[0] - (1 - hi)) + abs(sp[1] - (1 - lo)))
+            if abs(mir[0] - (1 - hi)) + abs(mir[1] - (1 - lo)) < 1e-6 and r_span[mir] > 0.5:
+                todo.add(mir)
+        split = False
+        for lo, hi in sorted(todo):
+            if np.sum((params >= lo) & (params <= hi)) < 2 * (q + 1):
+                continue
+            if len(edges_) - 1 + split >= SPAN_MAX:
+                break
+            inner[0.5 * (lo + hi)] = max(q - 2, 1)
+            split = True
+        if not split:
+            break
+    return U, X, inner, worst
+
+
+def split_uv_spans(surf):
+    """An untrimmed surface cut at all its interior knots, both ways: one
+    Bezier patch per span (exact)."""
+    _, ext = _k()
+    out = []
+    for piece in split_v_spans(surf):
+        d = ext.surface_cvs(piece)
+        nu, nv = d["count_u"], d["count_v"]
+        G = np.array(d["points"], float).reshape(nu, nv, 3).transpose(1, 0, 2)
+        tr = ext.surface_from_cvs(int(d["degree_v"]), int(d["degree_u"]), [tuple(map(float, x)) for x in G.reshape(-1, 3)],
+                                  [float(k) for k in d["knots_v"]], [float(k) for k in d["knots_u"]])
+        for sub in split_v_spans(tr):              # (u, v swapped): back the other way round
+            e = ext.surface_cvs(sub)
+            H = np.array(e["points"], float).reshape(e["count_u"], e["count_v"], 3).transpose(1, 0, 2)
+            out.append(ext.surface_from_cvs(int(e["degree_v"]), int(e["degree_u"]),
+                                            [tuple(map(float, x)) for x in H.reshape(-1, 3)],
+                                            [float(k) for k in e["knots_v"]], [float(k) for k in e["knots_u"]]))
+    return out
+
+
+def split_v_spans(surf):
+    """An untrimmed surface cut at its interior v knots into its spans, each
+    a Bezier patch in v (knots raised to full multiplicity, exactly)."""
+    from .kernel.classa import insert_knot
+    _, ext = _k()
+    d = ext.surface_cvs(surf)
+    nu, nv, du, dv = d["count_u"], d["count_v"], int(d["degree_u"]), int(d["degree_v"])
+    if d.get("weights") and max(abs(w - 1.0) for w in d["weights"]) > 1e-12:
+        return [surf]
+    G = np.array(d["points"], float).reshape(nu, nv, 3)
+    A = G.transpose(1, 0, 2).reshape(nv, 3 * nu)
+    U = [float(k) for k in d["knots_v"]]
+    for t in sorted(set(U[dv + 1:-dv - 1])):
+        while sum(1 for k in U if k == t) < dv:
+            A, U = insert_knot(A, U, dv, t)
+            A = np.asarray(A, float)
+    br = sorted(set(U))
+    out = []
+    for j in range(len(br) - 1):
+        blk = A[j * dv:j * dv + dv + 1].reshape(dv + 1, nu, 3).transpose(1, 0, 2)
+        pts = [tuple(map(float, x)) for x in blk.reshape(-1, 3)]
+        out.append(ext.surface_from_cvs(du, dv, pts, [float(k) for k in d["knots_u"]],
+                                        [0.0] * (dv + 1) + [1.0] * (dv + 1)))
+    return out
+
+
 def blend_loft(a, b, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.0, cur_a=0.0, cur_b=0.0, fit_tol=1e-4,
-               degree_v=3):
-    """a, b: EdgeSample. Returns a kernel B-spline surface; u runs a -> b."""
+               degree_v=3, scale=None):
+    """a, b: EdgeSample. Returns a kernel B-spline surface; u runs a -> b.
+    scale: the length the tangent / curvature rows are measured in (default:
+    the mean distance between a and b)."""
     _, ext = _k()
     ka = CONT_ORDER[cont_a] if a.has_surface else 0
     kb = CONT_ORDER[cont_b] if b.has_surface else 0
     n_rows = 2 + ka + kb
     n_deg = n_rows - 1
-    scale = float(np.mean(np.linalg.norm(a.P - b.P, axis=1))) or 1.0
+    if scale is None:
+        scale = float(np.mean(np.linalg.norm(a.P - b.P, axis=1))) or 1.0
     rows_a = _side_rows(a, cont_a, tan_a, cur_a, n_deg, scale)
     rows_b = _side_rows(b, cont_b, tan_b, cur_b, n_deg, scale)
     rows = rows_a + rows_b[::-1]
@@ -876,7 +1203,7 @@ def blend_loft(a, b, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.0, cur_a=0.0, 
     # rows of a handle-to-bowl loft left its tangent 0.1-0.8 degrees off, the
     # result depending on Samples. The fit is linear in the rows, so the CVs
     # are the same as fitting the rows themselves.
-    F, tols = _difference_rows(rows_a, rows_b, tol, size)
+    F, tols = _difference_rows(rows_a, rows_b, tol, size, (getattr(a, "N", None), getattr(b, "N", None)))
     params = row_params(rows)
     fit = None
     if tol and degree_v < 3:

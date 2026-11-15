@@ -113,6 +113,25 @@ def target_side(obj, ref, m=160):
     return sample_side(obj, ref, m)
 
 
+def pieces(t):
+    """[(obj, ref)] of a target: one edge / curve (obj, ref), or a chain of
+    them (a list) -- an edge running along several trimmed edges."""
+    return list(t) if isinstance(t, list) else [t]
+
+
+def side_of(t, m=160):
+    """The Side along a target, a chain joined end to end (Loft's chained sides)."""
+    ps = pieces(t)
+    if len(ps) == 1:
+        return target_side(ps[0][0], ps[0][1], m)
+    from .loft_rails import chained_side
+    return chained_side(ps, m)
+
+
+def target_name(t):
+    return " + ".join(f"{o.name} {r}" for o, r in pieces(t))
+
+
 def _matched(side, E, mode="arc"):
     """Target data at the edge points E (m, 3, uniform in the edge's parameter),
     oriented like E. mode: "arc" equal arc length, "project" closest points,
@@ -328,15 +347,15 @@ def align_text(obj, text, jobs_, tangent=1.0, report=None, measure_only=False):
 
     sides = {}
     work = []
-    for edge, (tobj, tref), cont in jobs_:
+    for edge, tgt, cont in jobs_:
         if edge not in EDGES:
             raise RuntimeError(f"{edge} is not a boundary edge")
-        sd = target_side(tobj, tref)
+        sd = side_of(tgt)
         c = CONT[cont] if isinstance(cont, str) else int(cont)
         if not sd.has_surface and c > 0:
             c = 0                        # a curve only gives position
             if report is not None:
-                report.append(f"{edge}: {tobj.name} is a curve, aligned G0")
+                report.append(f"{edge}: {target_name(tgt)} is a curve, aligned G0")
         sides[edge] = sd
         work.append((edge, c))
     cmap = dict(work)
@@ -429,10 +448,13 @@ def overlaps(obj, edge, tobj, tref):
     return float(np.asarray(sd.B[k]) @ inward) < 0.0     # B points away from the target face
 
 
-def find_neighbour(obj, edge, cands, rel=0.05):
+def find_neighbour(obj, edge, cands, rel=0.05, chains=False):
     """(obj, ref) of the candidate edge / curve lying along `edge`, or None.
     cands: [(obj, ref, world points)] as the pick candidates. A surface lying on
-    the same side as obj (overlapping it) is only taken when nothing else fits."""
+    the same side as obj (overlapping it) is only taken when nothing else fits.
+    chains: when no single one fits, a list of edges (or curves) that each lie
+    on `edge` and together run along all of it (a loft's side over several
+    trimmed edges), in order along it."""
     surf = store.get_surfaces(obj)[0]
     M = geom.world_matrix(obj)
     E = np.array([tuple(M @ Vector(p)) for p in geom.boundary_points(surf, edge, 32)])
@@ -454,11 +476,52 @@ def find_neighbour(obj, edge, cands, rel=0.05):
                 return o, r
         except Exception:
             return o, r
-    return (scored[0][1], scored[0][2]) if scored else None
+    if scored:
+        return scored[0][1], scored[0][2]
+    return _find_chain(obj, edge, E, length, cands, rel) if chains else None
+
+
+def _find_chain(obj, edge, E, length, cands, rel):
+    """[(obj, ref)] in order along `edge`: the pieces lying on it that together
+    cover it (surface edges first, curves only when those don't), or None."""
+    on = []
+    for o, r, pts in cands:
+        if o == obj:
+            continue
+        P = np.array([tuple(p) for p in pts], float)
+        if len(P) < 2 or _poly_dist(P, E) > rel * length:
+            continue
+        piece_len = float(np.sum(np.linalg.norm(np.diff(P, axis=0), axis=1)))
+        if piece_len < 0.02 * length:
+            continue
+        try:
+            if overlaps(obj, edge, o, r):
+                continue
+        except Exception:
+            pass
+        on.append((o, r, P))
+    for kind in (lambda o: o.type != 'CURVE', lambda o: True):
+        use = [x for x in on if kind(x[0])]
+        if len(use) < 2:
+            continue
+        cover = np.min([[_poly_dist(e[None], x[2]) for x in use] for e in E], axis=1)
+        if float(np.mean(cover)) > rel * length:
+            continue
+        try:
+            ordered = features.chain_side([(o, r) for o, r, _ in use])
+        except Exception:
+            continue
+        return [(o, r) for o, r, _ in ordered]
+    return None
 
 
 def apply_surface_align(obj, text, inputs, p):
-    jobs_ = [(e, inp, c) for e, inp, c in zip(p["edges"], inputs, p["cont"])]
+    counts = p.get("targets") or [1] * len(p["edges"])
+    groups, k = [], 0
+    for n in counts:
+        groups.append(tuple(inputs[k]) if n == 1 else [tuple(x) for x in inputs[k:k + n]])
+        k += n
+    jobs_ = [(e, g, c) for e, g, c in zip(p["edges"], groups, p["cont"])]
     return align_text(obj, text, jobs_, float(p.get("tangent", 1.0)))
 
 
@@ -494,10 +557,11 @@ def _cont_prop(edge):
                         description=f"Continuity of edge {edge} to its neighbour")
 
 
-def parse_picks(picks):
+def parse_picks(picks, chains=False):
     """picks [(obj, ref)] -> (surface, [(edge, (target obj, ref) | None)]).
     The first pick names the surface; another of its edges adds an edge; a
-    pick on any other object is the target of the edge before it."""
+    pick on any other object is the target of the edge before it (chains:
+    several such picks in a row are a chained target, a list)."""
     if not picks:
         raise ValueError("pick an edge of an untrimmed surface first")
     obj = picks[0][0]
@@ -509,7 +573,14 @@ def parse_picks(picks):
             if r not in [e for e, _ in out]:
                 out.append([r, None])
         elif out:
-            out[-1][1] = (o, r)
+            if chains and out[-1][1] is not None:
+                out[-1][1] = pieces(out[-1][1]) + [(o, r)]
+            else:
+                out[-1][1] = (o, r)
+    if chains:
+        for x in out:
+            if isinstance(x[1], list):
+                x[1] = [(o, r) for o, r, _ in features.chain_side(x[1])]   # in order along the edge
     return obj, [tuple(x) for x in out]
 
 
@@ -555,9 +626,10 @@ class EdgePicking(PickMixin):
         context.area.tag_redraw()
         return cur
 
-    def picked_jobs(self, context, verb="aligned"):
-        """(surface, [(edge, (target obj, ref), continuity)]) from the picks."""
-        obj, edges = parse_picks(_decode_inputs(self.inputs))
+    def picked_jobs(self, context, verb="aligned", chains=False):
+        """(surface, [(edge, (target obj, ref), continuity)]) from the picks
+        (chains: a target may be a list of edges along the edge, see find_neighbour)."""
+        obj, edges = parse_picks(_decode_inputs(self.inputs), chains)
         if not store.is_natural(obj) or store.get_brep(obj).face_count() != 1:
             raise ValueError(f"{obj.name} is trimmed: only untrimmed single surfaces can be {verb} "
                              "(Refit to Trim first)")
@@ -567,7 +639,7 @@ class EdgePicking(PickMixin):
             if tgt is None:
                 if cands is None:
                     cands = [c for c in _pick_candidates(context) if c[0] != obj]
-                tgt = find_neighbour(obj, e, cands)
+                tgt = find_neighbour(obj, e, cands, chains=chains)
                 if tgt is None:
                     raise ValueError(f"no surface edge or curve touches {e}: pick its target right after the edge")
             jobs_.append((e, tgt, getattr(self, "cont_" + e)))
@@ -592,12 +664,12 @@ class NPROTO_OT_surface_align(EdgePicking, bpy.types.Operator):
                            description="Scale of the cross tangent at the aligned edges (G1 / G2)")
 
     def _jobs(self, context):
-        return self.picked_jobs(context, "aligned")
+        return self.picked_jobs(context, "aligned", chains=True)
 
     def draw(self, context):
         lay = self.layout
         try:
-            _, edges = parse_picks(_decode_inputs(self.inputs))
+            _, edges = parse_picks(_decode_inputs(self.inputs), chains=True)
         except Exception:
             edges = []
         col = lay.column(align=True)
@@ -621,7 +693,9 @@ class NPROTO_OT_surface_align(EdgePicking, bpy.types.Operator):
             if hist:
                 p = {"edges": [e for e, _, _ in jobs_], "cont": [c for _, _, c in jobs_],
                      "tangent": float(self.tangent)}
-                features.push_step(obj, "surface_align", [t for _, t, _ in jobs_], p)
+                if any(isinstance(t, list) for _, t, _ in jobs_):
+                    p["targets"] = [len(pieces(t)) for _, t, _ in jobs_]
+                features.push_step(obj, "surface_align", [x for _, t, _ in jobs_ for x in pieces(t)], p)
                 features.rebuild(obj, context, force=True)
                 align_text(obj, obj[store.PROP_BREP], jobs_, report=msgs, measure_only=True)
             else:
@@ -641,16 +715,17 @@ class NPROTO_OT_surface_align(EdgePicking, bpy.types.Operator):
         try:
             from .contlabels import measure
             for e, t, c in jobs_:
-                if overlaps(obj, e, *t):
-                    bad.append(f"{e}: {t[0].name} {t[1]} lies on the same side (overlapping surface)")
-                chk = measure(obj, t[0], t[1], CONT[c])
-                if not chk["ok"]:
-                    bad.append(f"{e} {c} {chk['text']}")
+                for to, tr in pieces(t):
+                    if overlaps(obj, e, to, tr):
+                        bad.append(f"{e}: {to.name} {tr} lies on the same side (overlapping surface)")
+                    chk = measure(obj, to, tr, CONT[c])
+                    if not chk["ok"]:
+                        bad.append(f"{e} {c} to {to.name} {tr}: {chk['text']}")
         except Exception as exc:
             print("NURBS surface align check:", exc)
         if bad:
             self.report({'WARNING'}, "Surface Align: " + "; ".join(bad))
-        names = ", ".join(f"{e}→{t[0].name} {t[1]} {c}" for e, t, c in jobs_)
+        names = ", ".join(f"{e}→{target_name(t)} {c}" for e, t, c in jobs_)
         self.report({'INFO'}, f"Aligned {names}" + (f"  ({'; '.join(msgs)})" if msgs else ""))
         _select_only(context, [obj])
         return {'FINISHED'}

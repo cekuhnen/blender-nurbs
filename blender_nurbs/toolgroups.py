@@ -61,8 +61,7 @@ GROUPS = (
              _t("nproto.planar", icon='MESH_PLANE')),
         )),
         ("Fill a Gap", (
-            (_t("nproto.boundary", icon='MESH_GRID'), _t("nproto.square", icon='MESH_PLANE'),
-             _t("nproto.patch", icon='MOD_TRIANGULATE')),
+            (_t("nproto.boundary", icon='MESH_GRID'), _t("nproto.patch", icon='MOD_TRIANGULATE')),
             (_t("nproto.dome", icon='MESH_UVSPHERE'),),
         )),
         ("From Surfaces", (
