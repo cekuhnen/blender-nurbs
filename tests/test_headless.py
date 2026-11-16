@@ -152,6 +152,30 @@ _gap_p = max(np.linalg.norm(_cp((np.linalg.inv(_Mrp) @ np.append(q_, 1.0))[:3]) 
              for q_ in _rot(_S[::8], np.array(_ap), _z, 150.0))
 _rp.nproto_feature.angle = 90.0           # edit in the Feature box: rebuilds from the history
 _hp = features.history(_rp)["params"]
+# the user's case: profile and axis line both selected, the line picked as the axis -> the line is
+# left out (turned about itself it has no surface: the kernel refused the face), the profile revolves,
+# and a failed object is not left behind
+_ucv = nurbs("UCurve", [(0.6425, 0, 0.3741), (0.3886, 0, 0.2942), (0.3517, 0, 0.0999), (0.4261, 0, -0.1368)])
+_uln = bpy.data.curves.new("ULine", 'CURVE'); _uln.dimensions = '3D'
+_usp = _uln.splines.new('POLY'); _usp.points.add(1)
+_usp.points[0].co = (0.8344, 0, 0.293, 1.0); _usp.points[1].co = (0.8344, 0, -0.1146, 1.0)
+_ulo = bpy.data.objects.new("ULine", _uln); ctx.collection.objects.link(_ulo)
+_n0 = len(bpy.data.objects)
+r_u = bpy.ops.nproto.revolve(inputs=ins((_ucv, "S0"), (_ulo, "S0")), angle=331.75, axis="PICKED",
+                             axis_point=(0.8344, 0, 0.293), axis_dir=(0, 0, -1))
+_umade = [o_ for o_ in bpy.data.objects if o_.name.startswith("Revolve") and o_ not in (_rp,)]
+_n1 = len(bpy.data.objects)
+_bad_g = features.run("revolve", [(_ulo, "S0")], {"angle": 90.0, "axis": "PICKED", "axis_point": (0.8344, 0, 0.293),
+                                                  "axis_dir": (0, 0, -1)})
+_nb = len(bpy.data.objects)
+try:
+    store.new_object(ctx, "ShouldNotStay", _bad_g); _raised = False
+except Exception:
+    _raised = True
+check("revolve: a selected curve on the picked axis is left out, the profile revolves; a failed object is removed",
+      r_u == {'FINISHED'} and _n1 == _n0 + 1 and _raised and len(bpy.data.objects) == _nb
+      and "ShouldNotStay" not in bpy.data.objects,
+      (r_u, _n1 - _n0, _raised, len(bpy.data.objects) - _nb))
 check("revolve about a picked line: on the preview's rotation; a Feature box edit keeps the line",
       r == {'FINISHED'} and _gap_p < 1e-5 and _hp["axis"] == "PICKED" and abs(_hp["angle"] - 90.0) < 1e-9
       and np.allclose(_hp["axis_point"], _ap) and np.allclose(_hp["axis_dir"], _ad, atol=1e-6),

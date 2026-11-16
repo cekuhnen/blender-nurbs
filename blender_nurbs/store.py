@@ -1305,8 +1305,19 @@ def new_object(context, name, geom, matrix=None):
     coll.objects.link(obj)
     if matrix is not None:
         obj.matrix_world = matrix
-    set_geometry(obj, geom, context)
+    try:
+        set_geometry(obj, geom, context)
+    except Exception:
+        _discard(obj)          # no empty object left behind (and no undo step to remove it)
+        raise
     return obj
+
+
+def _discard(obj):
+    me = obj.data
+    bpy.data.objects.remove(obj)
+    if me is not None and me.users == 0:
+        bpy.data.meshes.remove(me)
 
 
 def new_object_text(context, name, text, matrix=None):
@@ -1317,7 +1328,11 @@ def new_object_text(context, name, text, matrix=None):
     coll.objects.link(obj)
     if matrix is not None:
         obj.matrix_world = matrix
-    set_geometry_text(obj, text, context, keep_untrimmed=False)
+    try:
+        set_geometry_text(obj, text, context, keep_untrimmed=False)
+    except Exception:
+        _discard(obj)
+        raise
     return obj
 
 

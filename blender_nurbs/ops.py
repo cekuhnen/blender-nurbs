@@ -154,6 +154,17 @@ def _near_candidates(context, event, cands, max_px=18.0, tie_px=4.0):
     return ties
 
 
+def _on_axis(S, O, z, rel_tol=1e-6):
+    """Do the points S lie on the axis through O along z (all, within a
+    millionth of their size)?"""
+    S = np.asarray(S, float)
+    rel = S - np.asarray(O, float)
+    z = np.asarray(z, float)
+    rad = np.linalg.norm(rel - np.outer(rel @ z, z), axis=1)
+    size = float(np.ptp(S, axis=0).max()) or float(np.linalg.norm(rel, axis=1).max()) or 1.0
+    return float(rad.max()) <= rel_tol * size
+
+
 class _RegionMouse:
     """A mouse position (region pixels), standing in for an event."""
 
@@ -927,15 +938,27 @@ class _CurveTool(PickMixin):
     def execute(self, context):
         if not _kernel_ok(self):
             return {'CANCELLED'}
-        made = []
         try:
-            for inp in _decode_inputs(self.inputs):
-                made.append(_make_result(context, self.bl_label, self.op_name, [inp], self.params()))
+            ins = self.usable_inputs(_decode_inputs(self.inputs))
         except Exception as exc:
             self.report({'ERROR'}, f"{self.bl_label} failed: {exc}")
             return {'CANCELLED'}
+        made, failed = [], []
+        for inp in ins:            # one curve that fails doesn't take the others with it
+            try:
+                made.append(_make_result(context, self.bl_label, self.op_name, [inp], self.params()))
+            except Exception as exc:
+                failed.append(f"{inp[0].name}: {exc}")
+        if failed:
+            self.report({'ERROR'} if not made else {'WARNING'}, f"{self.bl_label} failed on " + "; ".join(failed))
+        if not made:
+            return {'CANCELLED'}
         _select_only(context, made)
         return {'FINISHED'}
+
+    def usable_inputs(self, ins):
+        """The inputs to make results from (a tool may leave some out, saying why)."""
+        return ins
 
 
 def _smooth_draft_normals(P, d, closed, flip):
@@ -1156,11 +1179,27 @@ class NPROTO_OT_revolve(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
     ask_dialog = False          # Value Input = Dialog: revolve at once, as it always did
     AXES = {"x": "X", "y": "Y", "z": "Z"}
 
+    def usable_inputs(self, ins):
+        """Leave out a curve lying on the axis (the line picked for it, still
+        selected): turned about itself it sweeps no surface, and the kernel
+        refuses to make a face of it."""
+        keep, skip = [], []
+        for obj, ref in ins:
+            S = geom.sample_curve(features.input_curve(obj, ref), 33)
+            (skip if _on_axis(S, *features.revolve_axis(obj, self.params())) else keep).append((obj, ref))
+        if skip:
+            self.report({'INFO'} if keep else {'ERROR'},
+                        ", ".join(o.name for o, _ in skip) + (" lies" if len(skip) == 1 else " lie")
+                        + " on the axis: not revolved" + ("" if keep else " -- pick a profile off the axis"))
+        return keep
+
     def drag_setup(self, context, mouse):
         self._rv = []
         for obj, ref in _decode_inputs(self.inputs):
             curve = features.input_curve(obj, ref)
-            self._rv.append((obj, geom.sample_curve(curve, 97)))
+            self._rv.append((obj, geom.sample_curve(curve, 97), ref))
+        self._rv_all = list(self._rv)
+        self._drop_on_axis()
         if not self._rv:
             return False
         self._mouse0 = mouse
@@ -1169,8 +1208,13 @@ class NPROTO_OT_revolve(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
         return True
 
     def _axis(self):
-        O, z = features.revolve_axis(self._rv[0][0], self.params())
+        O, z = features.revolve_axis(self._rv_all[0][0], self.params())
         return np.array(O, float), np.array(z, float)
+
+    def _drop_on_axis(self):
+        """The previewed profiles: those off the axis (as usable_inputs)."""
+        keep = [r for r in self._rv_all if not _on_axis(r[1], *features.revolve_axis(r[0], self.params()))]
+        self._rv = keep or self._rv_all[:1]
 
     def _place(self, context):
         """The handle's foot: the profile point clicked (when it was picked
@@ -1217,14 +1261,14 @@ class NPROTO_OT_revolve(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
         a = self.angle
         m = max(2, int(math.ceil(abs(a) / 7.5)) + 1)
         lines, tris = [], []
-        for obj, S in self._rv:
+        for obj, S, _ in self._rv:
             rows = [rotate_points(S, O, z, a * i / (m - 1)) for i in range(m)]
             L, T = ruled_preview(rows, ribs=8, row_every=3)
             lines += L
             tris.append(T)
         # the axis, a little longer than the profile reaches along it
-        h = np.concatenate([(S - O) @ z for _, S in self._rv])
-        size = float(np.ptp(np.vstack([S for _, S in self._rv]), axis=0).max()) or 1.0
+        h = np.concatenate([(S - O) @ z for _, S, _ in self._rv])
+        size = float(np.ptp(np.vstack([S for _, S, _ in self._rv]), axis=0).max()) or 1.0
         pad = max(0.15 * float(np.ptp(h)), 0.5 * size)     # visible even when the profile hardly runs along it
         axis = np.array([O + z * (h.min() - pad), O + z * (h.max() + pad)])
         return {"lines": lines, "tris": np.vstack(tris), "guides": [(axis, (0.55, 0.85, 1.0, 0.9))]}
@@ -1232,6 +1276,8 @@ class NPROTO_OT_revolve(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
     def drag_check(self):
         if abs(self.angle) < 0.05:
             return "Angle 0: drag the handle around the axis, or type an angle"
+        if all(_on_axis(r[1], *features.revolve_axis(r[0], self.params())) for r in self._rv):
+            return "the profile lies on the axis: pick another axis (A, X Y Z)"
         return ""
 
     def drag_key(self, context, event, ch):
@@ -1247,6 +1293,7 @@ class NPROTO_OT_revolve(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
             self.angle = -self.angle
         else:
             return False
+        self._drop_on_axis()
         self._place(context)
         return True
 
@@ -1269,9 +1316,9 @@ class NPROTO_OT_revolve(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
 
     # -- A: pick the axis (a line, an open curve, a straight edge) ------------
     def _start_axis_pick(self, context):
-        ins = {(o.name, r) for o, r in _decode_inputs(self.inputs)}
-        self._axis_cands = [c for c in _pick_candidates(context) if (c[0].name, c[1]) not in ins
-                            and np.linalg.norm(np.asarray(c[2][-1]) - np.asarray(c[2][0])) > 1e-9]
+        # a selected curve may be the axis too (select the profile and the line, then A)
+        self._axis_cands = [c for c in _pick_candidates(context)
+                            if np.linalg.norm(np.asarray(c[2][-1]) - np.asarray(c[2][0])) > 1e-9]
         self._axis_hover = None
         self._picking_axis = True
         draw.pick_overlay["hover"] = None
@@ -1307,12 +1354,22 @@ class NPROTO_OT_revolve(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
             self._drag_refresh(context)
             return {'RUNNING_MODAL'}
         if et == 'LEFTMOUSE' and self._axis_hover is not None:
+            key = (self._axis_hover[0].name, self._axis_hover[1])
+            ins = [(o, r) for o, r in _decode_inputs(self.inputs)]
+            rest = [(o, r) for o, r in ins if (o.name, r) != key]
+            if not rest:
+                self._msg = "that is the profile: pick another line for the axis"
+                return {'RUNNING_MODAL'}
+            if len(rest) < len(ins):            # the picked line was selected with the profile: no longer one
+                self.inputs = _encode_inputs(rest)
+                self._rv_all = [r for r in self._rv_all if (r[0].name, r[2]) != key]
             pts = self._axis_hover[2]
             p0, p1 = np.asarray(pts[0], float), np.asarray(pts[-1], float)
             self.axis_point = tuple(p0)
             self.axis_dir = tuple((p1 - p0) / np.linalg.norm(p1 - p0))
             self.axis = "PICKED"
             self._end_axis_pick(context)
+            self._drop_on_axis()
             self._place(context)
             self._drag_refresh(context)
             return {'RUNNING_MODAL'}
