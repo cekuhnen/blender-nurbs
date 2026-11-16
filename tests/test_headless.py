@@ -2223,6 +2223,23 @@ check("sweep from the rail's end matches the sweep from its start",
       all(np.allclose(bb["SwProfEnd"][i], bb["SwProfStart"][i], atol=1e-3) for i in (0, 1)) and bb["SwProfEnd"][1][1] < 101.6,
       str({k: (np.round(v[0], 3).tolist(), np.round(v[1], 3).tolist()) for k, v in bb.items()}))
 
+# --- Sweep: an exact circle along a path that runs straight, then bends (a user's tube): the row fit
+# used 28 CVs on 32 rows with a first knot span holding no row; the tube folded back behind its profile
+from blender_nurbs import primitives as _prm
+_tr = nurbs("SwTubePath", [(0, 200, 0), (0, 200.3048, 0), (0, 200.9144, 0), (0.3573, 201.47, 0), (1.2798, 201.648, 0),
+                           (1.4625, 200.701, 0), (1.8627, 200.6642, 0)], order=4)
+_tc = bpy.data.objects.new("SwTubeProf", bpy.data.curves.new("SwTubeProf", 'CURVE')); ctx.collection.objects.link(_tc)
+_prm.write_spline_object(_tc, _prm.exact_circle_spec(0.1016))
+_tc.location = (0, 200, 0); _tc.rotation_euler = (math.pi / 2, 0, math.pi); ctx.view_layer.update()
+_ts = features.run("sweep", [(_tc, "S0"), (_tr, "S0")], {"samples": 32})
+_tk = features.input_curve(_tr, "S0")
+_RP = np.array([_tk.evaluate(t) for t in np.linspace(*_tk.parameter_range(), 6000)])
+(_u0, _u1), (_v0, _v1) = _ts.u_domain(), _ts.v_domain()
+_X = np.array([_ts.evaluate(u, v) for u in np.linspace(_u0, _u1, 161) for v in np.linspace(_v0, _v1, 16)])
+_rerr = max(abs(float(np.min(np.linalg.norm(_RP - x, axis=1))) - 0.1016) for x in _X)
+check("sweep: a circle along a straight-then-bent path stays a round tube, nothing behind the profile",
+      _rerr < 1e-3 and _X[:, 1].min() > 200 - 1e-6, f"radius error {_rerr:.5f}, min y {_X[:, 1].min() - 200:.5f}")
+
 
 # --- Loft Rails: profiles + 0 / 1 / 2 rails, G0 / G1 / G2
 from blender_nurbs import loft_rails, square as _sqm

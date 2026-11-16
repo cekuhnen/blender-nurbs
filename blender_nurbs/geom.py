@@ -147,6 +147,8 @@ def fit_rows(rows, degree=3, tol=None, fallback=True, max_cvs=None, params=None)
     if tols is not None and np.all(tols > 0):
         for n_cvs in range(p + 1, N if max_cvs is None else min(N, max_cvs + 1)):
             U = _ls_knots(params, n_cvs, p)
+            if _empty_span(params, U):
+                continue
             X = _ls_fit(params, B, U, p, n_cvs)
             A = interp_matrix(params, U, p, n_cvs)
             err = np.abs(A @ X - B).reshape(N, -1, 3)
@@ -178,6 +180,20 @@ def _ls_knots(params, n_cvs, p):
         U.append((1 - a) * params[i - 1] + a * params[i])
     U += [1.0] * (p + 1)
     return U
+
+
+def _empty_span(params, U):
+    """True when a knot span holds no sample strictly inside it: nothing pins
+    the curve there, and a fit with nearly as many CVs as samples swings its
+    end CVs freely (a sweep with 28 CVs on 32 rows got a first span of 0.009
+    with no sample in it and folded back behind its profile)."""
+    t = np.asarray(params, float)
+    ks = np.unique(np.asarray(U, float))
+    eps = 1e-12 * max(1.0, float(ks[-1] - ks[0]))
+    for a, b in zip(ks[:-1], ks[1:]):
+        if not np.any((t > a + eps) & (t < b - eps)):
+            return True
+    return False
 
 
 def _ls_fit(params, B, U, p, n_cvs):
