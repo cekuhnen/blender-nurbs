@@ -751,6 +751,66 @@ def _deviation_to_faces(net, faces, m=25):
 
 
 # ---------------------------------------------------------------------------
+# deviation map: signed distance from the merged surface to the patches
+# ---------------------------------------------------------------------------
+
+def _eval_pts(net, u, v):
+    """Points and first derivatives at scattered parameters (u[i], v[i])."""
+    P = net["P"]
+    u, v = np.clip(u, 0.0, 1.0), np.clip(v, 0.0, 1.0)
+    Bu, Bv = _basis(net["Uu"], net["pu"], u), _basis(net["Uv"], net["pv"], v)
+    Bu1, Bv1 = _basis(net["Uu"], net["pu"], u, 1), _basis(net["Uv"], net["pv"], v, 1)
+    H = np.einsum("ia,abk,ib->ik", Bu, P, Bv)
+    Hu = np.einsum("ia,abk,ib->ik", Bu1, P, Bv)
+    Hv = np.einsum("ia,abk,ib->ik", Bu, P, Bv1)
+    w = H[:, 3:]
+    S = H[:, :3] / w
+    return S, (Hu[:, :3] - Hu[:, 3:] * S) / w, (Hv[:, :3] - Hv[:, 3:] * S) / w
+
+
+def _project(net, Q, u, v, iters=8):
+    """Feet of the points Q on the net (Newton from (u, v))."""
+    for _ in range(iters):
+        S, Su, Sv = _eval_pts(net, u, v)
+        r = S - Q
+        a, b, c = (Su * Su).sum(1), (Su * Sv).sum(1), (Sv * Sv).sum(1)
+        gu, gv = (Su * r).sum(1), (Sv * r).sum(1)
+        det = a * c - b * b
+        det = np.where(np.abs(det) > 1e-300, det, 1e-300)
+        u = np.clip(u - (c * gu - b * gv) / det, 0.0, 1.0)
+        v = np.clip(v - (a * gv - b * gu) / det, 0.0, 1.0)
+    return _eval_pts(net, u, v)[0]
+
+
+def deviation_map(out, ref_net=None, faces=None, max_per_dir=160):
+    """Signed distance (along the merged surface's normal: + above the
+    patches) at a grid on the merged surface, for drawing. ref_net: the exact
+    merged patches (Newton feet); else faces (the kernel's closest points).
+    Returns (P, N, T, V) as float32 / int32 arrays (local space)."""
+    def params(U):
+        spans = max(1, len(_inner(U)) + 1)
+        cap, want = (max_per_dir, 60) if ref_net is not None else (41, 41)
+        return _dense_params(U, int(np.clip(-(-want // spans), 2, max(2, cap // spans))))
+    su, sv = params(out["Uu"]), params(out["Uv"])
+    S = eval_d(out, su, sv)
+    N = np.cross(eval_d(out, su, sv, 1, 0), eval_d(out, su, sv, 0, 1))
+    N /= np.linalg.norm(N, axis=2, keepdims=True).clip(1e-300)
+    nu, nv = len(su), len(sv)
+    Q, Nf = S.reshape(-1, 3), N.reshape(-1, 3)
+    if ref_net is not None:
+        uu, vv = np.meshgrid(su, sv, indexing="ij")
+        F = _project(ref_net, Q, uu.ravel(), vv.ravel())
+    else:
+        F = np.array([min((f.closest_point(tuple(float(c) for c in q)) for f in faces), key=lambda h: h[1])[0]
+                      for q in Q], float)
+    V = ((Q - F) * Nf).sum(1)
+    i, j = np.meshgrid(np.arange(nu - 1), np.arange(nv - 1), indexing="ij")
+    a = (i * nv + j).ravel()
+    T = np.r_["0,2", np.c_[a, a + nv, a + nv + 1], np.c_[a, a + nv + 1, a + 1]]
+    return Q.astype(np.float32), Nf.astype(np.float32), T.astype(np.int32), V.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 
 def _cont_dict(cont):
     """cont: one value for every side or {side: value}; values -1/0/1/2 or
@@ -762,7 +822,7 @@ def _cont_dict(cont):
 
 
 def merge_text(text, mode="REDUCE", tol=0.0, degree=3, spans_u=0, spans_v=0, tol_rel=1e-4, cont="G2", edge_tol=0.0,
-               knots="ADAPTIVE", seams="KEEP"):
+               knots="ADAPTIVE", seams="KEEP", devmap=False):
     """Brep text of the single merged surface. Returns (text, info).
     tol: absolute tolerance (0 = tol_rel x size); cont: edge continuity kept
     (per side or one for all); edge_tol: edge position tolerance (0 = tol/10)."""
@@ -851,6 +911,11 @@ def merge_text(text, mode="REDUCE", tol=0.0, degree=3, spans_u=0, spans_v=0, tol
         dev = max(dev, _deviation_to_faces(out, faces))
     if merged is not None and mode != "EXACT":
         dev = max(dev, _deviation_to_faces(out, faces, 17))
+    if devmap:
+        try:
+            info["devmap"] = deviation_map(out, merged) if merged is not None else deviation_map(out, faces=faces)
+        except Exception as exc:          # a map is a display aid: never fail the merge for it
+            print(f"Merge Patches deviation map: {exc}")
     P, nu, nv = out["P"], out["P"].shape[0], out["P"].shape[1]
     X = _xyz(P)
     W = P[..., 3]
@@ -873,12 +938,26 @@ def params_cont(p):
     return {s: p.get(CONT_KEYS[s], "G2") for s in SIDES}
 
 
+DEVMAP = {}               # {"obj": name, "data": (P, N, T, V), "tol": tolerance, "id": n}: the map drawn
+WANT_DEVMAP = [False]     # set by the operator while it runs (a display aid, not a history setting)
+
+
 def apply_merge(obj, text, inputs, p):
+    want = WANT_DEVMAP[0]
     out, info = merge_text(text, p.get("merge_mode", "REDUCE"), float(p.get("merge_tolerance", 0.0)),
                            int(p.get("merge_degree", 3)), int(p.get("merge_spans_u", 0)),
                            int(p.get("merge_spans_v", 0)), cont=params_cont(p),
                            edge_tol=float(p.get("merge_edge_tolerance", 0.0)),
-                           knots=p.get("merge_knots", "ADAPTIVE"), seams=p.get("merge_seams", "KEEP"))
+                           knots=p.get("merge_knots", "ADAPTIVE"), seams=p.get("merge_seams", "KEEP"),
+                           devmap=want)
+    dm = info.pop("devmap", None)
+    if dm is not None:
+        V = np.abs(dm[3])
+        info["devmap_outside"] = float(np.mean(V > info["tolerance"])) if len(V) else 0.0
+        info["devmap_max"] = float(V.max()) if len(V) else 0.0
+        DEVMAP.update(obj=obj.name, data=dm, tol=info["tolerance"], id=DEVMAP.get("id", 0) + 1)
+    elif want is False:
+        DEVMAP.clear()
     LAST_INFO.clear()
     LAST_INFO.update(info)
     return out

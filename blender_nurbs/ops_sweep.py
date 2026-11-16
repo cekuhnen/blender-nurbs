@@ -624,6 +624,10 @@ class NPROTO_OT_merge_patches(bpy.types.Operator):
                                            "0 = the fewest within the tolerance")
     merge_knots: EnumProperty(name="Knots", items=MERGE_KNOTS, default="ADAPTIVE",
                               description="Where Refit puts its knots")
+    merge_show_dev: BoolProperty(name="Deviation Map", default=True,
+                                 description="Colour the result by its distance from the patches while this panel "
+                                             "is open: blue below, green on, red above (the ramp spans "
+                                             "minus to plus the tolerance; contour lines every tenth)")
     merge_seams: EnumProperty(name="Seams", items=MERGE_SEAMS, default="KEEP",
                               description="What Refit does at seams that are not smooth")
     merge_edges: EnumProperty(name="Edges", items=MERGE_CONT, default="G2", update=_merge_set_all,
@@ -728,6 +732,13 @@ class NPROTO_OT_merge_patches(bpy.types.Operator):
             lay.label(text=f"deviation {dist(inf['deviation'])}" + (f" > tolerance {dist(inf['tolerance'])}" if over else ""),
                       icon='ERROR' if over else 'CHECKMARK')
             lay.alert = False
+            row = lay.row(align=True)
+            row.prop(self, "merge_show_dev")
+            if self.merge_show_dev and "devmap_max" in inf:
+                out_ = inf.get("devmap_outside", 0.0)
+                row.label(text=f"max {dist(inf['devmap_max'])}" + (f" · {100 * out_:.1f}% over" if out_ > 0 else ""))
+                lay.label(text=f"blue -{dist(inf['tolerance'])} · green on · red +{dist(inf['tolerance'])}",
+                          icon='BLANK1')
             cont = inf.get("continuity", {})
             kept = [s_ for s_ in ("u0", "u1", "v0", "v1") if cont.get(s_, -1) >= 0]
             if self.merge_mode != "EXACT" and kept:
@@ -754,6 +765,18 @@ class NPROTO_OT_merge_patches(bpy.types.Operator):
             return {'CANCELLED'}
         p = self._params()
         done = []
+        merge.WANT_DEVMAP[0] = bool(self.merge_show_dev)
+        try:
+            self._run(context, objs, p, done)
+        finally:
+            merge.WANT_DEVMAP[0] = False
+        if not done:
+            return {'CANCELLED'}
+        _select_only(context, done)
+        return {'FINISHED'}
+
+    def _run(self, context, objs, p, done):
+        from . import merge
         for o in objs:
             try:
                 if features.history_enabled(context):
@@ -773,10 +796,6 @@ class NPROTO_OT_merge_patches(bpy.types.Operator):
                     except Exception:
                         pass
                 self.report({'ERROR'}, f"{o.name}: {exc}")
-        if not done:
-            return {'CANCELLED'}
-        _select_only(context, done)
-        return {'FINISHED'}
 
 
 class NPROTO_OT_rebuild_surface(bpy.types.Operator):

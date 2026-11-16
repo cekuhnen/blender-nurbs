@@ -9437,6 +9437,7 @@ for _o in _sobjs:
 ctx.view_layer.objects.active = _sobjs[0]
 bpy.ops.nproto.join()
 _SJ = ctx.active_object
+_SJ_text = _SJ[store.PROP_BREP]
 _sAs = _smk(_sA, _sUA)
 
 def _snbr(out_text):
@@ -9545,6 +9546,28 @@ bpy.ops.object.select_all(action='DESELECT')
 _SJ.select_set(True)
 ctx.view_layer.objects.active = _SJ
 r = bpy.ops.nproto.merge_patches(merge_mode="REFIT", merge_knots="UNIFORM")
+_dmap_ok = False
+try:
+    from blender_nurbs import draw as _dr
+    _dops = ctx.window_manager.operators       # (in the background the redo list may not hold it)
+    _dpanel = bool(_dops) and _dops[-1].bl_idname in ("NPROTO_OT_merge_patches", "nproto.merge_patches")
+    _dmap_ok = (_dr.merge_devmap_shown(ctx) is not None) == _dpanel and _mg.DEVMAP["obj"] == _SJ.name
+except Exception as exc:
+    _dmap_ok = repr(exc)
+_dP, _dN, _dT, _dV = _mg.DEVMAP.get("data", ([], [], [], []))
+_dt, _di = _mg.merge_text(_SJ_text, "REFIT", 0, 5, cont="FREE", knots="UNIFORM", devmap=True)
+_dfc = store.brep_from_text(_SJ_text).faces()
+_dk = np.random.default_rng(1).choice(len(_di["devmap"][0]), 60, replace=False)
+_dkd = np.array([min(f_.closest_point(tuple(map(float, _di["devmap"][0][k_])))[1] for f_ in _dfc) for k_ in _dk])
+check("merge patches deviation map: its distances agree with the kernel's closest points to the patches",
+      float(np.abs(_dkd - np.abs(_di["devmap"][3][_dk])).max()) < 0.05 * _di["tolerance"]
+      and float(np.abs(_di["devmap"][3]).max()) > 0.2 * _di["deviation"],
+      (f"{float(np.abs(_dkd - np.abs(_di['devmap'][3][_dk])).max()):.1e}", f"{_di['deviation']:.1e}"))
+check("merge patches deviation map: drawn while the panel is open, a mesh with one value per point, "
+      "its largest value the reported deviation",
+      _dmap_ok is True and len(_dT) > 0 and len(_dV) == len(_dP)
+      and abs(float(np.abs(_dV).max()) - _mg.LAST_INFO["deviation"]) <= 0.2 * _mg.LAST_INFO["deviation"] + 1e-12,
+      (_dmap_ok, len(_dP), float(np.abs(_dV).max()) if len(_dV) else None, _mg.LAST_INFO.get("deviation")))
 check("merge patches operator: Knots option reaches the history step", r == {'FINISHED'}
       and features.stack(_SJ)[-1]["op"] == "merge_patches"
       and features.stack(_SJ)[-1]["params"].get("merge_knots") == "UNIFORM")

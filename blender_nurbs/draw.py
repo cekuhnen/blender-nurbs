@@ -305,6 +305,35 @@ def _rebuild_preview_active(ctx):
     return bool(ops) and ops[-1].bl_idname in _PREVIEW_OPS
 
 
+def merge_devmap_shown(ctx):
+    """The Merge Patches panel is open with its Deviation Map on: the map to
+    draw (from merge.DEVMAP) and its object, else None."""
+    ops = ctx.window_manager.operators
+    if not ops or ops[-1].bl_idname not in ("NPROTO_OT_merge_patches", "nproto.merge_patches"):
+        return None
+    if not getattr(ops[-1].properties, "merge_show_dev", False):
+        return None
+    from . import merge
+    dm = merge.DEVMAP
+    obj = bpy.data.objects.get(dm.get("obj", "")) if dm else None
+    if obj is None or not obj.visible_get():
+        return None
+    return dm, obj
+
+
+def _draw_merge_devmap(ctx):
+    try:
+        hit = merge_devmap_shown(ctx)
+        if hit is None:
+            return
+        dm, obj = hit
+        from . import diagnostics
+        tol = float(dm["tol"]) or 1e-9
+        diagnostics.draw_value_mesh(ctx, obj, dm["id"], *dm["data"], -tol, tol, bands=10.0)
+    except Exception as exc:
+        print("NURBS Merge Patches deviation map:", exc)
+
+
 def _square_feature(obj):
     h = obj.get("nproto_hist")
     return isinstance(h, str) and '"op": "square"' in h
@@ -388,6 +417,7 @@ def _draw():
     from . import diagnostics
     if v is not None:
         diagnostics.draw_zebra(ctx)          # under the edges
+    _draw_merge_devmap(ctx)
     chord = store.tess_settings(ctx)[0]
     curves = []
     for obj in ctx.visible_objects:

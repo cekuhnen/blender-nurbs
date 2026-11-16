@@ -628,6 +628,60 @@ def _curv_batch(obj, shader, kind, angle_deg, chord_rel):
     return batch
 
 
+# -- value maps on meshes made elsewhere (Merge Patches' deviation map) ---------
+
+_value_batches = {}
+
+
+def draw_value_mesh(ctx, obj, key, P, N, T, V, vmin, vmax, bands=10.0, opacity=1.0):
+    """The curvature-map ramp (blue - green - red over vmin..vmax, contour
+    lines every 1/bands) on a mesh given in obj's local space. key: changes
+    when the mesh does (the batch is kept until then)."""
+    rv3d = ctx.region_data
+    if rv3d is None or obj is None or len(T) == 0:
+        return
+    try:
+        shader = _get_shader()
+    except Exception as exc:
+        print("NURBS diagnostics shader:", exc)
+        return
+    hit = _value_batches.get(obj.session_uid)
+    if hit is None or hit[0] != key:
+        hit = (key, batch_for_shader(shader, 'TRIS', {"pos": P, "nor": N, "val": V}, indices=T))
+        _value_batches.clear()
+        _value_batches[obj.session_uid] = hit
+    vinv = rv3d.view_matrix.inverted()
+    eye = vinv.translation if rv3d.is_perspective else (vinv.translation + vinv.to_3x3() @ Vector((0, 0, 1e6)))
+    gpu.state.depth_test_set('LESS_EQUAL')
+    gpu.state.blend_set('ALPHA')
+    shader.bind()
+    M = obj.matrix_world
+    shader.uniform_float("viewProjectionMatrix", rv3d.perspective_matrix)
+    shader.uniform_float("viewMatrix", rv3d.view_matrix)
+    shader.uniform_float("modelMatrix", M)
+    shader.uniform_float("normalMatrix", M.to_3x3().inverted_safe().transposed().to_4x4())
+    shader.uniform_float("eye", eye)
+    shader.uniform_float("bias", max(0.003 * float(rv3d.view_distance), _sag(obj)))
+    shader.uniform_float("pull", (0.0, 0.0, 1.0))
+    for n in ("stripes", "thr", "hl_pos", "hl_width", "line_px", "env_rot", "env_height", "env_gain",
+              "env_lights", "env_texels", "gloss", "env_rough", "metallic"):
+        shader.uniform_float(n, 0.0)
+    shader.uniform_float("paint", (0.0, 0.0, 0.0))
+    shader.uniform_float("opacity", float(opacity))
+    shader.uniform_float("vmin", float(vmin))
+    shader.uniform_float("vmax", float(vmax))
+    shader.uniform_float("bands", float(bands))
+    b = _blank()
+    for n in ENV_SAMPLERS:
+        shader.uniform_sampler(n, b)
+    shader.uniform_int("style", 0)
+    shader.uniform_int("coat_on", 0)
+    shader.uniform_int("direction", 0)
+    shader.uniform_int("mode", 2)
+    hit[1].draw(shader)
+    gpu.state.blend_set('ALPHA')
+
+
 # -- drawing -----------------------------------------------------------------
 
 LAST_RANGE = []          # curvature range of the last draw (shown in the panel)
