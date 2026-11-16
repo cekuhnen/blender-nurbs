@@ -460,12 +460,30 @@ def rows(knots, u, v, du=0, dv=0, kv=None):
     return (Bu[:, :, None] * Bv[:, None, :]).reshape(len(Bu), -1)
 
 
+_BASIS_CACHE = {}
+
+
+def _basis_cached(knots, s, der, p):
+    """basis(), remembered: the faces share a few knot vectors and the checks evaluate them at the same
+    parameters again and again (read-only arrays)."""
+    knots, s = np.asarray(knots, float), np.atleast_1d(np.asarray(s, float))
+    key = (knots.tobytes(), s.tobytes(), der, p)
+    B = _BASIS_CACHE.get(key)
+    if B is None:
+        if len(_BASIS_CACHE) > 4096:
+            _BASIS_CACHE.clear()
+        B = basis(knots, s, der, p)
+        B.flags.writeable = False
+        _BASIS_CACHE[key] = B
+    return B
+
+
 def derivs(net, ku, kv, u, v, ders):
     """{(a, b): d^(a+b) S / du^a dv^b at the points (u, v)} of a face's net,
     from 1D bases (no dense rows); the degrees from the (clamped) knots."""
     pu, pv = int(np.count_nonzero(ku == ku[0])) - 1, int(np.count_nonzero(kv == kv[0])) - 1
-    Bu = {a: basis(ku, u, a, pu) for a in {a for a, _ in ders}}
-    Bv = {b: basis(kv, v, b, pv) for b in {b for _, b in ders}}
+    Bu = {a: _basis_cached(ku, u, a, pu) for a in {a for a, _ in ders}}
+    Bv = {b: _basis_cached(kv, v, b, pv) for b in {b for _, b in ders}}
     X = {a: np.tensordot(B, net, axes=(1, 0)) for a, B in Bu.items()}      # (t, nv, 3); no einsum path search
     return {(a, b): np.einsum("tj,tjc->tc", Bv[b], X[a]) for a, b in ders}  # (it was 40% of einsum's time)
 
@@ -639,10 +657,14 @@ class Converter:
         return cub
 
     def fresh_natural(self, L):
-        """(nets, knots, corner limit points) of every face at level L, no sliver knots (natural)."""
-        c = Converter(self.V, self.F, self.sharp)
-        nets = c.natural(L, sliver=False)
-        return nets, list(c.fk), c.levels.corners
+        """(nets, knots, corner limit points) of every face at level L, no sliver knots (natural); kept, as
+        G2 (and its G1 start) ask for the same levels again."""
+        cache = self.__dict__.setdefault("_fresh", {})
+        if L not in cache:
+            c = Converter(self.V, self.F, self.sharp)
+            nets = c.natural(L, sliver=False)
+            cache[L] = (nets, list(c.fk), c.levels.corners)
+        return cache[L]
 
     def limit_grid(self, level):
         """Per face its SubD limit points at (i, j) / 2^level (level 2 or more)."""
