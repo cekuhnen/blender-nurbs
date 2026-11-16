@@ -8118,6 +8118,45 @@ _m2r = {}
 n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_cube("M2B_Cube"))
 _m2r["plain cube: 6 planes, a closed solid of the mesh's volume"] = \
     s_ == "6 planes" and b_.face_count() == 6 and sol_ and abs(v_ - _a ** 3) < 1e-6 * _a ** 3 and no_ is None
+def _m2b_whole(f_):
+    """Whether a face is its whole surface: the surface's four corners are the face's edge ends."""
+    s_ = f_.surface()
+    (u0_, u1_), (v0_, v1_) = s_.u_domain(), s_.v_domain()
+    C_ = np.array([tuple(s_.evaluate(u_, w_)) for u_ in (u0_, u1_) for w_ in (v0_, v1_)], float)
+    E_ = np.array([tuple(e_.point_at(t_)) for e_ in f_.edges() for t_ in e_.parameter_range()], float)
+    return max(np.linalg.norm(E_ - c_, axis=1).min() for c_ in C_) < 1e-6
+_m2r["plain cube: each four-sided face is an untrimmed bilinear patch on its corners, not a trimmed plane"] = \
+    all(_m2b_whole(f_) for f_ in b_.faces())
+def _m2b_notched(name, cuts, verts=48):
+    """A 3 x 1.4 x 0.5 plate at the origin (a mesh's float32 vertices far out are too coarse) with vertical
+    holes (x, y, r) cut by Blender's Boolean."""
+    bpy.ops.mesh.primitive_cube_add(size=1, location=(0, 0, 0)); o_ = ctx.active_object; o_.name = name
+    o_.scale = (3, 1.4, 0.5); bpy.ops.object.transform_apply(location=False, scale=True)
+    for x_, y_, r_ in cuts:
+        bpy.ops.mesh.primitive_cylinder_add(vertices=verts, radius=r_, depth=2, location=(x_, y_, 0)); c_ = ctx.active_object
+        m_ = o_.modifiers.new("b", 'BOOLEAN'); m_.object = c_; m_.operation = 'DIFFERENCE'
+        ctx.view_layer.objects.active = o_; bpy.ops.object.modifier_apply(modifier="b"); bpy.data.objects.remove(c_)
+    return o_
+def _m2b_cyl_dev(b_, cuts):
+    """Largest distance of the curved faces from the nearest cut's true cylinder."""
+    out_ = 0.0
+    for f_ in b_.faces():
+        s2_ = f_.surface()
+        if s2_.is_planar(1e-9):
+            continue
+        (u0_, u1_), (v0_, v1_) = s2_.u_domain(), s2_.v_domain()
+        P_ = np.array([tuple(s2_.evaluate(u_, w_)) for u_ in np.linspace(u0_, u1_, 41) for w_ in np.linspace(v0_, v1_, 5)])
+        out_ = max(out_, min(float(np.abs(np.hypot(P_[:, 0] - x_, P_[:, 1] - y_) - r_).max()) for x_, y_, r_ in cuts))
+    return out_
+for _nm, _cuts, _vn, _planes in (("through the end (half a cylinder)", [(1.5, 0.0, 0.4)], 48, 7),
+                                 ("off-centre through the end", [(1.6, 0.0, 0.4)], 48, 7),
+                                 ("off-centre, a 16-sided cylinder (facets cut short at its sides)", [(1.75, 0.0, 0.4)], 16, 7),
+                                 ("off-centre, 48 sides (the boolean splits it in pieces)", [(1.57, 0.0, 0.4)], 48, 7),
+                                 ("through a corner", [(1.5, 0.7, 0.4)], 48, 6)):
+    n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_notched("M2B_Notch", _cuts, _vn))
+    _m2r[f"a hole cut {_nm}: one exact cylinder face, no flat strips or free-form patch, a closed solid"] = \
+        sol_ and no_ is None and s_ == f"{_planes} planes · 1 hole ⌀ 80 cm" and b_.face_count() == _planes + 1 \
+        and _m2b_cyl_dev(b_, _cuts) < 1e-6
 for seg_ in (2, 3, 6, 12):
     n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_cube(f"M2B_Edge{seg_}", bevel=_top_x, seg=seg_))
     st_ = features.stack(n_)
@@ -8181,6 +8220,23 @@ for p_, seg_ in ((0.6, 8), (0.75, 4), (0.75, 8), (0.9, 8), (0.9, 16), (0.93, 12)
     _m2r[f"a boxy bevel (profile {p_}, {seg_} segments): one exact strip, the profile read back, exact volume"] = \
         b_.face_count() == 7 and sol_ and abs(v_ - exp_) < 1e-5 * exp_ and f"1 bevel profile {p_:.3g}" in s_ \
         and not features.stack(n_) and no_ is None
+def _m2b_plane_fit(b_):
+    """Largest ratio of a planar face's surface (its bilinear CV net) to the face's own area."""
+    out_ = 1.0
+    for f_ in b_.faces():
+        if not f_.surface().is_planar(1e-9):
+            continue
+        C_ = np.array(ext.surface_cvs(f_.surface())["points"], float)
+        if len(C_) == 4:
+            out_ = max(out_, float(np.linalg.norm(np.cross(C_[2] - C_[0], C_[1] - C_[0]))) / f_.area(1e-6))
+    return out_
+_m2r["a boxy bevel's end faces (a curved trim): their planes cut down to the outline, not the kernel's oversized plane"] = \
+    _m2b_plane_fit(_m2b_run(_m2b_cube("M2B_BoxyTight", bevel=_top_x, seg=8, profile=0.75))[3]) < 1.3
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_cube("M2B_FilletTight", bevel=_top_x, seg=6))
+_ft0 = _m2b_plane_fit(b_)
+features.rebuild(n_, ctx, force=True)
+_m2r["a filleted edge: the planes beside it cut down to what the fillet leaves, also when the history rebuilds it"] = \
+    sol_ and _ft0 < 1.1 and _m2b_plane_fit(store.get_brep(n_)) < 1.1 and bool(store.get_brep(n_).is_manifold_solid())
 n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_cube("M2B_BoxyG1", bevel=_top_x, seg=8, profile=0.8))
 _sw = [f_ for f_ in b_.faces() if not f_.surface().is_planar(1e-9)]
 _tan = 0

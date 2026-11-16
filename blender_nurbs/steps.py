@@ -210,6 +210,7 @@ def apply_edge_fillet(obj, text, inputs, p):
                         shape=p.get("shape", "CIRCULAR"), radius=p["radius"], end_radius=p.get("end_radius"),
                         chord=p["radius"] if p.get("chord") else None,
                         continuity=int(p.get("continuity", 1)), thumbweight=p.get("thumbweight", 1.0), loose=True,
+                        shrink_planes=bool(p.get("shrink_planes")),
                         **class_a_params(p))
     if "class_a" in info:
         obj["nproto_class_a"] = json.dumps(info["class_a"])

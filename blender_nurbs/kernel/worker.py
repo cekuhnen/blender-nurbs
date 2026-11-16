@@ -1779,6 +1779,12 @@ def job_edge_fillet(job):
                 new_faces.append([float(q.x), float(q.y), float(q.z)] if hasattr(q, "x") else [float(x) for x in q])
     except Exception:
         new_faces = []
+    try:                                  # (Mesh to BREP's fillets) the planes beside it: down to what is left
+        on_in = _input_test(b_ring) if job.get("shrink_planes") else None
+        if on_in is not None:
+            r = _shrink_planes(r, lambda f: on_in(f) and any(not on_in(g) for e in f.edges() for g in e.faces()))
+    except Exception:
+        pass
     save(to_local(r, job.get("xforms", {}).get("target")), job["out"]["result"])
     out = {"edges": len(sel), "faces": r.face_count(), "solid": solid, "new_faces": new_faces,
            "rings": [{k: v for k, v in g.items() if k != "at"} for g in rings], "rims_only": rims_only}
@@ -2307,6 +2313,103 @@ def job_thicken(job):
     return {"faces": r.face_count(), "volume": volume}
 
 
+def _flat_quad(loops, tol):
+    """The four corners of a face outline that is one convex, flat loop of four
+    straight sides (no holes, no curves), else None. Its bilinear patch is
+    then exactly the face -- flat, its edges the outline -- with no trim."""
+    np = _np()
+    if len(loops) != 1 or len(loops[0]) != 4 or any(isinstance(q, dict) for q in loops[0]):
+        return None
+    Q = np.array(loops[0], float)
+    n = np.cross(Q[2] - Q[0], Q[3] - Q[1])
+    if np.linalg.norm(n) <= 1e-12:
+        return None
+    n /= np.linalg.norm(n)
+    if np.abs((Q - Q.mean(0)) @ n).max() > tol:            # not flat: a bilinear patch would be warped
+        return None
+    turns = [np.cross(Q[(k + 1) % 4] - Q[k], Q[(k + 2) % 4] - Q[(k + 1) % 4]) @ n for k in range(4)]
+    side = max(np.linalg.norm(Q[(k + 1) % 4] - Q[k]) for k in range(4))
+    if min(turns) <= 1e-6 * side * side:                   # concave or a straight "corner": it would fold
+        return None
+    return [tuple(map(float, q)) for q in Q]
+
+
+def _open_edges(b):
+    return sum(1 for e in b.edges() if len(e.faces()) == 1)
+
+
+def _tight_plane(f, pad=0.005):
+    """The surface of planar face f cut down to its trim, or None: a plane
+    made as a bilinear patch on a parallelogram (the kernel's planar faces,
+    our quads) maps uv affinely, so the same patch over the sub-domain round
+    the trim's uv box (grown by pad of it) is the same plane -- the trims keep
+    their uv curves -- just no bigger than it needs to be. None if the
+    surface is not such a plane or is no more than 0.1% too big already."""
+    np = _np()
+    d = ext.surface_cvs(f.surface())
+    if d.get("degree_u") != 1 or d.get("degree_v") != 1 or d.get("count_u") != 2 or d.get("count_v") != 2 \
+            or d.get("weights"):
+        return None
+    (a0, a1), (c0, c1) = (d["knots_u"][0], d["knots_u"][-1]), (d["knots_v"][0], d["knots_v"][-1])
+    if a1 - a0 <= 0 or c1 - c0 <= 0:
+        return None
+    C = np.array(d["points"], float)                      # u-major: (a0,c0) (a0,c1) (a1,c0) (a1,c1)
+    o, du, dv = C[0], (C[2] - C[0]) / (a1 - a0), (C[1] - C[0]) / (c1 - c0)
+    if np.linalg.norm(C[3] - C[2] - (C[1] - C[0])) > 1e-9 * (np.linalg.norm(C[2] - C[0]) + np.linalg.norm(C[1] - C[0])):
+        return None                                       # not a parallelogram: uv is not affine on it
+    Q = []
+    for e in f.edges():
+        t0, t1 = e.parameter_range()
+        Q += [e.point_at(t) for t in np.linspace(t0, t1, 33)]
+    if not Q:
+        return None
+    UV = np.linalg.lstsq(np.stack([du, dv], 1), (np.array(Q, float) - o).T, rcond=None)[0].T + (a0, c0)
+    (u0, v0), (u1, v1) = UV.min(0), UV.max(0)
+    g = pad * max(u1 - u0, v1 - v0)
+    u0, v0, u1, v1 = max(u0 - g, a0), max(v0 - g, c0), min(u1 + g, a1), min(v1 + g, c1)
+    if (u1 - u0) * (v1 - v0) > 0.999 * (a1 - a0) * (c1 - c0):
+        return None
+    S = lambda u, v: tuple(map(float, o + (u - a0) * du + (v - c0) * dv))
+    return ext.surface_from_cvs(1, 1, [S(u0, v0), S(u0, v1), S(u1, v0), S(u1, v1)],
+                                [u0, u0, u1, u1], [v0, v0, v1, v1])
+
+
+def _shrink_plane(b):
+    """A one-face planar BREP (create_planar_faces) with its plane cut down to its trim."""
+    srf = _tight_plane(b.faces()[0])
+    if srf is None:
+        return b
+    out = b.copy()
+    try:
+        ext.replace_face_surfaces_keep_uv(out, [srf])
+    except Exception:
+        return b
+    return out if abs(out.area(1e-6) - b.area(1e-6)) <= 1e-6 * max(b.area(1e-6), 1e-12) else b
+
+
+def _shrink_planes(b, pick=None):
+    """Body b with the planes of its faces (those pick(face) accepts; all if
+    None) cut down to their trims -- after a fillet the faces beside it keep
+    the sharp face's plane. b itself if nothing changes or the result is not
+    the same body (open edges, solidity or area changed)."""
+    faces = b.faces()
+    srfs, n = [], 0
+    for f in faces:
+        t = _tight_plane(f) if pick is None or pick(f) else None
+        n += t is not None
+        srfs.append(t if t is not None else f.surface())
+    if not n:
+        return b
+    out = b.copy()
+    try:
+        ext.replace_face_surfaces_keep_uv(out, srfs)
+        same = _open_edges(out) == _open_edges(b) and bool(out.is_manifold_solid()) == bool(b.is_manifold_solid()) \
+            and abs(out.area(1e-6) - b.area(1e-6)) <= 1e-6 * max(b.area(1e-6), 1e-12)
+    except Exception:
+        return b
+    return out if same else b
+
+
 def job_mesh_to_brep(job):
     """Mesh to BREP (mesh_brep.py): planar faces from their outlines (outer
     loop, then holes) sewn into a body, cylinders added and holes cut
@@ -2317,30 +2420,47 @@ def job_mesh_to_brep(job):
     np = _np()
     tol = float(job.get("tol", 1e-6))
     body = None
-    parts = []
+    parts, tight = [], {}
     at = lambda q: tuple(q["p"]) if isinstance(q, dict) else tuple(q)
     for loops in job["faces"]:
+        quad = _flat_quad(loops, tol)
+        if quad is not None:                  # four straight sides: the bilinear patch on its corners, untrimmed
+            q0, q1, q2, q3 = quad
+            parts.append(ext.brep_from_surface(ext.surface_from_cvs(1, 1, [q0, q3, q1, q2],
+                                                                    [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0])))
+            continue
         cs = []
         for P in loops:                       # a point: a line to the next; {p, cvs, knots, degree}: a curve to it
             for k, q in enumerate(P):
                 if isinstance(q, dict):
-                    cs.append(ext.curve_from_cvs(int(q["degree"]), [tuple(c) for c in q["cvs"]], list(q["knots"])))
+                    cs.append(ext.curve_from_cvs(int(q["degree"]), [tuple(c) for c in q["cvs"]], list(q["knots"]),
+                                                 list(q["weights"]) if q.get("weights") else None))
                 else:
                     cs.append(sm.create_line_segment(at(q), at(P[(k + 1) % len(P)])))
         parts.append(sm.create_planar_faces(cs))
+        tight[len(parts) - 1] = _shrink_plane(parts[-1])   # its plane cut down to the outline
     for g in job.get("patches", []):          # a free-form patch: a B-spline (u-major net; bicubic unless said)
         d = int(g.get("degree", 3))
         parts.append(ext.brep_from_surface(ext.surface_from_cvs(d, d, [tuple(c) for c in g["net"]],
                                                                 list(g["ku"]), list(g["kv"]))))
-    for w in job.get("sweeps", []):           # a boxy bevel: ruled between its profiles at its two ends
+    for w in job.get("sweeps", []):           # a boxy bevel / cut cylinder: ruled between its curves at its two ends
         pts = [tuple(c) for a, b in zip(w["cvs"], w["cvs2"]) for c in (a, b)]
+        wts = [float(x) for x in w["weights"] for _ in (0, 1)] if w.get("weights") else None
         parts.append(ext.brep_from_surface(ext.surface_from_cvs(int(w["degree"]), 1, pts, list(w["knots"]),
-                                                                [0.0, 0.0, 1.0, 1.0])))
+                                                                [0.0, 0.0, 1.0, 1.0], wts)))
+    def sew(ps):
+        b = ps[0].copy()
+        for q in ps[1:]:                      # faces side by side (no intersecting: they only share edges)
+            ext.append_brep(b, q)
+        return sm.stitch_advanced(b, tol, squeeze_small_edges=False, making_manifold_solid=True)[0]
     if parts:
-        body = parts[0]
-        for q in parts[1:]:                   # faces side by side (no intersecting: they only share edges)
-            ext.append_brep(body, q)
-        body = sm.stitch_advanced(body, tol, squeeze_small_edges=False, making_manifold_solid=True)[0]
+        # the planes cut down to their outlines; their trim edges move by ~1e-6 doing so, which can
+        # keep a fine profile (a 16-segment boxy bevel) from stitching: then the kernel's own planes
+        body = sew([tight.get(k, q) for k, q in enumerate(parts)])
+        if any(tight[k] is not parts[k] for k in tight) and not body.is_manifold_solid():
+            plain = sew(parts)
+            if plain.is_manifold_solid() or _open_edges(plain) < _open_edges(body):
+                body = plain
         try:
             sm.unify_normals(body, max(body.faces(), key=lambda f: f.area()), 100)
         except Exception:
@@ -2387,6 +2507,8 @@ def job_mesh_to_brep(job):
             continue
         body = r
         done.append(g)
+    if done or job.get("cylinders"):         # planes a fillet or a hole cut into: down to what is left of them
+        body = _shrink_planes(body)
     xf = job.get("xform")
     if "base" in job["out"]:                  # (SubD to BREP has no fillets: it asks for the result only)
         save(to_local(base, xf), job["out"]["base"])

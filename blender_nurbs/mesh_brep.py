@@ -234,7 +234,8 @@ class Recognizer:
         self.open = any(len(fs) == 1 for fs in E.values())
         self.pn, self.pd = list(self.rn), list(self.rd)        # planes: the regions', then the boxy bevels' rails
         self._kept = {}                      # boxy bevels that end in a corner: {their faces: their regions}
-        self.bands = [B for B in self._bands() if (B["closed"] and rings) or (not B["closed"] and fillets)]
+        self.bands = [B for B in self._merge_cuts(self._bands()) if ((B["closed"] or B.get("kind") == "cut") and rings)
+                      or (not B["closed"] and B.get("kind") != "cut" and fillets)]
         if fillets:
             self.bands += self._strips({i for B in self.bands for i in B["regions"]})
         self.pn, self.pd = np.array(self.pn), np.array(self.pd)
@@ -372,9 +373,147 @@ class Recognizer:
             tang = [j for j in nb if abs(rn[j] @ ax) < SQUARE and self._width(j, ax) > wide
                     and abs(abs(c @ rn[j] - self.rd[j]) - r) < 100 * self.tol]
             if len(tang) != 2 or len(band) < 2 or min(self._rail(band, j, ax) for j in tang) < 0.5 * float(np.ptp(t)):
-                return None
+                return self._cut(B, vs)
             B["planes"] = tang
         return B
+
+    def _cut(self, B, vs):
+        """An open band that is no fillet: a hole or cylinder cut through an
+        edge or a corner (a notch) -- part of a cylinder, its two long sides
+        on planes along its axis (its rulings) and its two ends on planes
+        across it. None if it is not bordered so."""
+        V, rn, rd, tol = self.V, self.rn, self.rd, self.tol
+        band, ax, c, r = B["regions"], B["axis"], B["center"], B["r"]
+        if len(band) < 3:
+            return None
+        nb = {j for k in band for j in self.adj.get(k, ()) if j not in band}
+        sides = [j for j in nb if abs(rn[j] @ ax) < SQUARE]
+        ends = [j for j in nb if abs(rn[j] @ ax) > 0.2]
+        if len(ends) != 2 or not sides or len(sides) + len(ends) != len(nb):
+            return None
+        # where the band meets a side plane the mesh's vertices lie on the facets' chords, not
+        # the circle: the circle is fitted to the others, the corners are where it meets the planes
+        inner = [v for v in vs if all(abs(V[v] @ rn[j] - rd[j]) > 10 * tol for j in sides)]
+        fit = fit_circle(V[inner], ax) if len(inner) >= 3 else None
+        if fit is None or fit[2] > 10 * tol:
+            return None
+        c, r = fit[0], fit[1]
+        B["center"], B["r"] = c, r
+        u = np.cross(ax, (1.0, 0.0, 0.0) if abs(ax[0]) < 0.9 else (0.0, 1.0, 0.0))
+        u /= np.linalg.norm(u)
+        w = np.cross(ax, u)
+        d = V[vs] - c
+        ang = np.arctan2(d @ w, d @ u)
+        a = np.sort(ang)
+        gaps = np.diff(np.concatenate([a, a[:1] + 2 * math.pi]))
+        k = int(np.argmax(gaps))
+        a0 = float(a[(k + 1) % len(a)])                       # the band runs from a0 round to a0 + span
+        span = float(2 * math.pi - gaps[k])
+        step = float(np.delete(gaps, k).max())
+        if not 0.05 < span < 2 * math.pi - 0.05 or step > math.radians(30.0):
+            return None                                       # (facets of a cylinder: narrow; four corners of a
+                                                              # chamfered box corner also lie on a circle)
+        def on_side(th):                                      # the angle near th where a side plane cuts the circle
+            pt = c + r * (math.cos(th) * u + math.sin(th) * w)
+            j = min(sides, key=lambda j: abs(pt @ rn[j] - rd[j]))
+            A_, B_, C_ = r * (rn[j] @ u), r * (rn[j] @ w), rd[j] - c @ rn[j]
+            h = math.hypot(A_, B_)
+            if h < 1e-12 or abs(C_) > h:
+                return th
+            base, off = math.atan2(B_, A_), math.acos(max(-1.0, min(1.0, C_ / h)))
+            return min((base + sg * off for sg in (1, -1)), key=lambda x: abs((x - th + math.pi) % (2 * math.pi) - math.pi))
+        t0 = on_side(a0)
+        t1 = on_side(a0 + span)
+        span = (t1 - t0) % (2 * math.pi)
+        a0 = t0
+        if not 0.05 < span < 2 * math.pi - 0.05:
+            return None
+        arcs, corners = {}, {}
+        for j in ends:                                        # each end: the arc on that plane, its corners exact
+            on = [v for v in vs if abs(V[v] @ rn[j] - rd[j]) < 10 * tol]
+            if len(on) < 2:
+                return None
+            x = (np.arctan2((V[on] - c) @ w, (V[on] - c) @ u) - a0) % (2 * math.pi)
+            x[x > span + 0.5 * (2 * math.pi - span)] -= 2 * math.pi
+            if x.min() > 0.5 * step or x.max() < span - 0.5 * step:   # an end not across the whole band
+                                                              # (a chord's vertex is off the corner: half a facet)
+                return None
+            A = self._arc(c, ax, u, w, r, a0, span, rn[j], rd[j])
+            arcs[j] = A
+            corners[on[int(np.argmin(x))]] = A["cvs"][0]
+            corners[on[int(np.argmax(x))]] = A["cvs"][-1]
+        B["corners"] = corners
+        B.update(kind="cut", sides=sides, ends=ends, arcs=arcs)
+        return B
+
+    def _merge_cuts(self, bands):
+        """Cut cylinders made whole: pieces on one circle (a cylinder Blender's
+        boolean split) joined, and the facets it cut short at the band's sides
+        taken in -- two of their corners lie on a chord, not the circle, so
+        the band did not grow over them and they stayed thin flat faces."""
+        V, rn, rd, tol = self.V, self.rn, self.rd, self.tol
+        rest = [B for B in bands if B.get("kind") != "cut"]
+        taken = {i for B in rest for i in B["regions"]}
+        groups = []
+        for B in (B for B in bands if B.get("kind") == "cut"):
+            for g in groups:
+                A = g[0]
+                dc = B["center"] - A["center"]
+                if abs(A["axis"] @ B["axis"]) > 1 - 1e-6 and abs(A["r"] - B["r"]) < 100 * tol \
+                        and np.linalg.norm(dc - (dc @ A["axis"]) * A["axis"]) < 100 * tol:
+                    g.append(B)
+                    break
+            else:
+                groups.append([B])
+        out = []
+        for g in groups:
+            A = g[0]
+            ax, c, r = A["axis"], A["center"], A["r"]
+            regs = [i for B in g for i in B["regions"]]
+            widest = max(self._width(k, ax) for k in regs)
+            lo = r * math.cos(min(widest / r, 0.5 * math.pi)) - 10 * tol
+            n0 = len(regs)
+            grown = True
+            while grown:
+                grown = False
+                for j in sorted({j for k in regs for j in self.adj.get(k, ())} - set(regs) - taken):
+                    if abs(rn[j] @ ax) > SQUARE or self._width(j, ax) > 1.05 * widest:
+                        continue
+                    if not lo < abs(c @ rn[j] - rd[j]) < r + 10 * tol:    # a chord's plane: the facet's
+                        continue
+                    q = V[self.rverts[j]] - c
+                    q -= np.outer(q @ ax, ax)
+                    if np.sum(np.abs(np.linalg.norm(q, axis=1) - r) < 10 * tol) < 2:   # its edge on the circle
+                        continue
+                    regs.append(j)
+                    grown = True
+            if len(g) == 1 and len(regs) == n0:
+                out.append(A)
+                continue
+            vs = sorted({v for k in regs for v in self.rverts[k]})
+            t = (V[vs] - c) @ ax
+            B = self._cut({"regions": regs, "r": r, "axis": ax, "center": c, "t": (float(t.min()), float(t.max())),
+                           "closed": False, "inward": A["inward"]}, vs)
+            out += [B] if B is not None else g
+        return rest + out
+
+    @staticmethod
+    def _arc(c, ax, u, w, r, a0, span, n, dist):
+        """The circle's arc from angle a0 over span (rational quadratic, spans of
+        at most 90 degrees) lifted along the axis onto the plane n . x = dist
+        (an ellipse's arc there: the same weights)."""
+        m = max(1, int(math.ceil(span / (0.5 * math.pi) - 1e-9)))
+        h = 0.5 * span / m
+        cvs, wts = [], []
+        for k in range(m):
+            for q, (ang, rad, wt) in enumerate(((a0 + 2 * k * h, r, 1.0), (a0 + (2 * k + 1) * h, r / math.cos(h), math.cos(h)))):
+                cvs.append(c + rad * (math.cos(ang) * u + math.sin(ang) * w))
+                wts.append(wt)
+        cvs.append(c + r * (math.cos(a0 + span) * u + math.sin(a0 + span) * w))
+        wts.append(1.0)
+        cvs = [q + ax * (dist - q @ n) / (ax @ n) for q in cvs]
+        knots = [0.0] * 3 + [x for k in range(1, m) for x in (k / m, k / m)] + [1.0] * 3
+        return {"cvs": [list(map(float, q)) for q in cvs], "weights": wts, "knots": knots, "degree": 2}
 
     def _strips(self, used):
         """Boxy bevels: strips of evenly wide regions square to one axis
@@ -445,6 +584,8 @@ class Recognizer:
         if len(planes) != 2 or min(self._rail(strip, j, ax) for j in planes) < 0.5 * length:
             return None
         P, Q = planes
+        if abs(rn[P] @ rn[Q]) > SEED_COS:              # (near) parallel: no edge between them (a notch's two sides)
+            return None
         C0 = np.linalg.solve(np.array([rn[P], rn[Q], ax]), [rd[P], rd[Q], 0.0])
         # the segments lying within tolerance of a face merged into it: still thin
         # quads beside the strip, whose corners are on the curve too
@@ -552,7 +693,7 @@ class Recognizer:
         meet: corners on a sphere of the fillets' radius about the point where
         their axes end, bordered by no plane."""
         ends = [(B["center"] + B["axis"] * t, B["r"]) for B in self.bands
-                if not B["closed"] and "center" in B for t in B["t"]]
+                if not B["closed"] and "center" in B and B.get("kind") != "cut" for t in B["t"]]
         for i in range(len(self.regs)):
             if i in self.role:
                 continue
@@ -927,6 +1068,8 @@ class Recognizer:
             B = self.bands[role[1]]
             if B["closed"]:
                 return ("R", role[1], False)
+            if B.get("kind") == "cut":
+                return ("C", role[1], False)
             if i in B["planes"]:
                 if B.get("kind") == "boxy":
                     return ("P", B["rail"][i], False)
@@ -989,7 +1132,10 @@ class Recognizer:
                     (lq, _, _, _), (ls, a, g, rv) = runs[k - 1], runs[k]
                     if lq[:2] == ls[:2] and not (ls[2] and not g):
                         continue
-                    if "G" in (lq[0], ls[0]):                   # beside a free-form patch: the mesh's vertex
+                    if "C" in (lq[0], ls[0]):                   # at a cut cylinder: where it meets the planes
+                        C = ls if ls[0] == "C" else lq
+                        p = self.bands[C[1]]["corners"].get(a, V[a])
+                    elif "G" in (lq[0], ls[0]):                 # beside a free-form patch: the mesh's vertex
                         p = V[a]
                     elif "S" in (lq[0], ls[0]):                 # at a boxy bevel's end: its rail on this face
                         S, q = (ls, lq) if ls[0] == "S" else (lq, ls)
@@ -1004,6 +1150,13 @@ class Recognizer:
                         cvs, knots = self.hermite(rv)
                         cvs[0] = p
                         p = {"p": p, "cvs": cvs, "knots": knots, "degree": 3}
+                    elif ls[0] == "C" and i in self.bands[ls[1]]["arcs"]:
+                        A = self.bands[ls[1]]["arcs"][i]       # the edge from here is the cut cylinder's arc
+                        cvs, wts, knots = [list(q) for q in A["cvs"]], list(A["weights"]), list(A["knots"])
+                        if np.linalg.norm(np.array(cvs[0]) - p) > np.linalg.norm(np.array(cvs[-1]) - p):
+                            cvs, wts, knots = cvs[::-1], wts[::-1], [1.0 - x for x in knots[::-1]]
+                        cvs[0] = p
+                        p = {"p": p, "cvs": cvs, "knots": knots, "degree": 2, "weights": wts}
                     elif ls[0] == "S":                         # the edge from here is the bevel's profile
                         B = self.bands[ls[1]]
                         cvs, knots = self.profile(ls[1], i, reverse=lq[1] != B["planes"][0])
@@ -1065,6 +1218,11 @@ class Recognizer:
         pad = max(20 * self.tol, 2e-3 * self.size)
         cyls, fillets, sweeps = [], [], []
         for b, B in enumerate(self.bands):
+            if B.get("kind") == "cut":                        # ruled between its arcs on its two end planes
+                A0, A1 = (B["arcs"][j] for j in B["ends"])
+                sweeps.append({"cvs": A0["cvs"], "cvs2": A1["cvs"], "knots": A0["knots"], "degree": 2,
+                               "weights": A0["weights"]})
+                continue
             if B.get("kind") == "boxy":                       # ruled between its two ends (faces or mitres)
                 (c0, knots), (c1, _) = self.profile(b, B["ends"][0]), self.profile(b, B["ends"][1])
                 sweeps.append({"cvs": c0, "cvs2": c1, "knots": knots, "degree": 3})
@@ -1089,7 +1247,7 @@ class Recognizer:
             else:
                 groups.append({"r": r, "mids": [mid]})
         for g in groups:
-            g["r"] = float(np.mean([B["r"] for B in self.bands if not B["closed"] and "center" in B
+            g["r"] = float(np.mean([B["r"] for B in self.bands if not B["closed"] and "center" in B and B.get("kind") != "cut"
                                     and abs(B["r"] - g["r"]) <= 100 * self.tol]))
         patches = [dict(zip(("net", "ku", "kv"), self.patch(G))) for G in self.grids]
         return {"faces": faces, "cylinders": cyls, "fillets": groups, "sweeps": sweeps, "patches": patches,
@@ -1097,9 +1255,10 @@ class Recognizer:
 
     def summary(self):
         roles = [r[0] for r in self.role.values()]
-        holes = [B for B in self.bands if B["closed"] and B["inward"]]
-        cyls = [B for B in self.bands if B["closed"] and not B["inward"]]
-        fil = [B for B in self.bands if not B["closed"] and "center" in B]
+        cut = lambda B: B["closed"] or B.get("kind") == "cut"
+        holes = [B for B in self.bands if cut(B) and B["inward"]]
+        cyls = [B for B in self.bands if cut(B) and not B["inward"]]
+        fil = [B for B in self.bands if not cut(B) and "center" in B]
         boxy = [B for B in self.bands if B.get("kind") == "boxy"]
         planes = sum(1 for i, r in self.role.items() if r[0] == "plane"
                      and not all(f in self.gridface for f in self.regs[i]))
@@ -1170,7 +1329,8 @@ def convert(context, obj, rel_tol=1e-5, fillets=True, rings=True):
         for g in done:
             features.push_step(new, "edge_fillet", [], {
                 "mids_local": [list(Mi @ Vector(m)) for m in g["mids"]], "shape": "CIRCULAR", "radius": g["r"],
-                "end_radius": None, "chord": None, "continuity": 1, "thumbweight": 1.0, "class_a": False},
+                "end_radius": None, "chord": None, "continuity": 1, "thumbweight": 1.0, "class_a": False,
+                "shrink_planes": True},
                 base_text=base)
             base = None
     if info.get("failed"):
