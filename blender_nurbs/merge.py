@@ -419,6 +419,75 @@ def fit_surface(ref, p, Uu, Uv, cont, m):
     return {"P": H, "Uu": np.asarray(Uu), "Uv": np.asarray(Uv), "pu": p, "pv": p}, res_u, res_v
 
 
+def seam_report(net, kmin=0.0, m=21):
+    """Continuity across the inner knot lines where the net can break G2 (knot
+    multiplicity >= degree - 1: the patch seams, and any sharp line inside a
+    patch). Per line: direction ("u": the line u = t), t, normal angle (deg),
+    relative curvature jump across it, and kind: KINK (tangent break), G1
+    (tangent but curvature jumps) or G2."""
+    out = []
+    eps = 1e-9
+    s = np.linspace(0.0, 1.0, m)
+    for d, U, p in (("u", net["Uu"], net["pu"]), ("v", net["Uv"], net["pv"])):
+        U = np.round(np.asarray(U, float), 12)
+        for k in sorted(set(U[p + 1:len(U) - p - 1])):
+            if int(np.sum(U == k)) < max(1, p - 1):
+                continue
+
+            def frame(c):
+                a = ([c], s) if d == "u" else (s, [c])
+                Su, Sv = eval_d(net, *a, 1, 0).reshape(-1, 3), eval_d(net, *a, 0, 1).reshape(-1, 3)
+                Scc = (eval_d(net, *a, 2, 0) if d == "u" else eval_d(net, *a, 0, 2)).reshape(-1, 3)
+                Sc = Su if d == "u" else Sv
+                n = np.cross(Su, Sv)
+                ln = np.linalg.norm(n, axis=1)
+                n = n / ln.clip(1e-300)[:, None]
+                kap = np.einsum("ij,ij->i", Scc, n) / np.einsum("ij,ij->i", Sc, Sc).clip(1e-300)
+                return n, kap, ln
+            n0, k0, l0 = frame(k - eps)
+            n1, k1, l1 = frame(k + eps)
+            ok = (l0 > 1e-12 * max(l0.max(), 1e-300)) & (l1 > 1e-12 * max(l1.max(), 1e-300))   # skip poles
+            if not ok.any():
+                continue
+            ang = float(np.degrees(np.arccos(np.clip(np.einsum("ij,ij->i", n0, n1)[ok], -1, 1))).max())
+            scale = max(float(np.abs(np.r_[k0[ok], k1[ok]]).max()), kmin, 1e-12)
+            cj = float(np.abs(k1 - k0)[ok].max() / scale)
+            kind = "KINK" if ang > ANGLE_TOL else ("G1" if cj > CURV_TOL else "G2")
+            out.append({"dir": d, "t": float(k), "angle": ang, "curv": cj, "kind": kind})
+    return out
+
+
+def seam_knots(report, p):
+    """Knots Refit keeps for the seams that are not G2: (u list, v list) of
+    (t, multiplicity): degree p at a kink (C0), p - 1 where only the
+    curvature jumps (C1)."""
+    out = ([], [])
+    for r in report:
+        if r["kind"] == "G2":
+            continue
+        mult = p if r["kind"] == "KINK" else max(1, p - 1)
+        out[0 if r["dir"] == "u" else 1].append((r["t"], mult))
+    return out
+
+
+def _with_seams(U, p, sm):
+    """Knot vector U with the seam knots sm [(t, mult)] in it: each seam takes
+    the place of the nearest inner knot (so the span count stays) with its
+    multiplicity. U unchanged when it has too few inner knots."""
+    if not sm:
+        return U
+    inner = _inner(U)
+    if len(inner) < len(sm):
+        return U
+    mult = {}
+    for k, mu in sm:
+        i = min((i for i in range(len(inner)) if i not in mult), key=lambda i: abs(inner[i] - k))
+        inner[i] = k
+        mult[i] = mu
+    full = sorted(x for i, k in enumerate(inner) for x in [k] * mult.get(i, 1))
+    return _knots(p, full)
+
+
 def _inner(U):
     """Distinct inner knots of a knot vector (on 0..1)."""
     k = sorted(set(np.round(np.asarray(U, float), 12)))
@@ -438,7 +507,7 @@ PLACE_TRIES = 3          # knot re-placements per span count before adding a spa
 
 
 def refit_net(ref, degree, spans_u, spans_v, tol, cont, edge_tol, m=None, surf_err=None, max_spans=40, kmin=0.0,
-              knots="ADAPTIVE", breaks=None, grid_only=False):
+              knots="ADAPTIVE", breaks=None, grid_only=False, seams=None):
     """Fewest spans (per direction) of the chosen degree with the surface
     within tol and the constrained edges within their checks, or the spans
     given. Grows the direction that fails until both hold.
@@ -448,7 +517,9 @@ def refit_net(ref, degree, spans_u, spans_v, tol, cont, edge_tol, m=None, surf_e
     reference's own inner knots (u, v), tried as the knots when their count
     fits (the patches' knot lines are where their shape changes).
     grid_only: ref is only known at the m x m sample parameters (a projected
-    grid), so every check samples there."""
+    grid), so every check samples there. seams: knots kept in every knot
+    vector tried, (u list, v list) of (t, multiplicity) (see seam_knots);
+    a direction whose spans are set too few for its seams smooths them."""
     p = int(degree)
     m = m or max(41, 6 * (p + 1))
     t = np.linspace(0, 1, m)
@@ -461,6 +532,11 @@ def refit_net(ref, degree, spans_u, spans_v, tol, cont, edge_tol, m=None, surf_e
     adaptive = knots != "UNIFORM"
 
     breaks = breaks or (None, None)
+    seams = [list(x) for x in (seams or ([], []))]
+    for d, fixed in ((0, spans_u), (1, spans_v)):
+        if fixed and int(fixed) < len(seams[d]) + 1:
+            seams[d] = []
+    fix = lambda U, d: _with_seams(U, p, seams[d])
 
     def fit1(B, U):              # unconstrained 1D fit of all rows: error per sample
         A = _basis(U, p, t)
@@ -483,18 +559,20 @@ def refit_net(ref, degree, spans_u, spans_v, tol, cont, edge_tol, m=None, surf_e
             out.append(place(U, spans, err))
         return out
 
-    def guess(rows, fixed, brk):
+    def guess(rows, fixed, brk, d):
         """Fewest spans whose 1D fit of the rows stays within half the
         tolerance, and the knots that got there."""
         B = np.hstack(rows)
-        lo, hi = (int(fixed), int(fixed)) if fixed else (1, max(1, m // 2 - p))
+        n_s = len(seams[d])
+        lo, hi = (int(fixed), int(fixed)) if fixed else (n_s + 1, max(n_s + 1, m // 2 - p))
         best = None
         for s_ in range(lo, hi + 1):
-            U = _uniform(p, s_)
+            U = fix(_uniform(p, s_), d)
             e = fit1(B, U)
             if adaptive:
                 for _ in range(PLACE_TRIES):
                     for Uc in candidates(U, s_, e, brk):
+                        Uc = fix(Uc, d)
                         ec = fit1(B, Uc)
                         if ec.max() < e.max():
                             U, e = Uc, ec
@@ -502,7 +580,7 @@ def refit_net(ref, degree, spans_u, spans_v, tol, cont, edge_tol, m=None, surf_e
                 best = (s_, U, float(e.max()))
             if e.max() <= 0.5 * tol:
                 return s_, U
-        return best[0], (best[1] if fixed else _uniform(p, best[0]))
+        return best[0], (best[1] if fixed else fix(_uniform(p, best[0]), d))
 
     def profiles(net):
         """Error along u and along v, each sample relative to its limit."""
@@ -523,6 +601,7 @@ def refit_net(ref, degree, spans_u, spans_v, tol, cont, edge_tol, m=None, surf_e
         return _knots(p, equidistribute(ts, err, U, p, spans))
 
     def run(Uu, Uv):
+        Uu, Uv = fix(Uu, 0), fix(Uv, 1)
         net, res_u, res_v = fit_surface(ref, p, Uu, Uv, cont, m)
         dev = surf_err(net)
         errs = side_errors(net, ref, cont, m=edge_m, kmin=kmin)
@@ -530,8 +609,8 @@ def refit_net(ref, degree, spans_u, spans_v, tol, cont, edge_tol, m=None, surf_e
                                        e.get("curv", 0.0) / CURV_TOL) for e in errs.values()])
         return {"net": net, "res": (res_u, res_v), "dev": dev, "errs": errs, "score": score, "U": (Uu, Uv)}
 
-    sv, Uv0 = guess([G[i] for i in range(m)], spans_v, breaks[1])
-    su, Uu0 = guess([G[:, j] for j in range(m)], spans_u, breaks[0])
+    sv, Uv0 = guess([G[i] for i in range(m)], spans_v, breaks[1], 1)
+    su, Uu0 = guess([G[:, j] for j in range(m)], spans_u, breaks[0], 0)
     cur = run(Uu0, Uv0)
     best_here, tries, best = cur, 0, cur
     while True:
@@ -557,7 +636,9 @@ def refit_net(ref, degree, spans_u, spans_v, tol, cont, edge_tol, m=None, surf_e
                 if Bu is not None or Bv is not None:
                     nUu = Bu if Bu is not None else Uu
                     nUv = Bv if Bv is not None else Uv
-            if np.allclose(nUu, Uu, atol=1e-6) and np.allclose(nUv, Uv, atol=1e-6):
+            nUu, nUv = fix(nUu, 0), fix(nUv, 1)
+            if len(nUu) == len(Uu) and len(nUv) == len(Uv) and np.allclose(nUu, Uu, atol=1e-6) \
+                    and np.allclose(nUv, Uv, atol=1e-6):
                 tries = PLACE_TRIES
             else:
                 cur = run(nUu, nUv)
@@ -681,7 +762,7 @@ def _cont_dict(cont):
 
 
 def merge_text(text, mode="REDUCE", tol=0.0, degree=3, spans_u=0, spans_v=0, tol_rel=1e-4, cont="G2", edge_tol=0.0,
-               knots="ADAPTIVE"):
+               knots="ADAPTIVE", seams="KEEP"):
     """Brep text of the single merged surface. Returns (text, info).
     tol: absolute tolerance (0 = tol_rel x size); cont: edge continuity kept
     (per side or one for all); edge_tol: edge position tolerance (0 = tol/10)."""
@@ -724,6 +805,9 @@ def merge_text(text, mode="REDUCE", tol=0.0, degree=3, spans_u=0, spans_v=0, tol
         Rpts = eval_net(merged, su_ref, sv_ref)
         surf_err = lambda nt: float(np.linalg.norm(eval_net(nt, su_ref, sv_ref) - Rpts, axis=2).max())
         info["exact_cvs"] = merged["P"].shape[:2]
+        info["seams"] = seam_report(merged, kmin)
+        keep = seam_knots(info["seams"], int(degree)) if seams == "KEEP" else ([], [])
+        info["seams_kept"] = sum(len(x) for x in keep) if mode == "REFIT" else 0
         if mode == "EXACT":
             out, dev = merged, 0.0
             errs = {s: {"pos": 0.0} for s in SIDES if cont[s] >= 0}
@@ -733,7 +817,11 @@ def merge_text(text, mode="REDUCE", tol=0.0, degree=3, spans_u=0, spans_v=0, tol
         else:
             out, spans, dev, errs = refit_net(ref, degree, spans_u, spans_v, tol, cont, edge_tol, surf_err=surf_err,
                                               kmin=kmin, knots=knots,
-                                              breaks=(_inner(merged["Uu"]), _inner(merged["Uv"])))
+                                              breaks=(_inner(merged["Uu"]), _inner(merged["Uv"])), seams=keep)
+            fits = [not sp or sp >= len(k_) + 1 for sp, k_ in ((spans_u, keep[0]), (spans_v, keep[1]))]
+            info["seams_kept"] = sum(len(k_) for f_, k_ in zip(fits, keep) if f_)
+            if info["seams_kept"] < sum(len(x) for x in keep):
+                info["note"] = (info["note"] + "; " if info["note"] else "") + "spans too few to keep the seams sharp"
             info["spans"] = spans
     else:
         G = projected_grid(brep, size)
@@ -790,7 +878,7 @@ def apply_merge(obj, text, inputs, p):
                            int(p.get("merge_degree", 3)), int(p.get("merge_spans_u", 0)),
                            int(p.get("merge_spans_v", 0)), cont=params_cont(p),
                            edge_tol=float(p.get("merge_edge_tolerance", 0.0)),
-                           knots=p.get("merge_knots", "ADAPTIVE"))
+                           knots=p.get("merge_knots", "ADAPTIVE"), seams=p.get("merge_seams", "KEEP"))
     LAST_INFO.clear()
     LAST_INFO.update(info)
     return out

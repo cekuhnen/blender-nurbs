@@ -593,6 +593,12 @@ MERGE_MODES = [
     ("REFIT", "Refit", "Fewest spans of the chosen degree within the tolerance (or the spans given)"),
 ]
 
+MERGE_SEAMS = [
+    ("KEEP", "Keep Kinks", "Seams where the patches meet with a kink (or a curvature jump) stay sharp: "
+                           "Refit puts a full knot there"),
+    ("SMOOTH", "Smooth", "Refit runs smoothly across every seam (a kink is rounded off within the tolerance)"),
+]
+
 MERGE_KNOTS = [
     ("ADAPTIVE", "Adaptive", "Move the knots to where the surface needs them: fewer spans for the same tolerance"),
     ("UNIFORM", "Uniform", "Evenly spaced knots"),
@@ -618,6 +624,8 @@ class NPROTO_OT_merge_patches(bpy.types.Operator):
                                            "0 = the fewest within the tolerance")
     merge_knots: EnumProperty(name="Knots", items=MERGE_KNOTS, default="ADAPTIVE",
                               description="Where Refit puts its knots")
+    merge_seams: EnumProperty(name="Seams", items=MERGE_SEAMS, default="KEEP",
+                              description="What Refit does at seams that are not smooth")
     merge_edges: EnumProperty(name="Edges", items=MERGE_CONT, default="G2", update=_merge_set_all,
                               description="What the outer edges keep from the patches, on all four sides. "
                                           "Keeping their tangents and curvature keeps the continuity they had "
@@ -634,7 +642,8 @@ class NPROTO_OT_merge_patches(bpy.types.Operator):
     def _params(self):
         p = {"merge_mode": self.merge_mode, "merge_tolerance": self.merge_tolerance, "merge_degree": self.merge_degree,
              "merge_spans_u": self.merge_spans_u, "merge_spans_v": self.merge_spans_v,
-             "merge_edge_tolerance": self.merge_edge_tolerance, "merge_knots": self.merge_knots}
+             "merge_edge_tolerance": self.merge_edge_tolerance, "merge_knots": self.merge_knots,
+             "merge_seams": self.merge_seams}
         for s_, _ in MERGE_SIDE_NAMES:
             p[f"merge_cont_{s_}"] = getattr(self, f"merge_cont_{s_}")
         return p
@@ -666,6 +675,8 @@ class NPROTO_OT_merge_patches(bpy.types.Operator):
             row.prop(self, "merge_spans_v", text="Spans V")
             lay.label(text="Spans: 0 = auto · 1 = one piece, no inner knot")
             lay.row(align=True).prop(self, "merge_knots", expand=True)
+            if inf and any(r_["kind"] != "G2" for r_ in inf.get("seams", [])):
+                lay.row(align=True).prop(self, "merge_seams", expand=True)
         if self.merge_mode != "EXACT":
             row = lay.row(align=True)
             row.prop(self, "merge_edges", expand=True)
@@ -684,6 +695,28 @@ class NPROTO_OT_merge_patches(bpy.types.Operator):
             if inf.get("route") == "grid":
                 lay.label(text=f"{inf['grid'][0]} x {inf['grid'][1]} patch grid · exact merge "
                                f"{inf['exact_cvs'][0]} x {inf['exact_cvs'][1]} CVs", icon='CHECKMARK')
+                seams = inf.get("seams", [])
+                if seams:
+                    kinks = [r_ for r_ in seams if r_["kind"] == "KINK"]
+                    g1 = [r_ for r_ in seams if r_["kind"] == "G1"]
+                    parts = []
+                    if kinks:
+                        parts.append(f"{len(kinks)} kink{'s' if len(kinks) > 1 else ''} "
+                                     f"{max(r_['angle'] for r_ in kinks):.2f}°")
+                    if g1:
+                        parts.append(f"{len(g1)} G1 (curvature {100 * max(r_['curv'] for r_ in g1):.0f}%)")
+                    n2 = len(seams) - len(kinks) - len(g1)
+                    if n2:
+                        parts.append(f"{n2} G2")
+                    txt = "seams " + " · ".join(parts)
+                    if kinks or g1:
+                        if self.merge_mode == "REFIT":
+                            txt += " · kept sharp" if inf.get("seams_kept") else " · smoothed"
+                        elif self.merge_mode == "EXACT":
+                            txt += " · kept"
+                    lay.label(text=txt, icon='ERROR' if kinks else ('INFO' if g1 else 'CHECKMARK'))
+                if inf.get("note"):
+                    lay.label(text=inf["note"], icon='INFO')
             else:
                 lay.label(text=f"Refitted over the outer boundary ({inf.get('note', '')})", icon='INFO')
             su, sv = inf["knots_u"] + 1, inf["knots_v"] + 1

@@ -9507,6 +9507,43 @@ _gres = {k_: _mg.refit_net(_gref, 3, 0, 0, 2.2e-4, {s_: 0 for s_ in _mg.SIDES}, 
 check("merge patches projected grid: edges pass on the grid samples, Adaptive needs fewer spans than Uniform",
       all(v[2] <= 2.2e-4 and _mg.edges_ok(v[3], 2.2e-5) for v in _gres.values())
       and _gres["ADAPTIVE"][1][0] < _gres["UNIFORM"][1][0], {k_: (v[1], f"{v[2]:.1e}") for k_, v in _gres.items()})
+# seams: two Bezier patches meeting with a kink, two meeting tangent with a curvature jump. The check
+# names each seam; Refit keeps it sharp (a full / C1 knot there) and fits exactly, Smooth rounds it off
+_zU4 = [0, 0, 0, 0, 1, 1, 1, 1]
+
+def _zpatch(name, x0, zf):
+    P_ = [(x0 + i / 3, j / 3, zf(i) + 0.05 * math.sin(j)) for i in range(4) for j in range(4)]
+    return store.new_object(ctx, name, ext.surface_from_cvs(3, 3, P_, _zU4, _zU4))
+
+def _zjoin(a_, b_):
+    bpy.ops.object.select_all(action='DESELECT')
+    a_.select_set(True)
+    b_.select_set(True)
+    ctx.view_layer.objects.active = a_
+    bpy.ops.nproto.join()
+    return ctx.active_object
+_zcases = {"KINK": _zjoin(_zpatch("SeamKL", 0, lambda i: 0.3 * i / 3), _zpatch("SeamKR", 1, lambda i: 0.3 - 0.4 * i / 3)),
+           "G1": _zjoin(_zpatch("SeamGL", 0, lambda i: 0.0), _zpatch("SeamGR", 1, lambda i: 0.3 * (0, 0, 1 / 3, 1)[i]))}
+_zres = {}
+for _zk, _zo in _zcases.items():
+    _zT = _zo[store.PROP_BREP]
+    _zres[_zk] = (_mg.merge_text(_zT, "EXACT", 0, 3)[1]["seams"],
+                  _mg.merge_text(_zT, "REFIT", 0, 3, seams="KEEP")[1], _mg.merge_text(_zT, "REFIT", 0, 3, seams="SMOOTH")[1])
+check("merge patches seams: a kink and a curvature jump are found, Refit keeps them sharp and exact, Smooth rounds them",
+      [r_["kind"] for r_ in _zres["KINK"][0]] == ["KINK"] and _zres["KINK"][0][0]["angle"] > 30
+      and [r_["kind"] for r_ in _zres["G1"][0]] == ["G1"] and _zres["G1"][0][0]["angle"] < 0.01
+      and all(v[1]["deviation"] < 1e-9 and v[1]["spans"][0] == 2 and v[1]["seams_kept"] == 1 and v[1]["edges_ok"]
+              for v in _zres.values())
+      and all(v[2]["spans"][0] > 4 and v[2]["seams_kept"] == 0 for v in _zres.values())
+      and _mres["EXACT"]["seams"] and all(r_["kind"] == "G2" for r_ in _mres["EXACT"]["seams"]),
+      {k_: ([(r_["kind"], f"{r_['angle']:.1f}", f"{r_['curv']:.2f}") for r_ in v[0]], v[1]["spans"],
+             f"{v[1]['deviation']:.1e}", v[2]["spans"], f"{v[2]['deviation']:.1e}") for k_, v in _zres.items()})
+_zt, _zi = _mg.merge_text(_zcases["KINK"][store.PROP_BREP], "REFIT", 0, 3, 1, 0)
+check("merge patches seams: spans set too few for a kink smooth it and say so",
+      _zi["seams_kept"] == 0 and "too few" in _zi["note"], (_zi["spans"], _zi["note"]))
+bpy.ops.object.select_all(action='DESELECT')
+_SJ.select_set(True)
+ctx.view_layer.objects.active = _SJ
 r = bpy.ops.nproto.merge_patches(merge_mode="REFIT", merge_knots="UNIFORM")
 check("merge patches operator: Knots option reaches the history step", r == {'FINISHED'}
       and features.stack(_SJ)[-1]["op"] == "merge_patches"

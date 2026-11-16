@@ -26,7 +26,7 @@ STEP_FIELDS = {
     "refit_trim": ["refit_degree", "refit_spans_u", "refit_spans_v"],
     "merge_patches": ["merge_mode", "merge_tolerance", "merge_degree", "merge_spans_u", "merge_spans_v",
                       "merge_cont_u0", "merge_cont_u1", "merge_cont_v0", "merge_cont_v1", "merge_edge_tolerance",
-                      "merge_knots"],
+                      "merge_knots", "merge_seams"],
 }
 CA_DEFAULTS = {"ca_tolerance": 1e-4, "ca_angle": 0.1, "ca_degree": 7}
 ROLE = {"trim": "trim cutter", "fillet_trim": "fillet partner"}
@@ -129,6 +129,7 @@ class NprotoStep(bpy.types.PropertyGroup):
     merge_cont_v1: EnumProperty(name="Edge V end", items=[(k, k.title() if k == "FREE" else k, "") for k in ("FREE", "G0", "G1", "G2")], **_S())
     merge_edge_tolerance: FloatProperty(name="Edge Tolerance (0 auto)", min=0.0, soft_max=0.001, precision=6, unit='LENGTH', **_S())
     merge_knots: EnumProperty(name="Knots", items=[("ADAPTIVE", "Adaptive", ""), ("UNIFORM", "Uniform", "")], **_S())
+    merge_seams: EnumProperty(name="Seams", items=[("KEEP", "Keep Kinks", ""), ("SMOOTH", "Smooth", "")], **_S())
 
 
 def sync_step(obj, k):
