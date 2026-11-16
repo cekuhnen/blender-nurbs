@@ -547,22 +547,25 @@ before its Subdivision Surface modifier), with **one face per cage face**.
 * **Higher degree at the star points.** No bicubic faces can be the surface there and also join smoothly, so a face
   with a star corner becomes **2 x 2 polynomial pieces**, evenly spread like the subdivided cage (knots 0, ½, 1) and
   smooth across its own middle lines: **degree 6 in G2** (12 x 12 CVs), **degree 5 in G1** (10 x 10 CVs, the lighter
-  net). It is fitted to the SubD, then moved as little and as smoothly as possible until it joins every neighbour
+  net); G2 can also be **degree 5** (**Degree** *5 · Lighter*: G1's net, still exactly G2). It is fitted to the SubD, then moved as little and as smoothly as possible until it joins every neighbour
   **exactly**: the normals agree all along each edge (G1) and, in G2, the curvature too, right to the star point.
   No extra knots, no flattened points: the faces bend through the star point as the SubD does.
 * **G1 is G1, G2 is G2:** Continuity Check reads G1 0.000° and G2 0.00 % on every edge of a jack (3-, 5- and 6-edge
   star points), a boot (creases, corners) and a cylinder with 8-edge poles, star points included. In G1 the faces by
   star points are only tangent: their curvature may differ across edges there.
-* **Light:** the jack is 2,792 CVs in G1, 3,936 in G2; the boot 2,308 and 3,232. (Lower degrees than 5 cannot join
+* **Light:** the jack is 2,792 CVs in G1, 3,936 in G2; the boot 2,308 and 3,232. G2 at degree 5 has G1's count:
+  2,792 and 2,308, about 30 % fewer than degree 6. (Lower degrees than 5 cannot join
   G1 at 5-edge star points without bending their edges there into near-straight curves: they would leave the SubD
   by about 1 % of the model's size.)
 * **Close to the SubD surface:** exactly on it on the bicubic faces; on the others within about 0.15 % of the
-  model's size in G2 (the jack 0.11 %, the boot 0.07 %) and 0.25 % in G1 (the jack 0.24 %, the boot 0.06 %). Next to a star point with 5 or more edges the SubD's own curvature
+  model's size in G2 (the jack 0.11 %, the boot 0.07 %) and 0.25 % in G1 (the jack 0.24 %, the boot 0.06 %). G2 at
+  degree 5 stays about as far as G1 (the jack 0.24 %, the boot 0.08 %): twice as far as degree 6 by star points. Next to a star point with 5 or more edges the SubD's own curvature
   grows without bound; there the faces stay a little smoother than the SubD.
-* **Speed:** the jack about 2 s in G2 (0.55 s in G1), the boot about 1.5 s (0.6 s), on Apple Silicon. The joins are
-  one sparse solve per step (Apple's Accelerate on macOS; Windows and Linux use a slower solver, a few times longer).
-* **It asks first:** a dialog with **Continuity** (G1 or G2; G2 by default), **Angle** and **Curvature %** (G2: a
-  join further off than these is reported) and **Hide Meshes** (the SubD objects stay, hidden in the viewport and in
+* **Speed:** the jack about 1.3 s in G2 (1.0 s at degree 5, 0.5 s in G1), the boot about 1 s (0.75 s, 0.5 s), on
+  Apple Silicon. G2 starts from the G1 solve (one linear step) raised to its degree, which halves its steps. The joins
+  are one sparse solve per step (Apple's Accelerate on macOS; Windows and Linux use a slower solver, a few times longer).
+* **It asks first:** a dialog with **Continuity** (G1 or G2; G2 by default), in G2 **Degree** (*6 · Closer*, the
+  default, or *5 · Lighter*), **Angle** and **Curvature %** (G2: a join further off than these is reported) and **Hide Meshes** (the SubD objects stay, hidden in the viewport and in
   renders); **Convert** runs it. The same settings stay in the Adjust Last Operation panel afterwards.
 * A cage without star points or odd creases (a torus) becomes exact faces of 16 CVs.
 * **Creases** (edge crease 1.0) become sharp edges along the SubD's own crease curves: each side follows its own

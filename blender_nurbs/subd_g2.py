@@ -3,7 +3,9 @@
 Faces without a star corner stay one bicubic span: the SubD surface exactly.
 A face with one becomes 2 x 2 polynomial pieces, C1 across its middle lines:
 of degree 6 for G2 (knots [0^7, .5^5, 1^7], 12 x 12 CVs, G2 across the middle
-lines too), of degree 5 for G1 (knots [0^6, .5^4, 1^6], 10 x 10 CVs). It is
+lines too), of degree 5 for G1 (knots [0^6, .5^4, 1^6], 10 x 10 CVs). G2 also
+works at degree 5 (the same net as G1; about twice as far from the SubD as
+degree 6): the lighter option. It is
 fitted to the SubD and then moved as little and as smoothly as possible until
 it joins its neighbours exactly:
 
@@ -84,12 +86,13 @@ def _piece(sb, net, ku, kv, lo_u, lo_v, Pi, s):
 
 def build(sb, conv, g2=True, kernel=None, opts=None):
     """(nets, knots, info) for every cage face of conv (a subd_brep.Converter with star points): bicubic
-    one-span nets, and at star points 2 x 2 pieces of degree 6 (G2: 12 x 12 CVs) or 5 (G1: 10 x 10).
+    one-span nets, and at star points 2 x 2 pieces of degree 6 (G2: 12 x 12 CVs) or 5 (G1, or a lighter G2
+    with opts["degree"] = 5: 10 x 10).
     kernel: the B-rep kernel extension (KKTFactor)."""
     opts = opts or {}
     p = int(opts.get("degree", 6 if g2 else 5))
-    if g2 and p < 6:
-        raise ValueError("G2 needs degree 6 at the star points")
+    if g2 and p < 5:
+        raise ValueError("G2 needs degree 5 or more at the star points")
     N, Mid, R = 2 * p, p, p + 1                                    # last grid index, middle row, piece / view size
     q = int(opts.get("beta_power", 2))                            # beta's power (see above)
     T0 = time.perf_counter()
@@ -607,12 +610,12 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
         return Pc, hist
 
     Pc, hist = None, None
-    if g2 and p == 6 and opts.get("warm", True) and n:
+    if g2 and p in (5, 6) and opts.get("warm", True) and n:
         # start from the G1 solve (linear, one factorisation) raised to degree 6 exactly: already G1, so Newton
         # has only the curvature left to do -- about half the factorisations. Where that start does not reach
         # the tolerance (a G1 corner that G2 must bend away from), the usual start from the SubD fit
         n1, _, _ = build(sb, conv, g2=False, kernel=kernel, opts={"degree": 5})
-        E = _elevate(5)
+        E = _elevate(5) if p == 6 else np.eye(6)
         Pw = P.copy()
         keep5 = [i for i in range(11) if i != 5]
         for f in faces_i:
@@ -623,8 +626,8 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
             G6 = np.zeros((N + 1, N + 1, 3))
             for qu in (0, 1):
                 for qv in (0, 1):
-                    G6[6 * qu:6 * qu + 7, 6 * qv:6 * qv + 7] = np.einsum("ia,jb,abc->ijc", E, E,
-                                                                         G5[5 * qu:5 * qu + 6, 5 * qv:5 * qv + 6])
+                    G6[p * qu:p * qu + p + 1, p * qv:p * qv + p + 1] = np.einsum("ia,jb,abc->ijc", E, E,
+                                                                                 G5[5 * qu:5 * qu + 6, 5 * qv:5 * qv + 6])
             ids = np.array([[kid[key[(f, i, j)]] for j in range(N + 1)] for i in range(N + 1)])
             mv = ~fixed[ids]
             Pw[ids[mv]] = G6[mv]
