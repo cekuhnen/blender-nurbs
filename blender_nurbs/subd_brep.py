@@ -1,5 +1,7 @@
 """SubD to BREP: a Subdivision Surface model (Catmull-Clark on a quad cage)
 as a NURBS body with one face per cage face, G1 or G2 across every edge.
+(Triangles and n-gons: MacroConverter -- one face per quad, the n-gons split
+into the quads of Catmull-Clark's first step, T-junctions where they meet.)
 
 Catmull-Clark's surface is a uniform bicubic B-spline wherever the mesh is
 regular. So every face gets even knots (4 spans for G1, 8 for G2) and its CVs
@@ -63,19 +65,27 @@ def cage(obj, depsgraph):
         for m, s in zip(subs, shown):
             m.show_viewport = s
         depsgraph.update()
-    if any(len(f) != 4 for f in F):                 # triangles / n-gons: one Catmull-Clark step makes quads
-        V, F, sharp = refine_any(V, F, sharp)
+    F = [tuple(int(x) for x in f) for f in F]
+    if all(len(f) == 4 for f in F):                 # (triangles / n-gons: build() splits them, MacroConverter)
+        sharp = with_borders(F, sharp)
+    return V, F, sharp, obj.matrix_world.copy()
+
+
+def with_borders(F, sharp):
+    """sharp and the open borders (edges of one face): those behave like creases."""
     uses = {}
     for f in F:
-        for i in range(4):
-            e = tuple(sorted((f[i], f[(i + 1) % 4])))
+        for i in range(len(f)):
+            e = tuple(sorted((f[i], f[(i + 1) % len(f)])))
             uses[e] = uses.get(e, 0) + 1
-    sharp |= {e for e, n in uses.items() if n != 2}  # open borders behave like creases
-    return V, [tuple(int(x) for x in f) for f in F], sharp, obj.matrix_world.copy()
+    return set(sharp) | {e for e, n in uses.items() if n != 2}
 
 
 def refine_any(V, F, sharp):
-    """One Catmull-Clark step on a mesh with any polygons (quads out)."""
+    """One Catmull-Clark step on a mesh with any polygons (quads out): the vertex
+    points first (same indices), then the edge points, then the face points;
+    face k's children consecutively, child i (F[k][i], its edge point towards
+    F[k][i + 1], the face point, its edge point towards F[k][i - 1])."""
     fp = np.array([V[list(f)].mean(0) for f in F])
     edges = {}
     for k, f in enumerate(F):
@@ -579,6 +589,67 @@ class Converter:
         n = n - (n * d).sum(1)[:, None] * d
         return n / np.maximum(np.linalg.norm(n, axis=1), 1e-300)[:, None]
 
+    # -- the faces' topology, as the star-point solve (subd_g2) and the checks see it ----------------
+    tedges, tmid, tq, tp = (), {}, {}, {}                          # T-junctions (MacroConverter's)
+
+    def hard(self, e):
+        """A creased or open edge: no join across it."""
+        return e in self.sharp or len(self.edges[e]) != 2
+
+    def across(self, f, e):
+        """The faces across edge e from face f."""
+        return [g for g, _, _ in self.edges[e] if g != f]
+
+    def joined_at(self, x):
+        """The pairs of faces joined across a smooth edge at x."""
+        out = []
+        for z in self.nbr[x]:
+            e = (min(x, z), max(x, z))
+            if len(self.edges[e]) == 2 and e not in self.sharp:
+                out.append((self.edges[e][0][0], self.edges[e][1][0]))
+        return out
+
+    def joins(self):
+        """Per smooth join (its key): the two faces' sides along it, (face, side, A, B): the side's parameter
+        is A + B t along the join's t (from its lower vertex)."""
+        return [(e, [(f, k, 1.0, -1.0) if flip else (f, k, 0.0, 1.0) for f, k, flip in uses])
+                for e, uses in self.edges.items() if len(uses) == 2 and e not in self.sharp]
+
+    def crease_curve(self, a, b):
+        """The SubD's own curve along the creased (or open) edge a -> b at t in 0..1: the uniform cubic B-spline
+        of the crease polygon (a ghost 2a - b beyond a corner); None where an end is a dart."""
+        hn = {}
+        for e, us_ in self.edges.items():
+            if self.hard(e):
+                for x in e:
+                    hn.setdefault(x, []).append(e[1] if e[0] == x else e[0])
+        if len(hn.get(a, ())) < 2 or len(hn.get(b, ())) < 2:
+            return None
+        V = self.V
+
+        def outer(x, y):
+            nb_ = hn[x]
+            return V[nb_[0] if nb_[1] == y else nb_[1]] if len(nb_) == 2 else 2 * V[x] - V[y]
+        Qm, Qa, Qb, Qp = outer(a, b), V[a], V[b], outer(b, a)
+        bz = np.array([(Qm + 4 * Qa + Qb) / 6, (2 * Qa + Qb) / 3, (Qa + 2 * Qb) / 3, (Qa + 4 * Qb + Qp) / 6])
+
+        def cub(t):
+            t = np.asarray(t, float)[:, None]
+            return (1 - t) ** 3 * bz[0] + 3 * t * (1 - t) ** 2 * bz[1] + 3 * t * t * (1 - t) * bz[2] + t ** 3 * bz[3]
+        return cub
+
+    def fresh_natural(self, L):
+        """(nets, knots, corner limit points) of every face at level L, no sliver knots (natural)."""
+        c = Converter(self.V, self.F, self.sharp)
+        nets = c.natural(L, sliver=False)
+        return nets, list(c.fk), c.levels.corners
+
+    def limit_grid(self, level):
+        """Per face its SubD limit points at (i, j) / 2^level (level 2 or more)."""
+        c = Converter(self.V, self.F, self.sharp)
+        c.natural(level, sliver=False)
+        return list(c.levels.limit)
+
     # -- the knots -----------------------------------------------------------------------
     def irregular(self):
         """Vertices where the subdivided cage is not a regular grid: star
@@ -967,10 +1038,11 @@ class Converter:
             k = np.abs(H) + np.sqrt(np.maximum(H * H - K, 0.0))
         return float(k[ok].max()) if ok.any() else 0.0
 
-    def cross_curvatures(self, net, ku, kv, k, t, flip):
+    def cross_curvatures(self, net, ku, kv, k, t, A, B):
         """Normal curvature across side k of a face (square to the edge, in
-        the tangent plane) at edge parameters t, with the face's normals."""
-        u, v = SIDE_UV[k](1 - t if flip else t)
+        the tangent plane) at edge parameters t (side parameter A + B t), with
+        the face's normals."""
+        u, v = SIDE_UV[k](A + B * t)
         D = derivs(net, ku, kv, u, v, ((1, 0), (0, 1), (2, 0), (1, 1), (0, 2)))
         su, sv = D[(1, 0)], D[(0, 1)]
         n = np.cross(su, sv)
@@ -978,7 +1050,7 @@ class Converter:
         flat = ln < 1e-7 * np.linalg.norm(su, axis=1) * np.linalg.norm(sv, axis=1)       # a corner folded flat
         n /= np.maximum(ln, 1e-300)[:, None]
         (au, av) = ALONG[k]
-        T = (-1.0 if flip else 1.0) * (au * su + av * sv)
+        T = (-1.0 if B < 0 else 1.0) * (au * su + av * sv)
         b = np.cross(n, T)
         b /= np.maximum(np.linalg.norm(b, axis=1), 1e-300)[:, None]
         E, F_, G_ = (su * su).sum(1), (su * sv).sum(1), (sv * sv).sum(1)
@@ -988,13 +1060,13 @@ class Converter:
         kn = a_ * a_ * (D[(2, 0)] * n).sum(1) + 2 * a_ * c_ * (D[(1, 1)] * n).sum(1) + c_ * c_ * (D[(0, 2)] * n).sum(1)
         return np.where(flat, np.nan, kn), n
 
-    def _by_length(self, net, ku, kv, k, flip, n, skip):
+    def _by_length(self, net, ku, kv, k, A, B, n, skip):
         """Edge parameters (edge direction) evenly spaced by arc length from
         skip to 1 - skip, as Continuity Check samples an edge."""
-        key = (id(net), k, flip, n, skip)
+        key = (id(net), k, A, B, n, skip)
         if key not in self._arc:
             t = np.unique(np.r_[np.linspace(0, 1, 301), 2.0 ** -np.arange(3, 14), 1 - 2.0 ** -np.arange(3, 14)])
-            u, v = SIDE_UV[k](1 - t if flip else t)
+            u, v = SIDE_UV[k](A + B * t)
             P = derivs(net, ku, kv, u, v, ((0, 0),))[(0, 0)]
             d = np.r_[0, np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))]
             self._arc[key] = np.interp(np.linspace(skip, 1 - skip, n) * d[-1], d, t)
@@ -1007,19 +1079,19 @@ class Converter:
         G2), and where (t)."""
         kmax = {}
         out = {}
-        for e, uses in self.edges.items():
-            if len(uses) != 2 or e in self.sharp or (edges is not None and e not in edges):
+        for e, uses in self.joins():
+            if edges is not None and e not in edges:
                 continue
-            f0, k0, fl0 = uses[0]
-            t = self._by_length(nets[f0], *knots[f0], k0, fl0, samples, CHECK_ENDS)
+            f0, k0, A0, B0 = uses[0]
+            t = self._by_length(nets[f0], *knots[f0], k0, A0, B0, samples, CHECK_ENDS)
             ks = []
-            for f, k, flip in uses:
+            for f, k, A, B in uses:
                 if f not in kmax:
                     kmax[f] = self._face_kmax(nets[f], *knots[f])
-                ks.append(self.cross_curvatures(nets[f], *knots[f], k, t, flip))
+                ks.append(self.cross_curvatures(nets[f], *knots[f], k, t, A, B))
             (ka, na), (kb, nb) = ks
             kb = np.where((na * nb).sum(1) < 0, -kb, kb)
-            u0, v0 = SIDE_UV[k0](1 - t if fl0 else t)
+            u0, v0 = SIDE_UV[k0](A0 + B0 * t)
             L = float(np.linalg.norm(np.diff(derivs(nets[f0], *knots[f0], u0, v0, ((0, 0),))[(0, 0)], axis=0),
                                      axis=1).sum()) or 1.0
             scale = max(np.nanmax(np.abs(np.r_[ka, kb, 0.0])), kmax[uses[0][0]], kmax[uses[1][0]], 0.05 / L)
@@ -1045,20 +1117,20 @@ class Converter:
         out, out_all = {}, {}
         ends = 2.0 ** -np.arange(2, 16)
         t_all = np.unique(np.r_[np.linspace(0.0, 1.0, 81), ends, 1 - ends, 1.5 * ends, 1 - 1.5 * ends])   # by the corners too
-        for e, uses in self.edges.items():
-            if len(uses) != 2 or e in self.sharp or (edges is not None and e not in edges):
+        for e, uses in self.joins():
+            if edges is not None and e not in edges:
                 continue
-            f0, k0, fl0 = uses[0]
-            t = self._by_length(nets[f0], *knots[f0], k0, fl0, 81, skip) if skip else t_all
+            f0, k0, A0, B0 = uses[0]
+            t = self._by_length(nets[f0], *knots[f0], k0, A0, B0, 81, skip) if skip else t_all
             n_skip = len(t)
             if also_ends:
                 t = np.r_[t, t_all]
             ns, flat = [], np.zeros(len(t), bool)
-            for f, k, flip in uses:
-                u, v = SIDE_UV[k](1 - t if flip else t)
+            for f, k, A, B in uses:
+                u, v = SIDE_UV[k](A + B * t)
                 D = derivs(nets[f], *knots[f], u, v, ((1, 0), (0, 1)))
                 (au, av), (iu, iv) = ALONG[k], INWARD[k]
-                T = (-1.0 if flip else 1.0) * (au * D[(1, 0)] + av * D[(0, 1)])
+                T = (-1.0 if B < 0 else 1.0) * (au * D[(1, 0)] + av * D[(0, 1)])
                 I = iu * D[(1, 0)] + iv * D[(0, 1)]
                 n = np.cross(T, I)
                 ln = np.linalg.norm(n, axis=1)
@@ -1074,24 +1146,298 @@ class Converter:
         return (out, out_all) if also_ends else out
 
 
+_CORNER_UV = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+
+
+class MacroConverter(Converter):
+    """A cage with triangles or n-gons, built on its quads after one Catmull-Clark step (R, the same
+    surface): one face per cage quad (its four children, 2 x 2 in its (u, v)) and one per child of an n-gon.
+    A quad's side next to an n-gon meets two n-gon faces: a T-junction at the side's middle (R's edge point
+    there), joined like any edge (subd_g2: the quad's half split at its middle). A lighter layout than
+    one face per child of every face: the n-gons alone are split."""
+
+    def __init__(self, V, F, sharp, angle_tol=0.05, curv_tol=0.02):
+        V2, F2, s2 = refine_any(np.asarray(V, float), F, sharp)
+        F2 = [tuple(int(x) for x in f) for f in F2]
+        s2 = with_borders(F2, s2)
+        self.R = R = Converter(V2, F2, s2, angle_tol, curv_tol)
+        emid, MF, off = {}, [], 0                                  # cage edge -> its edge point in R
+        for f in F:
+            n = len(f)
+            for i in range(n):
+                emid[(min(f[i], f[(i + 1) % n]), max(f[i], f[(i + 1) % n]))] = F2[off + i][1]
+            if n == 4:
+                MF.append((tuple(int(x) for x in f), "q", list(range(off, off + 4))))
+            else:
+                MF += [(F2[c], "c", [c]) for c in range(off, off + n)]
+            off += n
+        self.emid = emid
+        self.pt_edge = {m: e for e, m in emid.items()}
+        self.V, self.F = V2, [fv for fv, _, _ in MF]
+        self.kind, self.kids = [k_ for _, k_, _ in MF], [c for _, _, c in MF]
+        self.angle_tol, self.curv_tol = angle_tol, curv_tol
+        self.size = R.size
+        self.sharp = set()
+        for fv, kind, _ in MF:
+            for i in range(4):
+                a, b = fv[i], fv[(i + 1) % 4]
+                e = (min(a, b), max(a, b))
+                half = (min(a, emid[e]), max(a, emid[e])) if kind == "q" else e
+                if half in s2:
+                    self.sharp.add(e)
+        self.edges, self.vf = {}, [[] for _ in V2]
+        for k, fv in enumerate(self.F):
+            for i in range(4):
+                a, b = fv[i], fv[(i + 1) % 4]
+                self.edges.setdefault((min(a, b), max(a, b)), []).append((k, i, a > b))
+            for a in fv:
+                self.vf[a].append(k)
+        corners = {x for fv in self.F for x in fv}
+        # the T-junctions: a quad's side used once whose middle is a corner of the n-gon faces beyond
+        self.tedges, self.tmid, self.tq, self.tp = [], {}, {}, {}
+        for e, uses in self.edges.items():
+            f, k, _ = uses[0]
+            if len(uses) != 1 or self.kind[f] != "q" or emid[e] not in corners:
+                continue
+            m = emid[e]
+            a, b = self.F[f][k], self.F[f][(k + 1) % 4]
+            pieces = []
+            for x in (a, b):
+                pe = (min(x, m), max(x, m))
+                us_ = self.edges.get(pe, [])
+                if len(us_) != 1:
+                    raise ValueError("a quad's side meets more than two n-gon faces")
+                pieces.append((x, us_[0][0], us_[0][1]))
+                self.tp[pe] = len(self.tedges)
+            self.tq[e] = self.tmid[m] = len(self.tedges)
+            self.tedges.append({"e": e, "q": f, "k": k, "a": a, "b": b, "m": m, "pieces": pieces})
+        self.open = any(len(u) != 2 and e not in self.tq and e not in self.tp for e, u in self.edges.items())
+        self.nbr = [set() for _ in V2]
+        for a, b in self.edges:
+            self.nbr[a].add(b)
+            self.nbr[b].add(a)
+        self.val, self.creased, self.star = R.val, R.creased, R.star
+        # R's irregular vertices are the faces' corners -- but for the middles of creased or open cage edges along
+        # a quad's side (the crease runs straight on through them)
+        on_crease = {m for m, (p_, q_) in self.pt_edge.items() if (min(p_, m), max(p_, m)) in s2}
+        if not set(R.irr) <= corners | on_crease:
+            raise ValueError("an irregular vertex inside a face")
+        self.irr = set(R.irr) & corners
+        # rings: R's, its edge points standing for the cage vertex beyond them (unless a face corner)
+        self.ring = [None] * len(V2)
+        for x in corners:
+            r = R.ring[x]
+            if r is None or x in self.tmid:
+                continue
+            es = []
+            for y in r[0]:
+                if y in corners:
+                    es.append(y)
+                elif y in self.pt_edge and x in self.pt_edge[y]:
+                    p_, q_ = self.pt_edge[y]
+                    es.append(q_ if p_ == x else p_)
+                else:
+                    es = None
+                    break
+            self.ring[x] = (es, r[1]) if es else None
+        self._vn, self._arc = {}, {}
+        self.deviation = 0.0
+        self._nat = {}
+
+    def hard(self, e):
+        return e in self.sharp or (len(self.edges[e]) != 2 and e not in self.tq and e not in self.tp)
+
+    def across(self, f, e):
+        if e in self.tq:
+            return [g for _, g, _ in self.tedges[self.tq[e]]["pieces"]]
+        if e in self.tp:
+            return [self.tedges[self.tp[e]]["q"]]
+        return super().across(f, e)
+
+    def joined_at(self, x):
+        out = super().joined_at(x)
+        for T in self.tedges:
+            if T["e"] not in self.sharp:
+                out += [(T["q"], g) for y, g, _ in T["pieces"] if y == x]
+        return out
+
+    def joins(self):
+        out = super().joins()
+        for T in self.tedges:
+            if T["e"] in self.sharp:
+                continue
+            q, kq, m = T["q"], T["k"], T["m"]
+            for x, g, kg in T["pieces"]:
+                pe = (min(x, m), max(x, m))
+                side_c = (0.0, 1.0) if self.F[g][kg] == pe[0] else (1.0, -1.0)
+                from_x = self.F[q][kq] == x                        # the quad's side runs from x
+                if x == pe[0]:
+                    side_q = (0.0, 0.5) if from_x else (1.0, -0.5)
+                else:
+                    side_q = (0.5, -0.5) if from_x else (0.5, 0.5)
+                out.append((pe, [(g, kg) + side_c, (q, kq) + side_q]))
+        return out
+
+    def crease_curve(self, a, b):
+        e = (min(a, b), max(a, b))
+        if e in self.R.edges:
+            return self.R.crease_curve(a, b)
+        m = self.emid[e]
+        c1, c2 = self.R.crease_curve(a, m), self.R.crease_curve(m, b)
+        if c1 is None or c2 is None:
+            return None
+
+        def cub(t):
+            t = np.asarray(t, float)
+            out = np.zeros((len(t), 3))
+            lo = t <= 0.5
+            if lo.any():
+                out[lo] = c1(2 * t[lo])
+            if (~lo).any():
+                out[~lo] = c2(2 * t[~lo] - 1)
+            return out
+        return cub
+
+    def _quad_eval(self, nets, kn, u, w):
+        """The surface of a cage quad's four children (their nets, knots) at its (u, v)."""
+        quad = np.where(u > 0.5, np.where(w > 0.5, 2, 1), np.where(w > 0.5, 3, 0))
+        P = np.c_[u, w]
+        out = np.zeros((len(u), 3))
+        for i in range(4):
+            sel = quad == i
+            if not sel.any():
+                continue
+            C, du, dv = _CORNER_UV[i], _CORNER_UV[(i + 1) % 4] - _CORNER_UV[i], _CORNER_UV[i - 1] - _CORNER_UV[i]
+            d = P[sel] - C
+            s, t = np.clip(2 * d @ du, 0, 1), np.clip(2 * d @ dv, 0, 1)
+            out[sel] = derivs(nets[i], *kn[i], s, t, ((0, 0),))[(0, 0)]
+        return out
+
+    def _fit_quad(self, f, nets, kn, kq, whole=False):
+        """Least-squares net on knots kq (both ways) of a quad's surface: its children's (nets, knots), or one
+        net over the whole quad (whole); and how far off it stays at the samples."""
+        ts = samples(np.union1d(kq, kn[0][0]), 3)
+        U, W = np.meshgrid(ts, ts, indexing="ij")
+        if whole:
+            S = derivs(nets[0], *kn[0], U.ravel(), W.ravel(), ((0, 0),))[(0, 0)].reshape(len(ts), len(ts), 3)
+        else:
+            S = self._quad_eval(nets, kn, U.ravel(), W.ravel()).reshape(len(ts), len(ts), 3)
+        B = basis(kq, ts)
+        Bp = np.linalg.pinv(B)
+        net = np.einsum("ia,abc,jb->ijc", Bp, S, Bp, optimize=True)
+        err = float(np.abs(np.einsum("ia,abc,jb->ijc", B, net, B, optimize=True) - S).max())
+        return net, err
+
+    def fresh_natural(self, L):
+        """A quad at level L is its children at level L - 1 (one level more where L is 0, then one span
+        if that is exact); an n-gon's child its own level L."""
+        if L in self._nat:
+            return self._nat[L]
+        R = self.R
+        lq = max(L, 1)
+        nc_ = 2 ** (lq - 1)                                        # a child's cells at R's level lq - 1
+        nq_ = 2 * nc_
+        lev = Levels(R.V, R.F, R.sharp, lq - 1, base=lq - 1)
+        Cq, kL = _clamping(nq_)
+        cc = None
+        if any(k_ == "c" for k_ in self.kind):
+            cc = Converter(R.V, R.F, R.sharp)
+            nc = cc.natural(L, sliver=False)
+        m = len(self.F)
+        nets, fk, cor = [None] * m, [None] * m, np.zeros((m, 4, 3))
+        a, b = np.meshgrid(np.arange(nc_ + 3), np.arange(nc_ + 3), indexing="ij")
+        ghost = (a == 0) | (b == 0) | (a == nc_ + 2) | (b == nc_ + 2)
+        for f in range(m):
+            ch = self.kids[f]
+            if self.kind[f] == "c":
+                nets[f], fk[f], cor[f] = nc[ch[0]], cc.fk[ch[0]], cc.levels.corners[ch[0]]
+                continue
+            # the quad's grid (one ring of ghosts) from its children's, as the cage subdivided would give it;
+            # the ghosts first, the children's own points over them
+            G = np.zeros((nq_ + 3, nq_ + 3, 3))
+            for part in (ghost, ~ghost):
+                for i, c in enumerate(ch):
+                    C, du, dv = _CORNER_UV[i], _CORNER_UV[(i + 1) % 4] - _CORNER_UV[i], _CORNER_UV[i - 1] - _CORNER_UV[i]
+                    p = C + ((a[part] - 1)[:, None] * du + (b[part] - 1)[:, None] * dv) / nq_
+                    I, J = 1 + np.rint(p[:, 0] * nq_).astype(int), 1 + np.rint(p[:, 1] * nq_).astype(int)
+                    ok = (I >= 0) & (J >= 0) & (I <= nq_ + 2) & (J <= nq_ + 2)
+                    G[I[ok], J[ok]] = lev.ext[lq - 1][c][part][ok]
+            net = np.einsum("ia,jb,abc->ijc", Cq, Cq, G, optimize=True)
+            cs = [lev.corners[c, 0] for c in ch]
+            net[0, 0], net[-1, 0], net[-1, -1], net[0, -1] = cs   # the corners on their exact limit points
+            kq = kL
+            if L == 0:                                             # one span where that is the surface exactly
+                k1 = np.r_[[0.0] * 4, [1.0] * 4]
+                n1, err = self._fit_quad(f, [net] * 4, [(kq, kq)] * 4, k1, whole=True)
+                if err < 1e-9 * self.size:
+                    net, kq = n1, k1
+                    net[0, 0], net[-1, 0], net[-1, -1], net[0, -1] = cs
+            nets[f], fk[f], cor[f] = net, (kq, kq), cs
+        self._nat[L] = (nets, fk, cor)
+        return self._nat[L]
+
+    def limit_grid(self, level):
+        R = self.R
+        cq = Converter(R.V, R.F, R.sharp)
+        cq.natural(level - 1, sliver=False)
+        limq = cq.levels.limit
+        limc = None
+        out = []
+        for f in range(len(self.F)):
+            ch = self.kids[f]
+            if self.kind[f] == "c":
+                if limc is None:
+                    c2 = Converter(R.V, R.F, R.sharp)
+                    c2.natural(level, sliver=False)
+                    limc = c2.levels.limit
+                out.append(limc[ch[0]])
+                continue
+            n = limq.shape[1] - 1
+            G = np.zeros((2 * n + 1, 2 * n + 1, 3))
+            a, b = np.meshgrid(np.arange(n + 1), np.arange(n + 1), indexing="ij")
+            for i, c in enumerate(ch):
+                C, du, dv = _CORNER_UV[i], _CORNER_UV[(i + 1) % 4] - _CORNER_UV[i], _CORNER_UV[i - 1] - _CORNER_UV[i]
+                p = C[None, None] + (a[..., None] * du + b[..., None] * dv) / (2 * n)
+                I, J = np.rint(p[..., 0] * 2 * n).astype(int), np.rint(p[..., 1] * 2 * n).astype(int)
+                G[I, J] = limq[c]
+            out.append(G)
+        return out
+
+
 def _length(context, x):
     us = context.scene.unit_settings
     return bpy.utils.units.to_string(us.system, 'LENGTH', x * (us.scale_length or 1.0), precision=3)
 
 
 def build(V, F, sharp, g2=True, angle_tol=0.05, curv_tol=0.02):
-    """(nets, knots, stats, conv) for a quad cage: faces without a star corner one
-    bicubic span (the SubD exactly), the others 2 x 2 pieces joined exactly, of
-    degree 6 in G2, 5 in G1 (subd_g2); the joins measured as Continuity Check
-    would."""
+    """(nets, knots, stats, conv) for a cage: faces without a star corner bicubic
+    (the SubD exactly), the others 2 x 2 pieces joined exactly, of degree 6 in
+    G2, 5 in G1 (subd_g2); the joins measured as Continuity Check would. A cage
+    with triangles or n-gons: one face per quad, the n-gons split (MacroConverter,
+    T-junctions where they meet quads); if that cannot be solved, every face
+    split by one subdivision step."""
+    if any(len(f) != 4 for f in F):
+        try:
+            return _build(MacroConverter(V, F, sharp, angle_tol, curv_tol), g2, macro=True)
+        except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
+            V2, F2, s2 = refine_any(np.asarray(V, float), F, sharp)
+            F2 = [tuple(int(x) for x in f) for f in F2]
+            nets, knots, st, conv = _build(Converter(V2, F2, with_borders(F2, s2), angle_tol, curv_tol), g2)
+            st["layout_fallback"] = str(exc)
+            return nets, knots, st, conv
+    return _build(Converter(V, F, sharp, angle_tol, curv_tol), g2)
+
+
+def _build(conv, g2, macro=False):
     import sys
     from . import subd_g2
-    conv = Converter(V, F, sharp, angle_tol, curv_tol)
     info, fallback = {}, None
     if conv.irr:
         try:
             nets, knots, info = subd_g2.build(sys.modules[__name__], conv, g2=g2, kernel=store._k()[1])
         except (RuntimeError, ValueError, np.linalg.LinAlgError, AttributeError) as exc:
+            if macro:                                              # the earlier joints know quads only
+                raise RuntimeError(str(exc)) from exc
             # the solve failed (or a kernel older than this add-on, without KKTFactor, is loaded): the earlier joints
             fallback = str(exc) if not isinstance(exc, AttributeError) else "restart Blender to load the new kernel"
             nets, knots, _ = conv.run(g2=g2)
@@ -1099,9 +1445,8 @@ def build(V, F, sharp, g2=True, angle_tol=0.05, curv_tol=0.02):
     else:
         nets = conv.natural(0, sliver=False)
         knots = list(conv.fk)
-    six = {f for f, (ku, _) in enumerate(knots) if len(ku) != 8}
-    edges = {e for e, uses in conv.edges.items() if len(uses) == 2 and e not in sharp
-             and any(f in six for f, _, _ in uses)}                # the others join as the SubD does: C2
+    six = {f for f, (ku, _) in enumerate(knots) if np.count_nonzero(ku == ku[0]) > 4}
+    edges = {e for e, uses in conv.joins() if any(u[0] in six for u in uses)}   # the others join as the SubD does: C2
     ends, every = conv.edge_jumps(nets, knots, CHECK_ENDS, edges=edges, also_ends=True)
     st = {"normal": max((j for j, _ in ends.values()), default=0.0),
           "normal_all": max((j for j, _ in every.values()), default=0.0),
@@ -1109,8 +1454,9 @@ def build(V, F, sharp, g2=True, angle_tol=0.05, curv_tol=0.02):
           if g2 else None,
           "deviation": subd_g2.deviation(sys.modules[__name__], conv, nets, knots) if six and not fallback else conv.deviation,
           "cvs": sum(n.shape[0] * n.shape[1] for n in nets), "star_points": len(conv.irr), "split": len(six),
+          "faces": len(nets), "t_junctions": len(conv.tedges),
           "degree": max((int(np.count_nonzero(knots[f][0] == 0.0)) - 1 for f in six), default=3),
-          "fallback": fallback, "solver": info}
+          "fallback": fallback, "layout_fallback": None, "solver": info}
     return nets, knots, st, conv
 
 
@@ -1137,17 +1483,21 @@ def convert(context, obj, angle_tol=0.05, g2=True, curv_tol=0.02):
     if st["star_points"]:
         scale = abs(np.linalg.det(np.asarray(M)[:3, :3])) ** (1 / 3) or 1.0
         pieces = f"of degree {st['degree']}"
-        layout = f"{st['split']} {pieces} by the {st['star_points']} star points, the rest one bicubic span"
+        layout = f"{st['split']} {pieces} by the {st['star_points']} star points, the rest bicubic"
         near = (f"within {_length(context, st['deviation'] * scale)} of the SubD surface "
-                f"(exactly on it on the one-span faces)")
+                f"(exactly on it on the bicubic faces)")
         at_points = f" ({st['normal_all']:.3f}° at the star points)" if st["normal_all"] > st["normal"] + 5e-4 else ""
     else:
         layout, near, at_points = "one bicubic span each", "exactly the SubD surface", ""
-    summary = (f"{len(F)} faces · {layout} · {st['cvs']:,} CVs · G1 within {st['normal']:.3f}°{at_points}"
+    tj = f" ({st['t_junctions']} T-junctions by the n-gons)" if st["t_junctions"] else ""
+    summary = (f"{len(nets)} faces{tj} · {layout} · {st['cvs']:,} CVs · G1 within {st['normal']:.3f}°{at_points}"
                + (f" · G2 within {100 * st['curvature']:.2f}%" if g2 else "") + f" · {near}")
     notes = [] if info.get("solid") or conv.open else ["the faces did not close into a solid"]
     if st["fallback"]:
         notes.append(f"the exact solve failed ({st['fallback']}): joined by the earlier method")
+    if st["layout_fallback"]:
+        notes.append(f"the n-gons could not be joined to the quads ({st['layout_fallback']}): every face split by "
+                     f"one subdivision step")
     if st["normal"] > angle_tol + 1e-9:
         notes.append(f"G1 {st['normal']:.3f}°, not {angle_tol:.3f}°")
     if g2 and st["curvature"] > curv_tol + 1e-9:
@@ -1157,10 +1507,11 @@ def convert(context, obj, angle_tol=0.05, g2=True, curv_tol=0.02):
 
 
 class NPROTO_OT_subd_to_brep(bpy.types.Operator):
-    """Convert the selected SubD models (Subdivision Surface on a quad cage) to NURBS
-    bodies: one face per cage face, each one bicubic span (the SubD exactly) but by star
-    points, where faces of degree 6 (G2) or 5 (G1) join exactly; creases (1.0) as sharp
-    edges. The meshes are kept (hidden)"""
+    """Convert the selected SubD models (Subdivision Surface on a cage) to NURBS bodies:
+    one face per cage quad, each bicubic (the SubD exactly) but by star points, where faces
+    of degree 6 (G2) or 5 (G1) join exactly; triangles and n-gons split into quads (meeting
+    the quads beside them at T-junctions); creases (1.0) as sharp edges. The meshes are kept
+    (hidden)"""
     bl_idname = "nproto.subd_to_brep"
     bl_label = "SubD to BREP"
     bl_options = {'REGISTER', 'UNDO'}

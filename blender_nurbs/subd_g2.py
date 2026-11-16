@@ -45,6 +45,18 @@ def _bez(sb, x, d=0, p=6):
     return sb.basis(np.r_[[0.0] * (p + 1), [1.0] * (p + 1)], np.atleast_1d(np.asarray(x, float)), d, p)
 
 
+def _split(p):
+    """(2p + 1, p + 1): a Bezier curve's CVs -> its two halves' (de Casteljau at 1/2, sharing the middle one)."""
+    L = np.zeros((p + 1, p + 1))
+    Rr = np.zeros((p + 1, p + 1))
+    for j in range(p + 1):
+        for k in range(j + 1):
+            L[j, k] = math.comb(j, k) / 2 ** j
+        for k in range(j, p + 1):
+            Rr[j, k] = math.comb(p - j, k - j) / 2 ** (p - j)
+    return np.vstack([L, Rr[1:]])
+
+
 def knots_for(p):
     """The faces' knots at star points: 2 x 2 pieces of degree p, C1 at 0.5 (2p CVs a direction)."""
     return np.r_[[0.0] * (p + 1), [0.5] * (p - 1), [1.0] * (p + 1)]
@@ -73,12 +85,14 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
     irr = conv.irr
     V, F = conv.V, conv.F
     m = len(F)
-    nat0 = sb.Converter(V, F, conv.sharp).natural(0, sliver=False)
-    c2 = sb.Converter(V, F, conv.sharp)
-    nat2 = c2.natural(2, sliver=False)
+    nat0, k0, _ = conv.fresh_natural(0)
+    nat2, fk2, cor2 = conv.fresh_natural(2)
     star = [[x in irr for x in fv] for fv in F]
     smooth_star = {x for x in irr if conv.ring[x] is not None and x not in conv.creased}
     sext = [any(s_) for s_ in star]
+    # a T-junction's middle (where a quad's side meets two n-gon faces): their corner there is the quad's
+    # middle cell on that side
+    tal = {T["m"]: ("e", T["e"][0], T["e"][1], Mid) for T in conv.tedges if sext[T["q"]] and T["e"] not in conv.sharp}
 
     # ---- the grids ((2p + 1)^2: 2 x 2 Bezier pieces sharing the middle rows) and their shared cells
     s15 = np.linspace(0, 1, 2 * p + 3)
@@ -92,10 +106,10 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
         # the star pieces first: the exact pieces then overwrite the rows they share
         order = sorted(((qu, qv) for qu in (0, 1) for qv in (0, 1)), key=lambda q: not star[f][corner_of[q]])
         for qu, qv in order:
-            G[p * qu:p * qu + R, p * qv:p * qv + R] = _piece(sb, nat2[f], *c2.fk[f], 0.5 * qu, 0.5 * qv, Pi6, s15)
+            G[p * qu:p * qu + R, p * qv:p * qv + R] = _piece(sb, nat2[f], *fk2[f], 0.5 * qu, 0.5 * qv, Pi6, s15)
         for k in range(4):
             if star[f][k]:
-                G[(0, N, N, 0)[k], (0, 0, N, N)[k]] = c2.levels.corners[f, k]   # on the limit point
+                G[(0, N, N, 0)[k], (0, 0, N, N)[k]] = cor2[f][k]   # on the limit point
         grids[f] = G
     faces_i = sorted(grids)
 
@@ -112,7 +126,7 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
             a, b = fv[k], fv[(k + 1) % 4]
             for t in range(N + 1):
                 i, j = side_cell(k, t)
-                key[(f, i, j)] = ("v", a) if t == 0 else (("v", b) if t == N else
+                key[(f, i, j)] = tal.get(a, ("v", a)) if t == 0 else (tal.get(b, ("v", b)) if t == N else
                                                        ("e", min(a, b), max(a, b), t if a < b else N - t))
     uniq = sorted(set(key.values()), key=str)
     kid = {k_: n for n, k_ in enumerate(uniq)}
@@ -122,59 +136,17 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
 
     # crease and border curves: the uniform cubic B-spline of the crease polygon (a ghost 2a - b beyond a
     # corner), which is what the subdivision makes of them; left as fitted where an end is a dart
-    hard_n = {}
-    for e, us_ in conv.edges.items():
-        if e in conv.sharp or len(us_) != 2:
-            for x in e:
-                hard_n.setdefault(x, []).append(e[1] if e[0] == x else e[0])
-
-    def outer(x, y):
-        nb_ = hard_n[x]
-        if len(nb_) == 2:
-            return V[nb_[0] if nb_[1] == y else nb_[1]]
-        return 2 * V[x] - V[y]
-
     for f in faces_i:
         for k in range(4):
             a, b = F[f][k], F[f][(k + 1) % 4]
-            e = (min(a, b), max(a, b))
-            if not (e in conv.sharp or len(conv.edges[e]) != 2):
+            if not conv.hard((min(a, b), max(a, b))):
                 continue
-            if len(hard_n.get(a, ())) < 2 or len(hard_n.get(b, ())) < 2:
+            cub = conv.crease_curve(a, b)
+            if cub is None:
                 continue
-            Qm, Qa, Qb, Qp = outer(a, b), V[a], V[b], outer(b, a)
-            bz = np.array([(Qm + 4 * Qa + Qb) / 6, (2 * Qa + Qb) / 3, (Qa + 2 * Qb) / 3, (Qa + 4 * Qb + Qp) / 6])
-
-            def cub(t):
-                t = np.asarray(t)[:, None]
-                return (1 - t) ** 3 * bz[0] + 3 * t * (1 - t) ** 2 * bz[1] + 3 * t * t * (1 - t) * bz[2] + t ** 3 * bz[3]
             row = np.vstack([Pi6 @ cub(0.5 * s15), (Pi6 @ cub(0.5 + 0.5 * s15))[1:]])
             for t in range(N + 1):
                 P[kid[key[(f,) + side_cell(k, t)]]] = row[t]
-
-    # ---- held cells: star corners; the edge curve of creases and borders; the rows by faces staying bicubic
-    # that the join depends on (three for G2, two for G1)
-    fixed = np.zeros(len(uniq), bool)
-    for k_ in uniq:
-        if k_[0] == "v" and k_[1] in irr:
-            fixed[kid[k_]] = True
-    for f in faces_i:
-        fv = F[f]
-        for k in range(4):
-            a, b = fv[k], fv[(k + 1) % 4]
-            e = (min(a, b), max(a, b))
-            uses = conv.edges[e]
-            hard = len(uses) != 2 or e in conv.sharp
-            if hard or not sext[[u[0] for u in uses if u[0] != f][0]]:
-                for t in range(N + 1):
-                    i, j = side_cell(k, t)
-                    for d in range(1 if hard else (3 if g2 else 2)):
-                        di, dj = (0, -d, 0, d)[k], (d, 0, -d, 0)[k]
-                        fixed[kid[key[(f, i + di, j + dj)]]] = True
-    free = np.nonzero(~fixed)[0]
-    col = -np.ones(len(uniq), int)
-    col[free] = np.arange(len(free))
-    n = len(free)
 
     # ---- the joins: per half-line, (p + 1)^2 views of cell ids on either side (a along the line, b across)
     def half_view(f, x, y):
@@ -197,6 +169,63 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
         else:
             A = [[(a, Mid + b) for b in rg] for a in rg]; B = [[(a, Mid - b) for b in rg] for a in rg]
         return [[kid[key[(f,) + c]] for c in r] for r in A], [[kid[key[(f,) + c]] for c in r] for r in B]
+
+    # ---- T-junctions: along each half of the quad's side, its corner piece split at the half's middle (de
+    # Casteljau) -- cells tied to the quad's by linear conditions, whose first row IS the n-gon face's side
+    # (one curve on both sides); the n-gon face then joins that split piece as it would a neighbour's
+    Ssplit = _split(p)
+    tblocks, lin, extra = [], [], []
+    for T in conv.tedges:
+        tq_ = T["q"]
+        if T["e"] in conv.sharp or not sext[tq_]:
+            continue
+        for x, c, kc in T["pieces"]:
+            Qv = np.array(half_view(tq_, x, T["b"] if x == T["a"] else T["a"]))   # (along from x, across)
+            from_x = F[c][kc] == x
+            VB = np.zeros((N + 1, R), int)
+            for i in range(N + 1):
+                VB[i, 0] = kid[key[(c,) + side_cell(kc, i if from_x else N - i)]]
+                for bb in range(1, R):
+                    VB[i, bb] = len(uniq) + len(extra)
+                    extra.append(("x", c, x, i, bb))
+            tblocks.append((x, c, VB, T))
+            for i in range(N + 1):
+                for bb in range(R):
+                    w = Ssplit[i]
+                    if VB[i, bb] == Qv[int(np.argmax(w)), bb] and abs(w.max() - 1.0) < 1e-12:
+                        continue                                   # (the piece's own end: the same cell)
+                    lin.append((VB[i, bb], Qv[:, bb], w))
+    if extra:
+        uniq = uniq + extra
+        P = np.vstack([P, np.zeros((len(extra), 3))])
+    for vid, ids, w in lin:
+        P[vid] = w @ P[ids]
+    LV = np.array([v_ for v_, _, _ in lin], int)
+    LI = np.array([i_ for _, i_, _ in lin], int).reshape(len(lin), R)
+    LW = np.array([w_ for _, _, w_ in lin], float).reshape(len(lin), R)
+
+    # ---- held cells: star corners; the edge curve of creases and borders; the rows by faces staying bicubic
+    # that the join depends on (three for G2, two for G1)
+    fixed = np.zeros(len(uniq), bool)
+    for k_ in uniq:
+        if k_[0] == "v" and k_[1] in irr:
+            fixed[kid[k_]] = True
+    for f in faces_i:
+        fv = F[f]
+        for k in range(4):
+            a, b = fv[k], fv[(k + 1) % 4]
+            e = (min(a, b), max(a, b))
+            hard = conv.hard(e)
+            if hard or not all(sext[g] for g in conv.across(f, e)):
+                for t in range(N + 1):
+                    i, j = side_cell(k, t)
+                    for d in range(1 if hard else (3 if g2 else 2)):
+                        di, dj = (0, -d, 0, d)[k], (d, 0, -d, 0)[k]
+                        fixed[kid[key[(f, i + di, j + dj)]]] = True
+    free = np.nonzero(~fixed)[0]
+    col = -np.ones(len(uniq), int)
+    col[free] = np.arange(len(free))
+    n = len(free)
 
     sharp_at = {}
     for e in conv.sharp:
@@ -221,11 +250,8 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
                 parent[f] = parent[parent[f]]
                 f = parent[f]
             return f
-        for z in conv.nbr[x]:
-            e2 = (min(x, z), max(x, z))
-            us_ = conv.edges[e2]
-            if len(us_) == 2 and e2 not in conv.sharp:
-                parent[root(us_[0][0])] = root(us_[1][0])
+        for f_, g_ in conv.joined_at(x):
+            parent[root(f_)] = root(g_)
         r0 = root(conv.edges[(min(x, y), max(x, y))][0][0])
         sector = [f for f in conv.vf[x] if root(f) == r0]
         theta = math.pi                                            # a crease or border runs smoothly through x
@@ -238,7 +264,7 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
                 i = fv.index(x)
                 for z in (fv[(i + 1) % 4], fv[i - 1]):
                     e2 = (min(x, z), max(x, z))
-                    if e2 in conv.sharp or len(conv.edges[e2]) != 2:
+                    if conv.hard(e2):
                         bounds.append(z)
                 da, db = V[fv[(i + 1) % 4]] - V[x], V[fv[i - 1]] - V[x]
                 cage_angle += math.acos(max(-1.0, min(1.0, float(da @ db / (np.linalg.norm(da) * np.linalg.norm(db) or 1.0)))))
@@ -255,7 +281,7 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
                 theta = math.pi / 2
         return 2 * math.cos(theta / len(sector))
 
-    VF, VG, BETA, ENDS = [], [], [], []
+    VF, VG, BETA, ENDS, ALPHA, BSHAPE = [], [], [], [], [], []
     for e, uses in conv.edges.items():
         if len(uses) != 2 or e in conv.sharp:
             continue
@@ -269,7 +295,26 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
             VF.append(half_view(f, x, y))
             VG.append(half_view(g, x, y))
             BETA.append(b_)
+            ALPHA.append(1.0)
+            BSHAPE.append(0)
             ENDS.append((("v", x, y), ("m", e, x)))
+    for x, c, VB, T in tblocks:                                   # an n-gon face's side against the split piece
+        tm = T["m"]
+        pe = (min(x, tm), max(x, tm))
+        b_ = edge_beta(x, tm)
+        if b_ is None:
+            continue
+        for frm, to in ((x, tm), (tm, x)):
+            VF.append(half_view(c, frm, to))
+            VG.append([[int(VB[a if frm == x else N - a, bb]) for bb in range(R)] for a in range(R)])
+            # the n-gon face runs at half the quad's speed both along and across (its pieces are half as big):
+            # f_t and f_u count twice; beta is the quad's own, beta (1 - U)^2 over its half side, in the n-gon
+            # face's halves (U = u / 2 from x, 1 - u / 2 from the middle): the same at the star point, vanishing
+            # with its slope where the quad's pieces meet
+            BETA.append(2.0 * b_ if frm == x else -2.0 * b_)     # (from the middle f_u runs back towards x)
+            ALPHA.append(2.0)
+            BSHAPE.append(1 if frm == x else 2)
+            ENDS.append((("v", frm, to), ("m", pe, frm)))
     HE = len(VF)                                                   # edge halves first, then the middle half-lines
     if g2:
         for f in faces_i:
@@ -278,11 +323,25 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
                 VF.append(A)
                 VG.append(B)
                 BETA.append(0.0)
+                ALPHA.append(1.0)
+                BSHAPE.append(0)
                 a, b = F[f][k], F[f][(k + 1) % 4]
-                ENDS.append((("m", (min(a, b), max(a, b)), ("f", f)), ("c", f, k)))
+                e = (min(a, b), max(a, b))
+                if e in conv.tq and conv.tedges[conv.tq[e]]["m"] in tal:   # ends at a T-junction's middle
+                    ENDS.append((("v", conv.tedges[conv.tq[e]]["m"], ("q", f)), ("c", f, k)))
+                else:
+                    ENDS.append((("m", e, ("f", f)), ("c", f, k)))
     VF = np.array(VF, int).reshape(-1, R, R)
     VG = np.array(VG, int).reshape(-1, R, R)
     BETA = np.array(BETA, float)
+    ALPHA = np.array(ALPHA, float)
+    BSHAPE = np.array(BSHAPE, int)
+
+    def bshape(u, kinds):
+        """beta's shape along each half-line (its value at the half's start is BETA's)."""
+        u = np.asarray(u)[None, :]
+        return np.where((kinds == 1)[:, None], (1 - u / 2) ** q,
+                        np.where((kinds == 2)[:, None], (u / 2) ** q, (1 - u) ** q))
     H = len(VF) if g2 else 0
     S = opts.get("ns", G2_SAMPLES)
     keep2 = np.ones((H, S), bool)
@@ -293,7 +352,12 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
         at.setdefault(("M", e1[1]) if e1[0] == "m" else ("C", e1[1]), []).append((h, S - 1, e1))
     for (kd, p_), lst in at.items():
         drop = []
-        if kd == "V":
+        if kd == "V" and p_ in tal:
+            # a T-junction's middle: four lines cross as at an ordinary vertex (the two halves of the quad's side,
+            # the quad's middle line, the n-gon faces' joint): one of each opposite two goes
+            far = conv.tedges[conv.tmid[p_]]["b"]
+            drop = [(h, s_) for h, s_, en in lst if en[2] == far or isinstance(en[2], tuple)]
+        elif kd == "V":
             ring_ = conv.ring[p_]
             if ring_ is None:
                 continue
@@ -306,7 +370,7 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
             elif n_ == 4 and not sharp_at.get(p_):
                 drop = [hs_ for i, hs_ in pos.items() if (i + 2) % 4 in pos and (i + 2) % 4 < i]
         elif kd == "M":
-            if p_ not in conv.sharp and len(conv.edges[p_]) == 2:  # the two halves are opposite, so are the lines
+            if not conv.hard(p_):                                 # the two halves are opposite, so are the lines
                 inners = [(h, s_) for h, s_, en in lst if isinstance(en[2], tuple)]
                 halves = [(h, s_) for h, s_, en in lst if not isinstance(en[2], tuple)]
                 drop = halves[1:] + inners[1:]
@@ -331,10 +395,12 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
     us1 = np.linspace(0, 1, S1)
     Bu1 = {d: _bez(sb, us1, d, p) for d in range(2)}
     W1 = {(i, j): np.einsum("sa,b->sab", Bu1[i], B0[j]) for i, j in ((0, 1), (1, 0))}
-    beta1 = BETA[:HE, None] * (1 - us1)[None, :] ** q
-    Wf1 = W1[(0, 1)][None] - beta1[:, :, None, None] * W1[(1, 0)][None]          # (HE, S1, R, R)
-    beta = BETA[:H, None] * (1 - us)[None, :] ** q
-    Wq = W[(0, 2)][None] - 2 * beta[:, :, None, None] * W[(1, 1)][None] + (beta ** 2)[:, :, None, None] * W[(2, 0)][None]
+    beta1 = BETA[:HE, None] * bshape(us1, BSHAPE[:HE])
+    Wf1 = ALPHA[:HE, None, None, None] * W1[(0, 1)][None] - beta1[:, :, None, None] * W1[(1, 0)][None]   # (HE, S1, R, R)
+    beta = BETA[:H, None] * bshape(us, BSHAPE[:H])
+    al = ALPHA[:H, None, None, None]
+    Wq = al ** 2 * W[(0, 2)][None] - 2 * al * beta[:, :, None, None] * W[(1, 1)][None] \
+        + (beta ** 2)[:, :, None, None] * W[(2, 0)][None]
     cf, cg = col[VF], col[VG]
     if H:
         # a G2 sample whose second derivatives are all held: only the normal could turn to meet it -- it goes
@@ -369,7 +435,8 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
             g2v = np.zeros(0)
         r3 = Pc[c1[:, 0]] + Pc[c1[:, 2]] - 2 * Pc[c1[:, 1]]
         sc3 = np.maximum(np.linalg.norm(Pc[c1[:, 2]] - Pc[c1[:, 0]], axis=1), 1e-300)
-        res = np.concatenate([r1.ravel(), g2v, (r3 / sc3[:, None]).ravel()])
+        rl = (Pc[LV] - np.einsum("lk,lkc->lc", LW, Pc[LI])) / size if len(LV) else np.zeros((0, 3))
+        res = np.concatenate([r1.ravel(), g2v, (r3 / sc3[:, None]).ravel(), rl.ravel()])
         if not jac:
             return res
         rows, cols, vals = [], [], []
@@ -422,6 +489,15 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
                 rows.append(off2 + ci[ok] * 3 + c)
                 cols.append(cc[ok] * 3 + c)
                 vals.append(w / sc3[ok])
+        off3 = off2 + len(c1) * 3                                  # the T-junctions' split cells: linear
+        li = np.arange(len(LV))
+        for ids, w in [(LV, np.ones(len(LV)))] + [(LI[:, k_], -LW[:, k_]) for k_ in range(R)]:
+            cc = col[ids] if len(ids) else np.zeros(0, int)
+            ok = (cc >= 0) & (w != 0)
+            for c in range(3):
+                rows.append(off3 + li[ok] * 3 + c)
+                cols.append(cc[ok] * 3 + c)
+                vals.append(w[ok] / size)
         R_, C_, V_ = np.concatenate(rows), np.concatenate(cols), np.concatenate(vals)
         ok = R_ >= 0
         return res, (R_[ok], C_[ok], V_[ok])
@@ -510,7 +586,8 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
             if (not ok and inner == 0) or cur < tol:
                 break
             res, J = residual(Pc)
-    info = {"newton": hist, "unknowns": 3 * n, "conditions": HE * S1 * 3 + n2 + len(c1) * 3,
+    info = {"newton": hist, "unknowns": 3 * n, "conditions": HE * S1 * 3 + n2 + len(c1) * 3 + len(LV) * 3,
+            "t_junctions": len(tblocks) // 2,
             "max_move": float(np.abs(Pc - P).max() / size) if len(P) else 0.0,
             "seconds": time.perf_counter() - T0, "degree": p}
 
@@ -518,7 +595,7 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
     for f in range(m):
         if not sext[f]:
             nets.append(nat0[f].copy())
-            knots.append((np.r_[[0.0] * 4, [1.0] * 4], np.r_[[0.0] * 4, [1.0] * 4]))
+            knots.append(k0[f])
         else:
             G = np.array([[Pc[kid[key[(f, i, j)]]] for j in range(N + 1)] for i in range(N + 1)])
             keep = [i for i in range(N + 1) if i != Mid]           # C1 at the middle: the shared row is redundant
@@ -530,18 +607,15 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
 def deviation(sb, conv, nets, knots, level=3):
     """Largest distance from the SubD surface to the faces built here: its exact limit points at the level's
     (i, j) / 2^level on every face by a star point, each projected onto its face (one-span faces are exact)."""
-    c = sb.Converter(conv.V, conv.F, conv.sharp)
-    c.natural(level, sliver=False)
-    lim = c.levels.limit
-    N = lim.shape[1] - 1
-    g = np.arange(N + 1) / N
-    G = np.stack(np.meshgrid(g, g, indexing="ij"), -1).reshape(-1, 2)
+    lims = conv.limit_grid(level)
     worst = 0.0
     for f, (net, (ku, kv)) in enumerate(zip(nets, knots)):
-        if len(ku) == 8:
+        if np.count_nonzero(ku == ku[0]) <= 4:
             continue
-        q = lim[f].reshape(-1, 3)
-        uv = G.copy()
+        N = lims[f].shape[0] - 1
+        g = np.arange(N + 1) / N
+        uv = np.stack(np.meshgrid(g, g, indexing="ij"), -1).reshape(-1, 2)
+        q = lims[f].reshape(-1, 3)
         best = None
         for it in range(6):                                      # Newton onto the face from the same parameters
             D = sb.derivs(net, ku, kv, uv[:, 0], uv[:, 1], ((0, 0), (1, 0), (0, 1)))
