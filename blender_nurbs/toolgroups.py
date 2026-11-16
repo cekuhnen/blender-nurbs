@@ -89,8 +89,8 @@ GROUPS = (
             (_t("nproto.refit_trim", icon='MOD_LATTICE'),),
         )),
         ("Trim and Join", (
-            (_t("nproto.trim", icon='MOD_BOOLEAN'), _t("nproto.split", icon='MOD_EDGESPLIT'),
-             _t("nproto.untrim", icon='LOOP_BACK')),
+            (_t("nproto.trim", icon='MOD_BOOLEAN'), _t("nproto.split", icon='MOD_EDGESPLIT')),
+            (_t("nproto.untrim", icon='LOOP_BACK'), _t("nproto.untrim_region", icon='SELECT_SUBTRACT')),
             (_t("nproto.join", icon='AUTOMERGE_ON'), _t("nproto.unjoin", icon='AUTOMERGE_OFF')),
         )),
         ("Fillets", (

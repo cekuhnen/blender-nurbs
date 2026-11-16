@@ -28,19 +28,6 @@ def _ray_nurbs(context, event):
     return None, None, None, direction
 
 
-def _curve_direction(kcurve, fallback):
-    """Plane normal of a planar cutting curve, else the fallback (view) direction."""
-    P = geom.sample_curve(kcurve, 48)
-    c = P.mean(axis=0)
-    size = float(np.linalg.norm(P.max(axis=0) - P.min(axis=0))) or 1.0
-    _, sv, vt = np.linalg.svd(P - c)
-    flat = sv[2] / max(len(P) ** 0.5, 1.0) <= 1e-4 * size
-    if flat and sv[1] > 1e-6 * size:  # planar and not a straight line
-        return Vector(vt[2]).normalized()
-    d = Vector(fallback)
-    return d.normalized() if d.length > 1e-9 else Vector((0, 0, 1))
-
-
 def _frozen(obj, op):
     """Trimming replaces the B-rep: construction history can no longer rebuild it."""
     if features.has_history(obj):
@@ -52,9 +39,39 @@ def _frozen(obj, op):
 # Trim
 # --------------------------------------------------------------------------
 
+def region_under(context, event, regions):
+    """Index of the region (dicts with world "tris") the mouse ray meets first."""
+    region, rv3d = context.region, context.region_data
+    mouse = (event.mouse_region_x, event.mouse_region_y)
+    o = np.array(view3d_utils.region_2d_to_origin_3d(region, rv3d, mouse), float)
+    dvec = np.array(view3d_utils.region_2d_to_vector_3d(region, rv3d, mouse), float)
+    best, best_t = None, np.inf
+    for ri, r in enumerate(regions):
+        T = r["tris"].astype(float)
+        if not len(T):
+            continue
+        e1, e2 = T[:, 1] - T[:, 0], T[:, 2] - T[:, 0]
+        pv = np.cross(dvec, e2)
+        det = np.einsum("ij,ij->i", e1, pv)
+        ok = np.abs(det) > 1e-14
+        inv = np.where(ok, 1.0 / np.where(ok, det, 1.0), 0.0)
+        tv = o - T[:, 0]
+        u = np.einsum("ij,ij->i", tv, pv) * inv
+        qv = np.cross(tv, e1)
+        v = (qv @ dvec) * inv
+        t = np.einsum("ij,ij->i", e2, qv) * inv
+        hit = ok & (u >= 0) & (v >= 0) & (u + v <= 1) & (t > 0)
+        if hit.any():
+            tm = float(t[hit].min())
+            if tm < best_t:
+                best, best_t = ri, tm
+    return best
+
+
 class NPROTO_OT_trim(bpy.types.Operator):
     """Trim a surface with projected curves or intersecting surfaces.
-    Click the surface on the side to keep, then pick cutting curves / edges / surfaces"""
+    Click the surface on the side to keep, pick cutting curves / edges / surfaces,
+    press Enter to see the regions, click regions to keep / discard them, Enter to trim"""
     bl_idname = "nproto.trim"
     bl_label = "Trim"
     bl_options = {'REGISTER', 'UNDO'}
@@ -76,11 +93,30 @@ class NPROTO_OT_trim(bpy.types.Operator):
     ], default="THROUGH")
     projection: EnumProperty(name="Project", items=[
         ("CURVE", "Curve Normal", "Project each planar cutting curve along its own plane normal "
-                                  "(cookie cutter); non-planar curves use the view direction"),
+                                  "(cookie cutter); non-planar curves use the view direction. A curve "
+                                  "lying on the surface cuts along itself"),
         ("VIEW", "View", "Project along the view direction"),
         ("NORMAL", "Surface Normal", "Project along the surface normal at the pick point"),
+        ("SURFACE", "On Surface", "No projection: cut along the curve itself, where it lies on or near the "
+                                  "surface (curves on the surface do this in Curve Normal too)"),
         ("X", "World X", ""), ("Y", "World Y", ""), ("Z", "World Z", ""),
     ], default="CURVE")
+    extend: BoolProperty(name="Extend Cutters", default=True,
+                         description="A curve, line, edge or surface whose cut stops inside the surface is "
+                                     "extended (its natural continuation) until it cuts all the way across")
+    reach: EnumProperty(name="Cut", items=[
+        ("BOTH", "Both Ways", "A projected curve cuts on both sides of itself (a circle inside a vase "
+                              "cuts the front and the back wall)"),
+        ("FRONT", "Along Normal", "Only where the projection direction points from the curve: for Curve "
+                                  "Normal, the curve object's blue Z axis (the sketch normal)"),
+        ("BACK", "Against Normal", "Only on the other side of the curve"),
+    ], default="BOTH")
+    through: BoolProperty(name="Surfaces Through", default=False,
+                          description="A cutting surface is extended (its natural continuation) past its open "
+                                      "edges until it cuts all the way through the part (a short tube through "
+                                      "both walls)")
+    # regions marked in the viewport before trimming: [[world point, keep?], ...]
+    marks: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
 
     # ---- interactive picking
     def invoke(self, context, event):
@@ -89,6 +125,7 @@ class NPROTO_OT_trim(bpy.types.Operator):
         self._stage = 0
         self._cuts = []
         self._target = None
+        self._regions, self._keep, self._hover = [], [], None
         draw.pick_overlay["picked"] = []
         draw.pick_overlay["hover"] = None
         context.window_manager.modal_handler_add(self)
@@ -99,20 +136,101 @@ class NPROTO_OT_trim(bpy.types.Operator):
         from . import hints
         if self._stage == 0:
             state = ["click the surface region to keep / discard", "Action and Project in F9"]
-        else:
+        elif self._stage == 1:
             state = [f"{self._target.name}: pick cutting curves / edges, or click a cutting surface",
                      f"{len(self._cuts)} picked"]
+        else:
+            k = sum(self._keep)
+            state = [f"{self._target.name}: click a region to keep / discard it",
+                     f"{k} kept · {len(self._keep) - k} discarded"]
         state.append(extra.strip(" ·[]"))
-        rows = [("Pick", [hints.key("Tab", "cycle overlapping", on=True if getattr(self, "_ties", None) else None),
-                          hints.key("Backspace", "undo"),
-                          hints.key("Enter", "trim", on=True if self._stage and self._cuts else False)])]
+        if self._stage < 2:
+            rows = [("Pick", [hints.key("Tab", "cycle overlapping", on=True if getattr(self, "_ties", None) else None),
+                              hints.key("Backspace", "undo"),
+                              hints.key("Enter", "show regions", on=True if self._stage and self._cuts else False)])]
+        else:
+            reach = {"BOTH": "both ways", "FRONT": "along normal", "BACK": "against normal"}[self.reach]
+            keys = []
+            if any(r != "SURF" for _, r in self._cuts):         # only a projected curve has a direction
+                keys.append(hints.key("F", f"cut: {reach}"))
+            if any(r == "SURF" for _, r in self._cuts):
+                keys.append(hints.key("E", "surfaces through", on=self.through))
+            rows = [("Regions", keys + [hints.key("I", "invert"),
+                                 hints.key("Backspace", "back to cutters"),
+                                 hints.key("Enter", "trim", on=True)])]
         hints.show(context, "Trim", state, rows, [("MOUSE_LMB", "Pick"), ("EVENT_ESC", "Cancel")])
 
     def _end(self, context):
         from . import hints
         draw.pick_overlay["picked"] = []
         draw.pick_overlay["hover"] = None
+        draw.pick_overlay["regions"] = []
+        draw.pick_overlay["region_hover"] = None
+        draw.pick_overlay["region_pal"] = None
         hints.clear(context)
+
+    def _job_inputs(self, cutter_pairs):
+        """(curves, cutting surfaces, direction) of the worker job."""
+        curves, cutter_objs = [], {}
+        for obj, ref in cutter_pairs:
+            if ref == "SURF":
+                cutter_objs[f"c{len(cutter_objs)}"] = obj
+            else:
+                curves.append(steps.cutter_curve_json(features.input_curve(obj, ref), self.projection,
+                                                      Vector(self.view_dir), steps.curve_up(obj)))
+        if self.projection in ("NORMAL", "CURVE", "SURFACE"):  # CURVE: used for cutting surfaces only
+            d = Vector(self.normal)
+        elif self.projection == "VIEW":
+            d = Vector(self.view_dir)
+        else:
+            d = Vector({"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}[self.projection])
+        if d.length < 1e-9:
+            d = Vector((0, 0, 1))
+        return curves, cutter_objs, d.normalized()
+
+    def _show_regions(self, context, prefer=None):
+        """Cut the target into its regions (nothing is changed yet) and mark
+        each keep / discard by the Action and Scope rule. prefer: {side of the
+        cutters: keep?} from the regions shown before (Cut changed with F), so
+        the same side stays kept wherever the click now falls. False: it failed."""
+        try:
+            curves, cutter_objs, d = self._job_inputs(self._cuts)
+            regions, picked, _ = steps.trim_regions(self._target, cutter_objs, curves=curves, direction=list(d),
+                                                    ref_point=list(self.ref_point), extend=bool(self.extend),
+                                                    reach=self.reach, through=self.through)
+        except (jobs.JobError, Exception) as exc:
+            self.report({'WARNING'}, f"Trim: {exc}")
+            return False
+        if len(regions) < 2:
+            self.report({'WARNING'}, "Trim: the cutters do not cut this surface into regions -- "
+                                     "check that they cross it (along the projection direction for curves)")
+            return False
+        sides = [tuple(r["side"]) for r in regions]
+        none = tuple(None for _ in sides[picked])
+        if self.scope == "THROUGH" and sides[picked] != none:
+            sel = {i for i, sd in enumerate(sides) if sd == sides[picked]}
+        else:
+            sel = {picked}
+        self._keep = [(i in sel) == (self.action != "DELETE") for i in range(len(regions))]
+        for i, sd in enumerate(sides):
+            if prefer and sd != none and sd in prefer:
+                self._keep[i] = prefer[sd]
+        M = self._target.matrix_world
+        self._regions = []
+        for r in regions:
+            tris, border = steps.region_mesh(r["text"], M)
+            self._regions.append({"point": r["point"], "tris": tris, "border": border, "side": tuple(r["side"])})
+        self._hover = None
+        self._sync_regions()
+        return True
+
+    def _sync_regions(self):
+        draw.pick_overlay["regions"] = [(r["tris"], r["border"], k) for r, k in zip(self._regions, self._keep)]
+        draw.pick_overlay["region_hover"] = self._hover
+
+    def _region_under(self, context, event):
+        return region_under(context, event, self._regions)
+
 
     def modal(self, context, event):
         if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM'}:
@@ -141,6 +259,9 @@ class NPROTO_OT_trim(bpy.types.Operator):
                 self._stage = 1
                 self._status(context)
             return {'RUNNING_MODAL'}
+
+        if self._stage == 2:
+            return self._modal_regions(context, event)
 
         # stage 1: cutters
         if event.type == 'MOUSEMOVE':
@@ -175,11 +296,101 @@ class NPROTO_OT_trim(bpy.types.Operator):
             draw.pick_overlay["picked"].pop()
             self._status(context)
         elif event.type in {'RET', 'NUMPAD_ENTER', 'SPACE'} and event.value == 'PRESS' and self._cuts:
+            context.window.cursor_set('WAIT')
+            shown = self._show_regions(context)
+            context.window.cursor_set('DEFAULT')
+            if shown:
+                self._stage = 2
+                draw.pick_overlay["hover"] = None
+            self._status(context)
+            context.area.tag_redraw()
+        return {'RUNNING_MODAL'}
+
+    def _modal_regions(self, context, event):
+        """Stage 2: the regions are shown (green keep, red discard); a click
+        flips one, Enter trims."""
+        if event.type == 'MOUSEMOVE':
+            h = self._region_under(context, event)
+            if h != self._hover:
+                self._hover = h
+                self._sync_regions()
+                context.area.tag_redraw()
+        elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            h = self._region_under(context, event)
+            if h is not None:
+                self._keep[h] = not self._keep[h]
+                self._sync_regions()
+                self._status(context)
+                context.area.tag_redraw()
+        elif event.type == 'E' and event.value == 'PRESS' and any(r == "SURF" for _, r in self._cuts):
+            prefer = {}
+            for r, k in zip(self._regions, self._keep):
+                prefer[r["side"]] = prefer.get(r["side"], False) or k
+            self.through = not self.through
+            context.window.cursor_set('WAIT')
+            if not self._show_regions(context, prefer):
+                self.through = not self.through
+                self._show_regions(context, prefer)
+            context.window.cursor_set('DEFAULT')
+            self._status(context)
+            context.area.tag_redraw()
+        elif event.type == 'F' and event.value == 'PRESS' and any(r != "SURF" for _, r in self._cuts):
+            order = ["BOTH", "FRONT", "BACK"]
+            prefer = {}       # keep the same side of the cutters (a side with mixed marks: kept if any is)
+            for r, k in zip(self._regions, self._keep):
+                prefer[r["side"]] = prefer.get(r["side"], False) or k
+            self.reach = order[(order.index(self.reach) + 1) % 3]
+            context.window.cursor_set('WAIT')
+            if not self._show_regions(context, prefer):        # nothing cut that way: try the next one
+                self.reach = order[(order.index(self.reach) + 1) % 3]
+                self._show_regions(context, prefer)
+            context.window.cursor_set('DEFAULT')
+            self._status(context)
+            context.area.tag_redraw()
+        elif event.type == 'I' and event.value == 'PRESS':
+            self._keep = [not k for k in self._keep]
+            self._sync_regions()
+            self._status(context)
+            context.area.tag_redraw()
+        elif event.type == 'BACK_SPACE' and event.value == 'PRESS':
+            self._stage = 1
+            draw.pick_overlay["regions"] = []
+            draw.pick_overlay["region_hover"] = None
+            self._status(context)
+            context.area.tag_redraw()
+        elif event.type in {'RET', 'NUMPAD_ENTER', 'SPACE'} and event.value == 'PRESS':
+            if not any(self._keep):
+                self.report({'WARNING'}, "Trim: every region is marked discard")
+                return {'RUNNING_MODAL'}
             self._end(context)
             self.target = self._target.name
             self.cutters = json.dumps([[o.name, r] for o, r in self._cuts])
+            self.marks = json.dumps([[list(r["point"]), bool(k), list(r["side"])]
+                                     for r, k in zip(self._regions, self._keep)])
+            if self.action == "DELETE" or (self.action == "SPLIT" and all(self._keep)):
+                self.action = "KEEP"          # the marks say what goes; Split needs something discarded
             return self.execute(context)
         return {'RUNNING_MODAL'}
+
+    def draw(self, context):
+        lay = self.layout
+        lay.use_property_split = True
+        lay.prop(self, "action")
+        if self.marks:
+            try:
+                m = json.loads(self.marks)
+            except ValueError:
+                m = []
+            k = sum(1 for mk in m if mk[1])
+            col = lay.column(align=True)
+            col.label(text=f"Regions marked in the viewport: {k} kept, {len(m) - k} discarded")
+            col.label(text="Discard inverts the marks; Split makes the discarded ones an object")
+        else:
+            lay.prop(self, "scope")
+        lay.prop(self, "projection")
+        lay.prop(self, "reach")
+        lay.prop(self, "through")
+        lay.prop(self, "extend")
 
     # ---- the actual trim
     def execute(self, context):
@@ -189,39 +400,27 @@ class NPROTO_OT_trim(bpy.types.Operator):
         if tgt is None or not store.is_nurbs(tgt):
             self.report({'ERROR'}, "Trim: no target surface")
             return {'CANCELLED'}
-        curves, cutter_objs = [], {}
         try:
-            for name, ref in json.loads(self.cutters or "[]"):
-                obj = bpy.data.objects[name]
-                if ref == "SURF":
-                    cutter_objs[f"c{len(cutter_objs)}"] = obj
-                else:
-                    kc = features.input_curve(obj, ref)
-                    cj = jobs.curve_json(kc)
-                    if self.projection == "CURVE":
-                        cj["dir"] = list(_curve_direction(kc, Vector(self.view_dir)))
-                    curves.append(cj)
+            pairs = [(bpy.data.objects[n], r) for n, r in json.loads(self.cutters or "[]")]
+            curves, cutter_objs, d = self._job_inputs(pairs)
+            marks = json.loads(self.marks) if self.marks else []
         except Exception as exc:
             self.report({'ERROR'}, f"Trim: bad cutter ({exc})")
             return {'CANCELLED'}
-        if self.projection in ("NORMAL", "CURVE"):  # CURVE: used for cutting surfaces only
-            d = Vector(self.normal)
-        elif self.projection == "VIEW":
-            d = Vector(self.view_dir)
-        else:
-            d = Vector({"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}[self.projection])
-        if d.length < 1e-9:
-            d = Vector((0, 0, 1))
         outs = ["KEEP", "DELETE"] if self.action == "SPLIT" else [self.action]
         pre_text = tgt[store.PROP_BREP]
         try:
             from .steps import run_trim
             res, breps = run_trim(tgt, cutter_objs, outs, curves=curves,
                                   direction=list(d.normalized()), ref_point=list(self.ref_point),
-                                action=self.action, scope=self.scope)
+                                  action=self.action, scope=self.scope, extend=bool(self.extend), marks=marks,
+                                  reach=self.reach, through=self.through)
         except jobs.JobError as exc:
             self.report({'ERROR'}, f"Trim failed: {exc}")
             return {'CANCELLED'}
+        crv_in = [(bpy.data.objects[n], r) for n, r in json.loads(self.cutters or "[]") if r != "SURF"]
+        for msg in steps.extended_notes(res.get("extended"), crv_in, cutter_objs, tgt.name):
+            self.report({'INFO'}, msg)
         keep_history = features.history_enabled(context)
         if not keep_history:
             _frozen(tgt, self)
@@ -235,7 +434,10 @@ class NPROTO_OT_trim(bpy.types.Operator):
             params = {"action": "KEEP" if self.action == "SPLIT" else self.action, "scope": self.scope,
                       "projection": self.projection, "ref_local": list(Mi @ Vector(self.ref_point)),
                       "normal_local": list(R @ Vector(self.normal)), "view_local": list(R @ Vector(self.view_dir)),
-                      "side": (res.get("info") or {}).get("side")}
+                      "side": (res.get("info") or {}).get("side"), "extend": bool(self.extend),
+                      "reach": self.reach, "through": self.through}
+            if marks:
+                params["marks_local"] = [[list(Mi @ Vector(mk[0]))] + list(mk[1:]) for mk in marks]
             features.push_step(tgt, "trim", inputs, params, base_text=pre_text)
         if self.action == "SPLIT":
             other = store.new_object_text(context, tgt.name + "_split", breps["DELETE"], geom.world_matrix(tgt))
@@ -250,6 +452,33 @@ class NPROTO_OT_trim(bpy.types.Operator):
         return {'FINISHED'}
 
 
+TRIM_OPS = {"trim", "fillet_trim", "untrim_region"}
+
+
+def untrim_all(o, context):
+    """Back to the surface before its first trim. False: nothing to undo."""
+    if store.is_nurbs(o) and features.PROP_STACK in o and any(
+            e["op"] in ("trim", "fillet_trim") for e in features.stack(o)):
+        features.remove_steps(o, TRIM_OPS)
+        if features.PROP_STACK not in o and features.PROP_HIST not in o:
+            text, nat = o[features.PROP_BASE], o.get(features.PROP_BASE + "_natural", 0)
+            store.set_geometry_text(o, text, context, keep_untrimmed=False)
+            o[store.PROP_NATURAL] = nat
+            del o[features.PROP_BASE]
+            if store.PROP_UNTRIM in o:
+                del o[store.PROP_UNTRIM]
+        else:
+            features.rebuild(o, context, force=True)
+        return True
+    if store.is_nurbs(o) and store.PROP_UNTRIM in o:
+        natural = o.get(store.PROP_UNTRIM + "_natural", 0)
+        store.set_geometry_text(o, o[store.PROP_UNTRIM], context, keep_untrimmed=False)
+        o[store.PROP_NATURAL] = natural
+        del o[store.PROP_UNTRIM]
+        return True
+    return False
+
+
 class NPROTO_OT_untrim(bpy.types.Operator):
     """Restore selected surfaces to how they were before their first trim"""
     bl_idname = "nproto.untrim"
@@ -259,30 +488,172 @@ class NPROTO_OT_untrim(bpy.types.Operator):
     def execute(self, context):
         if not _kernel_ok(self):
             return {'CANCELLED'}
-        n = 0
-        for o in context.selected_objects:
-            if store.is_nurbs(o) and features.PROP_STACK in o and any(
-                    e["op"] in ("trim", "fillet_trim") for e in features.stack(o)):
-                features.remove_steps(o, {"trim", "fillet_trim"})
-                if features.PROP_STACK not in o and features.PROP_HIST not in o:
-                    text, nat = o[features.PROP_BASE], o.get(features.PROP_BASE + "_natural", 0)
-                    store.set_geometry_text(o, text, context, keep_untrimmed=False)
-                    o[store.PROP_NATURAL] = nat
-                    del o[features.PROP_BASE]
-                    if store.PROP_UNTRIM in o:
-                        del o[store.PROP_UNTRIM]
-                else:
-                    features.rebuild(o, context, force=True)
-                n += 1
-                continue
-            if store.is_nurbs(o) and store.PROP_UNTRIM in o:
-                natural = o.get(store.PROP_UNTRIM + "_natural", 0)
-                store.set_geometry_text(o, o[store.PROP_UNTRIM], context, keep_untrimmed=False)
-                o[store.PROP_NATURAL] = natural
-                del o[store.PROP_UNTRIM]
-                n += 1
+        n = sum(1 for o in context.selected_objects if untrim_all(o, context))
         self.report({'INFO'}, f"Untrimmed {n} object(s)")
         return {'FINISHED'} if n else {'CANCELLED'}
+
+
+def _trim_history(o):
+    return features.PROP_STACK in o and any(e["op"] in ("trim", "fillet_trim") for e in features.stack(o))
+
+
+def _untrimmable(o):
+    return store.is_nurbs(o) and (store.PROP_UNTRIM in o or _trim_history(o))
+
+
+class NPROTO_OT_untrim_region(bpy.types.Operator):
+    """Untrim some areas of trimmed surfaces: what was trimmed away shows in red;
+    click the areas to bring back (green), Enter untrims them. The other trims
+    stay. Works on the selected trimmed surfaces, or every visible one"""
+    bl_idname = "nproto.untrim_region"
+    bl_label = "Untrim Region"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    target: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    point: FloatVectorProperty(name="Edge Point", subtype='XYZ', options={'HIDDEN', 'SKIP_SAVE'})
+    points: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})     # JSON: world points inside removed areas
+
+    # ---- the work (one object)
+    def untrim(self, context, obj, point=None, points=None):
+        """Give back the area at the cut edge nearest `point`, or the areas
+        nearest `points`. Returns an error text or None."""
+        hist = _trim_history(obj)
+        try:
+            untrimmed = features.base_text(obj) if hist else obj[store.PROP_UNTRIM]
+            text, info = steps.untrim_region_text(obj[store.PROP_BREP], untrimmed, jobs.xform(obj), point, points)
+        except (jobs.JobError, KeyError) as exc:
+            return str(exc)
+        if info.get("cuts_left", 1) == 0:        # nothing trimmed is left: the whole surface again
+            untrim_all(obj, context)
+            return None
+        if hist:
+            Mi = geom.world_matrix(obj).inverted()
+            p = {"points_local": [list(Mi @ Vector(q)) for q in points]} if points \
+                else {"point_local": list(Mi @ Vector(point))}
+            features.push_step(obj, "untrim_region", [], p)
+            features.rebuild(obj, context, force=True)
+        else:
+            store.set_geometry_text(obj, text, context)        # keeps the untrimmed surface for Untrim
+        return None
+
+    def execute(self, context):
+        if not _kernel_ok(self):
+            return {'CANCELLED'}
+        if self.points:       # from the viewport (or a script): {object: [points]}
+            done, errs = 0, []
+            for name, pts in json.loads(self.points).items():
+                obj = bpy.data.objects.get(name)
+                err = "not a trimmed surface" if obj is None or not _untrimmable(obj) else \
+                    self.untrim(context, obj, points=[Vector(q) for q in pts])
+                if err:
+                    errs.append(f"{name}: {err}")
+                else:
+                    done += 1
+            for e in errs:
+                self.report({'WARNING'}, f"Untrim Region: {e}")
+            return {'FINISHED'} if done else {'CANCELLED'}
+        obj = bpy.data.objects.get(self.target)
+        if obj is None or not _untrimmable(obj):
+            self.report({'ERROR'}, "Untrim Region: pick an edge of a trimmed surface")
+            return {'CANCELLED'}
+        err = self.untrim(context, obj, Vector(self.point))
+        if err:
+            self.report({'ERROR'}, f"Untrim Region: {err}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+    # ---- interactive: the removed areas show; click the ones to bring back
+    def invoke(self, context, event):
+        if not _kernel_ok(self):
+            return {'CANCELLED'}
+        objs = [o for o in context.selected_objects if _untrimmable(o)] \
+            or [o for o in context.visible_objects if _untrimmable(o)]
+        if not objs:
+            self.report({'WARNING'}, "Untrim Region: no trimmed surface (select one)")
+            return {'CANCELLED'}
+        self._regions, self._keep, self._hover = [], [], None
+        context.window.cursor_set('WAIT')
+        for o in objs:
+            try:
+                untrimmed = features.base_text(o) if _trim_history(o) else o[store.PROP_UNTRIM]
+                for text, pt in steps.untrim_preview(o[store.PROP_BREP], untrimmed, jobs.xform(o)):
+                    tris, border = steps.region_mesh(text, o.matrix_world)
+                    self._regions.append({"target": o.name, "point": pt, "tris": tris, "border": border})
+                    self._keep.append(False)
+            except (jobs.JobError, KeyError) as exc:
+                self.report({'WARNING'}, f"Untrim Region: {o.name}: {exc}")
+        context.window.cursor_set('DEFAULT')
+        if not self._regions:
+            return {'CANCELLED'}
+        self._sync()
+        context.window_manager.modal_handler_add(self)
+        self._status(context)
+        return {'RUNNING_MODAL'}
+
+    def _sync(self):
+        draw.pick_overlay["regions"] = [(r["tris"], r["border"], k) for r, k in zip(self._regions, self._keep)]
+        draw.pick_overlay["region_hover"] = self._hover
+
+    def _status(self, context):
+        from . import hints
+        k = sum(self._keep)
+        state = ["click what was trimmed away (red) to bring it back (green)",
+                 f"{k} of {len(self._keep)} to untrim"]
+        rows = [("Regions", [hints.key("A", "all"), hints.key("Enter", "untrim", on=bool(k))])]
+        hints.show(context, "Untrim Region", state, rows, [("MOUSE_LMB", "Switch area"), ("EVENT_ESC", "Cancel")])
+
+    def _end(self, context):
+        from . import hints
+        draw.pick_overlay["regions"] = []
+        draw.pick_overlay["region_hover"] = None
+        hints.clear(context)
+
+    def modal(self, context, event):
+        if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM',
+                          'INBETWEEN_MOUSEMOVE'}:
+            return {'PASS_THROUGH'}
+        if event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MOUSEMOVE'} and not PickMixin._in_view(context, event):
+            return {'PASS_THROUGH'}
+        from . import hints
+        if hints.handle(event):
+            context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+        if event.type in {'ESC', 'RIGHTMOUSE'} and event.value == 'PRESS':
+            self._end(context)
+            context.area.tag_redraw()
+            return {'CANCELLED'}
+        if event.type == 'MOUSEMOVE':
+            h = region_under(context, event, self._regions)
+            if h != self._hover:
+                self._hover = h
+                self._sync()
+                context.area.tag_redraw()
+        elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            h = region_under(context, event, self._regions)
+            if h is not None:
+                self._keep[h] = not self._keep[h]
+                self._sync()
+                self._status(context)
+                context.area.tag_redraw()
+        elif event.type == 'A' and event.value == 'PRESS':
+            self._keep = [not all(self._keep)] * len(self._keep)
+            self._sync()
+            self._status(context)
+            context.area.tag_redraw()
+        elif event.type in {'RET', 'NUMPAD_ENTER', 'SPACE'} and event.value == 'PRESS':
+            if not any(self._keep):
+                return {'RUNNING_MODAL'}
+            pts = {}
+            for r, k in zip(self._regions, self._keep):
+                if k:
+                    pts.setdefault(r["target"], []).append(list(r["point"]))
+            self.points = json.dumps(pts)
+            self._end(context)
+            context.window.cursor_set('WAIT')
+            res = self.execute(context)
+            context.window.cursor_set('DEFAULT')
+            return res
+        return {'RUNNING_MODAL'}
 
 
 # --------------------------------------------------------------------------
@@ -483,11 +854,35 @@ class NPROTO_OT_fillet(AskValue, bpy.types.Operator):
 # Split
 # --------------------------------------------------------------------------
 
+def _split_selection(context):
+    """(surfaces to split, curve refs) from the selection: every spline of the
+    selected curves and lines, and the edges picked in Edge mode (a surface
+    with picked edges cuts with them and is not split itself)."""
+    from . import subsel
+    surfs, refs = [], []
+    for o in context.selected_objects:
+        if o.type == 'CURVE':
+            refs += [[o.name, f"S{i}"] for i in range(len(o.data.splines))]
+        elif store.is_nurbs(o):
+            edges = subsel.picks(o, "EDGE")
+            if edges:
+                refs += [[o.name, f"E{i}"] for i in edges]
+            else:
+                surfs.append(o)
+    return surfs, refs
+
+
+COL_SPLIT_JOINED = (0.25, 0.6, 1.0)     # regions joined into one piece; green: each its own piece
+
+
 class NPROTO_OT_split(bpy.types.Operator):
     """Split the selected surfaces along each other and/or along the selected
-    curves. Every region becomes its own object; nothing is removed. With
-    history the split surfaces are kept as hidden inputs and each region
-    follows them (and what cut them)"""
+    curves, lines and picked edges (projected onto the surface). A cutter that
+    stops short is extended until it cuts across. The regions show first, all
+    green: each becomes its own object. Click regions to turn them blue: the
+    blue ones are joined into one piece. Enter splits. Nothing is removed. With history the
+    split surfaces are kept as hidden inputs and each piece follows them (and
+    what cut them)"""
     bl_idname = "nproto.split"
     bl_label = "Split"
     bl_options = {'REGISTER', 'UNDO'}
@@ -495,49 +890,393 @@ class NPROTO_OT_split(bpy.types.Operator):
     surfaces_cut: BoolProperty(name="Surfaces Split Each Other", default=True,
                                description="Each selected surface is split by the other selected surfaces")
     projection: EnumProperty(name="Curve Projection", items=[
-        ("CURVE", "Curve Normal", "Each planar curve along its own normal; non-planar curves use the view"),
+        ("CURVE", "Curve Normal", "Each planar curve along its own normal; non-planar curves use the view. "
+                                  "A curve lying on the surface cuts along itself"),
         ("VIEW", "View", "Along the view direction"),
+        ("SURFACE", "On Surface", "No projection: cut along the curve itself, where it lies on or near the surface"),
         ("X", "World X", ""), ("Y", "World Y", ""), ("Z", "World Z", ""),
     ], default="CURVE")
+    reach: EnumProperty(name="Cut", items=[
+        ("BOTH", "Both Ways", "A projected curve cuts on both sides of itself"),
+        ("FRONT", "Along Normal", "Only where the projection direction points from the curve: for Curve "
+                                  "Normal, the curve object's blue Z axis (the sketch normal)"),
+        ("BACK", "Against Normal", "Only on the other side of the curve"),
+    ], default="BOTH")
+    through: BoolProperty(name="Surfaces Through", default=False,
+                          description="A cutting surface is extended (its natural continuation) past its open "
+                                      "edges until it cuts all the way through the part (a short tube through "
+                                      "both walls)")
+    extend: BoolProperty(name="Extend Cutters", default=True,
+                         description="A curve, line, edge or surface whose cut stops inside the surface is "
+                                     "extended (its natural continuation) until it cuts all the way across")
     view_dir: FloatVectorProperty(subtype='XYZ', options={'HIDDEN'})
     targets: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     curves: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    cutter_surfs: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})   # surfaces that only cut (picked as cutters)
+    split_all: BoolProperty(name="Split All", default=False,
+                            description="Every region becomes its own object (the marks are ignored)")
+    # regions marked in the preview: {surface name: [[world point, stays?, side], ...]}
+    marks: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
 
+    def _params(self):
+        return {"surfaces_cut": bool(self.surfaces_cut), "projection": self.projection,
+                "view_dir": [float(x) for x in self.view_dir], "extend": bool(self.extend), "reach": self.reach,
+                "through": bool(self.through)}
+
+    def _inputs(self, tgt, surfs, crv_inputs):
+        cutters = [bpy.data.objects[n] for n in json.loads(self.cutter_surfs or "[]") if n in bpy.data.objects]
+        return [(tgt, "SURF")] + ([(s, "SURF") for s in surfs if s != tgt] if self.surfaces_cut else []) \
+            + [(c, "SURF") for c in cutters if c != tgt] + crv_inputs
+
+    def _selection(self):
+        surfs = [bpy.data.objects[n] for n in json.loads(self.targets) if n in bpy.data.objects]
+        crv_inputs = [(bpy.data.objects[n], r) for n, r in json.loads(self.curves or "[]") if n in bpy.data.objects]
+        return surfs, crv_inputs
+
+    def _has_curves(self):
+        return bool(json.loads(self.curves or "[]"))
+
+    def _has_surfaces(self):
+        return bool(json.loads(self.cutter_surfs or "[]")) or (self.surfaces_cut and len(json.loads(self.targets or "[]")) > 1)
+
+    def _enough(self, surfs, crv_inputs):
+        return bool(surfs) and (len(surfs) >= 2 or bool(crv_inputs) or bool(json.loads(self.cutter_surfs or "[]")))
+
+    # ---- preview
     def invoke(self, context, event):
         rv3d = getattr(context, "region_data", None)
         if rv3d is not None:
             self.view_dir = rv3d.view_rotation @ Vector((0, 0, -1))
-        surfs = [o for o in context.selected_objects if store.is_nurbs(o)]
-        crvs = [o for o in context.selected_objects if o.type == 'CURVE']
+        surfs, refs = _split_selection(context)
         self.targets = json.dumps([o.name for o in surfs])
-        self.curves = json.dumps([[o.name, f"S{i}"] for o in crvs for i in range(len(o.data.splines))])
-        return self.execute(context)
+        self.curves = json.dumps(refs)
+        self.marks = ""
+        self.cutter_surfs = ""
+        if not _kernel_ok(self):
+            return {'CANCELLED'}
+        self._regions, self._keep, self._hover = [], [], None
+        self._ties, self._cycle = [], 0
+        if not self._enough(surfs, refs):        # pick what to split and what cuts it, like Trim
+            self._stage = "pick"
+            self._targets = list(surfs)
+            self._cuts = [(bpy.data.objects[n], r) for n, r in refs]
+            draw.pick_overlay["picked"], draw.pick_overlay["colors"] = [], []
+            for o in self._targets:
+                self._mark_pick(o, None, None, target=True)
+            for o, r in self._cuts:
+                self._mark_pick(o, r, None)
+            self._order = [("target", o, None) for o in self._targets] + [("curve", o, r) for o, r in self._cuts]
+            self._refresh_cands(context)
+            context.window_manager.modal_handler_add(self)
+            self._status(context)
+            return {'RUNNING_MODAL'}
+        context.window.cursor_set('WAIT')
+        shown = self._show_regions(context)
+        context.window.cursor_set('DEFAULT')
+        if not shown:
+            return {'CANCELLED'}
+        self._stage = "regions"
+        context.window_manager.modal_handler_add(self)
+        self._status(context)
+        return {'RUNNING_MODAL'}
 
+    # ---- pick stage
+    def _refresh_cands(self, context):
+        self._cands = [c for c in _pick_candidates(context) if c[0] not in self._targets]
+
+    def _mark_pick(self, obj, ref, pts, target=False):
+        """Highlight a pick: a target's or cutting surface's edges, or a curve / edge."""
+        if pts is None:
+            M = obj.matrix_world
+            pts = []
+            if store.is_nurbs(obj) and ref and ref.startswith("E"):
+                pts = [M @ Vector(p) for p in store.display(obj).get("edges", [])[int(ref[1:])]]
+            elif store.is_nurbs(obj):
+                for e in store.display(obj).get("edges", []):
+                    pts += [M @ Vector(p) for p in e]
+            elif obj.type == 'CURVE' and ref:
+                c = geom.spline_to_kernel_curve(obj.data.splines[int(ref[1:])], geom.world_matrix(obj))
+                pts = [Vector(p) for p in geom.sample_curve(c, 48)]
+        draw.pick_overlay["picked"].append(pts)
+        draw.pick_overlay["colors"].append(1 if target else 0)
+
+    def _picks(self):
+        """[(kind, object, ref)] in pick order, matching the overlay."""
+        return getattr(self, "_order", [])
+
+    def _modal_pick(self, context, event):
+        if event.type == 'MOUSEMOVE':
+            if not self._targets:
+                return {'RUNNING_MODAL'}
+            ties = _near_candidates(context, event, self._cands)
+            if [(c[0].name, c[1]) for c in ties] != [(c[0].name, c[1]) for c in self._ties]:
+                self._ties, self._cycle = ties, 0
+            cur = self._ties[self._cycle % len(self._ties)] if self._ties else None
+            draw.pick_overlay["hover"] = cur[2] if cur else None
+            context.area.tag_redraw()
+        elif event.type == 'TAB' and event.value == 'PRESS' and self._ties:
+            self._cycle += 1
+            draw.pick_overlay["hover"] = self._ties[self._cycle % len(self._ties)][2]
+            context.area.tag_redraw()
+        elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            obj, _, _, _ = _ray_nurbs(context, event)
+            if not self._targets or (event.shift and obj is not None and obj not in self._targets):
+                if obj is None:
+                    return {'RUNNING_MODAL'}
+                self._targets.append(obj)                   # a surface to split
+                self._order = self._picks() + [("target", obj, None)]
+                self._mark_pick(obj, None, None, target=True)
+                self._refresh_cands(context)
+            else:
+                ties = _near_candidates(context, event, self._cands)
+                if ties:
+                    cur = ties[self._cycle % len(ties)] if ties == self._ties else ties[0]
+                    self._cuts.append((cur[0], cur[1]))
+                    self._order = self._picks() + [("curve", cur[0], cur[1])]
+                    self._mark_pick(cur[0], cur[1], cur[2])
+                elif obj is not None and obj not in self._targets:
+                    self._cuts.append((obj, "SURF"))       # a cutting surface: it cuts, it is not split
+                    self._order = self._picks() + [("curve", obj, "SURF")]
+                    self._mark_pick(obj, None, None)
+            self._status(context)
+            context.area.tag_redraw()
+        elif event.type == 'BACK_SPACE' and event.value == 'PRESS' and self._picks():
+            kind, obj, ref = self._order.pop()
+            if kind == "target":
+                self._targets.remove(obj)
+                self._refresh_cands(context)
+            else:
+                self._cuts.remove((obj, ref))
+            draw.pick_overlay["picked"].pop()
+            draw.pick_overlay["colors"].pop()
+            self._status(context)
+            context.area.tag_redraw()
+        elif event.type in {'RET', 'NUMPAD_ENTER', 'SPACE'} and event.value == 'PRESS':
+            self.targets = json.dumps([o.name for o in self._targets])
+            self.curves = json.dumps([[o.name, r] for o, r in self._cuts if r != "SURF"])
+            self.cutter_surfs = json.dumps([o.name for o, r in self._cuts if r == "SURF"])
+            surfs, crv_inputs = self._selection()
+            if not self._enough(surfs, crv_inputs):
+                self.report({'WARNING'}, "Split: click a surface to split, then what cuts it")
+                return {'RUNNING_MODAL'}
+            context.window.cursor_set('WAIT')
+            shown = self._show_regions(context)
+            context.window.cursor_set('DEFAULT')
+            if shown:
+                self._stage = "regions"
+                draw.pick_overlay["picked"], draw.pick_overlay["colors"] = [], []
+                draw.pick_overlay["hover"] = None
+            self._status(context)
+            context.area.tag_redraw()
+        return {'RUNNING_MODAL'}
+
+    def _show_regions(self, context, prefer=None):
+        """Split every target (nothing changes yet) and show its regions. By
+        default every region is its own piece (none joined); prefer:
+        {(surface, side): joined?} carried over when Cut changes."""
+        surfs, crv_inputs = self._selection()
+        regions, keep, skipped = [], [], []
+        for tgt in surfs:
+            inputs = self._inputs(tgt, surfs, crv_inputs)
+            if len(inputs) < 2:
+                continue
+            try:
+                info = steps.split_info(inputs, self._params())
+            except Exception as exc:
+                skipped.append(f"{tgt.name}: {exc}")
+                continue
+            if len(info["texts"]) < 2:
+                skipped.append(f"{tgt.name}: the cutters do not split it into separate regions")
+                continue
+            M = tgt.matrix_world
+            for i, text in enumerate(info["texts"]):
+                tris, border = steps.region_mesh(text, M)
+                side = tuple(info["sides"][i]) if i < len(info["sides"]) else ()
+                regions.append({"target": tgt.name, "point": info["points"][i], "side": side,
+                                "tris": tris, "border": border})
+                k = False                  # each region its own piece
+                if prefer and (tgt.name, side) in prefer and any(v is not None for v in side):
+                    k = prefer[(tgt.name, side)]
+                keep.append(k)
+        for msg in skipped:
+            self.report({'WARNING'}, f"Split: {msg}")
+        if not regions:
+            self.report({'ERROR'}, "Split: nothing was split")
+            return False
+        self._regions, self._keep = regions, keep
+        draw.pick_overlay["region_pal"] = (COL_SPLIT_JOINED, draw.COL_REGION_KEEP)   # joined: blue, own piece: green
+        self._hover = None
+        self._sync()
+        return True
+
+    def _sync(self):
+        draw.pick_overlay["regions"] = [(r["tris"], r["border"], k) for r, k in zip(self._regions, self._keep)]
+        draw.pick_overlay["region_hover"] = self._hover
+
+    def _status(self, context):
+        from . import hints
+        if self._stage == "pick":
+            if not self._targets:
+                state = ["click the surface to split", "or select surfaces and curves, then Split"]
+            else:
+                state = [", ".join(o.name for o in self._targets) + ": pick cutting curves / edges, or click a "
+                         "cutting surface (Shift+click: another surface to split)", f"{len(self._cuts)} picked"]
+            rows = [("Pick", [hints.key("Tab", "cycle overlapping", on=True if self._ties else None),
+                              hints.key("Backspace", "undo"),
+                              hints.key("Enter", "show regions", on=bool(self._targets and self._cuts))])]
+            hints.show(context, "Split", state, rows, [("MOUSE_LMB", "Pick"), ("EVENT_ESC", "Cancel")])
+            return
+        k = sum(self._keep)
+        n = len(self._keep) - k
+        state = ["green: each its own piece · click regions to join them (blue: one piece together)",
+                 f"{n + (1 if k else 0)} pieces" + (f" · {k} joined" if k else "")]
+        reach = {"BOTH": "both ways", "FRONT": "along normal", "BACK": "against normal"}[self.reach]
+        keys = [hints.key("A", "split all", on=not any(self._keep))]
+        if self._has_curves():                # only a projected curve has a direction
+            keys.append(hints.key("F", f"cut: {reach}"))
+        if self._has_surfaces():
+            keys.append(hints.key("E", "surfaces through", on=self.through))
+        rows = [("Regions", keys + [hints.key("I", "invert"),
+                             hints.key("Enter", "split", on=True)])]
+        hints.show(context, "Split", state, rows, [("MOUSE_LMB", "Switch region"), ("EVENT_ESC", "Cancel")])
+
+    def _end(self, context):
+        from . import hints
+        draw.pick_overlay["regions"] = []
+        draw.pick_overlay["region_hover"] = None
+        draw.pick_overlay["region_pal"] = None
+        draw.pick_overlay["picked"], draw.pick_overlay["colors"] = [], []
+        draw.pick_overlay["hover"] = None
+        hints.clear(context)
+
+    def modal(self, context, event):
+        if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM',
+                          'INBETWEEN_MOUSEMOVE'}:
+            return {'PASS_THROUGH'}
+        if event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MOUSEMOVE'} and not PickMixin._in_view(context, event):
+            return {'PASS_THROUGH'}
+        from . import hints
+        if hints.handle(event):
+            context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+        if event.type in {'ESC', 'RIGHTMOUSE'} and event.value == 'PRESS':
+            self._end(context)
+            context.area.tag_redraw()
+            return {'CANCELLED'}
+        if self._stage == "pick":
+            return self._modal_pick(context, event)
+        if event.type == 'MOUSEMOVE':
+            h = region_under(context, event, self._regions)
+            if h != self._hover:
+                self._hover = h
+                self._sync()
+                context.area.tag_redraw()
+        elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            h = region_under(context, event, self._regions)
+            if h is not None:
+                self._keep[h] = not self._keep[h]
+                self._sync()
+                self._status(context)
+                context.area.tag_redraw()
+        elif event.type == 'A' and event.value == 'PRESS':
+            if any(self._keep):                     # every region its own piece
+                self._saved_keep = list(self._keep)
+                self._keep = [False] * len(self._keep)
+            else:                                   # again: back to what it was
+                self._keep = getattr(self, "_saved_keep", None) or self._keep
+            self._sync()
+            self._status(context)
+            context.area.tag_redraw()
+        elif event.type == 'I' and event.value == 'PRESS':
+            self._keep = [not k for k in self._keep]
+            self._sync()
+            self._status(context)
+            context.area.tag_redraw()
+        elif event.type == 'E' and event.value == 'PRESS' and self._has_surfaces():
+            prefer = {}
+            for r, k in zip(self._regions, self._keep):
+                key = (r["target"], r["side"])
+                prefer[key] = prefer.get(key, False) or k
+            self.through = not self.through
+            context.window.cursor_set('WAIT')
+            if not self._show_regions(context, prefer):
+                self.through = not self.through
+                self._show_regions(context, prefer)
+            context.window.cursor_set('DEFAULT')
+            self._status(context)
+            context.area.tag_redraw()
+        elif event.type == 'F' and event.value == 'PRESS' and self._has_curves():
+            prefer = {}
+            for r, k in zip(self._regions, self._keep):
+                key = (r["target"], r["side"])
+                prefer[key] = prefer.get(key, False) or k
+            order = ["BOTH", "FRONT", "BACK"]
+            old = self.reach
+            context.window.cursor_set('WAIT')
+            for _ in range(2):            # nothing split that way: the next one
+                self.reach = order[(order.index(self.reach) + 1) % 3]
+                if self._show_regions(context, prefer):
+                    break
+            else:
+                self.reach = old
+                self._show_regions(context, prefer)
+            context.window.cursor_set('DEFAULT')
+            self._status(context)
+            context.area.tag_redraw()
+        elif event.type in {'RET', 'NUMPAD_ENTER', 'SPACE'} and event.value == 'PRESS':
+            marks = {}
+            for r, k in zip(self._regions, self._keep):
+                marks.setdefault(r["target"], []).append([list(r["point"]), bool(k), list(r["side"])])
+            self.marks = json.dumps(marks)
+            self.split_all = not any(self._keep)
+            self._end(context)
+            return self.execute(context)
+        return {'RUNNING_MODAL'}
+
+    def draw(self, context):
+        lay = self.layout
+        lay.use_property_split = True
+        for name in ("surfaces_cut", "projection", "reach", "through", "extend", "split_all"):
+            lay.prop(self, name)
+        if self.marks and not self.split_all:
+            lay.label(text="Pieces as marked in the viewport")
+
+    # ---- the split
     def execute(self, context):
         if not _kernel_ok(self):
             return {'CANCELLED'}
         if not self.targets:  # called from a script: use the selection
-            self.targets = json.dumps([o.name for o in context.selected_objects if store.is_nurbs(o)])
-            self.curves = json.dumps([[o.name, f"S{i}"] for o in context.selected_objects if o.type == 'CURVE'
-                                      for i in range(len(o.data.splines))])
-        surfs = [bpy.data.objects[n] for n in json.loads(self.targets) if n in bpy.data.objects]
-        curve_refs = json.loads(self.curves or "[]")
-        if not surfs or (len(surfs) < 2 and not curve_refs):
-            self.report({'WARNING'}, "Select two or more surfaces, or surfaces and curves")
+            surfs, refs = _split_selection(context)
+            self.targets = json.dumps([o.name for o in surfs])
+            self.curves = json.dumps(refs)
+        surfs, crv_inputs = self._selection()
+        if not self._enough(surfs, crv_inputs):
+            self.report({'WARNING'}, "Select two or more surfaces, or surfaces and curves / lines "
+                                     "(or edges picked in Edge mode)")
             return {'CANCELLED'}
-        params = {"surfaces_cut": bool(self.surfaces_cut), "projection": self.projection,
-                  "view_dir": [float(x) for x in self.view_dir]}
-        crv_inputs = [(bpy.data.objects[n], r) for n, r in curve_refs if n in bpy.data.objects]
+        params = self._params()
+        all_marks = json.loads(self.marks) if self.marks and not self.split_all else {}
 
         # compute every split from the ORIGINAL geometry first, then apply
-        results, skipped = {}, []
+        results, skipped, notes = {}, [], []
         for tgt in surfs:
-            inputs = [(tgt, "SURF")] + ([(s, "SURF") for s in surfs if s != tgt] if self.surfaces_cut else []) \
-                + crv_inputs
+            inputs = self._inputs(tgt, surfs, crv_inputs)
             if len(inputs) < 2:
                 continue
             try:
-                results[tgt.name] = (inputs, steps.split_regions(inputs, params))
+                info = steps.split_info(inputs, params, notes)
+                if len(info["texts"]) < 2:
+                    raise jobs.JobError("the cutters do not split this surface into separate regions")
+                stays = self._stays(info, all_marks.get(tgt.name))
+                if all(stays):     # every region joined: this surface only cuts the others
+                    skipped.append(f"{tgt.name}: every region joined, left as it is")
+                    continue
+                pieces = []        # (text, [region indices])
+                if any(stays):
+                    pieces.append((steps.merge_regions(inputs, params, stays), [i for i, k in enumerate(stays) if k]))
+                off = sorted((i for i, k in enumerate(stays) if not k), key=lambda i: -info["areas"][i])
+                pieces += [(info["texts"][i], [i]) for i in off]          # largest first
+                results[tgt.name] = (inputs, info, pieces)
             except jobs.JobError as exc:
                 skipped.append(f"{tgt.name}: {exc}")
             except Exception as exc:
@@ -547,29 +1286,54 @@ class NPROTO_OT_split(bpy.types.Operator):
             return {'CANCELLED'}
         made = []
         keep = features.history_enabled(context)
-        for name, (inputs, texts) in results.items():
+        for name, (inputs, info, pieces) in results.items():
             tgt = bpy.data.objects[name]
             original = tgt.get(store.PROP_UNTRIM, tgt[store.PROP_BREP])
-            if not keep:                  # no history: the largest region stays in the surface itself
+            if not keep:                  # no history: the first piece stays in the surface itself
                 _frozen(tgt, self)
-                store.set_geometry_text(tgt, texts[0], context)
+                store.set_geometry_text(tgt, pieces[0][0], context)
                 made.append(tgt)
-            for i, text in enumerate(texts if keep else texts[1:], 1):
+            centroids = [steps.region_point(t) for t in info["texts"]]
+            for i, (text, idx) in enumerate(pieces if keep else pieces[1:], 1):
                 o = store.new_object_text(context, f"{name}_split{i}", text, geom.world_matrix(tgt))
                 o[store.PROP_UNTRIM] = original
                 if tgt.data.materials:
                     for m in tgt.data.materials:
                         o.data.materials.append(m)
-                if keep:              # each region follows the split surface and what cut it
-                    features.record(o, "split_region", inputs, {**params, "at": steps.region_point(text)})
+                if keep:              # each piece follows the split surface and what cut it
+                    if len(idx) == 1:
+                        p = {**params, "at": steps.region_point(text)}
+                    else:
+                        p = {**params, "keep_at": [centroids[j] for j in idx],
+                             "drop_at": [centroids[j] for j in range(len(centroids)) if j not in idx]}
+                    features.record(o, "split_region", inputs, p)
                 made.append(o)
         if keep:
             features.keep_inputs(context, [bpy.data.objects[n] for n in results])
         for msg in skipped:
             self.report({'WARNING'}, msg)
+        for msg in notes:
+            self.report({'INFO'}, msg)
         _select_only(context, made)
         self.report({'INFO'}, f"Split into {len(made)} pieces")
         return {'FINISHED'}
+
+    @staticmethod
+    def _stays(info, marks):
+        """Which regions (split_info order) stay one piece: the marks (each
+        region takes the nearest mark of its side), else none -- every region
+        its own piece, as before the preview."""
+        n = len(info["texts"])
+        if not marks:
+            return [False] * n
+        out = []
+        for i in range(n):
+            q = Vector(info["points"][i])
+            side = list(info["sides"][i]) if i < len(info["sides"]) else []
+            cand = [m for m in marks if list(m[2]) == side] or marks
+            best = min(cand, key=lambda m: (Vector(m[0]) - q).length)
+            out.append(bool(best[1]))
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -1359,6 +2123,6 @@ class NPROTO_OT_flip_normal(bpy.types.Operator):
         return {'FINISHED'}
 
 
-classes = (NPROTO_OT_trim, NPROTO_OT_untrim, NPROTO_OT_fillet, NPROTO_OT_split, NPROTO_OT_join, NPROTO_OT_unjoin,
+classes = (NPROTO_OT_trim, NPROTO_OT_untrim, NPROTO_OT_untrim_region, NPROTO_OT_fillet, NPROTO_OT_split, NPROTO_OT_join, NPROTO_OT_unjoin,
            NPROTO_OT_delete_faces, NPROTO_OT_restore_inputs,
            NPROTO_OT_edge_fillet, NPROTO_OT_boolean, NPROTO_OT_flip_normal, NPROTO_OT_boundary_fill)

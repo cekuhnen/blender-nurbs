@@ -645,20 +645,24 @@ def visible_grid_step(steps, ppu):
 
 
 def pixels_per_unit(region, rv3d, at, axes):
-    """Screen pixels per world unit at the point `at` along each of `axes`,
-    the smallest: the exact derivative of the view's projection there (a
-    finite step of a whole unit went behind the camera, or far off, in a
-    close perspective view). None behind the camera."""
+    """Screen pixels per world unit at the point `at`: the exact derivative of
+    the view's projection there (a finite step of a whole unit went behind the
+    camera, or far off, in a close perspective view). One axis: along it. Two
+    (a plane's, at right angles): in the plane's most squeezed direction,
+    whichever way it points -- the smaller singular value -- as the grids
+    fade their levels (draw.py, workplanes.py). None behind the camera."""
     M = np.array(rv3d.perspective_matrix, float)
     q = M @ np.append(np.asarray(at, float), 1.0)
     if q[3] <= 1e-12 or not axes:
         return None
     half = np.array([region.width, region.height], float) * 0.5
-    rates = []
+    cols = []
     for a in axes:
         da = M[:, :3] @ np.asarray(a, float)
-        rates.append(float(np.linalg.norm((da[:2] * q[3] - q[:2] * da[3]) / (q[3] * q[3]) * half)))
-    return max(min(rates), 1e-9)
+        cols.append((da[:2] * q[3] - q[:2] * da[3]) / (q[3] * q[3]) * half)
+    if len(cols) == 2:
+        return max(float(np.linalg.svd(np.column_stack(cols), compute_uv=False)[-1]), 1e-9)
+    return max(min(float(np.linalg.norm(c)) for c in cols), 1e-9)
 
 
 class SketchMixin:

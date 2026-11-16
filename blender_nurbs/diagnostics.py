@@ -604,7 +604,7 @@ def curvature_range(objs, kind, angle_deg, chord_rel):
     v = np.concatenate(vals)
     lo, hi = np.percentile(v, 2), np.percentile(v, 98)
     if kind in ("GAUSS", "MEAN"):
-        m = max(abs(lo), abs(hi)) or 1e-9
+        m = float(max(abs(lo), abs(hi))) or 1e-9   # numpy float32 breaks uniform_float
         return -m, m
     if hi - lo < 1e-12:
         hi = lo + 1e-9
@@ -675,7 +675,7 @@ def draw_zebra(ctx):
     vmin, vmax = 0.0, 1.0
     if mode == 2:
         if v.curv_auto:
-            vmin, vmax = curvature_range(objs, v.curv_kind, float(v.curv_angle), float(v.curv_chord))
+            vmin, vmax = map(float, curvature_range(objs, v.curv_kind, float(v.curv_angle), float(v.curv_chord)))
             LAST_RANGE[:] = [vmin, vmax]
         else:
             vmin, vmax = float(v.curv_min), float(v.curv_max)

@@ -25,6 +25,7 @@ import traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _nproto_kernel as sm  # noqa: E402
 from harden import harden  # noqa: E402
+from natext import extend_curve, extend_grid  # noqa: E402
 
 harden(sm)               # end-of-range curve evaluation that every kernel build accepts
 
@@ -159,9 +160,10 @@ class CurveCutter:
     """A cutting curve projected along a direction: splits by parallel
     projection; a point is 'inside' when it projects inside the curve outline."""
 
-    def __init__(self, data, direction):
+    def __init__(self, data, direction, reach="BOTH"):
         np = _np()
         self.data = data
+        self.reach = reach      # BOTH ways from the curve, or only FRONT (along direction) / BACK
         d = np.array(direction, float)
         self.dir = d / (np.linalg.norm(d) or 1.0)
         P = np.array(_poly(curve(data)))
@@ -172,6 +174,7 @@ class CurveCutter:
         b = np.cross(self.dir, a)
         self.basis = (a, b)
         self.poly2d = np.stack([P @ a, P @ b], axis=1)
+        self.origin = P.mean(axis=0)
         self.closed = np.linalg.norm(P[0] - P[-1]) <= 1e-6 * (np.ptp(P, axis=0).max() or 1.0)
 
     def split(self, b, ref):
@@ -188,9 +191,11 @@ class CurveCutter:
         P = np.array(_poly(curve(self.data), 64))
         reach = float(np.linalg.norm(hi - lo)) + float(np.max(np.linalg.norm(P - 0.5 * (lo + hi), axis=1)))
         L = 4.0 * (reach or 1.0)
+        d = -self.dir if self.reach == "BACK" else self.dir
+        start = -0.5 * L if self.reach == "BOTH" else 0.0
         for piece in corner_pieces(self.data):
-            c = sm.translate(curve(piece), tuple(-0.5 * L * self.dir))
-            sheet = ext.brep_from_surface(sm.create_extrude_surface(c, tuple(L * self.dir)))
+            c = sm.translate(curve(piece), tuple(start * d)) if start else curve(piece)
+            sheet = ext.brep_from_surface(sm.create_extrude_surface(c, tuple(L * d)))
             b = sm.boolean_with_options(b, sheet, operation=sm.BooleanOp.UNION, imprinting=True,
                                         keep_other_brep=True)
             if b is None:
@@ -201,6 +206,10 @@ class CurveCutter:
         if not self.closed:
             return None  # an open cutter only splits; it has no inside
         np = _np()
+        if self.reach != "BOTH":     # behind a one-sided cut nothing was cut: never inside there
+            ahead = float(np.dot(np.asarray(p, float) - self.origin, self.dir))
+            if (ahead < 0) if self.reach == "FRONT" else (ahead > 0):
+                return False
         a, bb = self.basis
         x, y = float(np.dot(p, a)), float(np.dot(p, bb))
         poly = self.poly2d
@@ -216,15 +225,18 @@ class SurfaceCutter:
     """A cutting surface: the target is imprinted exactly along the
     intersection; 'inside' = the side of the cutter's surface normal."""
 
-    def __init__(self, job, key):
+    def __init__(self, job, key, brep=None):
         np = _np()
-        self.job, self.key = job, key
-        arr = world_brep(job, key).tessellate(chord_height_tolerance=0.0005).to_numpy_arrays()
+        self.job, self.key, self.brep = job, key, brep    # brep: the cutter extended to reach across
+        arr = self._brep().tessellate(chord_height_tolerance=0.0005).to_numpy_arrays()
         self.P = arr["points"].astype(float)
         self.N = arr["normals"].astype(float)
 
+    def _brep(self):
+        return self.brep.copy() if self.brep is not None else world_brep(self.job, self.key)
+
     def split(self, b, ref):
-        return sm.boolean_with_options(b, world_brep(self.job, self.key), operation=sm.BooleanOp.UNION,
+        return sm.boolean_with_options(b, self._brep(), operation=sm.BooleanOp.UNION,
                                        imprinting=True, keep_other_brep=True)
 
     def inside(self, p):
@@ -296,9 +308,205 @@ def _regions(job, cutters):
     sides = []
     for g in groups:
         f = max((faces[i] for i in g), key=lambda fc: fc.area(1e-3))
-        p = np.array(f.interior_point())
+        p = _inner_point(f)          # not on an edge, where the side is ambiguous
         sides.append(tuple(c.inside(p) for c in cutters))
     return b, faces, groups, picked, sides
+
+
+def _near_edges(brep, tol):
+    """Is a point on one of brep's edges (within tol)? Sampled finely: a
+    48-point polyline sags off a curved edge by more than tol."""
+    np = _np()
+    polys = [np.array(p) for p in (_edge_poly(e, 400) for e in brep.edges()) if len(p)]
+
+    def on(pt):
+        for P in polys:
+            seg = P[1:] - P[:-1]
+            t = np.clip(np.einsum("ij,ij->i", pt - P[:-1], seg)
+                        / np.maximum(np.einsum("ij,ij->i", seg, seg), 1e-30), 0, 1)
+            if np.min(np.linalg.norm(P[:-1] + seg * t[:, None] - pt, axis=1)) <= tol:
+                return True
+        return False
+    return on
+
+
+def heal_cut_seams(b, original):
+    """Remove the cut edges that have kept surface on both sides: a trim
+    imprints every cutter, and where a region on each side is kept (the far
+    wall a projected circle also crossed) the imprint stayed as a seam -- two
+    faces, or one face whose loop runs out and back along a slit. Each such
+    set of faces on one surface is trimmed again to the outline of their
+    union, exactly (the edges' own curves). Original edges (a revolve's seam)
+    stay. Returns b unchanged when anything does not check out."""
+    np = _np()
+    lo, hi = (np.array(v) for v in original.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    tol = 1e-5 * size
+    on_original = _near_edges(original, 10 * tol)
+
+    def key(e):
+        m = _edge_mid(e)
+        return None if m is None else tuple(round(float(v) / tol) for v in m)
+
+    faces = b.faces()
+    skeys = []
+    for f in faces:
+        try:
+            skeys.append(_surface_key(f.surface()))
+        except Exception:
+            skeys.append(None)
+    uses = {}       # edge key -> [(face index, forward)]
+    edge_of = {}
+    for i, f in enumerate(faces):
+        for loop in f.boundary_loops():
+            for e, fw in loop:
+                k = key(e)
+                if k is None:
+                    return b
+                uses.setdefault(k, []).append((i, fw))
+                edge_of[k] = e
+    seams = set()
+    parent = list(range(len(faces)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    for k, us in uses.items():
+        if len(us) != 2 or us[0][1] == us[1][1] or skeys[us[0][0]] is None \
+                or skeys[us[0][0]] != skeys[us[1][0]]:
+            continue
+        pts = _edge_poly(edge_of[k], 7)[1:-1]
+        if pts and all(on_original(np.array(p)) for p in pts):
+            continue                               # an original edge: the seam of a revolve
+        seams.add(k)
+        parent[find(us[0][0])] = find(us[1][0])
+    if not seams:
+        return b
+    clusters = {}
+    for i in range(len(faces)):
+        clusters.setdefault(find(i), []).append(i)
+    merged, drop = [], []
+    for members in clusters.values():
+        if not any(k in seams for k, us in uses.items() if us[0][0] in members):
+            continue
+        # the union's boundary: every oriented edge of the members but the seams.
+        # A loop the cut did not touch is kept as the kernel gives it (a
+        # revolve's loop runs along its seam both ways, with closed circles,
+        # which chaining by position would mix up); the rest are chained anew
+        segs, loops, runs = [], [], []
+        for i in members:
+            for loop in faces[i].boundary_loops():
+                ids = []
+                for e, fw in loop:
+                    if key(e) in seams:
+                        ids.append(None)
+                        continue
+                    P = _edge_poly(e, 3)
+                    a, z = (np.array(P[0]), np.array(P[-1])) if fw else (np.array(P[-1]), np.array(P[0]))
+                    segs.append((e, fw, a, z))
+                    ids.append(len(segs) - 1)
+                if None not in ids:
+                    loops.append(ids)
+                    continue
+                # the loop's runs between cut edges, each in the loop's own order
+                # (closed rims meeting a revolve's seam at one vertex make
+                # chaining single edges by position ambiguous)
+                k = ids.index(None)
+                rot = ids[k + 1:] + ids[:k + 1]
+                cur = []
+                for j in rot:
+                    if j is None:
+                        if cur:
+                            runs.append(cur)
+                        cur = []
+                    else:
+                        cur.append(j)
+                if cur:
+                    runs.append(cur)
+        def link(join_first):
+            """Loops from the runs. join_first: a run that comes back to its
+            start still takes on another run starting there (a cut that met a
+            revolve's seam at one vertex leaves a closed run on each side)."""
+            rs, out = [list(r) for r in runs], [list(lp) for lp in loops]
+            while rs:
+                chain = rs.pop(0)
+                start = segs[chain[0]][2]
+                while True:
+                    end = segs[chain[-1]][3]
+                    nxt = min(range(len(rs)), key=lambda r: np.linalg.norm(segs[rs[r][0]][2] - end), default=None)
+                    near = nxt is not None and np.linalg.norm(segs[rs[nxt][0]][2] - end) <= 100 * tol
+                    closed = np.linalg.norm(end - start) <= 100 * tol
+                    if closed and not (join_first and near):
+                        break
+                    if not near:
+                        return None
+                    chain += rs.pop(nxt)
+                out.append(chain)
+            return out
+
+        def span(lp):
+            P = np.array([segs[j][2] for j in lp])
+            return float(np.linalg.norm(P.max(axis=0) - P.min(axis=0)))
+        area = sum(faces[i].area(1e-6) for i in members)
+        made = None
+        for join_first in (False, True):
+            loops_try = link(join_first)
+            if loops_try is None or (join_first and not runs):
+                continue
+            loops_try.sort(key=span, reverse=True)          # the outer loop first
+            for tight in (True, False):
+                curves = []
+                for lp in loops_try:
+                    for j in lp:
+                        e, fw = segs[j][0], segs[j][1]
+                        d = ext.curve_cvs(e.curve())
+                        U, Pc, Wt = list(d["knots"]), list(d["points"]), d.get("weights")
+                        if not fw:
+                            a0, a1 = U[0], U[-1]
+                            U = [a0 + a1 - k for k in reversed(U)]
+                            Pc, Wt = Pc[::-1], (list(Wt)[::-1] if Wt else None)
+                        curves.append(ext.curve_from_cvs(d["degree"], Pc, U, list(Wt) if Wt else None))
+                sd = ext.surface_cvs(faces[members[0]].surface())
+                surf = ext.surface_from_cvs(sd["degree_u"], sd["degree_v"], list(sd["points"]), list(sd["knots_u"]),
+                                            list(sd["knots_v"]), list(sd["weights"]) if sd.get("weights") else None) \
+                    if "knots_u" in sd else faces[members[0]].surface()
+                try:
+                    if tight and hasattr(ext, "trim_surface_with_3d_curves_tol"):
+                        cand = ext.trim_surface_with_3d_curves_tol(surf, [len(lp) for lp in loops_try], curves, tol,
+                                                                   0.01)
+                    else:
+                        cand = sm.trim_surface_with_3d_curves(surf, [len(lp) for lp in loops_try], curves)
+                except Exception:
+                    continue
+                if cand.face_count() == 1 and abs(cand.area(1e-6) - area) <= 1e-4 * max(area, 1e-12):
+                    made = cand
+                    break
+            if made is not None:
+                break
+        if made is None:
+            return b
+        merged.append(made)
+        drop += members
+    if len(drop) == len(faces):
+        if len(merged) == 1:
+            return merged[0]
+        out = merged[0]
+        for m in merged[1:]:
+            ext.append_brep(out, m)
+        return out
+    out = b.copy()
+    of = out.faces()
+    ext.delete_faces(out, [of[i] for i in drop])
+    for m in merged:
+        ext.append_brep(out, m)
+    before_open = _open_edge_count(b) - 2 * len(seams)
+    for t in (tol / 10, tol, 10 * tol):
+        st = sm.stitch_advanced(out.copy(), t, squeeze_small_edges=False, making_manifold_solid=False)[0]
+        if _open_edge_count(st) <= max(before_open, 0) and st.face_count() == out.face_count():
+            return st
+    return b
 
 
 def job_trim(job):
@@ -311,13 +519,7 @@ def job_trim(job):
     cutters as the clicked one is affected (a circle in front of a vase cuts
     both walls); with PICKED only the clicked region is."""
     ref = tuple(job["ref_point"])
-    cutters = []
-    for c in job.get("curves", []):
-        cutters.append(CurveCutter(c, c.get("dir") or job["direction"]))
-    for key in job.get("cutter_breps", []):
-        if not sm.intersect_breps(world_brep(job, "target"), world_brep(job, key))[0]:
-            raise RuntimeError(f"cutter surface does not intersect the target")
-        cutters.append(SurfaceCutter(job, key))
+    cutters = build_cutters(job, strict=job.get("strict", True))
     if not cutters:
         raise RuntimeError("no cutters")
 
@@ -327,6 +529,32 @@ def job_trim(job):
               "check that they cross it (along the projection direction for curves)")
 
     stored_side = job.get("side")   # history rebuild: the side of the cutters that was kept
+    marks = job.get("marks") or []  # [[world point, keep?], ...]: regions marked in the viewport
+
+    def marked(faces, groups, picked, sides):
+        """Groups to KEEP from the viewport marks: each mark labels the region
+        nearest to it; a region no mark reaches (the cut changed) follows the
+        side rule of the clicked one."""
+        np = _np()
+        owner = {i: gi for gi, g in enumerate(groups) for i in g}
+        label, by_side = {}, {}
+        none = tuple(None for _ in sides[picked])
+        for mk in marks:
+            pt, keep = mk[0], bool(mk[1])
+            side = tuple(mk[2]) if len(mk) > 2 and mk[2] is not None else None
+            if side is not None and side != none:
+                by_side[side] = by_side.get(side, False) or keep
+            q = tuple(float(x) for x in pt)
+            fi = min(range(len(faces)), key=lambda i: faces[i].closest_point(q)[1])
+            gi = owner[fi]
+            if side is not None and sides[gi] != side:
+                continue           # the cut changed (Cut flipped): that point now lies in another kind of region
+            label.setdefault(gi, keep)
+        same = {gi for gi, s in enumerate(sides) if s == sides[picked]} if sides[picked] != none else {picked}
+
+        def default(gi):
+            return by_side[sides[gi]] if sides[gi] in by_side else gi in same
+        return {gi for gi in range(len(groups)) if label.get(gi, default(gi))}
 
     def chosen(groups, picked, sides):
         if stored_side is not None and through and len(stored_side) == len(sides[0]) \
@@ -341,8 +569,24 @@ def job_trim(job):
     results, info = {}, {}
     for act in (["KEEP", "DELETE"] if action == "SPLIT" else [action]):
         b, faces, groups, picked, sides = _regions(job, cutters)
+        info = {"regions": len(groups), "side": list(sides[picked])}
+        if marks:   # explicit: KEEP writes the regions marked keep, DELETE the others
+            keep = marked(faces, groups, picked, sides)
+            if len(groups) < 2:
+                raise RuntimeError(no_cut)
+            if not keep:
+                raise RuntimeError("every region is marked discard")
+            out_g = keep if act == "KEEP" else set(range(len(groups))) - keep
+            if not out_g:
+                raise RuntimeError("no region is marked discard -- nothing to split off")
+            info["selected"] = len(keep)
+            drop = [f for i, f in enumerate(faces) if not any(i in groups[gi] for gi in out_g)]
+            if drop:
+                ext.delete_faces(b, drop)
+            results[act] = heal_cut_seams(b, world_brep(job, "target"))
+            continue
         sel = chosen(groups, picked, sides)
-        info = {"regions": len(groups), "selected": len(sel), "side": list(sides[picked])}
+        info["selected"] = len(sel)
         sel_faces = {i for gi in sel for i in groups[gi]}
         if len(groups) < 2 and act == "DELETE":
             raise RuntimeError(no_cut)
@@ -356,8 +600,8 @@ def job_trim(job):
                 raise RuntimeError("that would remove the whole surface")
         if drop:
             ext.delete_faces(b, drop)
-        results[act] = b
-    out = {"info": info}
+        results[act] = heal_cut_seams(b, world_brep(job, "target"))
+    out = {"info": info, "extended": job.get("extended", [])}
     for act, b in results.items():
         save(to_local(b, job.get("xforms", {}).get("target")), job["out"][act])
         out[act] = {"faces": b.face_count(), "area": b.area()}
@@ -384,14 +628,20 @@ def _foot(surf, q):
 
 
 def _rail_sheet(edge, base, h):
-    """Degree-1 x rail sheet whose middle line is EXACTLY the rail curve: rows =
-    rail CVs -+ h * (base normal at the CV's Greville point), same weights."""
+    """Degree-1 x rail sheet whose middle line is EXACTLY the rail curve."""
+    return _normal_sheet(ext.curve_cvs(edge.curve()), base, h)
+
+
+def _normal_sheet(d, base, h):
+    """Degree-1 x curve sheet whose middle line is EXACTLY the curve (data d):
+    rows = curve CVs -+ h * (base normal at the CV's Greville point), same
+    weights. A cutter for a curve on (or near) the base: it stands across the
+    base along its normals."""
     np = _np()
-    d = ext.curve_cvs(edge.curve())
-    p, U = d["degree"], list(d["knots"])
+    p, U = int(d["degree"]), [float(k) for k in d["knots"]]
     P = np.array(d["points"], float)
     W = np.array(d["weights"], float) if d.get("weights") else np.ones(len(P))
-    c = edge.curve()
+    c = curve(d)
     faces = base.faces()
     N = []
     for i in range(len(P)):
@@ -691,19 +941,491 @@ def _fillet_finish(job, f, A, B):
     return out
 
 
-def _cutters_from_job(job):
-    cutters = [CurveCutter(c, c.get("dir") or job["direction"]) for c in job.get("curves", [])]
+# ---------------------------------------------------------------------------
+# Cutters that stop short: extended (naturally, exactly) until they reach across
+# ---------------------------------------------------------------------------
+
+EXTEND_STEPS = (0.05, 0.15, 0.4, 1.0, 2.0)     # fractions of the target's size, tried in turn
+
+
+def _poly_dist(q, P):
+    """Distance from point q to the polyline P (n, 3)."""
+    np = _np()
+    seg = P[1:] - P[:-1]
+    t = np.clip(np.einsum("ij,ij->i", q - P[:-1], seg) / np.maximum(np.einsum("ij,ij->i", seg, seg), 1e-30), 0, 1)
+    return float(np.min(np.linalg.norm(P[:-1] + seg * t[:, None] - q, axis=1)))
+
+
+def _free_ends(target, cutter, edge_polys, tol):
+    """End points of the intersection curves of target and cutter that lie
+    inside the target (not on one of its edges): where the cut stops short
+    and the cutter has to go on. None when they do not intersect at all."""
+    np = _np()
+    try:
+        curves = sm.intersect_breps(target, cutter)[0]
+    except Exception:
+        return None
+    if not curves:
+        return None
+    tips = []
+    for c in curves:
+        try:
+            if c.is_closed():
+                continue
+            pts = [np.array(c.start_point(), float), np.array(c.end_point(), float)]
+        except Exception:
+            continue
+        if np.linalg.norm(pts[0] - pts[1]) <= tol:
+            continue                                   # closed after all
+        tips += pts
+    ends = []
+    for i, q in enumerate(tips):
+        # where two pieces of one cut meet (a loop split at a seam) the cut goes on
+        if any(j != i and np.linalg.norm(q - r) <= tol for j, r in enumerate(tips)):
+            continue
+        if not any(_poly_dist(q, P) <= tol for P in edge_polys):
+            ends.append(q)
+    return ends
+
+
+def _edge_polys(b):
+    np = _np()
+    return [np.array(p, float) for p in (_edge_poly(e, 64) for e in b.edges()) if len(p) > 1]
+
+
+def _iso(s, edge, n=96):
+    np = _np()
+    (u0, u1), (v0, v1) = s.u_domain(), s.v_domain()
+    ts = np.linspace(0.0, 1.0, n)
+    if edge in ("U0", "U1"):
+        u = u0 if edge == "U0" else u1
+        return np.array([s.evaluate(u, v0 + (v1 - v0) * t) for t in ts], float)
+    v = v0 if edge == "V0" else v1
+    return np.array([s.evaluate(u0 + (u1 - u0) * t, v) for t in ts], float)
+
+
+def _target_size(target):
+    np = _np()
+    lo, hi = (np.array(v, float) for v in target.bounding_box())
+    return float(np.linalg.norm(hi - lo)) or 1.0
+
+
+def extended_surface_cutter(target, cutter):
+    """The cutting surface, extended at the boundaries where its cut stops
+    inside the target until the cut reaches the target's edges (or the
+    longest extension tried). A cutter that already cuts across, or that is
+    not a single surface, comes back as it is. Returns (brep, edges extended)."""
+    size = _target_size(target)
+    tol = 1e-3 * size
+    polys = _edge_polys(target)
+    ends = _free_ends(target, cutter, polys, tol)
+    if not ends or cutter.face_count() != 1:
+        return cutter, []
+    s0 = cutter.faces()[0].surface()      # a trimmed cutter: its whole surface first
+    d0 = ext.surface_cvs(s0)
+    best, need, s = cutter, set(), s0
+    # a seam (the surface closes there) or a pole is no edge to extend
+    isos = {e: _iso(s0, e) for e in ("U0", "U1", "V0", "V1")}
+    np = _np()
+    shut = set()
+    for a, b in (("U0", "U1"), ("V0", "V1")):
+        if np.max(np.linalg.norm(isos[a] - isos[b], axis=1)) <= tol:
+            shut |= {a, b}
+    for e, P in isos.items():
+        if np.max(np.linalg.norm(P - P.mean(axis=0), axis=1)) <= tol:
+            shut.add(e)
+    open_edges = [e for e in ("U0", "U1", "V0", "V1") if e not in shut]
+    if not open_edges:
+        return cutter, []
+    for f in EXTEND_STEPS:
+        more = set()        # (an end at a crease or a knot of the cutter is no reason to extend)
+        for q in ends:
+            dist, e = min((_poly_dist(q, _iso(s, e)), e) for e in ("U0", "U1", "V0", "V1"))
+            if dist <= tol and e in open_edges:
+                more.add(e)
+        if not more:
+            break
+        need |= more
+        d, s = d0, None
+        try:
+            for e in sorted(need):
+                s = ext.surface_from_cvs(*extend_grid(d, e, f * size, chunks=True))
+                d = ext.surface_cvs(s)
+        except Exception:
+            break
+        cand = ext.brep_from_surface(s)
+        ends = _free_ends(target, cand, polys, tol)
+        if ends is None:
+            break
+        best = cand
+        if not ends:
+            break
+    return best, sorted(need)
+
+
+def through_surface_cutter(target, cutter):
+    """The cutting surface extended (its natural continuation) past every open
+    edge until that edge lies outside the target's box, so it cuts all the
+    way through (a short tube through both walls of a hood). Seams and poles
+    stay. A cutter of several faces comes back as it is. Returns (brep, edges)."""
+    np = _np()
+    if cutter.face_count() != 1:
+        return cutter, []
+    size = _target_size(target)
+    tol = 1e-3 * size
+    lo, hi = (np.array(v) for v in target.bounding_box())
+    lo, hi = lo - tol, hi + tol
+    s0 = cutter.faces()[0].surface()
+    isos = {e: _iso(s0, e) for e in ("U0", "U1", "V0", "V1")}
+    shut = set()
+    for a, b in (("U0", "U1"), ("V0", "V1")):
+        if np.max(np.linalg.norm(isos[a] - isos[b], axis=1)) <= tol:
+            shut |= {a, b}
+    for e, P in isos.items():
+        if np.max(np.linalg.norm(P - P.mean(axis=0), axis=1)) <= tol:
+            shut.add(e)
+
+    def outside(P):          # every point of the edge off the target's box
+        return bool(np.all(np.any((P < lo) | (P > hi), axis=1)))
+    d, s, done = ext.surface_cvs(s0), s0, []
+    for e in ("U0", "U1", "V0", "V1"):
+        if e in shut or outside(_iso(s, e)):
+            continue
+        for f in EXTEND_STEPS + (4.0,):
+            try:
+                cand = ext.surface_from_cvs(*extend_grid(d, e, f * size, chunks=True))
+            except Exception:
+                break
+            if outside(_iso(cand, e)) or f == 4.0:
+                d, s = ext.surface_cvs(cand), cand
+                done.append(e)
+                break
+    if not done:
+        return cutter, []
+    return ext.brep_from_surface(s), done
+
+
+def _curve_sheet(data, direction, L):
+    np = _np()
+    d = np.array(direction, float)
+    c = sm.translate(curve(data), tuple(-0.5 * L * d))
+    return ext.brep_from_surface(sm.create_extrude_surface(c, tuple(L * d)))
+
+
+def _is_closed_data(data):
+    np = _np()
+    P = np.array(_poly(curve(data), 64))
+    return np.linalg.norm(P[0] - P[-1]) <= 1e-6 * (np.ptp(P, axis=0).max() or 1.0)
+
+
+def _curve_gap(target, data, n=33):
+    """Largest distance from the curve to the target."""
+    return max(dist_to_brep(tuple(q), target) for q in _poly(curve(data), n))
+
+
+def extended_curve_data(target, data, sheets, direction=None):
+    """An open cutting curve, extended at the ends where its cut stops inside
+    the target, until it reaches the target's edges. sheets(data) gives the
+    cutter sheets of a curve; direction: the projection (ends are compared
+    across it), None for a curve cut along itself. Returns (data, ends
+    extended: "start" / "end")."""
+    np = _np()
+    if _is_closed_data(data):
+        return data, []                                  # closed: nothing to extend
+    size = _target_size(target)
+    tol = 1e-3 * size
+    if direction is None:
+        flat = lambda q: q
+    else:
+        d = np.array(direction, float)
+        d /= np.linalg.norm(d) or 1.0
+        flat = lambda q: q - (q @ d) * d                 # across the projection direction
+    polys = _edge_polys(target)
+
+    def free(dat):
+        out, hit = [], False
+        for sh in sheets(dat):
+            e = _free_ends(target, sh, polys, tol)
+            if e is not None:
+                hit = True
+                out += e
+        return out if hit else None
+
+    try:
+        ends = free(data)
+    except Exception:
+        return data, []
+    if not ends:
+        return data, []
+    best, need = data, set()
+    P = np.array(_poly(curve(data), 64))
+    a, b = P[0], P[-1]
+    for f in EXTEND_STEPS:
+        more = set()        # (an end at a corner of the curve is no reason to extend)
+        for q in ends:
+            da, db = np.linalg.norm(flat(q - a)), np.linalg.norm(flat(q - b))
+            if min(da, db) <= tol:
+                more.add("start" if da <= db else "end")
+        if not more:
+            break
+        need |= more
+        try:
+            cand = data
+            for which in sorted(need):
+                cand = extend_curve(cand, which == "start", f * size, chunks=True)
+            ends = free(cand)
+        except Exception:
+            break
+        if ends is None:
+            break
+        best = cand
+        Q = np.array(_poly(curve(cand), 64))
+        a, b = Q[0], Q[-1]
+        if not ends:
+            break
+    return best, sorted(need)
+
+
+class PullCutter(SurfaceCutter):
+    """A curve on (or near) the target, cut along itself -- no projection: a
+    sheet standing across the target along its normals, the curve exactly in
+    its middle (one sheet per smooth piece, as for projected curves). Its
+    side is the side of the sheet, like a cutting surface's."""
+
+    def __init__(self, target, data):
+        np = _np()
+        self.data = data
+        self.sheets = pull_sheets(target, data)
+        P, N = [], []
+        for sh in self.sheets:
+            arr = sh.tessellate(chord_height_tolerance=0.0005).to_numpy_arrays()
+            P.append(arr["points"].astype(float))
+            N.append(arr["normals"].astype(float))
+        self.P, self.N = np.concatenate(P), np.concatenate(N)
+
+    def split(self, b, ref):
+        for sh in self.sheets:
+            b = sm.boolean_with_options(b, sh.copy(), operation=sm.BooleanOp.UNION, imprinting=True,
+                                        keep_other_brep=True)
+            if b is None:
+                return None
+        return b
+
+
+def pull_sheets(target, data):
+    """The sheets of a curve cut along itself: half height enough to pass
+    through the target where the curve is off it, small enough not to reach
+    other parts of it (the far wall of a vase)."""
+    h = max(2.0 * _curve_gap(target, data), 0.02 * _target_size(target))
+    return [_normal_sheet(piece, target, h) for piece in corner_pieces(data)]
+
+
+def _pulled(target, c):
+    """Is curve c cut along itself? c["pull"]: True, False or "auto" (when it
+    lies on the target)."""
+    mode = c.get("pull", False)
+    if mode == "auto":
+        try:
+            return _curve_gap(target, c) <= 1e-3 * _target_size(target)
+        except Exception:
+            return False
+    return bool(mode)
+
+
+def build_cutters(job, strict):
+    """Trim / split cutters: projected curves, curves cut along themselves
+    (on the surface) and cutting surfaces. With job['extend'] a curve or
+    surface whose cut stops inside the target is extended until it reaches
+    across (job['extended'] lists what was). strict: a cutting surface that
+    misses the target is an error (Trim), else it is left out (Split)."""
+    extend = job.get("extend", False)
+    target = world_brep(job, "target")
+    cutters, extended = [], []
+    for i, c in enumerate(job.get("curves", [])):
+        if _pulled(target, c):
+            if extend:
+                data, ends = extended_curve_data(target, c, lambda dat: pull_sheets(target, dat))
+                if ends:
+                    c = data
+                    extended.append({"curve": i, "ends": ends})
+            cutters.append(PullCutter(target, c))
+            continue
+        direction = c.get("dir") or job["direction"]
+        if extend:
+            np = _np()
+            P = np.array(_poly(curve(c), 64))
+            lo, hi = (np.array(v) for v in target.bounding_box())
+            L = 4.0 * (_target_size(target) + float(np.max(np.linalg.norm(P - 0.5 * (lo + hi), axis=1))))
+            data, ends = extended_curve_data(target, c, lambda dat: [_curve_sheet(dat, direction, L)], direction)
+            if ends:
+                c = dict(data, dir=c.get("dir"))
+                extended.append({"curve": i, "ends": ends})
+        cutters.append(CurveCutter(c, direction, job.get("reach", "BOTH")))
     for key in job.get("cutter_breps", []):
-        if sm.intersect_breps(world_brep(job, "target"), world_brep(job, key))[0]:
-            cutters.append(SurfaceCutter(job, key))
+        cut = world_brep(job, key)
+        if not sm.intersect_breps(target, cut)[0]:
+            if strict:
+                raise RuntimeError("cutter surface does not intersect the target")
+            continue
+        brep = None
+        if job.get("through"):      # all the way through the part
+            brep, edges = through_surface_cutter(target, cut)
+            if edges:
+                extended.append({"surface": key, "edges": edges})
+            else:
+                brep = None
+        elif extend:
+            brep, edges = extended_surface_cutter(target, cut)
+            if edges:
+                extended.append({"surface": key, "edges": edges})
+            else:
+                brep = None
+        cutters.append(SurfaceCutter(job, key, brep))
+    job["extended"] = extended
     return cutters
+
+
+def _inner_point(f, n=13):
+    """A point well inside face f: of a grid of (u, v) the face calls inside,
+    the one farthest from its edges. The kernel's interior_point() can lie on
+    an edge (the top of a notch's arc)."""
+    np = _np()
+    try:
+        (u0, v0), (u1, v1) = f.uv_domain()
+        surf = f.surface()
+        E = [np.array(p) for p in (_edge_poly(e, 64) for e in f.edges()) if len(p)]
+        E = np.vstack(E) if E else None
+        best, best_d = None, -1.0
+        for u in np.linspace(u0, u1, n + 2)[1:-1]:
+            for v in np.linspace(v0, v1, n + 2)[1:-1]:
+                if f.classify_uv(float(u), float(v)) != "inside":
+                    continue
+                p = np.array(surf.evaluate(float(u), float(v)))
+                d = float(np.min(np.linalg.norm(E - p, axis=1))) if E is not None else 0.0
+                if d > best_d:
+                    best, best_d = p, d
+        if best is not None:
+            return best
+    except Exception:
+        pass
+    return np.array(f.interior_point())
+
+
+def _untrim_regions(job):
+    """The surface as it was before its trims ("untrimmed") cut along the
+    trimmed one's ("target") cut edges -- the edges that are not the
+    untrimmed surface's own boundary. Returns (b, faces, groups, present,
+    removed, untrimmed, current, own-edge test): present groups are on the
+    trimmed surface, removed ones were trimmed away."""
+    np = _np()
+    cur = world_brep(job, "target")
+    unt = world_brep(job, "untrimmed")
+    lo, hi = (np.array(v) for v in unt.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    tol = 1e-5 * size
+    on_own = _near_edges(unt, 10 * tol)
+    cut_edges = []
+    for e in cur.edges():
+        pts = _edge_poly(e, 9)
+        if pts and not all(on_own(p) for p in np.array(pts)[1:-1]):
+            cut_edges.append(e)
+    if not cut_edges:
+        raise RuntimeError("nothing is trimmed on this surface")
+    cutters = []
+    for e in cut_edges:
+        d = ext.curve_cvs(e.curve())
+        data = {"degree": d["degree"], "points": [list(p) for p in d["points"]], "knots": list(d["knots"]),
+                "weights": list(d["weights"]) if d.get("weights") else None}
+        cutters.append(PullCutter(unt, data))
+    lo2, hi2 = (np.array(v) for v in cur.bounding_box())
+    sub = dict(job, ref_point=list(job.get("point") or (0.5 * (lo2 + hi2)).tolist()))
+    sub["breps"] = dict(job["breps"], target=job["breps"]["untrimmed"])
+    sub["xforms"] = dict(job.get("xforms", {}), target=job.get("xforms", {}).get("untrimmed"))
+    b, faces, groups, _, _ = _regions(sub, cutters)
+    cur_faces = cur.faces()
+
+    def on_current(p):
+        """Is p (on the untrimmed surface) inside the trimmed one? The face's own
+        trim test on the surface parameters -- a distance test called a removed
+        area present when its sample point lay near the cut edge."""
+        q = tuple(float(v) for v in p)
+        for f in cur_faces:
+            try:
+                _, uvs, d = sm.surface_closest_point(f.surface(), q)
+                if d <= 100 * tol and any(f.classify_uv(float(uv.x), float(uv.y)) in ("inside", "boundary")
+                                          for uv in uvs):
+                    return True
+            except Exception:
+                if f.closest_point(q)[1] <= 10 * tol:
+                    return True
+        return False
+    present, removed = [], []
+    for gi, g in enumerate(groups):
+        f = max((faces[i] for i in g), key=lambda fc: fc.area(1e-3))
+        (present if on_current(_inner_point(f)) else removed).append(gi)
+    area_present = sum(faces[i].area(1e-6) for gi in present for i in groups[gi])
+    if abs(area_present - cur.area(1e-6)) > 1e-3 * max(cur.area(1e-6), 1e-12):
+        raise RuntimeError("this surface has more on it than trims (a fillet?) -- use Untrim for all of it")
+    if not removed:
+        raise RuntimeError("no trimmed-away area found")
+    return b, faces, groups, present, removed, unt, cur, on_own
+
+
+def job_untrim_preview(job):
+    """The areas trimmed away (out_region<i>.sm, the untrimmed body's local
+    space) and a world point inside each, for picking them in the viewport."""
+    b, faces, groups, present, removed, unt, cur, _ = _untrim_regions(job)
+    x = job.get("xforms", {}).get("untrimmed")
+    points = []
+    for k, gi in enumerate(removed):
+        part = b.copy()
+        pf = part.faces()
+        ext.delete_faces(part, [f for i, f in enumerate(pf) if i not in groups[gi]])
+        save(to_local(part, x), os.path.join(job["out_dir"], f"out_region{k}.sm"))
+        f = max((faces[i] for i in groups[gi]), key=lambda fc: fc.area(1e-3))
+        points.append([float(v) for v in _inner_point(f)])
+    return {"regions": len(removed), "points": points}
+
+
+def job_untrim_region(job):
+    """Untrim areas: the trimmed-away areas nearest job["points"] (world;
+    or job["point"], a point on a cut edge) come back; the cut edges between
+    them and the rest are merged away. The other trims stay."""
+    np = _np()
+    pts = job.get("points") or [job["point"]]
+    if job.get("point") is not None and not job.get("points"):
+        # a click on an edge: it must be a cut edge, not the surface's own
+        cur = world_brep(job, "target")
+        unt = world_brep(job, "untrimmed")
+        lo, hi = (np.array(v) for v in unt.bounding_box())
+        on_own = _near_edges(unt, 1e-4 * (float(np.linalg.norm(hi - lo)) or 1.0))
+        q = np.array(job["point"], float)
+        best = min((e for e in cur.edges() if _edge_poly(e, 9)),
+                   key=lambda e: float(np.min(np.linalg.norm(np.array(_edge_poly(e, 9)) - q, axis=1))))
+        if all(on_own(p) for p in np.array(_edge_poly(best, 9))[1:-1]):
+            raise RuntimeError("that edge is the surface's own boundary: nothing was trimmed there")
+    b, faces, groups, present, removed, unt, cur, on_own = _untrim_regions(job)
+    back = set()
+    for pt in pts:
+        q = tuple(float(v) for v in pt)
+        back.add(min(removed, key=lambda gi: min(faces[i].closest_point(q)[1] for i in groups[gi])))
+    keep = set(present) | back
+    drop = [f for i, f in enumerate(faces) if not any(i in groups[gi] for gi in keep)]
+    if drop:
+        ext.delete_faces(b, drop)
+    b = heal_cut_seams(b, unt)
+    save(to_local(b, job.get("xforms", {}).get("untrimmed")), job["out"]["result"])
+    left = sum(1 for e in b.edges() if _edge_poly(e, 9)
+               and not all(on_own(p) for p in np.array(_edge_poly(e, 9))[1:-1]))
+    return {"faces": b.face_count(), "area": b.area(1e-6), "cuts_left": left,
+            "restored": float(sum(faces[i].area(1e-6) for gi in back for i in groups[gi]))}
 
 
 def job_split(job):
     """Split the target along all cutters and write EVERY region as its own
     brep (out_region<i>.sm in out_dir). Cutting surfaces that miss the target
     are ignored; nothing is removed."""
-    cutters = _cutters_from_job(job)
+    cutters = build_cutters(job, strict=False)
     if not cutters:
         raise RuntimeError("nothing crosses this surface")
     if "ref_point" not in job:
@@ -713,7 +1435,10 @@ def job_split(job):
     if len(groups) < 2:
         raise RuntimeError("the cutters do not split this surface into separate regions")
     x = job.get("xforms", {}).get("target")
-    areas = []
+    areas, points = [], []
+    for g in groups:   # a point inside each region (world), the one its side is judged at
+        f = max((faces[i] for i in g), key=lambda fc: fc.area(1e-3))
+        points.append([float(v) for v in _inner_point(f)])
     for gi, g in enumerate(groups):
         part = b.copy()
         pf = part.faces()
@@ -723,7 +1448,8 @@ def job_split(job):
             ext.delete_faces(part, drop)
         save(to_local(part, x), os.path.join(job["out_dir"], f"out_region{gi}.sm"))
         areas.append(part.area())
-    return {"regions": len(groups), "areas": areas}
+    return {"regions": len(groups), "areas": areas, "extended": job.get("extended", []),
+            "points": points, "sides": [list(sd) for sd in sides], "picked": picked}
 
 
 def _shared_edges(b):
@@ -1675,7 +2401,7 @@ def job_mesh_to_brep(job):
             "filleted": done, "failed": failed}
 
 
-JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean,
+JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "untrim_region": job_untrim_region, "untrim_preview": job_untrim_preview, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean,
         "flip": job_flip, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken,
         "mesh_to_brep": job_mesh_to_brep}
 

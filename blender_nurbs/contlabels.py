@@ -234,7 +234,7 @@ def corner_marks(obj):
 
 
 _base_cache = {}
-CUT_STEPS = {"edge_fillet", "trim", "fillet_trim"}     # steps that only cut / round the feature's result
+CUT_STEPS = {"edge_fillet", "trim", "fillet_trim", "untrim_region"}     # steps that only cut / round the feature's result
 
 
 def _base_brep(obj):

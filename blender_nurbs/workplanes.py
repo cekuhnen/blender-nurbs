@@ -879,7 +879,8 @@ class VIEW3D_PT_nproto_workplanes(bpy.types.Panel):
 # Drawn in the plane's own coordinates (x, y; the plane is z = 0 there) with
 # the fine floor grid's rules (draw.py): eight levels, finest first; each
 # fades in from GRID_FADE_PX apart, the next two up are heavier; the whole
-# grid fades as the plane turns edge-on, an endless one also towards its rim.
+# grid fades right at edge-on and once even its coarsest level is too dense,
+# an endless one also towards its rim.
 # Its X and Y axes are drawn in the theme's axis colours.
 
 import gpu  # noqa: E402
@@ -927,7 +928,12 @@ void main()
   if (det < 1e-30) {
     discard;
   }
-  float ppu = min(length(vec2(dx.y, dy.y)), length(vec2(dx.x, dy.x))) / det;
+  /* pixels per unit in the plane's most squeezed direction (whatever way it
+     points: 1 / the larger singular value of the pixel-to-plane map), so a
+     level fades at the same density looking along an axis or across it */
+  float aa = dot(dx, dx) + dot(dy, dy);
+  float smax = sqrt(max(0.5 * (aa + sqrt(max(aa * aa - 4.0 * det * det, 0.0))), 1e-30));
+  float ppu = 1.0 / smax;
   float fpx = params.x;
   int i = 0;
   while (i < 7 && level(i) * ppu < fpx) {
@@ -948,11 +954,13 @@ void main()
   c = mix(c, emph, grid_line(co, fw, s3));
   c = mix(c, axisX, axis_line(co.y, fw.y));
   c = mix(c, axisY, axis_line(co.x, fw.x));
+  /* seen almost edge-on: a short fade right at the end, and the lines go once
+     even the coarsest level is denser than the fade (the levels already thin
+     out with the density, measured in the most squeezed direction) */
   vec3 n = normalize(ModelMatrix[2].xyz);
   vec3 vv = (eye.w > 0.5) ? normalize(eye.xyz - wpos) : eye.xyz;
-  float a = 1.0 - abs(dot(vv, n));
-  a *= a;
-  c.a *= 1.0 - a * a;
+  c.a *= smoothstep(0.0, 0.03, abs(dot(vv, n)));
+  c.a *= clamp(level(7) * ppu / fpx, 0.0, 1.0);
   if (params.w > 0.0) {
     c.a *= 1.0 - smoothstep(0.5 * params.w, params.w, length(co - rim.xy));
   }

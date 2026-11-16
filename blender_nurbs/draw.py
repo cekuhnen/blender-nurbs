@@ -10,7 +10,12 @@ from . import store
 _handle = None
 _handle_px = None
 _label_cache = {}
-pick_overlay = {"hover": None, "picked": [], "colors": []}  # filled by the modal pick operator
+pick_overlay = {"hover": None, "picked": [], "colors": [],   # filled by the modal pick operator
+                # Trim's regions before it commits: [(world tris (n,3,3), outline (m,2,3), keep?)]
+                "regions": [], "region_hover": None,
+                "region_pal": None}     # (colour of keep, of not): Split uses its own pair
+COL_REGION_KEEP = (0.25, 0.9, 0.4)
+COL_REGION_DROP = (1.0, 0.2, 0.2)
 # filled by the sketch tools (CV Curve / Line): world-space polylines and points
 sketch_overlay = {"curves": [], "hull": [], "cvs": [], "snap": None, "snap_label": None, "axes": [],
                   "refs": [], "cursor": None, "comb": None, "guides": [], "face": [], "face_pts": []}
@@ -326,6 +331,15 @@ def _draw():
         workplanes.draw_active_marker(ctx)     # the active work plane's axes
     except Exception as exc:
         print("NURBS work plane:", exc)
+    regs = pick_overlay.get("regions") or []
+    if regs:       # see-through, so a region on a far wall shows too (blending is on)
+        hov = pick_overlay.get("region_hover")
+        for i, (tris, border, keep) in enumerate(regs):
+            pal = pick_overlay.get("region_pal") or (COL_REGION_KEEP, COL_REGION_DROP)
+            c = pal[0] if keep else pal[1]
+            a = (0.18 if keep else 0.38) + (0.2 if i == hov else 0.0)
+            _draw_tris(tris.reshape(-1, 3), (*c, a))
+            _draw_lines(border.reshape(-1, 3).tolist(), (*c, 1.0), 3.5 if i == hov else 2.0)
     cols = pick_overlay.get("colors") or []
     if len(cols) != len(pick_overlay["picked"]):
         cols = [min(i, 2) for i in range(len(pick_overlay["picked"]))]
@@ -584,8 +598,8 @@ void main()
 # orthographic; perspective?); rim: (centre x, y, radius -- 0: none) of the
 # fade towards the edge (perspective: a circle round the eye, so the grid ends
 # as far straight ahead as off to the sides -- the square it is drawn on would
-# reach 1.4x further along its diagonals). Levels, blending and the fade
-# towards edge-on as Blender's grid shader.
+# reach 1.4x further along its diagonals). Levels and blending as Blender's
+# grid shader; only the levels below Blender's own (base) are drawn.
 _GRID_FRAG = """
 float grid_line(vec2 co, vec2 fw, float s)
 {
@@ -603,7 +617,12 @@ void main()
   if (det < 1e-30) {
     discard;
   }
-  float ppu = min(length(vec2(dx.y, dy.y)), length(vec2(dx.x, dy.x))) / det;
+  /* pixels per unit in the plane's most squeezed direction (whatever way it
+     points: 1 / the larger singular value of the pixel-to-plane map), so a
+     level fades at the same density looking along an axis or across it */
+  float aa = dot(dx, dx) + dot(dy, dy);
+  float smax = sqrt(max(0.5 * (aa + sqrt(max(aa * aa - 4.0 * det * det, 0.0))), 1e-30));
+  float ppu = 1.0 / smax;
   float fpx = params.y;
   float s0, s1, s2, s3;
   if (steps.x * ppu >= fpx) {
@@ -628,12 +647,18 @@ void main()
   vec4 emph = vec4(clamp(gridColor.rgb + vec3(params.w), 0.0, 1.0), gridColor.a);
   vec4 c = gridColor;
   c.a *= grid_line(co, fw, s1) * blend;
-  c = mix(c, mix(gridColor, emph, blend), grid_line(co, fw, s2));
-  c = mix(c, emph, grid_line(co, fw, s3));
+  /* only the levels Blender's floor doesn't draw: drawn twice they'd show
+     brighter, and step back where this grid hands over to Blender's */
+  if (s2 < params.x * 0.999) {
+    c = mix(c, mix(gridColor, emph, blend), grid_line(co, fw, s2));
+  }
+  if (s3 < params.x * 0.999) {
+    c = mix(c, emph, grid_line(co, fw, s3));
+  }
+  /* seen almost edge-on: a short fade right at the end (the levels already
+     thin out with the density, measured in the most squeezed direction) */
   vec3 vv = (eye.w > 0.5) ? normalize(eye.xyz - wpos) : eye.xyz;
-  float a = 1.0 - abs(vv.z);
-  a *= a;
-  c.a *= 1.0 - a * a;
+  c.a *= smoothstep(0.0, 0.03, abs(vv.z));
   if (rim.z > 0.0) {
     c.a *= 1.0 - smoothstep(0.6 * rim.z, rim.z, length(co - rim.xy));
   }

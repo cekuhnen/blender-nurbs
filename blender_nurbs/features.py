@@ -2095,10 +2095,14 @@ def _rebuild_inner(obj, context, h, entries, steps, turned):
         base_text = obj[PROP_BASE]
         natural = bool(obj.get(PROP_BASE + "_natural", 0))
     text = base_text
-    for e in entries:
-        if e["params"].get("_off"):   # muted in the history list
-            continue
-        text = steps.APPLY[e["op"]](obj, text, e["inputs"], e["params"])
+    steps.REBUILD_BASE[0] = base_text
+    try:
+        for e in entries:
+            if e["params"].get("_off"):   # muted in the history list
+                continue
+            text = steps.APPLY[e["op"]](obj, text, e["inputs"], e["params"])
+    finally:
+        steps.REBUILD_BASE[0] = None
     store.set_geometry_text(obj, text, context, keep_untrimmed=False)
     active = [e for e in entries if not e["params"].get("_off")]
     # Flip Normal keeps a surface as it is (plain or trimmed): look past it

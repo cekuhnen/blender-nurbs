@@ -18,7 +18,7 @@ _syncing = [False]
 
 # settings each step type exposes (in this order)
 STEP_FIELDS = {
-    "trim": ["action", "scope", "projection"],
+    "trim": ["action", "scope", "projection", "reach", "through"],
     "edge_fillet": ["shape", "rail_type", "radius", "variable", "end_radius", "continuity", "thumbweight",
                     "class_a", "ca_tolerance", "ca_angle", "ca_degree", "ca_continuity"],
     "rebuild_surface": ["degree_u", "degree_v", "spans_u", "spans_v"],
@@ -87,6 +87,11 @@ class NprotoStep(bpy.types.PropertyGroup):
     projection: EnumProperty(name="Project", items=[
         ("CURVE", "Curve Normal", ""), ("VIEW", "View", ""), ("NORMAL", "Surface Normal", ""),
         ("X", "World X", ""), ("Y", "World Y", ""), ("Z", "World Z", "")], **_S())
+    reach: EnumProperty(name="Cut", items=[("BOTH", "Both Ways", "A projected curve cuts on both sides of itself"),
+                                           ("FRONT", "Along Normal", "Only along the sketch normal (the curve's Z)"),
+                                           ("BACK", "Against Normal", "Only on the other side")], **_S())
+    through: BoolProperty(name="Surfaces Through", description="A cutting surface is extended until it cuts "
+                          "all the way through the part", **_S())
     shape: EnumProperty(name="Shape", items=[("CIRCULAR", "Circular", ""), ("CHAMFER", "Chamfer", ""),
                                              ("BLEND", "Blend", "")], **_S())
     rail_type: EnumProperty(name="Rail", items=[
@@ -135,6 +140,10 @@ def sync_step(obj, k):
                     pg.continuity = str(int(p.get("continuity", 2)))
                 elif name == "ca_continuity":
                     pg.ca_continuity = str(int(p.get("ca_continuity", 2)))
+                elif name == "reach":
+                    pg.reach = p.get("reach", "BOTH")
+                elif name == "through":
+                    pg.through = bool(p.get("through", False))
                 elif name == "class_a":
                     pg.class_a = bool(p.get("class_a", False))
                 elif name in CA_DEFAULTS and name not in p:
@@ -367,7 +376,7 @@ def draw_steps(box, obj, only=None, bare=False):
                 inner.label(text=pg.error, icon='ERROR')
 
 
-STEP_ICON = {"edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
+STEP_ICON = {"untrim_region": 'SELECT_SUBTRACT', "edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
              "flip_normal": 'NORMALS_FACE', "surface_align": 'SNAP_EDGE', "match_surface": 'SNAP_FACE', "extend_surface": 'FULLSCREEN_ENTER',
              "rebuild_surface": 'MOD_REMESH', "refit_trim": 'MOD_LATTICE'}
 

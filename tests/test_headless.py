@@ -389,6 +389,129 @@ check("projection defaults to the curve normal (ignores surface normal/view)",
       r == {'FINISHED'} and abs((vase_area - store.get_brep(vase).area(1e-6)) - disc) < 1e-3)
 bpy.ops.object.select_all(action='DESELECT'); vase.select_set(True); bpy.ops.nproto.untrim()
 
+# --- Trim: regions marked before committing (the preview stage) -------------
+regs, picked_i, _ = steps.trim_regions(vase, {}, curves=[steps.cutter_curve_json(features.input_curve(small, "S0"),
+                                       "CURVE", Vector((0, -1, 0)))], direction=[0, 1, 0], ref_point=[60.0, 0.0, 3.0],
+                                       extend=True)
+tri_ok = all(len(steps.region_mesh(rg["text"], vase.matrix_world)[0]) for rg in regs)
+check("trim preview: three regions (outside + a disc on each wall), each drawable", len(regs) == 3 and tri_ok,
+      f"{len(regs)} regions")
+front_i = max(range(len(regs)), key=lambda i: regs[i]["point"][1])
+marks = json.dumps([[rg["point"], i != front_i] for i, rg in enumerate(regs)])
+r = bpy.ops.nproto.trim(target="VaseT", cutters=ins((small, "S0")), ref_point=(60.0, 0.0, 3.0), normal=(0, 1, 0),
+                        view_dir=(0, -1, 0), action="KEEP", scope="THROUGH", marks=marks)
+cut = vase_area - store.get_brep(vase).area(1e-6)
+check("trim marks: keep outside + back disc removes only the front disc", r == {'FINISHED'} and abs(cut - disc) < 1e-3,
+      f"removed {cut:.4f} vs {disc:.4f}")
+st = features.stack(vase)
+if st:
+    features.rebuild(vase, ctx, force=True)
+    check("trim marks survive a history rebuild",
+          abs((vase_area - store.get_brep(vase).area(1e-6)) - disc) < 1e-3 and bool(st[-1]["params"].get("marks_local")))
+marked_edges = store.get_brep(vase).edge_count()
+bpy.ops.object.select_all(action='DESELECT'); vase.select_set(True); bpy.ops.nproto.untrim()
+# one-sided: the circle's Z points to -Y, so Against Normal cuts only the +Y (front_pt) wall
+r = bpy.ops.nproto.trim(target="VaseT", cutters=ins((small, "S0")), ref_point=front_pt, normal=(0, 1, 0),
+                        view_dir=(0, -1, 0), action="DELETE", scope="THROUGH", reach="BACK")
+cut = vase_area - store.get_brep(vase).area(1e-6)
+check("trim reach: against the sketch normal cuts one wall only", r == {'FINISHED'} and abs(cut - disc) < 1e-3,
+      f"removed {cut:.4f} vs {disc:.4f}")
+one_sided_edges = store.get_brep(vase).edge_count()
+check("trim marks: the kept wall has no seam left from the cut (as many edges as a one-sided cut)",
+      marked_edges == one_sided_edges, f"{marked_edges} vs {one_sided_edges} edges")
+bpy.ops.object.select_all(action='DESELECT'); vase.select_set(True); bpy.ops.nproto.untrim()
+r = bpy.ops.nproto.trim(target="VaseT", cutters=ins((small, "S0")), ref_point=front_pt, normal=(0, 1, 0),
+                        view_dir=(0, -1, 0), action="KEEP", scope="THROUGH", reach="FRONT")
+check("trim reach: along the normal only the -Y wall loses its disc (keep outside)", r == {'FINISHED'}
+      and abs(store.get_brep(vase).area(1e-6) - (vase_area - disc)) < 1e-3,
+      f"{store.get_brep(vase).area(1e-6):.4f} vs {vase_area - disc:.4f}")
+bpy.ops.object.select_all(action='DESELECT'); vase.select_set(True); bpy.ops.nproto.untrim()
+
+# marks made with one Cut direction keep their side of the cutter when Cut is flipped (F9 / F)
+regs, picked_i, _ = steps.trim_regions(vase, {}, curves=[steps.cutter_curve_json(features.input_curve(small, "S0"),
+                                       "CURVE", Vector((0, -1, 0)), steps.curve_up(small))], direction=[0, 1, 0],
+                                       ref_point=list(front_pt), extend=True, reach="FRONT")
+marks = json.dumps([[rg["point"], not any(rg["side"]), rg["side"]] for rg in regs])   # keep the outside
+r = bpy.ops.nproto.trim(target="VaseT", cutters=ins((small, "S0")), ref_point=front_pt, normal=(0, 1, 0),
+                        view_dir=(0, -1, 0), action="KEEP", reach="BACK", marks=marks)
+cut = vase_area - store.get_brep(vase).area(1e-6)
+check("trim marks: flipping Cut keeps the same side (the outside), not the clicked region",
+      r == {'FINISHED'} and abs(cut - disc) < 1e-3, f"removed {cut:.4f} vs {disc:.4f}")
+bpy.ops.object.select_all(action='DESELECT'); vase.select_set(True); bpy.ops.nproto.untrim()
+
+# --- Untrim Region: give back one trimmed-away area -----------------------
+r = vtrim("DELETE", small, front_pt, scope="THROUGH")          # a hole in each wall
+def hole_point(sign):
+    for e in store.get_brep(vase).edges():
+        t0, t1 = e.parameter_range(); m = e.point_at(0.5 * (t0 + t1))
+        if sign * m[1] > 0.5 and abs(m[0] - 60.0) < 0.5 and 1.0 < m[2] < 2.0:
+            return m
+prev = steps.untrim_preview(vase[store.PROP_BREP], features.base_text(vase), jobs.xform(vase))
+check("untrim preview: both holes show as removed areas", len(prev) == 2
+      and all(abs(store.brep_from_text(t).area(1e-6) - disc) < 1e-3 for t, _ in prev), f"{len(prev)} areas")
+r = bpy.ops.nproto.untrim_region(target="VaseT", point=hole_point(+1))
+a = store.get_brep(vase).area(1e-6)
+check("untrim region: the +Y hole is filled, the -Y hole stays", r == {'FINISHED'} and abs((vase_area - a) - disc) < 1e-3
+      and hole_point(+1) is None and hole_point(-1) is not None, f"missing {vase_area - a:.4f} vs {disc:.4f}")
+check("untrim region: one face, no seam where the hole was", store.get_brep(vase).face_count() == 1)
+if features.PROP_STACK in vase:
+    check("untrim region is a history step", [e["op"] for e in features.stack(vase)][-1] == "untrim_region")
+    features.rebuild(vase, ctx, force=True)
+    check("untrim region survives a rebuild", abs((vase_area - store.get_brep(vase).area(1e-6)) - disc) < 1e-3)
+try:
+    r = bpy.ops.nproto.untrim_region(target="VaseT", point=(58.8, 0.0, 0.0))     # the vase's own bottom rim
+except RuntimeError:
+    r = {'CANCELLED'}
+check("untrim region refuses the surface's own edge", r == {'CANCELLED'})
+prev = steps.untrim_preview(vase[store.PROP_BREP], features.base_text(vase), jobs.xform(vase))
+r = bpy.ops.nproto.untrim_region(points=json.dumps({"VaseT": [p for _, p in prev]}))     # picked in the preview
+check("untrim region: the last hole gives the whole surface back (trim steps gone)",
+      r == {'FINISHED'} and abs(store.get_brep(vase).area(1e-6) - vase_area) < 1e-3
+      and not any(e["op"] in ("trim", "untrim_region") for e in features.stack(vase)))
+bpy.ops.object.select_all(action='DESELECT'); vase.select_set(True); bpy.ops.nproto.untrim()
+
+# --- Split with pieces marked in the preview (on a copy of the vase) -------
+vc = store.new_object_text(ctx, "VaseCopy", vase[store.PROP_BREP], geom.world_matrix(vase))
+info = steps.split_info([(vc, "SURF"), (small, "S0")], {"projection": "CURVE", "view_dir": (0, -1, 0)})
+plus = max(range(len(info["texts"])), key=lambda i: info["points"][i][1] if any(info["sides"][i]) else -1e9)
+marks = json.dumps({"VaseCopy": [[pt, i != plus, sd] for i, (pt, sd) in enumerate(zip(info["points"], info["sides"]))]})
+bpy.ops.object.select_all(action='DESELECT')
+r = bpy.ops.nproto.split(targets=json.dumps(["VaseCopy"]), curves=ins((small, "S0")), view_dir=(0, -1, 0), marks=marks)
+made = list(ctx.selected_objects)
+pieces = sorted((store.get_brep(o).area(1e-6), store.get_brep(o).face_count()) for o in made)
+check("split marks: two pieces -- the +Y disc, and the rest as one face (no seam at the -Y disc)",
+      r == {'FINISHED'} and len(pieces) == 2 and abs(pieces[0][0] - disc) < 1e-3
+      and abs(pieces[1][0] - (vase_area - disc)) < 1e-3 and pieces[1][1] == 1, str(pieces))
+for o in made + [vc]:
+    if o.name in bpy.data.objects:
+        bpy.data.objects.remove(o)
+vc = store.new_object_text(ctx, "VaseCopy", vase[store.PROP_BREP], geom.world_matrix(vase))
+before = vc[store.PROP_BREP]
+info = steps.split_info([(vc, "SURF"), (small, "S0")], {"projection": "CURVE", "view_dir": (0, -1, 0)})
+marks = json.dumps({"VaseCopy": [[pt, True, sd] for pt, sd in zip(info["points"], info["sides"])]})
+try:
+    r = bpy.ops.nproto.split(targets=json.dumps(["VaseCopy"]), curves=ins((small, "S0")), view_dir=(0, -1, 0),
+                             marks=marks)
+except RuntimeError:
+    r = {'CANCELLED'}
+check("split marks: a surface with every region joined is left as it is (no seam, no new object)",
+      r == {'CANCELLED'} and vc[store.PROP_BREP] == before and "VaseCopy_split1" not in bpy.data.objects)
+bpy.data.objects.remove(vc)
+bpy.ops.object.select_all(action='DESELECT'); vase.select_set(True); ctx.view_layer.objects.active = vase
+
+# --- a cutting surface extended through the part ----------------------------
+bpy.ops.curve.primitive_nurbs_circle_add(radius=0.3, location=(60.0, 1.0, 1.5), rotation=(math.pi / 2, 0, 0))
+tube_c = ctx.active_object; tube_c.name = "TubeCirc"
+bpy.ops.nproto.extrude(inputs=ins((tube_c, "S0")), distance=0.8, direction="Y")
+tube = ctx.active_object; tube.name = "ShortTube"
+n_as_is = len(steps.split_info([(vase, "SURF"), (tube, "SURF")], {"view_dir": (0, -1, 0)})["texts"])
+n_through = len(steps.split_info([(vase, "SURF"), (tube, "SURF")], {"view_dir": (0, -1, 0), "through": True})["texts"])
+check("surfaces through: a short tube through one wall cuts both when extended", n_as_is == 2 and n_through == 3,
+      f"{n_as_is} regions as is, {n_through} through")
+for o in (tube, tube_c):
+    bpy.data.objects.remove(o)
+bpy.ops.object.select_all(action='DESELECT'); vase.select_set(True); ctx.view_layer.objects.active = vase
+
 # --- Trim: THROUGH scope, revolve seam, surface cutters -------------------
 r = vtrim("DELETE", small, front_pt, scope="THROUGH")
 both = vase_area - store.get_brep(vase).area(1e-6)
@@ -463,13 +586,99 @@ check("split: vase and tube split each other", r == {'FINISHED'} and len(vp_) ==
       and abs(sum(store.get_brep(o).area(1e-7) for o in vp_) - vase_area) < 2e-3,
       f"vase pieces={[round(area(o), 3) for o in vp_]} tube pieces={[round(area(o), 3) for o in tp_]}")
 
+# cutters that stop short are extended until they cut across (floors: x -50..-46, y -2..2 around y0)
+def _split_sel(*objs, **kw):
+    bpy.ops.object.select_all(action='DESELECT')
+    for o in objs:
+        o.select_set(True)
+    ctx.view_layer.objects.active = objs[0]
+    try:
+        return bpy.ops.nproto.split(**kw)
+    except RuntimeError:
+        return {'CANCELLED'}
+_xf = make_floor("SxA", loc=(-50, 200, 0)); _xl = poly("SxA_cut", [(-48, 197, 1), (-48, 201, 1)])
+r0 = _split_sel(_xf, _xl, extend=False)
+r = _split_sel(_xf, _xl)
+check("split: a line that stops inside the surface is extended to cut across (8 + 8); without Extend nothing splits",
+      r0 == {'CANCELLED'} and r == {'FINISHED'} and sorted(round(area(o), 4) for o in pieces("SxA")) == [8.0, 8.0],
+      f"{r0} {r} {[round(area(o), 4) for o in pieces('SxA')]}")
+_xf = make_floor("SxB", loc=(-50, 210, 0)); _xl = poly("SxB_cut", [(-49, 209.5, 1), (-49, 210.5, 1)])
+r = _split_sel(_xf, _xl)
+check("split: a line inside the surface is extended at both ends (4 + 12)",
+      r == {'FINISHED'} and sorted(round(area(o), 4) for o in pieces("SxB")) == [4.0, 12.0],
+      f"{[round(area(o), 4) for o in pieces('SxB')]}")
+_xf = make_floor("SxC", loc=(-50, 220, 0)); _xwl = poly("QwC_ln", [(-48, 217, -1), (-48, 221, -1)])
+bpy.ops.nproto.extrude(inputs=ins((_xwl, "S0")), distance=3.0, direction="Z"); _xw = ctx.active_object; _xw.name = "QwC"
+r = _split_sel(_xf, _xw)
+check("split: a wall and a floor that each stop inside the other both get extended (floor 8 + 8, wall 4 + 8)",
+      r == {'FINISHED'} and sorted(round(area(o), 4) for o in pieces("SxC")) == [8.0, 8.0]
+      and sorted(round(area(o), 4) for o in pieces("QwC")) == [4.0, 8.0],
+      f"{[round(area(o), 4) for o in pieces('SxC')]} {[round(area(o), 4) for o in pieces('QwC')]}")
+# an edge picked in Edge mode cuts like a curve; its surface is not split
+from blender_nurbs import subsel as _ss
+_xf = make_floor("SxD", loc=(-50, 230, 0))
+_xpl = poly("QpD_ln", [(-48, 229, 1), (-48, 231, 1)])
+bpy.ops.nproto.extrude(inputs=ins((_xpl, "S0")), distance=1.0, direction="X"); _xp = ctx.active_object; _xp.name = "QpD"
+_xpe = store.get_brep(_xp).edges()
+_xat = _xp.matrix_world.inverted() @ Vector((-48, 230, 1))
+_ei = min(range(len(_xpe)), key=lambda i: (Vector(_xpe[i].point_at(sum(_xpe[i].parameter_range()) / 2)) - _xat).length)
+_xp.select_set(True); _ss.set_picks(_xp, "EDGE", [_ei])
+r = _split_sel(_xf, _xp)
+_ss.set_picks(_xp, "EDGE", [])
+check("split: a picked surface edge splits like a line (extended, 8 + 8), its own surface stays whole",
+      r == {'FINISHED'} and sorted(round(area(o), 4) for o in pieces("SxD")) == [8.0, 8.0]
+      and len(pieces("QpD")) == 1 and abs(area(_xp) - 2.0) < 1e-6,
+      f"{[round(area(o), 4) for o in pieces('SxD')]} {[o.name for o in pieces('QpD')]}")
+
+# curves lying on the surface cut along themselves, not projected (cylinder r=1, z 0..2 at x=-60)
+_xcp = poly("SxE_p", [(1, 0, 0), (1, 0, 2)], loc=(-60, 240, 0))
+bpy.ops.nproto.revolve(inputs=ins((_xcp, "S0")), axis="Z", pivot="OBJECT", angle=360); _xc = ctx.active_object
+_xc.name = "SxE"
+_xc0 = area(_xc)
+bpy.ops.curve.primitive_nurbs_circle_add(radius=1.0, location=(-60, 240, 0.5)); _xring = ctx.active_object
+r = _split_sel(_xc, _xring, view_dir=(0, -1, 0))      # projected along this view it would cut both walls
+check("split: a ring lying on a cylinder cuts along itself, not projected through both walls (1/4 + 3/4)",
+      r == {'FINISHED'} and len(pieces("SxE")) == 2
+      and abs(min(area(o) for o in pieces("SxE")) - 0.25 * _xc0) < 0.01 * _xc0,
+      f"{[round(area(o), 4) for o in pieces('SxE')]} of {_xc0:.4f}")
+# an exact 120 deg arc on a half cylinder, extended both ways (exactly round) to its straight edges
+_xhp = poly("SxF_p", [(1, 0, 0), (1, 0, 2)], loc=(-70, 240, 0))
+bpy.ops.nproto.revolve(inputs=ins((_xhp, "S0")), axis="Z", pivot="OBJECT", angle=180); _xh = ctx.active_object
+_xh.name = "SxF"
+_xh0 = area(_xh)
+_cu = bpy.data.curves.new("SxF_arc", 'CURVE'); _cu.dimensions = '3D'
+_sp = _cu.splines.new('NURBS'); _sp.points.add(2)
+_c30 = math.cos(math.pi / 6)
+_hb = store.get_brep(_xh).bounding_box()                # which half the revolve made: the arc goes round its middle
+_side = 1.0 if (_hb[0][1] + _hb[1][1]) * 0.5 > 0 else -1.0
+for _p, _c in zip(_sp.points, [(_c30, 0.5 * _side, 1, 1), (0, 2 * _side, 1, 0.5), (-_c30, 0.5 * _side, 1, 1)]):
+    _p.co = _c
+_sp.order_u = 3; _sp.use_endpoint_u = True
+_xarc = bpy.data.objects.new("SxF_arc", _cu); _xarc.location = (-70, 240, 0); ctx.collection.objects.link(_xarc)
+ctx.view_layer.update()
+r = _split_sel(_xh, _xarc, view_dir=(0, -1, 0))
+check("split: an arc on a half cylinder that stops short is extended round it to the edges (half + half)",
+      r == {'FINISHED'} and len(pieces("SxF")) == 2 and all(abs(area(o) - 0.5 * _xh0) < 2e-3 * _xh0 for o in pieces("SxF")),
+      f"{[round(area(o), 4) for o in pieces('SxF')]} of {_xh0:.4f}")
+# Trim extends its cutters too, and cuts along a curve on the surface whatever the view
+_xt = make_floor("SxG", loc=(-50, 250, 0)); _xtl = poly("SxG_cut", [(-48, 247, 1), (-48, 251, 1)])
+r = bpy.ops.nproto.trim(target="SxG", cutters=ins((_xtl, "S0")), ref_point=(-49, 250, 0), normal=(0, 0, 1),
+                        view_dir=(0, 0, -1), action="KEEP")
+check("trim: a line that stops inside the surface is extended to cut across (16 -> 8)",
+      r == {'FINISHED'} and abs(area(_xt) - 8.0) < 1e-4, f"{area(_xt):.4f}")
+_xt = make_floor("SxH", loc=(-50, 260, 0)); _xtl = poly("SxH_cut", [(-47, 259, 0), (-47, 260.5, 0)])
+r = bpy.ops.nproto.trim(target="SxH", cutters=ins((_xtl, "S0")), ref_point=(-49, 260, 0), normal=(0, 0, 1),
+                        view_dir=(1, 0, 0), action="KEEP", projection="SURFACE")
+check("trim On Surface: a line lying in the surface cuts along itself (a view along the surface cannot project it), "
+      "extended both ways (16 -> 12)", r == {'FINISHED'} and abs(area(_xt) - 12.0) < 1e-4, f"{area(_xt):.4f}")
+
 # split keeps history: the regions follow the split surface and what cut it
 _sl = poly("SpH_ln", [(0, 120, 0), (0, 124, 0)])
 bpy.ops.nproto.extrude(inputs=ins((_sl, "S0")), distance=4.0, direction="X"); _shf = ctx.active_object; _shf.name = "SpH"
 _scl = poly("SpHW_ln", [(2, 119, -1), (2, 125, -1)])
 bpy.ops.nproto.extrude(inputs=ins((_scl, "S0")), distance=3.0, direction="Z"); _shw = ctx.active_object; _shw.name = "SpHW"
 bpy.ops.object.select_all(action='DESELECT'); _shf.select_set(True); _shw.select_set(True); ctx.view_layer.objects.active = _shf
-r = bpy.ops.nproto.split()
+r = bpy.ops.nproto.split(extend=False)    # (extended, the floor would cut the wall too)
 _hp = pieces("SpH_")
 _hp_hist = [features.history(o) for o in _hp]
 _kept = _shf.hide_get() and not _shw.hide_get()       # (the wall is not split by the floor: it stays, as the cutter)
@@ -1449,6 +1658,9 @@ check("curvature map: cylinder r=1 -> Gaussian 0, mean +-0.5, principal 1 and 0 
       and np.abs(_V["MIN"] if _sg > 0 else _V["MAX"]).max() < 1e-3,
       f"H {_V['MEAN'].min():.4f}..{_V['MEAN'].max():.4f} k1 {_V['MAX'].min():.4f}..{_V['MAX'].max():.4f} "
       f"k2 {_V['MIN'].min():.4f}..{_V['MIN'].max():.4f}")
+_rngs = {k: _dg.curvature_range([_sph, _cy2], k, 8.0, 0.004) for k in _dg.CURV_KINDS}
+check("curvature map: auto range is plain Python floats for every kind (numpy float32 breaks the GPU uniform)",
+      all(type(x) is float for r in _rngs.values() for x in r), str({k: [type(x).__name__ for x in r] for k, r in _rngs.items()}))
 check("draft angle: vertical wall 0, 5 deg tilt towards pull +5, undercut -5",
       abs(_dg.draft_angle_deg((1, 0, 0), (0, 0, 1))) < 1e-9
       and abs(_dg.draft_angle_deg((math.cos(math.radians(5)), 0, math.sin(math.radians(5))), (0, 0, 1)) - 5) < 1e-9
@@ -7692,8 +7904,22 @@ _q0 = _Wp @ _Vp @ Vector((0, 0, 0, 1)); _q1 = _Wp @ _Vp @ Vector((_hx, 0, 0, 1))
 _fd = np.linalg.norm((np.array(_q1[:2]) / _q1[3] - np.array(_q0[:2]) / _q0[3]) * 500) / _hx
 check("Ctrl step in a close perspective view: pixels per unit from the projection's derivative (matches a tiny "
       "step), the fewer of the plane's two axes",
-      abs(_ppx - _fd) < 1e-3 * _fd and _ppy < _ppx and abs(_ppb - _ppy) < 1e-9 and _ppx > 5000,
+      abs(_ppx - _fd) < 1e-3 * _fd and _ppy < _ppx and abs(_ppb - _ppy) < 1e-9 * _ppy and _ppx > 5000,
       f"x {_ppx:.0f} (fd {_fd:.0f}) y {_ppy:.0f}")
+# looking across the axes (view turned 45 degrees about Z): the density in the
+# most squeezed direction, the same however the plane's axes point (the grids
+# fade the same looking along an axis or diagonally across)
+_Rz45 = _Eu((0, 0, math.radians(45))).to_matrix()     # the same view, turned about Z round the origin
+_Vd = (_Mx.Translation(_Rz45 @ Vector((0, -0.1, 0.06))) @ (_Rz45 @ _Rp).to_4x4()).inverted()
+_rvd = _types.SimpleNamespace(perspective_matrix=_Wp @ _Vd)
+_c45, _s45 = math.cos(math.radians(45)), math.sin(math.radians(45))
+_pd_xy = _dt.pixels_per_unit(_rgp, _rvd, np.zeros(3), [np.array((1.0, 0, 0)), np.array((0, 1.0, 0))])
+_pd_rot = _dt.pixels_per_unit(_rgp, _rvd, np.zeros(3), [np.array((_c45, _s45, 0)), np.array((-_s45, _c45, 0))])
+_pd_x = _dt.pixels_per_unit(_rgp, _rvd, np.zeros(3), [np.array((1.0, 0, 0))])
+check("grid density looking diagonally across the axes: the most squeezed direction, the same for any axes "
+      "(and below what either axis alone gives)",
+      abs(_pd_xy - _pd_rot) < 1e-9 * _pd_rot and _pd_xy < 0.9 * _pd_x and abs(_pd_xy - _ppy) < 1e-6 * _ppy,
+      f"xy {_pd_xy:.1f} rotated {_pd_rot:.1f} x alone {_pd_x:.1f} looking along y {_ppy:.1f}")
 
 # --- Fine floor grid (draw.py): a turned orthographic view gets the levels below 1 m / 1 ft a Top view draws
 from blender_nurbs import draw as _drw
