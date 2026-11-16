@@ -176,6 +176,18 @@ check("revolve: a selected curve on the picked axis is left out, the profile rev
       r_u == {'FINISHED'} and _n1 == _n0 + 1 and _raised and len(bpy.data.objects) == _nb
       and "ShouldNotStay" not in bpy.data.objects,
       (r_u, _n1 - _n0, _raised, len(bpy.data.objects) - _nb))
+# the last selected decides: a straight active line is Revolve's axis; Sweep's active curve is the path and,
+# on two rails, the profile is the curve touching both others
+from blender_nurbs.ops import _straight_line
+from blender_nurbs.ops_sweep import sweep_profile
+_sl = _straight_line(features.input_curve(_ulo, "S0"))
+_sw_r1 = nurbs("SwR1", [(0, 20, 0), (0, 20.5, 1), (0, 21, 2), (0, 21.5, 3)])
+_sw_r2 = nurbs("SwR2", [(2, 20, 0), (2, 20.5, 1), (2, 21, 2), (2, 21.5, 3)])
+_sw_pr = nurbs("SwPr", [(0, 20, 0), (0.7, 19.6, 0), (1.3, 19.6, 0), (2, 20, 0)])
+check("two-element tools: a straight line is found (a curve is not); Sweep's profile among three curves",
+      _sl is not None and np.allclose(_sl[1], (0, 0, -1), atol=1e-6) and _straight_line(features.input_curve(_ucv, "S0")) is None
+      and sweep_profile([_sw_r1, _sw_pr, _sw_r2], _sw_r2) is _sw_pr and sweep_profile([_sw_pr, _sw_r1], _sw_r1) is _sw_pr,
+      (_sl, sweep_profile([_sw_r1, _sw_pr, _sw_r2], _sw_r2).name))
 check("revolve about a picked line: on the preview's rotation; a Feature box edit keeps the line",
       r == {'FINISHED'} and _gap_p < 1e-5 and _hp["axis"] == "PICKED" and abs(_hp["angle"] - 90.0) < 1e-9
       and np.allclose(_hp["axis_point"], _ap) and np.allclose(_hp["axis_dir"], _ad, atol=1e-6),

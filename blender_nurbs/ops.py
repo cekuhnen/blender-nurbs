@@ -154,6 +154,20 @@ def _near_candidates(context, event, cands, max_px=18.0, tie_px=4.0):
     return ties
 
 
+def _straight_line(curve, rel_tol=1e-4):
+    """(start, unit direction) of a curve that is a straight line (every
+    point within rel_tol of its length off the chord), else None."""
+    P = geom.sample_curve(curve, 17)
+    d = P[-1] - P[0]
+    L = float(np.linalg.norm(d))
+    if L < 1e-12:
+        return None
+    u = d / L
+    rel = P - P[0]
+    off = np.linalg.norm(rel - np.outer(rel @ u, u), axis=1)
+    return (P[0], u) if float(off.max()) <= rel_tol * L else None
+
+
 def _on_axis(S, O, z, rel_tol=1e-6):
     """Do the points S lie on the axis through O along z (all, within a
     millionth of their size)?"""
@@ -929,7 +943,7 @@ class _CurveTool(PickMixin):
         go = self.ask if isinstance(self, AskValue) else self.execute
         if self.inputs:                     # picked already (see PickMixin._finish)
             return go(context)
-        ins = _curve_inputs(context)
+        ins = self.selection_inputs(context)
         if ins and not event.alt:
             self.inputs = _encode_inputs(ins)
             return go(context)
@@ -959,6 +973,10 @@ class _CurveTool(PickMixin):
     def usable_inputs(self, ins):
         """The inputs to make results from (a tool may leave some out, saying why)."""
         return ins
+
+    def selection_inputs(self, context):
+        """The inputs a selection gives (every spline of the selected curves)."""
+        return _curve_inputs(context)
 
 
 def _smooth_draft_normals(P, d, closed, flip):
@@ -1178,6 +1196,47 @@ class NPROTO_OT_revolve(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
     angle_fields = ("angle",)
     ask_dialog = False          # Value Input = Dialog: revolve at once, as it always did
     AXES = {"x": "X", "y": "Y", "z": "Z"}
+
+    # nothing selected: click the profile, then the axis (Enter after the profile keeps the axis setting)
+    pick_max = 2
+    finish_on_min = False
+
+    def pick_state(self):
+        if not self._picks:
+            return "click the profile"
+        return "click the axis: a line or straight edge  ·  Enter: " + self._axis_name()
+
+    def _axis_name(self):
+        if self.axis == "PICKED":
+            return "the line picked last time"
+        return (self.axis.replace("LOCAL_", "Local ") if self.axis.startswith("LOCAL_") else "World " + self.axis)
+
+    def _finish(self, context):
+        if len(self._picks) == 2:           # the second click was the axis
+            pts = draw.pick_overlay["picked"][1]
+            p0, p1 = np.asarray(pts[0], float), np.asarray(pts[-1], float)
+            if np.linalg.norm(p1 - p0) > 1e-9:
+                self.axis_point, self.axis_dir = tuple(p0), tuple((p1 - p0) / np.linalg.norm(p1 - p0))
+                self.axis = "PICKED"
+            self._picks = self._picks[:1]
+        return super()._finish(context)
+
+    def selection_inputs(self, context):
+        """Profile(s) and axis selected, the axis last (active): a straight
+        line made active is the axis, from its start to its end; the other
+        selected curves are the profiles. (Only a straight line: two
+        profiles revolved about World Z stay two profiles.)"""
+        ins = _curve_inputs(context)
+        act = context.view_layer.objects.active
+        curves = {o for o, _ in ins}
+        if act is None or act.type != 'CURVE' or act not in curves or len(curves) < 2 or len(act.data.splines) != 1:
+            return ins
+        line = _straight_line(features.input_curve(act, "S0"))
+        if line is None:
+            return ins
+        self.axis_point, self.axis_dir = tuple(line[0]), tuple(line[1])
+        self.axis = "PICKED"
+        return [(o, r) for o, r in ins if o != act]
 
     def usable_inputs(self, ins):
         """Leave out a curve lying on the axis (the line picked for it, still

@@ -39,7 +39,8 @@ def _new_curves(context, name, op, inputs, params):
 
 class NPROTO_OT_sweep(PickMixin, bpy.types.Operator):
     """Sweep a profile along one rail, two rails (Shift+click the 1st rail), or a
-    surface edge (tangent to that surface). Pick the profile first"""
+    surface edge (tangent to that surface). Select the profile, then the path
+    (last); or with nothing selected click the profile, then the path"""
     bl_idname = "nproto.sweep"
     bl_label = "Sweep"
     bl_options = {'REGISTER', 'UNDO'}
@@ -63,10 +64,17 @@ class NPROTO_OT_sweep(PickMixin, bpy.types.Operator):
         crv = [o for o in context.selected_objects if o.type == 'CURVE']
         act = context.active_object
         if len(crv) in (2, 3) and act in crv and not event.alt:
-            rails = [o for o in crv if o != act]
-            self.inputs = _encode_inputs([(act, "S0")] + [(o, "S0") for o in rails])
+            prof = sweep_profile(crv, act)
+            rails = [o for o in crv if o != prof]
+            rails.sort(key=lambda o: o == act)          # the path selected last
+            self.inputs = _encode_inputs([(prof, "S0")] + [(o, "S0") for o in rails])
             return self.execute(context)
         return self.start_picking(context, event)
+
+    def pick_state(self):
+        n = len(self._picks)
+        return ["click the profile", "click the path (Shift+click: a first rail of two)",
+                "click the second rail"][min(n, 2)]
 
     def _params(self):
         return {k: getattr(self, k) for k in ("samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height")}
@@ -84,6 +92,22 @@ class NPROTO_OT_sweep(PickMixin, bpy.types.Operator):
             return {'CANCELLED'}
         _select_only(context, [obj])
         return {'FINISHED'}
+
+
+def sweep_profile(crv, act):
+    """The profile among selected curves, the path selected last (active):
+    with two, the one not active; with three (a profile on two rails), the
+    one that touches both others, as a profile spans its rails."""
+    others = [o for o in crv if o != act]
+    if len(crv) == 2:
+        return others[0]
+    from . import features
+    pts = {o: geom.sample_curve(features.input_curve(o, "S0"), 64) for o in crv}
+
+    def gap(a, b):
+        A, B = pts[a], pts[b]
+        return float(np.min(np.linalg.norm(A[:, None, :] - B[None, :, :], axis=2)))
+    return min(crv, key=lambda c: sum(gap(c, o) for o in crv if o != c))
 
 
 class NPROTO_OT_pipe(AskValue, PickMixin, bpy.types.Operator):
