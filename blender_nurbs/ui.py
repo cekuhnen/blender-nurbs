@@ -553,17 +553,8 @@ class VIEW3D_PT_nproto_active(_SidePanel, bpy.types.Panel):
         from . import cvs as _cvs
         cage = _cage(context)
         if cage is not None:
-            box = lay.box()
-            box.alert = True
-            box.label(text=f"Editing CVs of {cage[_cvs.CAGE_OF]}", icon='EDITMODE_HLT')
-            box.label(text="G / R / S, proportional editing, snapping...")
-            src = bpy.data.objects.get(cage[_cvs.CAGE_OF])
-            if src is not None and features.has_history(src):
-                box.label(text="Moving a CV bakes this surface (Cancel keeps its history)", icon='FREEZE')
-            row = box.row(align=True)
-            row.scale_y = 1.3
-            row.operator("nproto.cvs_done", icon='CHECKMARK')
-            row.operator("nproto.cvs_cancel", icon='X')
+            # A plain line like the object's own; Tab goes back to Object Mode
+            lay.box().label(text=f"{cage[_cvs.CAGE_OF]}: editing CVs", icon='EDITMODE_HLT')
 
         from . import feature_ui as _fui
         _fui.draw_feature(lay, context)
