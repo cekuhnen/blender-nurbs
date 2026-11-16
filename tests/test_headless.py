@@ -1259,6 +1259,35 @@ r = bpy.ops.nproto.intersect()
 ic = geom.sample_curve(features.input_curve(ctx.active_object, "S0"), 64)
 rr = np.linalg.norm(ic[:, :2] - [0, Y0 + 40], axis=1)
 check("intersect sphere x plane = circle r=sqrt(0.75)", r == {'FINISHED'} and abs(rr.mean() - math.sqrt(0.75)) < 2e-3
+# Duplicate Edge / Iso Curve keep the surface's own CVs: an exact cylinder's rim
+# comes back as its rational circle (cyclic, the ring's CV count), not a dense fit
+ctx.scene.cursor.location = (0, Y0 + 40, 0)
+bpy.ops.nproto.add_primitive(kind="CYLINDER", radius=1.0, height=2.0, degree="0"); cy_ = ctx.active_object
+_cyd = ext.surface_cvs(store.get_surfaces(cy_)[0])
+_rims = []
+for _ref in ("U0", "U1", "V0", "V1"):
+    bpy.ops.object.select_all(action='DESELECT')
+    bpy.ops.nproto.dup_edge(inputs=ins((cy_, _ref)))
+    _sp = ctx.active_object.data.splines[0]
+    _q = geom.sample_curve(features.input_curve(ctx.active_object, "S0"), 64)
+    _rr = np.linalg.norm(_q[:, :2] - [0, Y0 + 40], axis=1)
+    if np.ptp(_q[:, 2]) < 1e-9:
+        _rims.append((_ref, len(_sp.points), _sp.use_cyclic_u, min(p.co[3] for p in _sp.points), float(np.abs(_rr - 1).max())))
+_ring_n = max(_cyd["count_u"], _cyd["count_v"])
+check("duplicate edge: exact cylinder rim keeps its rational CVs (cyclic, no refit, on the circle)",
+      len(_rims) == 2 and all(n_ == _ring_n - 1 and cyc and w_ < 0.99 and e_ < 1e-6 for _, n_, cyc, w_, e_ in _rims),
+      f"{_rims} ring {_ring_n}")
+_isos = []
+for _dir in ("U", "V"):
+    bpy.ops.object.select_all(action='DESELECT'); cy_.select_set(True); ctx.view_layer.objects.active = cy_
+    bpy.ops.nproto.iso_curve(iso_dir=_dir, param=0.3)
+    _q = geom.sample_curve(features.input_curve(ctx.active_object, "S0"), 64)
+    _isos.append((len(ctx.active_object.data.splines[0].points), float(np.ptp(_q[:, 2])),
+                  float(np.abs(np.linalg.norm(_q[:, :2] - [0, Y0 + 40], axis=1) - 1).max())))
+check("iso curve: exact isoparm (circle with the ring's CVs, line with the profile's), both on the cylinder",
+      any(z_ < 1e-9 and n_ == _ring_n - 1 for n_, z_, _ in _isos) and all(e_ < 2e-5 for _, _, e_ in _isos)
+      and any(abs(z_ - 2.0) < 1e-6 and n_ <= min(_cyd["count_u"], _cyd["count_v"]) for n_, z_, _ in _isos),
+      f"{_isos} grid {_cyd['count_u']}x{_cyd['count_v']}")
       and np.abs(ic[:, 2] - 0.5).max() < 1e-3, f"r={rr.mean():.5f}")
 # rebuild surface: exact sphere -> degree 3, 6x6 spans
 bpy.ops.object.select_all(action='DESELECT'); sp_.select_set(True); ctx.view_layer.objects.active = sp_

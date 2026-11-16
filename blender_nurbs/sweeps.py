@@ -487,25 +487,80 @@ def _kcurve_poly(kc, n=200):
     return [kc.evaluate(t0 + (t1 - t0) * i / (n - 1)) for i in range(n)]
 
 
+def _spec_samples(sp, n=97):
+    deg, P, W, U = geom.blender_nurbs_to_clamped(sp["points"], sp["weights"], sp["order"], sp["cyclic"],
+                                                 sp["endpoint"], sp["bezier"])
+    return np.array([geom.eval_bspline(P, W, U, deg, t) for t in np.linspace(U[deg], U[-deg - 1], n)])
+
+
+def _cyclic_if_closed(sp):
+    """A closed endpoint + Bezier spec as a cyclic one (one CV fewer, no seam
+    CV pair), when that holds exactly the same curve."""
+    if sp["cyclic"] or not (sp["endpoint"] and sp["bezier"]):
+        return sp
+    P, W, k = np.array(sp["points"], float), sp["weights"], sp["order"]
+    size = float(np.ptp(P, axis=0).max()) or 1.0
+    n = len(P) - 1
+    if (n < 2 * (k - 1) or n % (k - 1) or np.linalg.norm(P[0] - P[-1]) > 1e-9 * size
+            or abs(W[0] - W[-1]) > 1e-12 * abs(W[0])):
+        return sp
+    cyc = dict(sp, points=sp["points"][:-1], weights=W[:-1], cyclic=True)
+    try:
+        A, B = _spec_samples(sp), _spec_samples(cyc)
+    except Exception:
+        return sp
+    return cyc if np.abs(A - B).max() <= 1e-9 * size else sp
+
+
+def _kcurve_to_spec(kc):
+    """The kernel curve's own CVs, weights and knots as a Blender spline
+    (exact: Bezier spans, or uniform when that is exact; cyclic when closed).
+    Only a curve Blender cannot hold (degree above 5) is refitted."""
+    from .curvejoin import kernel_curve_spans, spans_to_spec
+    try:
+        return _cyclic_if_closed(spans_to_spec(kernel_curve_spans(kc), simplify=True))
+    except ValueError:
+        return _poly_to_spec(_kcurve_poly(kc))
+
+
+def _iso_kcurve(obj, iso_dir, t):
+    """Exact world-space isoparm of an object's surface at fraction t of the
+    fixed direction's domain: the CV columns blended by that direction's basis
+    (in homogeneous space), with the other direction's degree and knots."""
+    _, ext = _k()
+    d = ext.surface_cvs(store.get_surfaces(obj)[0])
+    nu, nv = d["count_u"], d["count_v"]
+    Pg = np.array(d["points"], float).reshape(nu, nv, 3)
+    Wg = np.array(d["weights"], float).reshape(nu, nv) if d.get("weights") else np.ones((nu, nv))
+    H = np.concatenate([Pg * Wg[..., None], Wg[..., None]], axis=2)
+    if iso_dir == "U":                       # u fixed, the curve runs along v
+        U, deg, cnt = list(d["knots_u"]), d["degree_u"], nu
+    else:
+        U, deg, cnt = list(d["knots_v"]), d["degree_v"], nv
+        H = H.transpose(1, 0, 2)
+    s = U[deg] + (U[-deg - 1] - U[deg]) * min(max(t, 0.0), 1.0)
+    N = geom.interp_matrix([s], U, deg, cnt)[0]
+    Q = np.tensordot(N, H, axes=(0, 0))      # n_out x 4
+    W = Q[:, 3]
+    P = Q[:, :3] / W[:, None]
+    M = np.array(geom.world_matrix(obj), dtype=float)
+    Pw = [tuple(map(float, M[:3, :3] @ p + M[:3, 3])) for p in P]
+    knots = d["knots_v"] if iso_dir == "U" else d["knots_u"]
+    deg_c = d["degree_v"] if iso_dir == "U" else d["degree_u"]
+    Wl = None if np.abs(W - 1.0).max() < 1e-12 else [float(w) for w in W]
+    return ext.curve_from_cvs(int(deg_c), Pw, [float(k) for k in knots], Wl)
+
+
 @features.builder("iso_curve")
 def build_iso_curve(inputs, p):
     obj = inputs[0][0]
-    surf = store.get_surfaces(obj)[0]
-    (u0, u1), (v0, v1) = surf.u_domain(), surf.v_domain()
-    t = float(p.get("param", 0.5))
-    M = geom.world_matrix(obj)
-    if p.get("iso_dir", "U") == "U":
-        u = u0 + (u1 - u0) * t
-        pts = [surf.evaluate(u, v0 + (v1 - v0) * i / 199) for i in range(200)]
-    else:
-        v = v0 + (v1 - v0) * t
-        pts = [surf.evaluate(u0 + (u1 - u0) * i / 199, v) for i in range(200)]
-    return ("splines", [_poly_to_spec([tuple(M @ Vector(x)) for x in pts])])
+    kc = _iso_kcurve(obj, p.get("iso_dir", "U"), float(p.get("param", 0.5)))
+    return ("splines", [_kcurve_to_spec(kc)])
 
 
 @features.builder("dup_edge")
 def build_dup_edge(inputs, p):
-    return ("splines", [_poly_to_spec(_kcurve_poly(features.input_curve(o, r))) for o, r in inputs])
+    return ("splines", [_kcurve_to_spec(features.input_curve(o, r)) for o, r in inputs])
 
 
 @features.builder("project_curve")
