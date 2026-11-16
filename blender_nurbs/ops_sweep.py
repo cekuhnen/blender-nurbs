@@ -590,7 +590,12 @@ def _merge_set_all(self, context):
 MERGE_MODES = [
     ("EXACT", "Exact", "Keep every CV: identical to the patches, seams stay as knot lines"),
     ("REDUCE", "Reduce", "Remove seam and span knots while the surface stays within the tolerance (keeps the degree)"),
-    ("REFIT", "Refit", "Fewest uniform spans of the chosen degree within the tolerance (or the spans given)"),
+    ("REFIT", "Refit", "Fewest spans of the chosen degree within the tolerance (or the spans given)"),
+]
+
+MERGE_KNOTS = [
+    ("ADAPTIVE", "Adaptive", "Move the knots to where the surface needs them: fewer spans for the same tolerance"),
+    ("UNIFORM", "Uniform", "Evenly spaced knots"),
 ]
 
 
@@ -611,6 +616,8 @@ class NPROTO_OT_merge_patches(bpy.types.Operator):
     merge_spans_v: IntProperty(name="Spans V (0 = auto)", default=0, min=0, max=32,
                                description="Pieces between knots along V; 1 = one piece with no inner knot, "
                                            "0 = the fewest within the tolerance")
+    merge_knots: EnumProperty(name="Knots", items=MERGE_KNOTS, default="ADAPTIVE",
+                              description="Where Refit puts its knots")
     merge_edges: EnumProperty(name="Edges", items=MERGE_CONT, default="G2", update=_merge_set_all,
                               description="What the outer edges keep from the patches, on all four sides. "
                                           "Keeping their tangents and curvature keeps the continuity they had "
@@ -627,7 +634,7 @@ class NPROTO_OT_merge_patches(bpy.types.Operator):
     def _params(self):
         p = {"merge_mode": self.merge_mode, "merge_tolerance": self.merge_tolerance, "merge_degree": self.merge_degree,
              "merge_spans_u": self.merge_spans_u, "merge_spans_v": self.merge_spans_v,
-             "merge_edge_tolerance": self.merge_edge_tolerance}
+             "merge_edge_tolerance": self.merge_edge_tolerance, "merge_knots": self.merge_knots}
         for s_, _ in MERGE_SIDE_NAMES:
             p[f"merge_cont_{s_}"] = getattr(self, f"merge_cont_{s_}")
         return p
@@ -658,6 +665,7 @@ class NPROTO_OT_merge_patches(bpy.types.Operator):
             row.prop(self, "merge_spans_u", text="Spans U")
             row.prop(self, "merge_spans_v", text="Spans V")
             lay.label(text="Spans: 0 = auto · 1 = one piece, no inner knot")
+            lay.row(align=True).prop(self, "merge_knots", expand=True)
         if self.merge_mode != "EXACT":
             row = lay.row(align=True)
             row.prop(self, "merge_edges", expand=True)

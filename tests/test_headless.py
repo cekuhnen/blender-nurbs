@@ -9472,7 +9472,7 @@ def _snbr(out_text):
 
 _sres = {}
 for _c in ("G2", "FREE"):
-    _t, _i = _mg.merge_text(_SJ[store.PROP_BREP], "REFIT", 0, 3, cont=_c)
+    _t, _i = _mg.merge_text(_SJ[store.PROP_BREP], "REFIT", 0, 3, cont=_c, knots="UNIFORM")   # off the knot lines
     _sres[_c] = (_snbr(_t), _i)
 _t, _i = _mg.merge_text(_SJ[store.PROP_BREP], "REDUCE", 0, 3, cont="G2")
 _sres["REDUCE"] = (_snbr(_t), _i)
@@ -9484,5 +9484,32 @@ check("merge patches edges: Refit G2 keeps tangent plane and curvature at the ne
 _t, _i = _mg.merge_text(_SJ[store.PROP_BREP], "REFIT", 0, 3, 1, 0, cont="G2")
 check("merge patches: forced spans that cannot hold the edges stop and report it (no runaway spans)",
       _i["spans"][0] == 1 and _i["spans"][1] <= 12 and not _i["edges_ok"], _i["spans"])
+_kres = {k_: _mg.merge_text(_SJ[store.PROP_BREP], "REFIT", 0, 3, cont="G2", knots=k_)[1] for k_ in ("UNIFORM", "ADAPTIVE")}
+check("merge patches: Adaptive knots refit the strip with far fewer spans than Uniform (on the patches' knot lines)",
+      _kres["ADAPTIVE"]["edges_ok"] and _kres["ADAPTIVE"]["deviation"] < 1e-6
+      and _kres["ADAPTIVE"]["spans"][0] * 2 <= _kres["UNIFORM"]["spans"][0]
+      and _kres["UNIFORM"]["edges_ok"], {k_: (v["spans"], f"{v['deviation']:.1e}") for k_, v in _kres.items()})
+# a sampled grid (as the projected route gives) with a sharp ridge: edges checked on the grid's own samples
+# (not rounded to them), and Adaptive puts the spans at the ridge
+_gm = 61
+_gt = np.linspace(0, 1, _gm)
+_gU, _gV = np.meshgrid(_gt, _gt, indexing="ij")
+_gG = np.stack([_gU * 2, _gV, 0.15 * np.tanh(8 * (_gU - 0.7)) + 0.05 * np.sin(3 * _gV)], -1)
+
+def _gref(a, b, du=0, dv=0):
+    if du or dv:
+        return np.zeros((len(a), len(b), 3))
+    return _gG[np.ix_(np.rint(np.asarray(a, float) * (_gm - 1)).astype(int),
+                      np.rint(np.asarray(b, float) * (_gm - 1)).astype(int))]
+_gerr = lambda nt: float(np.linalg.norm(_mg.eval_net(nt, _gt, _gt) - _gG, axis=2).max())
+_gres = {k_: _mg.refit_net(_gref, 3, 0, 0, 2.2e-4, {s_: 0 for s_ in _mg.SIDES}, 2.2e-5, m=_gm, surf_err=_gerr,
+                           knots=k_, grid_only=True) for k_ in ("UNIFORM", "ADAPTIVE")}
+check("merge patches projected grid: edges pass on the grid samples, Adaptive needs fewer spans than Uniform",
+      all(v[2] <= 2.2e-4 and _mg.edges_ok(v[3], 2.2e-5) for v in _gres.values())
+      and _gres["ADAPTIVE"][1][0] < _gres["UNIFORM"][1][0], {k_: (v[1], f"{v[2]:.1e}") for k_, v in _gres.items()})
+r = bpy.ops.nproto.merge_patches(merge_mode="REFIT", merge_knots="UNIFORM")
+check("merge patches operator: Knots option reaches the history step", r == {'FINISHED'}
+      and features.stack(_SJ)[-1]["op"] == "merge_patches"
+      and features.stack(_SJ)[-1]["params"].get("merge_knots") == "UNIFORM")
 
 print("ALL OK" if ok else "SOME FAILED")

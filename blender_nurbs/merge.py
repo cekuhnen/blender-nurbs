@@ -290,10 +290,10 @@ def _end_derivs(U, p, C, k_start, k_end):
     return s, e
 
 
-def side_errors(new, ref, cont, m=41, kmin=0.0):
-    """Per constrained side: max position gap, normal angle (deg) and relative
-    normal-curvature difference across the edge. ref(su, sv, du, dv)."""
-    t = np.linspace(0, 1, m)
+def _side_arrays(new, ref, cont, t, kmin=0.0):
+    """Per constrained side, per sample t along it: position gap, normal angle
+    (deg) and relative normal-curvature difference across the edge."""
+    t = np.asarray(t, float)
     out = {}
     for side in SIDES:
         k = cont.get(side, -1)
@@ -315,14 +315,21 @@ def side_errors(new, ref, cont, m=41, kmin=0.0):
             return S, n, kap
         S1, n1, k1 = frame(lambda a, b, du, dv: eval_d(new, a, b, du, dv))
         S0, n0, k0 = frame(ref)
-        e = {"pos": float(np.linalg.norm(S1 - S0, axis=1).max())}
+        e = {"pos": np.linalg.norm(S1 - S0, axis=1)}
         if k >= 1:
-            e["angle"] = float(np.degrees(np.arccos(np.clip(np.einsum("ij,ij->i", n0, n1), -1, 1))).max())
+            e["angle"] = np.degrees(np.arccos(np.clip(np.einsum("ij,ij->i", n0, n1), -1, 1)))
         if k >= 2:
             scale = max(float(np.abs(k0).max()), kmin, 1e-12)
-            e["curv"] = float(np.abs(k1 - k0).max() / scale)
+            e["curv"] = np.abs(k1 - k0) / scale
         out[side] = e
     return out
+
+
+def side_errors(new, ref, cont, m=41, kmin=0.0):
+    """Per constrained side: max position gap, normal angle (deg) and relative
+    normal-curvature difference across the edge. ref(su, sv, du, dv)."""
+    arr = _side_arrays(new, ref, cont, np.linspace(0, 1, m), kmin)
+    return {s: {k: float(v.max()) for k, v in e.items()} for s, e in arr.items()}
 
 
 def edges_ok(errs, edge_tol):
@@ -383,13 +390,12 @@ def reduce_knots(net, ref, surf_err, tol, cont, edge_tol, kmin=0.0, max_iter=400
     return cur, err
 
 
-def fit_surface(ref, p, su, sv, cont, m):
-    """Tensor-product least squares of the reference on uniform knots, keeping
-    each constrained side's derivative curves (two passes: along v for every
-    sample row and for the u-derivative rows at the u ends, then along u)."""
+def fit_surface(ref, p, Uu, Uv, cont, m):
+    """Tensor-product least squares of the reference on knots Uu x Uv (degree
+    p), keeping each constrained side's derivative curves (two passes: along v
+    for every sample row and for the u-derivative rows at the u ends, then
+    along u)."""
     t = np.linspace(0, 1, m)
-    Uu = geom.clamped_uniform_knots(p + su, p)
-    Uv = geom.clamped_uniform_knots(p + sv, p)
     kv0, kv1 = max(-1, cont.get("v0", -1)), max(-1, cont.get("v1", -1))
     ku0, ku1 = max(-1, cont.get("u0", -1)), max(-1, cont.get("u1", -1))
 
@@ -413,48 +419,157 @@ def fit_surface(ref, p, su, sv, cont, m):
     return {"P": H, "Uu": np.asarray(Uu), "Uv": np.asarray(Uv), "pu": p, "pv": p}, res_u, res_v
 
 
-def refit_net(ref, degree, spans_u, spans_v, tol, cont, edge_tol, m=None, surf_err=None, max_spans=40, kmin=0.0):
-    """Fewest uniform spans (per direction) of the chosen degree with the
-    surface within tol and the constrained edges within their checks, or the
-    spans given. Grows the direction that fails until both hold."""
+def _inner(U):
+    """Distinct inner knots of a knot vector (on 0..1)."""
+    k = sorted(set(np.round(np.asarray(U, float), 12)))
+    return list(k[1:-1])
+
+
+def _knots(p, inner):
+    return np.r_[[0.0] * (p + 1), np.asarray(inner, float), [1.0] * (p + 1)]
+
+
+def _uniform(p, spans):
+    return np.asarray(geom.clamped_uniform_knots(p + spans, p), float)
+
+
+KNOT_PLACEMENTS = ("ADAPTIVE", "UNIFORM")
+PLACE_TRIES = 3          # knot re-placements per span count before adding a span
+
+
+def refit_net(ref, degree, spans_u, spans_v, tol, cont, edge_tol, m=None, surf_err=None, max_spans=40, kmin=0.0,
+              knots="ADAPTIVE", breaks=None, grid_only=False):
+    """Fewest spans (per direction) of the chosen degree with the surface
+    within tol and the constrained edges within their checks, or the spans
+    given. Grows the direction that fails until both hold.
+    knots: UNIFORM keeps even spans; ADAPTIVE moves the knots to where the
+    error is (surface and edge checks, each relative to its limit) before
+    each extra span, and keeps the best placement it found. breaks: the
+    reference's own inner knots (u, v), tried as the knots when their count
+    fits (the patches' knot lines are where their shape changes).
+    grid_only: ref is only known at the m x m sample parameters (a projected
+    grid), so every check samples there."""
     p = int(degree)
     m = m or max(41, 6 * (p + 1))
     t = np.linspace(0, 1, m)
     G = ref(t, t, 0, 0)
+    tt = t if grid_only else np.linspace(0, 1, 2 * m - 1)
+    Gd = ref(tt, tt, 0, 0)
+    edge_m = m if grid_only else 41
     if surf_err is None:
-        tt = np.linspace(0, 1, 2 * m - 1)
-        Gd = ref(tt, tt, 0, 0)
         surf_err = lambda nt: float(np.linalg.norm(eval_net(nt, tt, tt) - Gd, axis=2).max())
+    adaptive = knots != "UNIFORM"
 
-    def fit1(rows, spans):       # unconstrained 1D estimate for the first guess
-        n = p + spans
-        U = geom.clamped_uniform_knots(n, p)
-        A = geom.interp_matrix(t, U, p, n)
-        B = np.hstack(rows)
+    breaks = breaks or (None, None)
+
+    def fit1(B, U):              # unconstrained 1D fit of all rows: error per sample
+        A = _basis(U, p, t)
         X = np.linalg.lstsq(A, B, rcond=None)[0]
-        return float(np.linalg.norm((A @ X - B).reshape(m, -1, 3), axis=2).max())
+        return np.linalg.norm((A @ X - B).reshape(m, -1, 3), axis=2).max(axis=1)
 
-    def guess(rows, fixed):
-        if fixed:
-            return int(fixed)
-        for s_ in range(1, max(2, m // 2 - p)):
-            if fit1(rows, s_) <= 0.5 * tol:
-                return s_
-        return max(1, m // 2 - p)
-    sv = guess([G[i] for i in range(m)], spans_v)
-    su = guess([G[:, j] for j in range(m)], spans_u)
-    while True:
-        net, res_u, res_v = fit_surface(ref, p, su, sv, cont, m)
+    def from_breaks(brk, spans):
+        if brk is None or len(brk) != spans - 1:
+            return None
+        return _knots(p, brk)
+
+    def candidates(U, spans, err, brk):
+        """Knot vectors to try at this span count: the reference's own knots
+        when they fit, then the current ones moved to where the error is."""
+        out = []
+        Ub = from_breaks(brk, spans)
+        if Ub is not None:
+            out.append(Ub)
+        if spans > 1 and err is not None:
+            out.append(place(U, spans, err))
+        return out
+
+    def guess(rows, fixed, brk):
+        """Fewest spans whose 1D fit of the rows stays within half the
+        tolerance, and the knots that got there."""
+        B = np.hstack(rows)
+        lo, hi = (int(fixed), int(fixed)) if fixed else (1, max(1, m // 2 - p))
+        best = None
+        for s_ in range(lo, hi + 1):
+            U = _uniform(p, s_)
+            e = fit1(B, U)
+            if adaptive:
+                for _ in range(PLACE_TRIES):
+                    for Uc in candidates(U, s_, e, brk):
+                        ec = fit1(B, Uc)
+                        if ec.max() < e.max():
+                            U, e = Uc, ec
+            if best is None or e.max() < best[2]:
+                best = (s_, U, float(e.max()))
+            if e.max() <= 0.5 * tol:
+                return s_, U
+        return best[0], (best[1] if fixed else _uniform(p, best[0]))
+
+    def profiles(net):
+        """Error along u and along v, each sample relative to its limit."""
+        E = np.linalg.norm(eval_net(net, tt, tt) - Gd, axis=2) / tol
+        eu, ev = E.max(axis=1), E.max(axis=0)
+        lim = {"pos": edge_tol, "angle": ANGLE_TOL, "curv": CURV_TOL}
+        for side, e in _side_arrays(net, ref, cont, tt, kmin).items():
+            r = np.max([v / lim[k] for k, v in e.items()], axis=0)
+            if side[0] == "v":           # v = const: the edge runs along u
+                eu = np.maximum(eu, r)
+            else:
+                ev = np.maximum(ev, r)
+        return eu, ev
+
+    def place(U, spans, err):
+        from .kernel.classa import equidistribute
+        ts = t if len(err) == len(t) else tt
+        return _knots(p, equidistribute(ts, err, U, p, spans))
+
+    def run(Uu, Uv):
+        net, res_u, res_v = fit_surface(ref, p, Uu, Uv, cont, m)
         dev = surf_err(net)
-        errs = side_errors(net, ref, cont, kmin=kmin)
+        errs = side_errors(net, ref, cont, m=edge_m, kmin=kmin)
+        score = max([dev / tol] + [max(e["pos"] / edge_tol, e.get("angle", 0.0) / ANGLE_TOL,
+                                       e.get("curv", 0.0) / CURV_TOL) for e in errs.values()])
+        return {"net": net, "res": (res_u, res_v), "dev": dev, "errs": errs, "score": score, "U": (Uu, Uv)}
+
+    sv, Uv0 = guess([G[i] for i in range(m)], spans_v, breaks[1])
+    su, Uu0 = guess([G[:, j] for j in range(m)], spans_u, breaks[0])
+    cur = run(Uu0, Uv0)
+    best_here, tries, best = cur, 0, cur
+    while True:
+        net, dev, errs = cur["net"], cur["dev"], cur["errs"]
+        res_u, res_v = cur["res"]
         bad_u = [s for s in ("v0", "v1") if s in errs and not edges_ok({s: errs[s]}, edge_tol)]   # curves along u
         bad_v = [s for s in ("u0", "u1") if s in errs and not edges_ok({s: errs[s]}, edge_tol)]   # curves along v
         if dev <= tol and not bad_u and not bad_v:
+            best = cur
             break
+        if cur["score"] < best_here["score"]:
+            best_here = cur
+        if cur["score"] < best["score"]:
+            best = cur
+        if adaptive and tries < PLACE_TRIES:     # same spans, knots moved to where the error is
+            tries += 1
+            eu, ev = profiles(best_here["net"])
+            Uu, Uv = best_here["U"]
+            nUu = Uu if su == 1 else place(Uu, su, eu)
+            nUv = Uv if sv == 1 else place(Uv, sv, ev)
+            if tries == 1:                        # first retry: the reference's knot lines, when they fit
+                Bu, Bv = from_breaks(breaks[0], su), from_breaks(breaks[1], sv)
+                if Bu is not None or Bv is not None:
+                    nUu = Bu if Bu is not None else Uu
+                    nUv = Bv if Bv is not None else Uv
+            if np.allclose(nUu, Uu, atol=1e-6) and np.allclose(nUv, Uv, atol=1e-6):
+                tries = PLACE_TRIES
+            else:
+                cur = run(nUu, nUv)
+                continue
         grow_u = not spans_u and su < max_spans
         grow_v = not spans_v and sv < max_spans
         # grow the direction at fault; when that one is fixed by the user, stop
         # (more spans the other way cannot help)
+        res_u, res_v = best_here["res"]
+        dev, errs = best_here["dev"], best_here["errs"]
+        bad_u = [s for s in ("v0", "v1") if s in errs and not edges_ok({s: errs[s]}, edge_tol)]
+        bad_v = [s for s in ("u0", "u1") if s in errs and not edges_ok({s: errs[s]}, edge_tol)]
         if dev > tol:
             want_u = res_u >= res_v
         else:
@@ -465,7 +580,21 @@ def refit_net(ref, degree, spans_u, spans_v, tol, cont, edge_tol, m=None, surf_e
             sv += 1
         else:
             break
-    return net, (su, sv), dev, errs
+        Uu, Uv = best_here["U"]
+        if adaptive:
+            eu, ev = profiles(best_here["net"])
+            if want_u:
+                Uu = from_breaks(breaks[0], su)
+                Uu = place(best_here["U"][0], su, eu) if Uu is None else Uu
+            else:
+                Uv = from_breaks(breaks[1], sv)
+                Uv = place(best_here["U"][1], sv, ev) if Uv is None else Uv
+        else:
+            Uu, Uv = _uniform(p, su), _uniform(p, sv)
+        cur = run(Uu, Uv)
+        best_here, tries = cur, 0
+    su, sv = len(set(np.round(best["U"][0], 12))) - 1, len(set(np.round(best["U"][1], 12))) - 1
+    return best["net"], (su, sv), best["dev"], best["errs"]
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +680,8 @@ def _cont_dict(cont):
     return {s: conv(cont) for s in SIDES}
 
 
-def merge_text(text, mode="REDUCE", tol=0.0, degree=3, spans_u=0, spans_v=0, tol_rel=1e-4, cont="G2", edge_tol=0.0):
+def merge_text(text, mode="REDUCE", tol=0.0, degree=3, spans_u=0, spans_v=0, tol_rel=1e-4, cont="G2", edge_tol=0.0,
+               knots="ADAPTIVE"):
     """Brep text of the single merged surface. Returns (text, info).
     tol: absolute tolerance (0 = tol_rel x size); cont: edge continuity kept
     (per side or one for all); edge_tol: edge position tolerance (0 = tol/10)."""
@@ -602,7 +732,8 @@ def merge_text(text, mode="REDUCE", tol=0.0, degree=3, spans_u=0, spans_v=0, tol
             errs = side_errors(out, ref, cont, kmin=kmin)
         else:
             out, spans, dev, errs = refit_net(ref, degree, spans_u, spans_v, tol, cont, edge_tol, surf_err=surf_err,
-                                              kmin=kmin)
+                                              kmin=kmin, knots=knots,
+                                              breaks=(_inner(merged["Uu"]), _inner(merged["Uv"])))
             info["spans"] = spans
     else:
         G = projected_grid(brep, size)
@@ -625,7 +756,7 @@ def merge_text(text, mode="REDUCE", tol=0.0, degree=3, spans_u=0, spans_v=0, tol
         def ref_pos(a, b, du=0, dv=0):        # side_errors also asks for derivatives: none to compare
             return ref(a, b) if not (du or dv) else np.zeros((len(a), len(b), 3))
         out, spans, dev, errs = refit_net(ref_pos, degree, spans_u, spans_v, tol, cont0, edge_tol, m=m,
-                                          surf_err=surf_err)
+                                          surf_err=surf_err, knots=knots, grid_only=True)
         errs = {s: {"pos": e["pos"]} for s, e in errs.items()}
         info["spans"] = spans
         info["mode_used"] = "REFIT"
@@ -658,7 +789,8 @@ def apply_merge(obj, text, inputs, p):
     out, info = merge_text(text, p.get("merge_mode", "REDUCE"), float(p.get("merge_tolerance", 0.0)),
                            int(p.get("merge_degree", 3)), int(p.get("merge_spans_u", 0)),
                            int(p.get("merge_spans_v", 0)), cont=params_cont(p),
-                           edge_tol=float(p.get("merge_edge_tolerance", 0.0)))
+                           edge_tol=float(p.get("merge_edge_tolerance", 0.0)),
+                           knots=p.get("merge_knots", "ADAPTIVE"))
     LAST_INFO.clear()
     LAST_INFO.update(info)
     return out
