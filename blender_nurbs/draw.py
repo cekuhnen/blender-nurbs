@@ -31,6 +31,8 @@ COL_CV_SEL = (1.0, 0.62, 0.12, 1.0)
 COL_CV_ACT = (1.0, 1.0, 1.0, 1.0)
 COL_HULL_SEL = (1.0, 0.62, 0.12, 0.9)
 COL_ISO = (1.0, 0.78, 0.25, 1.0)
+COL_SPAN = (0.1, 0.1, 0.1, 0.6)          # Spans: the knot isoparms of every surface
+COL_SPAN_SEL = (0.75, 0.42, 0.1, 0.85)
 COL_GHOST = (0.2, 0.85, 1.0, 0.9)
 # the hidden object picked in the Construction Tree, whose edges are drawn as a
 # ghost; an object hidden with H while active is not one
@@ -78,7 +80,7 @@ def _edge_bias(ctx, obj, chord):
 
 
 def _draw_lines(coords, color, width):
-    if not coords:
+    if coords is None or len(coords) == 0:
         return
     sh = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
     region = bpy.context.region
@@ -97,7 +99,7 @@ def _draw_tris(coords, color):
 
 
 def _draw_points(coords, color, size):
-    if not coords:
+    if coords is None or len(coords) == 0:
         return
     sh = gpu.shader.from_builtin('POINT_UNIFORM_COLOR')
     gpu.state.point_size_set(size)
@@ -141,6 +143,156 @@ def topology(obj):
         data = None
     _topo_cache[obj.session_uid] = (rev, data)
     return data
+
+
+_span_cache = {}   # session_uid -> (rev, (m, 3) float32 line pairs in object space)
+SPAN_SAMPLES = 64  # points along one span line (before trim ends are refined)
+
+
+def _iso_runs(face, surf, fixed, a, b, along_u, n):
+    """Runs of object-space points of one iso line of the face's surface from
+    a to b (u = fixed when along V), inside the trimmed face; each run end
+    found on the trim by bisection."""
+    def uv(t):
+        return (t, fixed) if along_u else (fixed, t)
+
+    def inside(t):
+        try:
+            return face.classify_uv(*uv(t)) != "outside"
+        except Exception:
+            return True
+
+    def edge(t_in, t_out):
+        for _ in range(12):
+            m = 0.5 * (t_in + t_out)
+            if inside(m):
+                t_in = m
+            else:
+                t_out = m
+        return t_in
+
+    ts = [a + (b - a) * i / n for i in range(n + 1)]
+    ins = [inside(t) for t in ts]
+    runs, cur = [], []
+    for i, t in enumerate(ts):
+        if not ins[i]:
+            if cur:
+                cur.append(edge(ts[i - 1], t))
+                runs.append(cur)
+                cur = []
+            continue
+        if not cur and i > 0:
+            cur.append(edge(t, ts[i - 1]))
+        cur.append(t)
+    if cur:
+        runs.append(cur)
+    out = []
+    for r in runs:
+        if len(r) < 2:
+            continue
+        try:
+            out.append([tuple(surf.evaluate(*uv(t))) for t in r])
+        except Exception:
+            pass
+    return out
+
+
+def span_lines(obj):
+    """Span isoparms of every face of a NURBS object (lines at the interior
+    knots, both directions), clipped to each face's trims: (m, 3) float32
+    line pairs in object space (cached per object revision)."""
+    import numpy as np
+    rev = obj.get(store.PROP_REV, 0)
+    hit = _span_cache.get(obj.session_uid)
+    if hit and hit[0] == rev:
+        return hit[1]
+    segs = []
+    try:
+        from .kernel import load as _load
+        ext = _load().blender_ext
+        for face in store.get_brep(obj).faces():
+            try:
+                surf = face.surface()
+                d = ext.surface_cvs(surf)
+                (fu0, fv0), (fu1, fv1) = face.uv_domain()       # the trim's UV box: no samples wasted outside
+            except Exception:
+                continue
+            polys = []
+            for knots, lo, hi, a, b, along_u in ((d["knots_u"], fu0, fu1, fv0, fv1, False),
+                                                 (d["knots_v"], fv0, fv1, fu0, fu1, True)):
+                eps = 1e-9 * max(hi - lo, 1e-12)
+                for k in sorted({float(k) for k in knots if lo + eps < k < hi - eps}):
+                    polys += _iso_runs(face, surf, k, a, b, along_u, SPAN_SAMPLES)
+            for pl in polys:
+                for i in range(len(pl) - 1):
+                    segs += (pl[i], pl[i + 1])
+    except Exception as exc:
+        print("NURBS spans:", exc)
+    arr = np.asarray(segs, np.float32).reshape(-1, 3)
+    _span_cache[obj.session_uid] = (rev, arr)
+    return arr
+
+
+def _world_biased(L, M, bias):
+    """Object-space points L (n, 3) to world space, pulled toward the viewer
+    like the edges (see _edge_bias)."""
+    import numpy as np
+    A = np.array(M, np.float64)
+    W = L.astype(np.float64) @ A[:3, :3].T + A[:3, 3]
+    if bias is not None:
+        eye, vdir, amount = bias
+        if eye is not None:
+            D = np.asarray(eye, np.float64) - W
+            ln = np.linalg.norm(D, axis=1, keepdims=True)
+            W += D / np.where(ln > 0, ln, 1.0) * amount
+        else:
+            W += np.asarray(vdir, np.float64) * amount
+    return W.astype(np.float32)
+
+
+def curve_cage(obj):
+    """CV hull of a curve object in world space: (hull line pairs, CVs,
+    Bezier handle points). NURBS / Poly splines: the CVs in order (closed when
+    cyclic); Bezier splines: each point with its two handles."""
+    M = obj.matrix_world
+    hull, cvs, handles = [], [], []
+    for sp in obj.data.splines:
+        if sp.type == 'BEZIER':
+            for bp in sp.bezier_points:
+                c, h0, h1 = M @ bp.co, M @ bp.handle_left, M @ bp.handle_right
+                hull += [h0, c, c, h1]
+                cvs.append(c)
+                handles += [h0, h1]
+            continue
+        P = [M @ Vector(p.co[:3]) for p in sp.points]
+        for a, b in zip(P, P[1:]):
+            hull += [a, b]
+        if sp.use_cyclic_u and len(P) > 2:
+            hull += [P[-1], P[0]]
+        cvs += P
+    return hull, cvs, handles
+
+
+_CURVE_PREVIEW_OPS = ("NPROTO_OT_blend_curve", "nproto.blend_curve")
+
+
+def curve_preview_active(ctx):
+    """A curve tool's F9 panel is up (it was the last operator): the curve it
+    is making shows its CVs."""
+    ops = ctx.window_manager.operators
+    return bool(ops) and ops[-1].bl_idname in _CURVE_PREVIEW_OPS
+
+
+def curve_cvs_shown(ctx, obj):
+    """Is this curve's CV hull drawn: selected, and CVs / Hulls on or a Blend
+    Curve being made (its F9 panel up)? Never in Edit mode, where Blender
+    draws its own."""
+    if obj.type != 'CURVE' or obj.mode == 'EDIT' or not obj.select_get():
+        return False
+    v = getattr(ctx.window_manager, "nproto_view", None)
+    if v is not None and v.show_cvs:
+        return True
+    return curve_preview_active(ctx)
 
 
 _PREVIEW_OPS = ("NPROTO_OT_rebuild_surface", "nproto.rebuild_surface", "NPROTO_OT_square", "nproto.square",
@@ -223,6 +375,7 @@ def _draw():
     v = getattr(ctx.window_manager, "nproto_view", None)
     show_edges = v.show_edges if v else True
     show_cvs = v.show_cvs if v else False
+    show_spans = v.show_spans if v else False
     gpu.state.blend_set('ALPHA')
     gpu.state.depth_test_set('LESS_EQUAL')
     if _grid_shader is not False and (v is None or v.show_fine_grid):
@@ -235,7 +388,11 @@ def _draw():
     if v is not None:
         diagnostics.draw_zebra(ctx)          # under the edges
     chord = store.tess_settings(ctx)[0]
+    curves = []
     for obj in ctx.visible_objects:
+        if obj.type == 'CURVE':
+            curves.append(obj)
+            continue
         if not store.is_nurbs(obj):
             continue
         d = store.display(obj)
@@ -248,6 +405,11 @@ def _draw():
             _draw_lines(_sx.keep_segments(_lines_from_polylines(d.get("edges", []), M, _edge_bias(ctx, obj, chord)),
                                           _sx.clip_planes(obj)),
                         COL_EDGE_SEL if hot else COL_EDGE, 2.0 if sel else 1.5)
+        if show_spans:
+            S = span_lines(obj)
+            if len(S):
+                _draw_lines(_world_biased(S, M, _edge_bias(ctx, obj, chord)),
+                            COL_SPAN_SEL if sel else COL_SPAN, 1.0)
         if show_cvs and sel:
             gpu.state.depth_test_set('NONE')
             from . import subsel as _ss
@@ -267,6 +429,19 @@ def _draw():
                 _draw_lines(hull, COL_HULL, 1.0)
                 _draw_points(W, COL_CV, 6.0)
             gpu.state.depth_test_set('LESS_EQUAL')
+
+    gpu.state.depth_test_set('NONE')
+    for obj in curves:                   # curve CV hulls outside Edit mode
+        try:
+            if not curve_cvs_shown(ctx, obj):
+                continue
+            hull, cvs, handles = curve_cage(obj)
+        except Exception:
+            continue
+        _draw_lines(hull, COL_HULL, 1.0)
+        _draw_points(handles, COL_CV, 4.0)
+        _draw_points(cvs, COL_CV, 6.0)
+    gpu.state.depth_test_set('LESS_EQUAL')
 
     _draw_cage(ctx)
 

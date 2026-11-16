@@ -976,9 +976,31 @@ r = bpy.ops.nproto.blend_curve('INVOKE_DEFAULT')
 bc2 = ctx.active_object
 p_first = np.array(bc2.matrix_world @ Vector(bc2.data.splines[0].points[0].co[:3]))
 check("blend curve from selection picks the nearest ends", r == {'FINISHED'} and np.linalg.norm(p_first - np.array(ka_.end_point())) < 1e-5)
+# its CV hull shows outside Edit mode: while selected (a Blend Curve feature), with CVs / Hulls off
+from blender_nurbs import draw as _cdrw
+_vv = ctx.window_manager.nproto_view; _old_cv = _vv.show_cvs; _vv.show_cvs = False
+_h, _c, _hd = _cdrw.curve_cage(bc2)
+_shown = _cdrw.curve_cvs_shown(ctx, bc2); bc2.select_set(False); _hid = _cdrw.curve_cvs_shown(ctx, bc2); bc2.select_set(True)
+_npts = len(bc2.data.splines[0].points)
+BA.select_set(True); _ba_off = _cdrw.curve_cvs_shown(ctx, BA)
+BA.select_set(True); _vv.show_cvs = True; _ba_on = _cdrw.curve_cvs_shown(ctx, BA); BA.select_set(False); _vv.show_cvs = _old_cv
+_bc2_feat = "nproto_hist" in bc2
+check("curve CVs: a selected Blend Curve (a feature) shows its CV hull with CVs / Hulls off only while its F9 panel is up; "
+      "curves with CVs / Hulls on",
+      _bc2_feat and _shown == _cdrw.curve_preview_active(ctx) and not _hid and len(_c) == _npts and len(_h) == 2 * (_npts - 1) and not _hd and not _ba_off and _ba_on
+      and np.allclose(np.array(_c[0]), p_first, atol=1e-6), f"{_shown} {_cdrw.curve_preview_active(ctx)} {_hid} {len(_c)}/{_npts} {_ba_off} {_ba_on}")
+bpy.ops.curve.primitive_bezier_circle_add(radius=1.0, location=(0, 0, 30)); _bz = ctx.active_object
+_h, _c, _hd = _cdrw.curve_cage(_bz)
+check("curve CVs: a Bezier circle's cage is its 4 points with their handles", len(_c) == 4 and len(_hd) == 8 and len(_h) == 16
+      and abs(np.linalg.norm(np.array(_c[0]) - (0, 0, 30)) - 1.0) < 1e-6)
+bpy.data.objects.remove(_bz)
 # a blend curve is a normal curve input: loft from it
 r = bpy.ops.nproto.extrude(inputs=ins((bc2, "S0")), distance=1.0, direction="Z")
 check("blend curve usable as a tool input (extrude)", r == {'FINISHED'})
+_vv.show_cvs = False; bc2.select_set(True)
+check("curve CVs: after another tool a selected Blend Curve hides its CVs (CVs / Hulls off)",
+      not _cdrw.curve_preview_active(ctx) and not _cdrw.curve_cvs_shown(ctx, bc2))
+_vv.show_cvs = _old_cv
 
 # --- Primitives + live Feature editor -------------------------------------
 ctx.scene.cursor.location = (0, 200, 0)
@@ -1308,6 +1330,24 @@ from blender_nurbs import draw as ndraw, cvs as ncvs2
 tp = ndraw.topology(rp_)
 check("rebuild preview topology: 1x1 spans, 4x4 CVs, 4 isoparms", tp is not None and tp["spans"] == (1, 1)
       and tp["count"] == (4, 4) and len(tp["iso"]) == 4 and len(tp["hull"]) == 8, str(tp and (tp["spans"], tp["count"])))
+# Spans: the interior knot lines of every face, clipped to the trims
+bpy.ops.nproto.add_primitive(kind="PLANE", width=4, depth=4, pl_degree_u=3, pl_degree_v=3, spans_u=4, spans_v=4); spp = ctx.active_object
+spp.name = "SpansPlane"; spp.location = (0, 0, -60); ctx.view_layer.update()
+def _span_len(o):
+    S = ndraw.span_lines(o).astype(float)
+    return float(np.linalg.norm(S[1::2] - S[0::2], axis=1).sum()), S
+_l0, _S0 = _span_len(spp)
+check("spans: a 4 x 4 span plane shows 3 + 3 lines across it", abs(_l0 - 24.0) < 1e-6, f"length {_l0}")
+bpy.ops.curve.primitive_bezier_circle_add(radius=0.5, location=(0, 0, -59)); _hc = ctx.active_object
+r = bpy.ops.nproto.trim(target="SpansPlane", cutters=ins((_hc, "S0")), ref_point=(0, 0, -60), normal=(0, 0, 1),
+                        view_dir=(0, 0, -1), action="DELETE")
+import time as _tm
+_t0 = _tm.time(); _l1, _S1 = _span_len(spp); _dt = _tm.time() - _t0
+_rad = np.linalg.norm(_S1[:, :2], axis=1)
+_near = _rad[_rad < 0.51]
+check("spans: a hole clips the lines through it, ends on the trim", r == {'FINISHED'} and abs(_l1 - 22.0) < 2e-3
+      and len(_near) >= 4 and np.allclose(_near, 0.5, atol=2e-3) and _rad.min() > 0.498, f"length {_l1:.4f} ends {_near} {_dt * 1000:.0f} ms")
+bpy.data.objects.remove(_hc); bpy.data.objects.remove(spp)
 bpy.ops.object.select_all(action='DESELECT'); rp_.select_set(True); ctx.view_layer.objects.active = rp_
 r = bpy.ops.nproto.tab_edit()
 cg = ctx.active_object
@@ -4435,8 +4475,8 @@ finally:
     ctx.view_layer.objects.active = _act
 check("UI: Active Object panel shows for a NURBS object, hides with nothing active; Analyze and Settings draw",
       _side_err is None and _shown and _hidden and store.is_nurbs(_act), f"{_side_err} active={_act and _act.name}")
-_tog = ["show_edges", "show_cvs", "show_cont_labels", "show_fine_grid"]
-check("UI: Settings split -- Display (the four toggles, then the quality preset and the four tessellation "
+_tog = ["show_edges", "show_cvs", "show_spans", "show_cont_labels", "show_fine_grid"]
+check("UI: Settings split -- Display (the five toggles, then the quality preset and the four tessellation "
       "values right under them, no sub-panel), History; the toggles also sit as icons in the 3D view header",
       _side_err is None and [e["prop"] for e in _rest[1] if "prop" in e] == _tog + [
           "display_quality", "chord_tolerance", "angle_tolerance", "edge_angle_tolerance", "max_edge_rel"]

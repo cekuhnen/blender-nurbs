@@ -288,7 +288,12 @@ class NprotoView(bpy.types.PropertyGroup):
                                                    "Edge Fillet, Continuity Check, Loft, Square, Planar, Patch... "
                                                    "take the picked edges", 'EDGESEL', 4)])
     show_edges: BoolProperty(name="Edges", default=True, update=lambda s, c: _redraw_views(c))
-    show_cvs: BoolProperty(name="CVs / Hulls", default=False, update=lambda s, c: _redraw_views(c))
+    show_cvs: BoolProperty(name="CVs / Hulls", default=False, update=lambda s, c: _redraw_views(c),
+                           description="CV nets of the selected surfaces and CV hulls of the selected curves, "
+                                       "outside Edit mode too")
+    show_spans: BoolProperty(name="Spans", default=False, update=lambda s, c: _redraw_views(c),
+                             description="Span lines (isoparms at the knots) on every visible NURBS surface, "
+                                         "clipped to its trims: how the surface is split into its polynomial pieces")
     show_fine_grid: BoolProperty(name="Fine Grid", default=True, update=lambda s, c: _redraw_views(c),
                                  description="Finer floor grid lines (mm, cm, 10 cm; inches) in a perspective or turned "
                                              "orthographic view, where Blender's floor grid stops at 1 m (1 ft); "
@@ -605,6 +610,7 @@ class VIEW3D_PT_nproto_analyze_side(_SidePanel, bpy.types.Panel):
 
 
 DISPLAY_TOGGLES = (("show_edges", "Edges", 'MOD_WIREFRAME'), ("show_cvs", "CVs / Hulls", 'OUTLINER_DATA_LATTICE'),
+                   ("show_spans", "Spans", 'MESH_GRID'),
                    ("show_cont_labels", "Feature Labels", 'FONT_DATA'), ("show_fine_grid", "Fine Grid", 'GRID'))
 
 
@@ -702,7 +708,7 @@ def draw_clip_warning(layout, context):
 
 
 def draw_display_toggles(layout, v, icons_only=False):
-    """Edges / CVs / Hulls / Feature Labels / Fine Grid: two by two in the
+    """Edges / CVs / Hulls / Spans / Feature Labels / Fine Grid: two by two in the
     Display panel (their names fit the sidebar), and as a row of icons in the
     3D view header (always at hand)."""
     if icons_only:
