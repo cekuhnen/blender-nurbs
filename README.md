@@ -3,6 +3,9 @@
 **A Class-A NURBS surface modeling toolkit for Blender**, built on NVIDIA's open-source
 [USD BRep](https://github.com/NVIDIA-Omniverse/usd-brep) kernel.
 
+NURBS Proto is a research project: it brings Class-A NURBS surface modeling to Blender, together with ideas
+from solid modeling (exact bodies, booleans, fillets and history that rebuilds).
+
 Explore a product idea, a concept form or a car body part with NURBS curves and
 surfaces right in Blender, alongside SubD. Every surface is exact: check it with
 zebra and curvature tools, then take it to your CAD app as STEP.
@@ -31,7 +34,7 @@ Features remember how they were built. Move a curve, change a setting or a cutte
 everything built from it rebuilds.
 
 - Live feature settings in the **Active Object** panel: continuity, weights, degree, spans
-- History steps on top: Trim, Edge Fillet, Fillet Trim (edit, mute or remove each one)
+- History steps on top: Trim, Edge Fillet, Fillet Trim, Refit to Trim, Merge Patches (edit, mute or remove each one)
 - Construction Tree: what an object is built from, and what uses it
 - Remove a feature to step back: its inputs return
 - Pause Rebuild, Delete History, Collect Inputs
@@ -42,7 +45,8 @@ everything built from it rebuilds.
 - **Between curves:** Blend Curve, Fillet (trims and joins)
 - **From curves:** Offset Curve (individual or joined; sharp, round or chamfered corners)
 - **Shapes:** in Shift+A every shape at the 3D cursor (sized to the view)
-- **From surfaces:** Iso Curve, Duplicate Edge, Project Curve, Intersect
+- **From surfaces:** Iso Curve, Duplicate Edge, Project Curve, Intersect (Iso Curve and Duplicate Edge keep the
+  surface's own CVs, degree, knots and weights: a cylinder rim is its exact 8-CV rational circle)
 - **Snapping:** to curves, NURBS surfaces and meshes (vertex, edge, edge center, face center; **O** onto the face), smart guides (aligned, tangent, parallel, perpendicular), sketches flat on the face you start on or on the world grid, **Alt** for a free point, **Ctrl** for the grid (a finer floor grid in perspective, on / off under Display)
 
 ### Curve Edit
@@ -60,7 +64,13 @@ everything built from it rebuilds.
 
 ### Surface Edit
 
-- **Shape:** Edit CVs, Flip Normal, Rebuild Surface, Extend Surface, Surface Align, Refit to Trim
+- **Shape:** Edit CVs (Tab switches between Object and CV editing), Flip Normal, Rebuild Surface, Extend Surface,
+  Surface Align, Refit to Trim
+- **Merge Patches:** a four-sided grid of patches rebuilt as one surface. **Exact** joins them with full seam knots,
+  **Reduce** removes knots within a tolerance, **Refit** finds the fewest spans of a chosen degree, with adaptive
+  knots placed where the shape needs them. The outer edges hold Free, G0, G1 or G2 (all sides or each side), so
+  continuity to the neighbours carries over; seams where the patches meet with a kink stay sharp (or Smooth).
+  Gap, angle and curvature checks show in the panel; trimmed patches fall back to a projected grid (G0 edges)
 - **Trim and join:** Trim, Split, Untrim, Join, Unjoin
 - **Fillets:** Surface Fillet, Edge Fillet
 - **Solids:** Union, Difference, Intersection, Boundary Fill
@@ -71,12 +81,15 @@ everything built from it rebuilds.
 - **Feature Labels:** each feature's edges show the continuity it holds, live; click one to change it
 - **Overlays:** Zebra, Curvature Map, Draft Angle, Matcap
 - **Combs and sections:** Curvature Comb, Surface Combs, Dynamic Section
+- **Display:** Edges, CVs / Hulls (surfaces, and selected curves outside Edit mode), Spans (every face's knot
+  lines, clipped to its trims), Feature Labels, Fine Grid
 
 ### Convert
 
 - **BREP to Mesh:** plain meshes for rendering, texturing and animation, at Low, Medium or High detail:
   n-gons on flat faces and quads on curved ones (or all triangles), welded, with sharp creases, UVs and seams
-- **Mesh to BREP:** mesh bodies rebuilt as NURBS bodies: flat faces as planes, round holes and cylinders exact,
+- **Mesh to BREP:** mesh bodies rebuilt as NURBS bodies: flat four-sided faces as untrimmed patches, other flat faces
+  as planes cut tight to their trims, round holes and cylinders exact (also a hole cut through an edge or corner),
   bevels (Profile 0.5) as G1 fillets of the bevel's radius, editable afterwards, boxy bevels (Profile above 0.5) as
   exact G2 superellipse strips, mitred where two meet; boxy corners and swept bevels as G1 free-form patches
 - **SubD to BREP:** Subdivision Surface models as NURBS bodies with one face per cage face: one bicubic span (the
@@ -97,6 +110,12 @@ Exchange exact geometry with your CAD app: **File → Import / Export → NURBS 
 
 - [Tool Guide](docs/GUIDE.md): every tool in detail, by area
 - [Development](docs/DEVELOPMENT.md): build the kernel, run the tests, package a release, known limits
+
+## Creator
+
+NURBS Proto is designed and built by industrial designer and design faculty **Claas Kuhnen** ([LinkedIn](https://www.linkedin.com/in/claaskuhnen/) · [GitHub](https://github.com/cekuhnen)), with Claude as a coding
+partner. Ideas, bug reports and models that break it are welcome in
+[Issues](https://github.com/cekuhnen/blender-nurbs/issues).
 
 ## License
 
