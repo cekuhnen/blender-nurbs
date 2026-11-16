@@ -220,6 +220,121 @@ for _shape in ("CIRCULAR", "CHAMFER"):
     _fl_gap.append(max(_t.find_nearest(Vector(q_))[3] for q_ in _X[1:-1].reshape(-1, 3)))
 check("edge fillet preview: rolling-ball arc and chamfer line lie on the kernel's fillet (box edge)",
       max(_fl_gap) < 1e-3, [round(float(x), 6) for x in _fl_gap])
+
+# --- Surface Fillet / Offset Curve / Extend Surface previews and their arrows
+from blender_nurbs import valuedrag as _vd, curveoffset as _cof, curvejoin as _cj, primitives as _prims
+from blender_nurbs.ops_trim import (NPROTO_OT_fillet as _OpSF, surface_fillet_frames as _sff,
+                                    surface_fillet_sections as _sfs)
+from blender_nurbs.ops_sweep import NPROTO_OT_extend as _OpEx
+
+def _pl_dist(q_, R_):
+    """Distance from point q_ to the polyline R_ (vectorized)."""
+    a_, ab_ = R_[:-1], np.diff(R_, axis=0)
+    t_ = np.clip(np.einsum("ij,ij->i", q_ - a_, ab_) / np.maximum(np.einsum("ij,ij->i", ab_, ab_), 1e-300), 0, 1)
+    return float(np.min(np.linalg.norm(a_ + t_[:, None] * ab_ - q_, axis=1)))
+
+_v3k = lambda c_: np.array([c_.x, c_.y, c_.z] if hasattr(c_, "x") else list(c_), float)
+
+def _plain(cls, **attrs):
+    """An object with the operator's methods (no Blender operator), for its preview code."""
+    body = {k: v for k, v in cls.__dict__.items() if not k.startswith("__") and not k.startswith("bl_")}
+    o_ = type("_Plain" + cls.__name__, (_vd.ValueDrag,), body)()
+    for k, v in attrs.items():
+        setattr(o_, k, v)
+    return o_
+
+_sf_gap, _sf_arrow = [], []
+for _kind, _fa, _fb2, _shape, _ra, _rb in ((60, False, False, "CIRCULAR", 0.2, 0.2), (60, True, True, "CIRCULAR", 0.2, 0.2),
+                                          (125, False, True, "CHAMFER", 0.15, 0.25), ("cyl", False, True, "CIRCULAR", 0.2, 0.2)):
+    bpy.ops.nproto.add_primitive(kind="PLANE"); _sa_o = ctx.active_object; _sa_o.location = (40, 0, 0)
+    if _kind == "cyl":
+        bpy.ops.nproto.add_primitive(kind="CYLINDER"); _sb_o = ctx.active_object; _sb_o.location = (40.2, 0.1, -0.3)
+    else:
+        bpy.ops.nproto.add_primitive(kind="PLANE"); _sb_o = ctx.active_object
+        _sb_o.rotation_euler = (0, math.radians(_kind), math.radians(20)); _sb_o.location = (40.3, 0, 0.2)
+    ctx.view_layer.update()
+    _fr = _sff(_sa_o, _sb_o)
+    _sg = (-1.0 if _fa else 1.0), (-1.0 if _fb2 else 1.0)
+    _Xs = [_sfs(P_, A_, B_, _ra, _rb, *_sg, _shape) for P_, A_, B_ in _fr]
+    # the arrows stand on the rails and give back the value they show
+    _f = _plain(_OpSF, _sf=_fr, flip_a=_fa, flip_b=_fb2, rail_type="RADIUS", same_radius=_ra == _rb, radius=_ra,
+                radius_b=_rb, shape=_shape)
+    _j = len(_fr[0][0]) // 2
+    for _h, _rail in zip(_f.drag_handles(), (_Xs[0][_j, 0], _Xs[0][_j, -1])):
+        _sf_arrow.append(max(float(np.linalg.norm(_vd.ValueDrag._pos(_h) - _rail)),
+                             abs(_h["to_value"](_h["param"]) - getattr(_f, _h["field"]))))
+    r = bpy.ops.nproto.fillet(surf_a=_sa_o.name, surf_b=_sb_o.name, radius=_ra, radius_b=_rb, same_radius=_ra == _rb,
+                              shape=_shape, flip_a=_fa, flip_b=_fb2, auto_flip=False, trim_bases=False)
+    _t = _tree(ctx.active_object)
+    _sf_gap.append(max(_t.find_nearest(Vector(q_))[3] for X_ in _Xs for q_ in X_[2:-2, 1:-1].reshape(-1, 3)))
+    for o_ in (_sa_o, _sb_o, ctx.active_object):
+        bpy.data.objects.remove(o_)
+check("surface fillet preview: ball arcs / chamfers on the kernel's fillet on every side (planes, cylinder, "
+      "two chamfer distances); the arrows sit on the rails", max(_sf_gap) < 2e-3 and max(_sf_arrow) < 1e-9,
+      ([round(float(x), 5) for x in _sf_gap], max(_sf_arrow)))
+bpy.ops.nproto.add_primitive(kind="PLANE"); _sa_o = ctx.active_object; _sa_o.location = (40, 0, 0)
+bpy.ops.nproto.add_primitive(kind="PLANE"); _sb_o = ctx.active_object; _sb_o.location = (40, 0, 3)
+ctx.view_layer.update()
+check("surface fillet: surfaces that do not cross have no preview (the dialog asks)", _sff(_sa_o, _sb_o) is None)
+
+_oc_free = nurbs("OcFree", [(0, 50, 0), (1, 51, 0), (2, 49.5, 0), (3, 50.8, 0), (4, 50, 0)])
+_oc_l = bpy.data.curves.new("OcL", 'CURVE'); _oc_l.dimensions = '3D'
+_oc_ls = _oc_l.splines.new('POLY'); _oc_ls.points.add(4); _oc_ls.use_cyclic_u = True
+for _q, _c in zip(_oc_ls.points, [(0, 54, 0), (3, 54, 0), (3, 55, 0), (1, 55, 0), (0, 56.5, 0)]):
+    _q.co = (*_c, 1.0)
+_oc_lo = bpy.data.objects.new("OcL", _oc_l); ctx.collection.objects.link(_oc_lo)
+_oc_dev = []
+for _o, _prm in ((_oc_free, {"distance": 0.3}), (_oc_free, {"distance": -0.2, "both_sides": True}),
+                 (_oc_lo, {"distance": 0.25, "oc_corner": "SHARP"}), (_oc_lo, {"distance": 0.25, "oc_corner": "ROUND"}),
+                 (_oc_lo, {"distance": -0.2, "oc_corner": "CHAMFER", "flip": True})):
+    _pcs = [_cj.input_spans(_o, "S0")]
+    _L = _cof.preview_polylines(_pcs, _prm, 1e-3)
+    _R = []
+    for sp_ in _cof.offset_curves(_pcs, _prm):  # noqa
+        k_ = _prims.spec_to_kernel_curve(sp_)
+        _R.append(np.array([k_.evaluate(t_) for t_ in np.linspace(*k_.parameter_range(), 3000)]))
+    _Rl = _R
+    _dev = max(min(_pl_dist(q_, R_) for R_ in _Rl) for L_ in _L for q_ in L_)
+    _R = np.vstack(_R)
+    _cov = max(min(_poly_dist(q_, L_) for L_ in _L) for q_ in _R[::25])     # and the preview covers all of it
+    # the arrow: its foot on the curve, a positive distance along it lands on the offset
+    _sp, _cl, _N, _sgn = _cof._chains(_pcs, dict(_prm, distance=1.0, both_sides=False), _cof._new_info())[0]
+    _B, _v = _cof.side_direction(_sp, _cl, _N, _sgn, _cof._start(_sp) + 0.3)
+    _arw = min(_pl_dist(_B + _prm["distance"] * _v, R_) for R_ in _Rl)
+    _oc_dev.append(round(max(_dev, _cov, _arw), 5))
+check("offset curve preview: the offset (corners sharp / round / chamfer, both sides, flipped) without the fit, "
+      "and its arrow points to the side the distance goes", max(_oc_dev) < 2e-3, _oc_dev)
+
+_ex_w = nurbs("ExW", [(0, 60, 0), (1, 60.5, 0), (2, 59.6, 0), (3, 60.1, 0)])
+bpy.ops.nproto.extrude(inputs=ins((_ex_w, "S0")), distance=1.5, direction="Z"); _ex_s = ctx.active_object
+_ex_s.scale = (1.5, 1.5, 1.5); ctx.view_layer.update()
+_ex_dev = []
+for _edge in ("U0", "U1", "V0", "V1"):
+    for _d in (0.4, -0.3):
+        _x = _plain(_OpEx, inputs=json.dumps([[_ex_s.name, _edge]]), distance=_d)
+        _ok = _x.drag_setup(ctx, None)
+        _rows, _path = _x._strip()
+        _h = _x.drag_handles()[0]
+        _sv = _ex_s.copy(); _sv.data = _ex_s.data.copy(); ctx.collection.objects.link(_sv)
+        for k_ in _ex_s.keys():
+            _sv[k_] = _ex_s[k_]
+        bpy.ops.nproto.extend(inputs=json.dumps([[_sv.name, _edge]]), distance=_d)
+        _rs = store.get_surfaces(_sv)[0]
+        _Mi = np.array(_sv.matrix_world.inverted(), float)
+        _loc = lambda q_: _Mi[:3, :3] @ q_ + _Mi[:3, 3]
+        _cpd = lambda q_: float(np.linalg.norm(_v3k(_sm.surface_closest_point(_rs, tuple(map(float, _loc(q_))))[0])
+                                               - _loc(q_)))
+        _new = _rows[-1] if _d > 0 else _rows[0]
+        _on = max(_cpd(q_) for r_ in (_rows if _d > 0 else [_new]) for q_ in r_[::4])
+        # the new edge is the result's boundary there (its far side: nothing beyond)
+        _bd = np.array(geom.boundary_points(_rs, _edge, 33)) @ np.array(_sv.matrix_world, float)[:3, :3].T \
+            + np.array(_sv.matrix_world.translation)
+        _edge_gap = max(min(_poly_dist(q_, _bd), _poly_dist(q_, _bd[::-1])) for q_ in _new[::4])
+        _ex_dev.append(round(max(_on, _edge_gap, float(np.linalg.norm(_vd.ValueDrag._pos(_h) - _new[16])))
+                             * (1 if _ok else 1e9), 7))
+        bpy.data.objects.remove(_sv)
+check("extend preview: the band lies on the extended surface, its far row is the new edge (shrink too), "
+      "the arrow head on it (U0 / U1 / V0 / V1, scaled object)", max(_ex_dev) < 1e-5, _ex_dev)
 # drafts of smooth curves: the result is a fit within ~3e-4 of the true draft here
 check("extrude preview rows lie on the built surface's edges (plain, tilt, draft, symmetric, cone, polyline)",
       max(_pv_worst) < 1e-3 and max(_pv_worst[i] for i in (0, 1, 6, 7, 8)) < 1e-5, _pv_worst)

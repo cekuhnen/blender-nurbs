@@ -31,6 +31,7 @@ LAST_INFO = {}
 CHAIN_TOL = 1e-3             # Joined: curve ends this close are chained
 PER_SPAN = 48                # samples per free-form span (at least)
 MAX_PER_SPAN = 1500
+_FAST = [False]              # the live preview: free-form offsets stay polylines (no fitting)
 
 
 # --------------------------------------------------------------------------
@@ -149,6 +150,8 @@ def offset_arc(seg, N, d):
 def _span_count(seg, N, d, tol, per=PER_SPAN):
     """Samples on one span so that the offset polyline's chords stay within
     a tenth of tol of the offset (the fit's error is measured against them)."""
+    if _FAST[0]:
+        per = 16
     ts = np.linspace(0.0, 1.0, per + 1)
     Q = []
     for t in ts:
@@ -239,6 +242,10 @@ def _dedupe(S):
 def fit_polyline(S, T0, T1, deg, tol, closed=False):
     """Piece dict of a uniform spline through the offset samples S."""
     S = _dedupe(S)
+    if _FAST[0]:                # the preview: the samples joined by straight lines
+        if closed and np.linalg.norm(S[-1] - S[0]) > 1e-12:
+            S = np.vstack([S, S[:1]])
+        return {"spans": [_line(a, b) for a, b in zip(S[:-1], S[1:])], "fit": None, "err": 0.0}
     if closed:
         X, e = curvetools.fit_auto(S, deg, True, None, tol)
         sp = curvetools.rebuilt_spec(X, deg, True)
@@ -519,22 +526,18 @@ def crosses_itself(spans, closed, tol):
     return any(not (closed and np.linalg.norm(P - seam) <= eps) for _, _, P in hits)
 
 
-def offset_curves(pieces, p):
-    """Specs (world) offsetting the input span lists with the params p."""
+def _chains(pieces, p, info):
+    """(spans, closed, N, d) per chain and side: the plane normal N and the
+    signed distance d each offset is made with."""
     d0 = float(p.get("distance", 0.1))
-    if abs(d0) < 1e-12:
-        raise ValueError("Distance is 0")
-    tol = float(p.get("tolerance", 1e-4))
-    mode = p.get("oc_corner", "SHARP")
     hint = np.asarray(p.get("plane_n", (0.0, 0.0, 1.0)), float)
     if p.get("oc_mode", "JOINED") == "JOINED":
         chains = [(s, c) for s, _, c, _ in curvejoin.chain_pieces(pieces, CHAIN_TOL)]
     else:
         chains = [(s, curvetrim.is_closed(s)) for s in pieces]
-    info = {"chains": len(chains), "exact": 0, "folds": 0, "collapsed": 0, "dropped": 0, "unresolved": 0,
-            "err": 0.0, "crossings": 0, "planar": True}
-    specs = []
+    info["chains"] = len(chains)
     sides = (1.0, -1.0) if p.get("both_sides") else (1.0,)
+    out = []
     for spans, closed in chains:
         if p.get("oc_plane") == "WORKPLANE":
             N, planar = _unit(hint), True
@@ -544,17 +547,72 @@ def offset_curves(pieces, p):
         base = d0 * (-1.0 if p.get("flip") else 1.0)
         if closed and signed_area(spans, N) > 0:
             base = -base                   # counter-clockwise: left is inside, positive goes out
-        for sgn in sides:
-            sp, out = offset_chain(spans, closed, N, sgn * base, mode, tol, info)
-            try:
-                if crosses_itself(out, closed, tol):
-                    info["crossings"] += 1
-            except Exception:
-                pass
-            specs.append(sp)
+        out += [(spans, closed, N, sgn * base) for sgn in sides]
+    return out
+
+
+def _new_info():
+    return {"chains": 0, "exact": 0, "folds": 0, "collapsed": 0, "dropped": 0, "unresolved": 0,
+            "err": 0.0, "crossings": 0, "planar": True}
+
+
+def offset_curves(pieces, p):
+    """Specs (world) offsetting the input span lists with the params p."""
+    if abs(float(p.get("distance", 0.1))) < 1e-12:
+        raise ValueError("Distance is 0")
+    tol = float(p.get("tolerance", 1e-4))
+    mode = p.get("oc_corner", "SHARP")
+    info = _new_info()
+    specs = []
+    for spans, closed, N, d in _chains(pieces, p, info):
+        sp, out = offset_chain(spans, closed, N, d, mode, tol, info)
+        try:
+            if crosses_itself(out, closed, tol):
+                info["crossings"] += 1
+        except Exception:
+            pass
+        specs.append(sp)
     LAST_INFO.clear()
     LAST_INFO.update(info)
     return specs
+
+
+def preview_polylines(pieces, p, tol):
+    """World polylines of the offset, fast enough to follow the mouse: the
+    same pieces, corners and trims as offset_curves, but free-form runs stay
+    the offset samples joined by lines (no fitting; tol: a coarse one)."""
+    if abs(float(p.get("distance", 0.1))) < 1e-12:
+        return []
+    mode = p.get("oc_corner", "SHARP")
+    info = _new_info()
+    lines = []
+    _FAST[0] = True
+    try:
+        for spans, closed, N, d in _chains(pieces, p, info):
+            ps = chain_pieces(spans, closed, N, d, tol, info)
+            if not ps:
+                continue
+            out, _ = resolve(ps, closed, mode, d, tol, info)
+            pts = []
+            for i, sp in enumerate(out):
+                ts = np.linspace(0.0, 1.0, 2 if len(sp) == 2 else 13)
+                pts.append(curvejoin.eval_span(sp, ts if not i else ts[1:]))
+            if pts:
+                lines.append(np.vstack(pts))
+    finally:
+        _FAST[0] = False
+    return lines
+
+
+def side_direction(spans, closed, N, d, at):
+    """(the point of the chain nearest `at`, the unit direction a positive
+    distance moves it there): what the offset arrow stands on."""
+    P, g = curvetrim.sample_spans(spans, 16)
+    k = int(np.argmin(np.linalg.norm(P - np.asarray(at, float), axis=1)))
+    i = min(int(g[k]), len(spans) - 1)
+    _, dp = curvetrim.eval_d(spans[i], float(g[k] - i))
+    v = _unit(np.cross(N, _unit(dp)))
+    return P[k], v * (1.0 if d >= 0 else -1.0)
 
 
 @features.builder("offset_curve")
@@ -616,10 +674,19 @@ def _hint(context):
     return [0.0, 0.0, 1.0] if fr is None else [float(x) for x in fr[3]]
 
 
-class NPROTO_OT_offset_curve(bpy.types.Operator):
+from .ops import AskValue  # noqa: E402
+from .valuedrag import BASE_PX, ValueDrag  # noqa: E402
+from . import hints  # noqa: E402
+
+CORNERS = ("SHARP", "ROUND", "CHAMFER")
+
+
+class NPROTO_OT_offset_curve(ValueDrag, AskValue, bpy.types.Operator):
     """Offset curves within their plane: lines and arcs exactly, free-form curves
     within Tolerance. Corners are trimmed or filled (Sharp, Round, Chamfer).
-    Individual offsets each curve, Joined chains touching curves first"""
+    Individual offsets each curve, Joined chains touching curves first. From
+    the UI an arrow on the curve shows the side: drag it, type a value, click
+    away or Enter to make it"""
     bl_idname = "nproto.offset_curve"
     bl_label = "Offset Curve"
     bl_options = {'REGISTER', 'UNDO'}
@@ -648,10 +715,90 @@ class NPROTO_OT_offset_curve(bpy.types.Operator):
         if not self._objs(context):
             self.report({'WARNING'}, "Select curves to offset")
             return {'CANCELLED'}
-        if bpy.app.background:
-            return self.execute(context)
-        return context.window_manager.invoke_props_dialog(self, width=320, title=self.bl_label,
-                                                          confirm_text=self.bl_label)
+        self._start_event = (event.mouse_x, event.mouse_y, event.type, event.value)
+        return self.ask(context)
+
+    # -- the live value stage (valuedrag.py) ----------------------------------
+    def drag_setup(self, context, mouse):
+        objs = self._objs(context)
+        self._oc = [(o, [curvejoin.input_spans(o, f"S{i}") for i in range(len(o.data.splines))]) for o in objs]
+        if not self._oc:
+            return False
+        P = np.vstack([curvetrim.sample_spans(sp, 16)[0] for _, pcs in self._oc for sp in pcs])
+        self._tol = 1e-3 * (float(np.ptp(P, axis=0).max()) or 1.0)       # the preview's: coarse
+        self._hint = _hint(context)
+        # the arrow stands where the curve is nearest the mouse (a shortcut in the view), else halfway along
+        self._anchor = P[len(P) // 2]
+        self._base_at_mouse = False
+        if mouse is not None:
+            best = None
+            for q in P:
+                sq = self._screen(context, q)
+                if sq is not None and (sq - mouse).length <= BASE_PX and (best is None or (sq - mouse).length < best[0]):
+                    best = ((sq - mouse).length, q)
+            if best is not None:
+                self._anchor, self._base_at_mouse = best[1], True
+        self._cache = None
+        return True
+
+    def _groups(self):
+        pieces = [pc for _, pcs in self._oc for pc in pcs]
+        if self.oc_mode == "JOINED":
+            return [pieces]
+        return [pcs for _, pcs in self._oc]
+
+    def drag_handles(self):
+        p = dict(self._params_hint(), distance=1.0, both_sides=False)
+        best = None
+        for g in self._groups():
+            for spans, closed, N, f in _chains(g, p, _new_info()):
+                B, v = side_direction(spans, closed, N, f, self._anchor)
+                dist = float(np.linalg.norm(B - self._anchor))
+                if best is None or dist < best[0]:
+                    best = (dist, B, v)
+        _, B, v = best
+        return [{"field": "distance", "kind": "arrow", "origin": B, "dir": v, "param": self.distance, "base": B,
+                 "to_value": lambda t: t}]
+
+    def _params_hint(self):
+        return {"distance": self.distance, "oc_mode": self.oc_mode, "oc_corner": self.oc_corner,
+                "flip": self.flip, "both_sides": self.both_sides, "plane_n": self._hint} | (
+            {"oc_plane": "WORKPLANE"} if self.oc_plane == "WORKPLANE" else {})
+
+    def drag_preview(self):
+        p = self._params_hint()
+        key = tuple(sorted((k, tuple(v) if isinstance(v, list) else v) for k, v in p.items()))
+        if self._cache is None or self._cache[0] != key:
+            lines = []
+            for g in self._groups():
+                try:
+                    lines += preview_polylines(g, p, self._tol)
+                except Exception as exc:          # a distance the shape can't take: nothing to show
+                    print("NURBS offset preview:", exc)
+            self._cache = (key, lines)
+        return {"lines": self._cache[1], "tris": np.zeros((0, 3))}
+
+    def drag_check(self):
+        return "" if abs(self.distance) > 1e-12 else "Distance 0: drag the arrow out, or type a value"
+
+    def drag_key(self, context, event, ch):
+        if ch == "f":
+            self.flip = not self.flip
+        elif ch == "c":
+            self.oc_corner = CORNERS[(CORNERS.index(self.oc_corner) + 1) % len(CORNERS)]
+        elif ch == "b":
+            self.both_sides = not self.both_sides
+        elif ch == "j":
+            self.oc_mode = "INDIVIDUAL" if self.oc_mode == "JOINED" else "JOINED"
+        else:
+            return False
+        return True
+
+    def drag_rows(self):
+        return [("Side", [hints.key("F", "the other side"), hints.toggle("B", "both sides", self.both_sides),
+                          hints.note("or drag the arrow across the curve")]),
+                ("Corners", [hints.cycle("C", ["sharp", "round", "chamfer"], self.oc_corner.lower()),
+                             hints.cycle("J", ["joined", "individual"], self.oc_mode.lower(), "curves")])]
 
     def draw(self, context):
         lay = self.layout
