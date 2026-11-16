@@ -36,10 +36,11 @@ from mathutils import Vector
 
 from . import draw, geom, store
 
-PAIRS = []           # [{"a": (obj name, ref, local mid), "b": (...) | None}]
+PAIRS = []           # [{"a": (obj name, ref, local mid), "b": (...) | None, "uid": {"a": session_uid, "b": ...}}]
 _cache = {}          # id(pair) -> (key, result | error string)
 PENDING = {"pts": None, "text": ""}   # the tool's first pick, waiting for the edge it meets
 TOOL = {"running": False, "stop": False}  # the picking tool, so its button can switch it off
+BOX = {"rect": None, "remove": False}     # the box being dragged (region pixels x0, y0, x1, y1)
 
 
 def active(context=None):
@@ -228,7 +229,10 @@ def _eval(face, side, p, T, uv0):
     su, sv, suu, suv, svv = (side.R @ np.asarray(x, float) for x in _second(surf, *uv))
     pt = side.R @ np.asarray(surf.evaluate(*uv), float) + side.T
     n = np.cross(su, sv)
-    n /= np.linalg.norm(n) or 1.0
+    ln = float(np.linalg.norm(n))
+    if ln <= 1e-9 * float(np.linalg.norm(su) * np.linalg.norm(sv)) or ln == 0.0:
+        raise ValueError("no normal here (a pole or a collapsed corner)")
+    n /= ln
     try:
         on = side.R @ np.asarray(face.outward_normal_at_uv(*uv), float)
         if n @ on < 0:
@@ -305,47 +309,57 @@ def _face_kmax(face, side, m=9):
 
 def _measure(A, fa, B, fb, separate, n):
     """Samples along A's edge, even by arc length: gap, normal angle, both
-    cross curvatures. An open edge leaves its very ends out (corners, where
-    a third face takes over); a closed one (a rim) is sampled all the way
-    round, its seam included -- the seams of the faces often sit there and
-    are where they kink. Separate edges: samples off B's edge are dropped."""
+    cross curvatures. An open edge is sampled from end to end, so the comb
+    covers the whole edge; a closed one (a rim) all the way round, its seam
+    included -- the seams of the faces often sit there and are where they
+    kink. Separate edges: samples off B's edge are dropped."""
     ts = np.linspace(A.t0, A.t1, 4 * n + 1)
     PA = np.array([A.world(t) for t in ts])
     d = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(PA, axis=0), axis=1))])
     L = float(d[-1]) or 1.0
     closed = float(np.linalg.norm(PA[0] - PA[-1])) < 1e-4 * L     # (kernel trim curves close to ~1e-6)
-    frac = np.arange(n) / n if closed else np.linspace(0.015, 0.985, n)
+    frac = np.arange(n) / n if closed else np.linspace(0.0, 1.0, n)
     tsel = np.interp(frac * L, d, ts)
     if separate:
         tsB = np.linspace(B.t0, B.t1, 8 * n + 1)
         PB = np.array([B.world(t) for t in tsB])
     reach = 0.02 * L
     rows = []
-    uva = uvb = None
-    for t in tsel:
+    uv = {"a": None, "b": None}
+
+    def sample(t):
         p = A.world(t)
         dt = 1e-4 * (A.t1 - A.t0)
         T = A.world(t + dt) - A.world(t - dt)
         T /= np.linalg.norm(T) or 1.0
+        tb = qb = None
         if separate:
             tb, qb = B.closest(p, tsB, PB)
             if np.linalg.norm(qb - p) > reach:
-                rows.append(None)
-                continue
+                return None
         try:
             # an untrimmed surface's own boundary: start on it -- the two ends of a
             # closed surface lie on each other and a free search may take either
-            uva, pa, na, ka = _fresh_if_lost(fa, A, p, T, A.uv_at(t) if A.uv_at else uva, 1e-6 * L)
+            uva, pa, na, ka = _fresh_if_lost(fa, A, p, T, A.uv_at(t) if A.uv_at else uv["a"], 1e-6 * L)
             uvb, pb, nb, kb = _fresh_if_lost(fb, B, qb if separate else p, T,
-                                             B.uv_at(tb) if separate and B.uv_at else uvb, 1e-6 * L)
+                                             B.uv_at(tb) if separate and B.uv_at else uv["b"], 1e-6 * L)
         except Exception:
-            rows.append(None)
-            continue
+            return None
+        uv["a"], uv["b"] = uva, uvb
         gv = (qb - p) if separate else (pb - pa)
         if na @ nb < 0:          # sides oriented apart (separate surfaces): compare like for like
             nb, kb = -nb, -kb
         ang = math.degrees(math.acos(min(1.0, max(-1.0, float(na @ nb)))))
-        rows.append((p, na, gv, float(np.linalg.norm(gv)), ang, ka, kb))
+        return (p, na, gv, float(np.linalg.norm(gv)), ang, ka, kb)
+
+    span = A.t1 - A.t0
+    for i, t in enumerate(tsel):
+        r = sample(t)
+        if r is None and not closed and i in (0, len(tsel) - 1):
+            # the very end: a corner where a surface collapses has no normal
+            # there; measure a hair inside instead
+            r = sample(t + (1e-4 if i == 0 else -1e-4) * span)
+        rows.append(r)
     return rows, L, closed
 
 
@@ -380,7 +394,7 @@ def _measure_seam(A, face, n):
     PA = np.array([A.world(t) for t in ts])
     d = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(PA, axis=0), axis=1))])
     L = float(d[-1]) or 1.0
-    tsel = np.interp(np.linspace(0.015, 0.985, n) * L, d, ts)
+    tsel = np.interp(np.linspace(0.0, 1.0, n) * L, d, ts)
     # which direction closes: the surface's two ends lie on each other there
     mid = A.Ri @ (PA[len(PA) // 2] - A.T)
     from .square import _foot
@@ -411,11 +425,28 @@ def _measure_seam(A, face, n):
     return rows, L, False
 
 
+def side_obj(pair, k):
+    """The object of side k ("a" / "b") of a check: the one it was picked on
+    (its session_uid), followed through a rename -- never another object that
+    took the name later (a new body called like a deleted one); None if gone."""
+    s = pair[k]
+    if s is None:
+        return None
+    o = bpy.data.objects.get(s[0])
+    uid = (pair.get("uid") or {}).get(k)
+    if uid is None or (o is not None and o.session_uid == uid):
+        return o
+    o = next((x for x in bpy.data.objects if x.session_uid == uid), None)
+    if o is not None:                                  # renamed: keep the name current
+        pair[k] = (o.name,) + tuple(s[1:])
+    return o
+
+
 def analyze(pair, n=None):
     """{P, N, D (gap vectors), gap, ang, kA, kB, crel, L, mid, ok mask}."""
     n = n or samples()
     a = pair["a"]
-    oa = bpy.data.objects.get(a[0])
+    oa = side_obj(pair, "a")
     if oa is None:
         raise ValueError(f"{a[0]} is gone")
     A = _Side(oa, a[1], a[2])
@@ -429,7 +460,7 @@ def analyze(pair, n=None):
         rows, L, closed = _measure(A, A.faces[0], A, A.faces[1], False, n)
     else:
         b = pair["b"]
-        ob = bpy.data.objects.get(b[0])
+        ob = side_obj(pair, "b")
         if ob is None:
             raise ValueError(f"{b[0]} is gone")
         B = _Side(ob, b[1], b[2])
@@ -456,10 +487,10 @@ def analyze(pair, n=None):
 
 def _key(pair):
     out = []
-    for s in (pair["a"], pair["b"]):
-        if s is None:
+    for k in ("a", "b"):
+        if pair[k] is None:
             continue
-        o = bpy.data.objects.get(s[0])
+        o = side_obj(pair, k)
         if o is None:
             return None
         out.append((o.get(store.PROP_REV), o.get("nproto_build_key"), tuple(round(x, 9) for r in o.matrix_world
@@ -549,6 +580,7 @@ def _same(s, obj, ref):
 
 def find_pair(obj, ref):
     for i, p in enumerate(PAIRS):
+        side_obj(p, "a"), side_obj(p, "b")
         if _same(p["a"], obj, ref) or _same(p["b"], obj, ref):
             return i
     return None
@@ -556,7 +588,8 @@ def find_pair(obj, ref):
 
 def add(obj, ref, partner=None):
     """Check an edge (and its partner edge on another surface)."""
-    pair = {"a": side_key(obj, ref), "b": side_key(*partner) if partner else None}
+    pair = {"a": side_key(obj, ref), "b": side_key(*partner) if partner else None,
+            "uid": {"a": obj.session_uid, "b": partner[0].session_uid if partner else None}}
     PAIRS.append(pair)
     return pair
 
@@ -566,6 +599,8 @@ def add_selected(context):
     on its own, an open edge with the edge it meets. Returns how many."""
     from . import subsel
     from .ops import _pick_candidates
+    if "EDGE" not in subsel.kinds(context):
+        return 0                    # picks left on a body outside Edge mode are not a selection
     picked = subsel.selected_edges(context)
     if not picked:
         return 0
@@ -620,6 +655,124 @@ def find_partner(obj, ref, pts, cands):
         if best is None or score > best[0]:
             best = (score, (o, r))
     return best[1] if best else None
+
+
+def add_edges(hits, cands):
+    """Check several edges at once (a box): a joined edge or a seam
+    on its own, an open edge with the edge that runs along it; already checked
+    ones and open edges that meet nothing are left out. Each is measured now
+    and dropped when it can't be. Returns (added, skipped)."""
+    added = skipped = 0
+    for obj, ref, pts in hits:
+        if find_pair(obj, ref) is not None:
+            continue
+        if edge_kind(obj, ref) in ("shared", "seam"):
+            add(obj, ref)
+        else:
+            partner = find_partner(obj, ref, pts, cands)
+            if partner is None:
+                skipped += 1
+                continue
+            if find_pair(*partner) is not None:       # its partner was taken in already
+                continue
+            add(obj, ref, partner)
+        if isinstance(result(PAIRS[-1]), str):
+            clear(len(PAIRS) - 1)
+            skipped += 1
+            continue
+        added += 1
+    return added, skipped
+
+
+def remove_edges(hits):
+    """Take the checks of these edges off; returns how many."""
+    n = 0
+    for obj, ref, _ in hits:
+        k = find_pair(obj, ref)
+        if k is not None:
+            clear(k)
+            n += 1
+    return n
+
+
+def _project(region, rv3d, pts):
+    """Region pixels (n, 2) of world points, and which are in front of the eye."""
+    P = np.array([tuple(p) for p in pts], float)
+    h = np.c_[P, np.ones(len(P))] @ np.array(rv3d.perspective_matrix).T
+    ok = h[:, 3] > 1e-9
+    w = np.where(ok, h[:, 3], 1.0)
+    return np.c_[(h[:, 0] / w * 0.5 + 0.5) * region.width, (h[:, 1] / w * 0.5 + 0.5) * region.height], ok
+
+
+def _visible(context, pts):
+    """Is any of these world points not hidden behind a surface?"""
+    from bpy_extras import view3d_utils
+    region, rv3d = context.region, context.region_data
+    dg = context.evaluated_depsgraph_get()
+    S, ok = _project(region, rv3d, pts)
+    for p, s, o_ in zip(pts, S, ok):
+        if not o_:
+            continue
+        o = view3d_utils.region_2d_to_origin_3d(region, rv3d, s)
+        d = view3d_utils.region_2d_to_vector_3d(region, rv3d, s)
+        dist = (Vector(p) - o).dot(d)
+        hit, loc, _, _, _, _ = context.scene.ray_cast(dg, o, d)
+        if not hit or (loc - o).dot(d) >= dist - 1e-3 * max(dist, 1e-6):
+            return True
+    return False
+
+
+def edges_in_box(context, cands, rect):
+    """The edges inside the box (region pixels x0, y0, x1, y1), as Blender's box
+    select takes them: those lying wholly inside, or -- when none does -- those
+    crossing it. Edges hidden behind a surface are left out (not in X-ray)."""
+    x0, y0, x1, y1 = rect
+    x0, x1 = sorted((x0, x1))
+    y0, y1 = sorted((y0, y1))
+    region, rv3d = context.region, context.region_data
+    full, part = [], []
+    for c in cands:
+        S, ok = _project(region, rv3d, c[2])
+        inside = ok & (S[:, 0] >= x0) & (S[:, 0] <= x1) & (S[:, 1] >= y0) & (S[:, 1] <= y1)
+        if inside.all():
+            full.append((c, inside))
+        elif inside.any():
+            part.append((c, inside))
+    hits = full or part
+    sd = getattr(context, "space_data", None)
+    xray = bool(sd is not None and getattr(sd, "shading", None) is not None and sd.shading.show_xray)
+    out = []
+    for c, inside in hits:
+        idx = np.flatnonzero(inside)
+        pick = idx[np.linspace(0, len(idx) - 1, min(len(idx), 7)).round().astype(int)]
+        if xray or _visible(context, [c[2][i] for i in pick]):
+            out.append(c)
+    return out
+
+
+def _clear_on_load():
+    PAIRS.clear()
+    _cache.clear()
+    PENDING["pts"], PENDING["text"] = None, ""
+    TOOL["running"], TOOL["stop"] = False, False
+    BOX["rect"] = None
+
+
+@bpy.app.handlers.persistent
+def _on_load(_):
+    """A new or opened file: the checks belong to the file they were made in
+    (loading ends every running operator, the tool included)."""
+    _clear_on_load()
+
+
+def register():
+    if _on_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_on_load)
+
+
+def unregister():
+    if _on_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_on_load)
 
 
 # --------------------------------------------------------------------------
@@ -715,6 +868,15 @@ def draw_px(ctx, region, rv3d, box):
     v = getattr(ctx.window_manager, "nproto_view", None)
     font = 0
     blf.size(font, 12)
+    if BOX["rect"] is not None and TOOL["running"]:     # the box being dragged: red removes
+        x0, y0, x1, y1 = BOX["rect"]
+        x0, x1 = sorted((x0, x1))
+        y0, y1 = sorted((y0, y1))
+        w, h = x1 - x0, y1 - y0
+        col = (1.0, 0.35, 0.3) if BOX["remove"] else (1.0, 1.0, 1.0)
+        box(x0, y0, w, h, col + (0.06,))
+        for bx in ((x0, y0, w, 1), (x0, y1 - 1, w, 1), (x0, y0, 1, h), (x1 - 1, y0, 1, h)):
+            box(*bx, col + (0.85,))
     if PENDING["pts"]:          # a first pick waiting for its partner: say so where you look
         pts = PENDING["pts"]
         q = location_3d_to_region_2d(region, rv3d, pts[len(pts) // 2])
@@ -768,6 +930,24 @@ def _redraw(context):
         for area in win.screen.areas:
             if area.type in ('VIEW_3D', 'UI') or area.type == 'PROPERTIES':
                 area.tag_redraw()
+
+
+def _main_region(area):
+    if area is None or area.type != 'VIEW_3D':
+        return None
+    return next((r for r in area.regions if r.type == 'WINDOW'), None)
+
+
+class _InView:
+    """The event with its mouse counted from the 3D view's main region."""
+
+    def __init__(self, event, region):
+        self._e = event
+        self.mouse_region_x = event.mouse_x - region.x
+        self.mouse_region_y = event.mouse_y - region.y
+
+    def __getattr__(self, name):
+        return getattr(self._e, name)
 
 
 class NPROTO_OT_continuity(bpy.types.Operator):
@@ -831,6 +1011,8 @@ class NPROTO_OT_continuity(bpy.types.Operator):
             return {'CANCELLED'}
         self._first = None
         self._ties, self._cycle = [], 0
+        self._press = None                        # (x, y) of a left press: a click, or a box when it drags
+        BOX["rect"] = None
         context.window_manager.nproto_view.cont_show_checks = True
         _drop_pending()
         draw.pick_overlay["hover"] = None
@@ -846,16 +1028,23 @@ class NPROTO_OT_continuity(bpy.types.Operator):
         if self._first is not None:
             msg = f"{self._first[0].name} {self._first[1]}: pick the edge it meets"
         else:
-            msg = "click an edge (a joined edge, or a surface edge); click a checked edge to remove it"
+            msg = ("click an edge (a joined edge, or a surface edge); click a checked edge to remove it; "
+                   "drag a box to add, Ctrl+drag to remove")
         rows = [("Show", [hints.cycle("0 1 2", ["G0", "G1", "G2"], v.cont_level),
-                          hints.key("+ -", "comb size")]),
-                ("Edges", [hints.key("Tab", "cycle overlapping", on=True if len(self._ties) > 1 else None),
-                           hints.key("Backspace", "undo"), hints.key("C", "clear all")])]
+                          hints.key("+ -", "comb size"),
+                          hints.toggle("K", "combs", v.cont_kcombs)]),
+                ("Edges", [hints.key("Tab", f"cycle overlapping ({self._cycle % len(self._ties) + 1} of {len(self._ties)})"
+                                  if len(self._ties) > 1 else "cycle overlapping", on=len(self._ties) > 1),
+                           hints.key("Backspace", "undo"),
+                           hints.key("C", "clear all")]),
+                ("Box", [hints.key(["drag"], "add"), hints.key(["Ctrl", "drag"], "remove")])]
         hints.show(context, "Continuity", [msg, extra.strip(" ·")], rows,
-                   [("MOUSE_LMB", "Pick edge"), ("EVENT_RETURN", "Done"), ("EVENT_ESC", "Done")])
+                   [("MOUSE_LMB", "Pick edge"), ("MOUSE_LMB_DRAG", "Box add"), ("EVENT_CTRL", "Box remove"),
+                    ("EVENT_RETURN", "Done"), ("EVENT_ESC", "Done")])
 
     def _end(self, context):
         TOOL["running"], TOOL["stop"] = False, False
+        BOX["rect"] = None
         _drop_pending()
         draw.pick_overlay["hover"] = None
         if context.area is not None:
@@ -864,15 +1053,29 @@ class NPROTO_OT_continuity(bpy.types.Operator):
         _redraw(context)
 
     def modal(self, context, event):
-        from .ops import PickMixin, _near_candidates
-        v = context.window_manager.nproto_view
         if TOOL["stop"]:                          # switched off from its button
             self._end(context)
             return {'CANCELLED'}
+        # started from a panel (the Analyze sidebar, the header popover) the
+        # tool's region is that panel's: no view there, and the mouse counted
+        # from its corner. Work in the 3D view's own region instead.
+        reg = _main_region(context.area)
+        if reg is None or reg == context.region:
+            return self._modal(context, event)
+        with context.temp_override(region=reg):
+            return self._modal(bpy.context, _InView(event, reg))
+
+    def _modal(self, context, event):
+        from .ops import PickMixin
+        v = context.window_manager.nproto_view
         if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM'}:
             return {'PASS_THROUGH'}
         if event.type == 'INBETWEEN_MOUSEMOVE':
             return {'PASS_THROUGH'}       # not used here; a gizmo drag needs them unhandled
+        if self._press is not None:       # the left button is down on the view: a click or a box
+            r = self._drag(context, event)
+            if r is not None:
+                return r
         if event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MOUSEMOVE'} and not PickMixin._in_view(context, event):
             return {'PASS_THROUGH'}
         from . import hints
@@ -884,9 +1087,11 @@ class NPROTO_OT_continuity(bpy.types.Operator):
             return {'RUNNING_MODAL'}
         if event.value != 'PRESS':
             return {'RUNNING_MODAL'}
-        if event.type == 'TAB' and self._ties:
+        if event.type == 'TAB' and len(self._ties) > 1:
             self._cycle += 1
-            draw.pick_overlay["hover"] = self._ties[self._cycle % len(self._ties)][2]
+            cur = self._ties[self._cycle % len(self._ties)]
+            draw.pick_overlay["hover"] = cur[2]
+            self._status(context, f"   ({cur[0].name} {cur[1]})")
             _redraw(context)
         elif event.type in {'ZERO', 'NUMPAD_0', 'ONE', 'NUMPAD_1', 'TWO', 'NUMPAD_2'}:
             v.cont_level = {"ZERO": "G0", "NUMPAD_0": "G0", "ONE": "G1", "NUMPAD_1": "G1"}.get(event.type, "G2")
@@ -896,6 +1101,14 @@ class NPROTO_OT_continuity(bpy.types.Operator):
             v.cont_scale = min(v.cont_scale * 1.25, 50.0)
         elif event.type in {'NUMPAD_MINUS', 'MINUS'}:
             v.cont_scale = max(v.cont_scale / 1.25, 0.02)
+        elif event.type == 'K':
+            # each side's own curvature comb; they belong to the G2 view, so
+            # switching them on from G0 / G1 shows G2
+            v.cont_kcombs = not v.cont_kcombs
+            if v.cont_kcombs:
+                v.cont_level = 'G2'
+            self._status(context)
+            _redraw(context)
         elif event.type == 'C':
             clear()
             self._first = None
@@ -911,20 +1124,80 @@ class NPROTO_OT_continuity(bpy.types.Operator):
             self._status(context)
             _redraw(context)
         elif event.type == 'LEFTMOUSE':
-            hit = self._hover(context, event)
-            if hit is not None:
-                self._pick(context, hit)
+            # a click picks on release; moved past the drag threshold first it is a box
+            self._press = (event.mouse_region_x, event.mouse_region_y)
+            BOX["remove"] = bool(event.ctrl)
         elif event.type in {'RET', 'NUMPAD_ENTER', 'SPACE', 'ESC', 'RIGHTMOUSE'}:
             self._end(context)
             return {'FINISHED'}
         return {'RUNNING_MODAL'}
+
+    def _drag(self, context, event):
+        """While the left button is down: the box follows the mouse once it has
+        moved past the drag threshold; the release checks the edges in it (Ctrl:
+        takes them off), or picks the edge under the mouse when it did not move.
+        None when the event is not part of it."""
+        x, y = event.mouse_region_x, event.mouse_region_y
+        if event.type == 'MOUSEMOVE':
+            x0, y0 = self._press
+            thr = max(4, getattr(context.preferences.inputs, "drag_threshold_mouse", 3))
+            if BOX["rect"] is not None or abs(x - x0) > thr or abs(y - y0) > thr:
+                BOX["rect"] = (x0, y0, x, y)
+                BOX["remove"] = BOX["remove"] or bool(event.ctrl)
+                draw.pick_overlay["hover"] = None
+                context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+        if event.type in {'LEFT_CTRL', 'RIGHT_CTRL'}:
+            BOX["remove"] = event.value == 'PRESS' or bool(event.ctrl)
+            context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+        if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+            rect, remove = BOX["rect"], BOX["remove"] or bool(event.ctrl)
+            BOX["rect"], self._press = None, None
+            if rect is None:
+                hit = self._hover(context, event)
+                if hit is not None:
+                    self._pick(context, hit)
+                return {'RUNNING_MODAL'}
+            hits = edges_in_box(context, self._cands, rect)
+            if remove:
+                n = remove_edges(hits)
+                self._status(context, f"   ({n} removed)")
+                _redraw(context)
+            else:
+                self._add(context, hits, "in the box")
+            return {'RUNNING_MODAL'}
+        if event.type in {'ESC', 'RIGHTMOUSE'} and event.value == 'PRESS':    # drop the box, stay in the tool
+            BOX["rect"], self._press = None, None
+            context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+        return None
+
+    def _add(self, context, hits, where):
+        if self._first is not None:
+            self._first = None
+            _drop_pending()
+        wm = context.window_manager
+        wm.progress_begin(0, 1)
+        try:
+            added, skipped = add_edges(hits, self._cands)
+        finally:
+            wm.progress_end()
+        msg = f"{added} edge(s) {where} checked" + (f", {skipped} skipped (open, or nothing they meet)"
+                                                    if skipped else "")
+        self.report({'INFO'}, msg)
+        self._status(context, f"   ({msg})")
+        _redraw(context)
 
     def _hover(self, context, event):
         from .ops import _near_candidates
         ties = _near_candidates(context, event, self._cands)
         key = [(c[0].name, c[1]) for c in ties]
         if key != [(c[0].name, c[1]) for c in self._ties]:
+            many = len(self._ties) > 1 or len(ties) > 1
             self._ties, self._cycle = ties, 0
+            if many:                         # the Tab hint lights up only over overlapping edges
+                self._status(context)
         cur = self._ties[self._cycle % len(self._ties)] if self._ties else None
         draw.pick_overlay["hover"] = cur[2] if cur else None
         context.area.tag_redraw()
@@ -1008,7 +1281,14 @@ def draw_panel(col, context):
     need = max([r_["recommended"] for r_ in (result(p_) for p_ in PAIRS) if not isinstance(r_, str)] or [0])
     if need > v.cont_samples:
         box.label(text=f"A dense surface: {need} samples show its true comb", icon='INFO')
-    for i, pair in enumerate(PAIRS):
+    # the list folds away (it gets long): its header still says how many fail
+    res_all = [result(p_) for p_ in PAIRS]
+    nbad = sum(1 for r_ in res_all if isinstance(r_, str) or not judge(r_, v)[v.cont_level][1])
+    head = f"{len(PAIRS)} Edge{'s' if len(PAIRS) != 1 else ''}"
+    head += f" · {nbad} fail {v.cont_level}" if nbad else f" · all hold {v.cont_level}"
+    box.prop(v, "cont_show_list", text=head, emboss=False,
+             icon='DISCLOSURE_TRI_DOWN' if v.cont_show_list else 'DISCLOSURE_TRI_RIGHT')
+    for i, pair in enumerate(PAIRS if v.cont_show_list else ()):
         res = result(pair)
         r = box.row(align=True)
         if isinstance(res, str):

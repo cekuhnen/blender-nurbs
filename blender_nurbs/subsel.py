@@ -114,7 +114,9 @@ def _locate(obj, kind, i, anchor, size):
     if not ds:
         return None
     k = int(np.argmin(ds))
-    return k if ds[k] < 0.02 * size else None
+    # only the same face / edge, found again after a renumbering (its point on
+    # it, up to the tessellation); never a neighbour that took its place
+    return k if ds[k] < max(2e-3, 4.0 * store.tess_settings()[0]) * size else None
 
 
 KINDS = ("FACE", "EDGE")

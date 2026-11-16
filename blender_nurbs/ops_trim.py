@@ -1867,6 +1867,8 @@ class NPROTO_OT_edge_fillet(AskValue, PickMixin, bpy.types.Operator):
                     "continuity": int(self.continuity), "thumbweight": self.thumbweight,
                     **self._ca_params()}, base_text=pre)
             done.append(obj)
+            from . import subsel
+            subsel.set_picks(obj, "EDGE", [])     # the picked edges are gone: no pick moves onto a rail
             msg = f"{name}: {info['edges']} edge(s) filleted" + (" (solid)" if info.get("solid") else "")
             if info.get("chord"):
                 lo, mean, hi = info["chord"]
