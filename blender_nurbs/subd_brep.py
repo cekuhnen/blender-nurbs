@@ -20,7 +20,11 @@ of the edges at the point lie in its tangent plane as an affine-regular
 n-gon (as Catmull-Clark's tangents do), so the faces meet tangentially at the
 point too. One linear solve per star point.
 
-Creases (crease 1.0) are sharp edges: each side follows its own surface."""
+Creases (crease 1.0) are sharp edges: each side follows its own surface. Open
+borders are smooth creases; with Keep Corners (the Subdivision modifier's
+Boundary Smooth) a border vertex of one face stays put, as a corner.
+A border running straight through a vertex (two faces) is no star point: the
+faces there are the SubD exactly, so a grid with kept corners is all bicubic."""
 
 
 import math
@@ -71,6 +75,12 @@ def cage(obj, depsgraph):
     return V, F, sharp, obj.matrix_world.copy()
 
 
+def keeps_corners(obj):
+    """The object's (last) Subdivision modifier keeps the border corners (Boundary Smooth: Keep Corners)."""
+    subs = [m for m in obj.modifiers if m.type == 'SUBSURF']
+    return bool(subs) and getattr(subs[-1], "boundary_smooth", "ALL") == 'PRESERVE_CORNERS'
+
+
 def with_borders(F, sharp):
     """sharp and the open borders (edges of one face): those behave like creases."""
     uses = {}
@@ -81,11 +91,12 @@ def with_borders(F, sharp):
     return set(sharp) | {e for e, n in uses.items() if n != 2}
 
 
-def refine_any(V, F, sharp):
+def refine_any(V, F, sharp, keep_corners=False):
     """One Catmull-Clark step on a mesh with any polygons (quads out): the vertex
     points first (same indices), then the edge points, then the face points;
     face k's children consecutively, child i (F[k][i], its edge point towards
-    F[k][i + 1], the face point, its edge point towards F[k][i - 1])."""
+    F[k][i + 1], the face point, its edge point towards F[k][i - 1]).
+    keep_corners: a vertex of one face stays put (it stays one face's)."""
     fp = np.array([V[list(f)].mean(0) for f in F])
     edges = {}
     for k, f in enumerate(F):
@@ -95,7 +106,7 @@ def refine_any(V, F, sharp):
     eid = {e: len(V) + i for i, e in enumerate(ek)}
     ep = np.array([0.5 * (V[a] + V[b]) if (a, b) in sharp or len(edges[(a, b)]) != 2
                    else 0.25 * (V[a] + V[b] + fp[edges[(a, b)][0]] + fp[edges[(a, b)][1]]) for a, b in ek])
-    nv = _vertex_points(V, F, fp, ek, sharp)
+    nv = _vertex_points(V, F, fp, ek, sharp, keep_corners)
     V2 = np.vstack([nv, ep, fp])
     F2, s2 = [], set()
     for k, f in enumerate(F):
@@ -109,7 +120,7 @@ def refine_any(V, F, sharp):
     return V2, F2, s2
 
 
-def _vertex_points(V, F, fp, ek, sharp):
+def _vertex_points(V, F, fp, ek, sharp, keep_corners=False):
     vf = [[] for _ in V]
     ve = [[] for _ in V]
     for k, f in enumerate(F):
@@ -122,7 +133,7 @@ def _vertex_points(V, F, fp, ek, sharp):
     for v in range(len(V)):
         sh = [u for u in ve[v] if tuple(sorted((u, v))) in sharp]
         n = len(ve[v])
-        if len(sh) >= 3 or not n:
+        if len(sh) >= 3 or not n or (keep_corners and len(vf[v]) == 1):
             out[v] = V[v]
         elif len(sh) == 2:
             out[v] = (V[sh[0]] + 6 * V[v] + V[sh[1]]) / 8
@@ -194,10 +205,11 @@ def _scatter(idx, vals, n):
     return np.stack([np.bincount(idx, weights=vals[:, c], minlength=n) for c in range(3)], 1)
 
 
-def cc_step(V, F, sharp_keys, UV):
+def cc_step(V, F, sharp_keys, UV, pin=None):
     """One Catmull-Clark step on quads. sharp_keys: sorted keys a * len(V) + b
     (a < b) of the creased edges (open borders count as creased too); UV: each
-    quad's corners in its cage face's (u, v). Returns the same for the result."""
+    quad's corners in its cage face's (u, v); pin: per vertex, a corner that
+    stays put (Keep Corners), or None. Returns the same for the result."""
     nv, m = len(V), len(F)
     fp = V[F].mean(1)
     lo, hi = np.minimum(F, np.roll(F, -1, axis=1)), np.maximum(F, np.roll(F, -1, axis=1))
@@ -220,7 +232,8 @@ def cc_step(V, F, sharp_keys, UV):
     sv = _scatter(np.r_[ea[hard], eb[hard]], np.vstack([V[eb[hard]], V[ea[hard]]]), nv)
     n = np.maximum(val, 1).astype(float)[:, None]
     smooth = (Q / np.maximum(nf, 1)[:, None] + 2 * R / n + (n - 3) * V) / n      # (Q + 2R + (n-3)S) / n
-    vp = np.where((ns >= 3)[:, None] | (val == 0)[:, None], V, np.where((ns == 2)[:, None], (sv + 6 * V) / 8, smooth))
+    still = (ns >= 3) | (val == 0) if pin is None else (ns >= 3) | (val == 0) | pin
+    vp = np.where(still[:, None], V, np.where((ns == 2)[:, None], (sv + 6 * V) / 8, smooth))
     V2 = np.vstack([vp, ep, fp])
     fc = (np.arange(m) + nv + ne)[:, None].repeat(4, 1)
     F2 = np.stack([F, inv + nv, fc, np.roll(inv, 1, axis=1) + nv], -1).reshape(-1, 4)
@@ -230,11 +243,12 @@ def cc_step(V, F, sharp_keys, UV):
     ce = np.nonzero(crease)[0]
     st = np.vstack([np.c_[np.minimum(ea[ce], nv + ce), np.maximum(ea[ce], nv + ce)],
                     np.c_[np.minimum(eb[ce], nv + ce), np.maximum(eb[ce], nv + ce)]]).astype(np.int64)
-    return V2, F2, np.sort(st[:, 0] * nv2 + st[:, 1]), UV2
+    pin2 = None if pin is None else np.r_[pin, np.zeros(nv2 - nv, bool)]   # the vertex points keep their indices
+    return V2, F2, np.sort(st[:, 0] * nv2 + st[:, 1]), UV2, pin2
 
 
-def cc_limit(V, F, sharp_keys):
-    """Each vertex's limit point."""
+def cc_limit(V, F, sharp_keys, pin=None):
+    """Each vertex's limit point (pin: corners that stay put, or None)."""
     nv = len(V)
     lo, hi = np.minimum(F, np.roll(F, -1, axis=1)), np.maximum(F, np.roll(F, -1, axis=1))
     uk, inv = np.unique((lo.astype(np.int64) * nv + hi).ravel(), return_inverse=True)
@@ -246,7 +260,8 @@ def cc_limit(V, F, sharp_keys):
     ns = np.bincount(ea[hard], minlength=nv) + np.bincount(eb[hard], minlength=nv)
     sv = _scatter(np.r_[ea[hard], eb[hard]], np.vstack([V[eb[hard]], V[ea[hard]]]), nv)
     n = np.maximum(val, 1).astype(float)[:, None]
-    return np.where((ns >= 3)[:, None], V, np.where((ns == 2)[:, None], (sv + 4 * V) / 6,
+    still = ns >= 3 if pin is None else (ns >= 3) | pin
+    return np.where(still[:, None], V, np.where((ns == 2)[:, None], (sv + 4 * V) / 6,
                                                      (n * n * V + 4 * E + D) / (n * (n + 5))))
 
 
@@ -263,11 +278,12 @@ class Levels:
 
     WINDOW = PRUNE_CELLS + 1                                       # a corner window's last grid index
 
-    def __init__(self, V, F, sharp, top, base=0, near=()):
+    def __init__(self, V, F, sharp, top, base=0, near=(), pin=None):
         """near: (face, corner index, level) at irregular vertices -- beyond
         level `base` only the cells around them are subdivided further, each
         corner down to its level (the surface elsewhere is known exactly from
-        level base)."""
+        level base). pin: per cage vertex, a corner that stays put (Keep
+        Corners), or None."""
         nv = len(V)
         keys = np.sort(np.array([a * nv + b for a, b in sharp], np.int64))
         m = len(F)
@@ -280,9 +296,10 @@ class Levels:
         self.base, self.ext, self.win = base, {}, {}
         W = self.WINDOW
         Vk, Fk, Kk = V.copy(), np.asarray(F), keys
+        Pk = None if pin is None or not np.any(pin) else np.asarray(pin, bool).copy()
         for lev in range(top + 1):
             if lev:
-                Vk, Fk, Kk, UV = cc_step(Vk, Fk, Kk, UV)
+                Vk, Fk, Kk, UV, Pk = cc_step(Vk, Fk, Kk, UV, Pk)
                 orig = np.repeat(orig, 4)
             N = 2 ** lev
             if lev > base:                                         # keep the cells near irregular corners only
@@ -304,6 +321,7 @@ class Levels:
                 na, nb = remap[a_[ok]], remap[b_[ok]]
                 Kk = np.sort(np.minimum(na, nb).astype(np.int64) * len(used) + np.maximum(na, nb))
                 Vk, Fk = Vk[used], remap[Fk]
+                Pk = None if Pk is None else Pk[used]
                 # per irregular corner a window of the grid, turned so that the corner is its (0, 0)
                 wins = [(f, i) for f in range(m) for i, d in near_of[f] if d >= lev]
                 grid = -np.ones((len(wins), W + 1, W + 1), int)
@@ -316,7 +334,7 @@ class Levels:
                     grid[w, a[inside], b[inside]] = ids[inside]
                 sides = np.array([[hard[f, 0 if i in (0, 1) else 2], False, False, hard[f, 3 if i in (0, 3) else 1]]
                                   for f, i in wins]).reshape(len(wins), 4)
-                G = self._extend(Vk, Fk, grid, W, sides, [(w, 0) for w in range(len(wins))])
+                G = self._extend(Vk, Fk, grid, W, sides, [(w, 0) for w in range(len(wins))], Pk)
                 self.win[lev] = {}
                 for w, (f, i) in enumerate(wins):
                     self.win[lev].setdefault(f, []).append((i, G[w]))
@@ -324,14 +342,14 @@ class Levels:
                 grid = -np.ones((m, N + 1, N + 1), int)
                 ij = np.rint(UV * N).astype(int)
                 grid[orig[:, None], ij[:, :, 0], ij[:, :, 1]] = Fk
-                self.ext[lev] = self._extend(Vk, Fk, grid, N, hard, None)
-                limit = cc_limit(Vk, Fk, Kk)
+                self.ext[lev] = self._extend(Vk, Fk, grid, N, hard, None, Pk)
+                limit = cc_limit(Vk, Fk, Kk, Pk)
                 self.corners = np.array([[limit[grid[f, i, j]] for i, j in ((0, 0), (N, 0), (N, N), (0, N))]
                                          for f in range(m)])
                 self.limit = limit[grid]                           # (m, N + 1, N + 1, 3): the surface at (i, j) / N
 
     @staticmethod
-    def _extend(V, F, grid, N, hard, near=None):
+    def _extend(V, F, grid, N, hard, near=None, pin=None):
         nv, m = len(V), len(grid)
         lo, hi = np.minimum(F, np.roll(F, -1, axis=1)), np.maximum(F, np.roll(F, -1, axis=1))
         uk = np.unique((lo.astype(np.int64) * nv + hi).ravel())
@@ -363,7 +381,7 @@ class Levels:
                 if p < 0 or (wanted is not None and (f, ci_n) not in wanted):
                     continue
                 nxt = None
-                gh = []
+                gh, inw, alg = [], [], []
                 for s_ in sides:
                     d = ((0, 1), (-1, 0), (0, -1), (1, 0))[s_]
                     q = grid[f, i + d[0], j + d[1]]
@@ -381,13 +399,25 @@ class Levels:
                         g = prv.get(a_) if nxt.get(a_) == q else nxt.get(a_) if prv.get(a_) == q else None
                     G[f, i - d[0] + 1, j - d[1] + 1] = V[g] if g is not None else 2 * V[p] - V[q]
                     gh.append(g)
+                    inw.append(q)
+                    alg.append(a_)
+                ci_, cj_ = (0 if i == 0 else N + 2), (0 if j == 0 else N + 2)
                 if nxt is not None and len(nxt) == 4 and None not in gh:   # an ordinary corner: the true diagonal
                     for fi in order[starts[p]:starts[p + 1]] // 4:
                         qq = list(F[fi])
                         if gh[0] in qq and gh[1] in qq:
                             k_ = qq.index(p)
-                            ci_, cj_ = (0 if i == 0 else N + 2), (0 if j == 0 else N + 2)
                             G[f, ci_, cj_] = V[qq[(k_ + 2) % 4]]
+                elif gh.count(None) == 1 and nxt is not None:      # a crease or border running straight on: the
+                    s = 0 if gh[0] is not None else 1              # neighbour's diagonal mirrored across it
+                    g, a_ = gh[s], alg[s]
+                    for fi in order[starts[p]:starts[p + 1]] // 4:
+                        qq = list(F[fi])
+                        if g in qq and a_ in qq:
+                            G[f, ci_, cj_] = 2 * V[g] - V[qq[(qq.index(p) + 2) % 4]]
+                elif gh == [None, None] and pin is not None and pin[p]:   # a kept corner: mirrored both ways
+                    w_ = grid[f, i + (1 if i == 0 else -1), j + (1 if j == 0 else -1)]
+                    G[f, ci_, cj_] = 4 * V[p] - 2 * V[inw[0]] - 2 * V[inw[1]] + V[w_]
         return G
 
     def evaluate(self, f, u, v, lev):
@@ -513,8 +543,9 @@ def _side_cells(N, s, M=None):
 
 # -- the conversion ------------------------------------------------------------------
 class Converter:
-    def __init__(self, V, F, sharp, angle_tol=0.05, curv_tol=0.02):
+    def __init__(self, V, F, sharp, angle_tol=0.05, curv_tol=0.02, keep_corners=False):
         self.V, self.F, self.sharp = V, F, sharp
+        self.keep_corners = keep_corners
         self.angle_tol, self.curv_tol = angle_tol, curv_tol
         self.size = float(np.linalg.norm(np.ptp(V, 0))) or 1.0
         self.edges, self.vf = {}, [[] for _ in V]
@@ -540,6 +571,8 @@ class Converter:
             ncrease[a] += 1
             ncrease[b] += 1
         self.star = (val != 4) | ((ncrease != 0) & (ncrease != 2)) | np.array([len(self.vf[v]) != val[v] for v in range(len(V))])
+        # Keep Corners: a border vertex of one face stays put (a corner, as one where three creases meet)
+        self.pin = np.array([keep_corners and len(self.vf[v]) == 1 for v in range(len(V))], bool)
         self.cage_normals = limit_normals(V, F, sharp)
         self._vn, self._arc = {}, {}
         self.irr = set(self.irregular())
@@ -647,7 +680,7 @@ class Converter:
 
         def outer(x, y):
             nb_ = hn[x]
-            return V[nb_[0] if nb_[1] == y else nb_[1]] if len(nb_) == 2 else 2 * V[x] - V[y]
+            return V[nb_[0] if nb_[1] == y else nb_[1]] if len(nb_) == 2 and not self.pin[x] else 2 * V[x] - V[y]
         Qm, Qa, Qb, Qp = outer(a, b), V[a], V[b], outer(b, a)
         bz = np.array([(Qm + 4 * Qa + Qb) / 6, (2 * Qa + Qb) / 3, (Qa + 2 * Qb) / 3, (Qa + 4 * Qb + Qp) / 6])
 
@@ -661,24 +694,29 @@ class Converter:
         G2 (and its G1 start) ask for the same levels again."""
         cache = self.__dict__.setdefault("_fresh", {})
         if L not in cache:
-            c = Converter(self.V, self.F, self.sharp)
+            c = Converter(self.V, self.F, self.sharp, keep_corners=self.keep_corners)
             nets = c.natural(L, sliver=False)
             cache[L] = (nets, list(c.fk), c.levels.corners)
         return cache[L]
 
     def limit_grid(self, level):
         """Per face its SubD limit points at (i, j) / 2^level (level 2 or more)."""
-        c = Converter(self.V, self.F, self.sharp)
+        c = Converter(self.V, self.F, self.sharp, keep_corners=self.keep_corners)
         c.natural(level, sliver=False)
         return list(c.levels.limit)
 
     # -- the knots -----------------------------------------------------------------------
     def irregular(self):
         """Vertices where the subdivided cage is not a regular grid: star
-        points, and crease vertices other than a crease running straight through."""
+        points, and crease vertices other than a crease running straight through.
+        A border running straight through (two faces) and a kept corner (one face)
+        are regular: the faces there are the cage's grid mirrored across the border."""
         out = []
         for v in range(len(self.V)):
             creases = [w for w in self.nbr[v] if (min(v, w), max(v, w)) in self.sharp]
+            if len(creases) == 2 and all(len(self.edges[(min(v, w), max(v, w))]) == 1 for w in creases) \
+                    and ((self.val[v] == 3 and len(self.vf[v]) == 2) or (self.val[v] == 2 and self.pin[v])):
+                continue
             straight = False
             if len(creases) == 2 and self.val[v] == 4 and self.ring[v] is not None:
                 es = self.ring[v][0]
@@ -807,7 +845,7 @@ class Converter:
         self.deep = deep
         near = [(f, i, deep[x]) for f, fv in enumerate(self.F) for i, x in enumerate(fv) if deep.get(x)]
         self.top = max([Lb] + [t for _, _, t in near])
-        self.levels = Levels(self.V, self.F, self.sharp, self.top, base=Lb, near=near)
+        self.levels = Levels(self.V, self.F, self.sharp, self.top, base=Lb, near=near, pin=self.pin)
         N = 2 ** Lb
         C, kL = _clamping(N)
         proj = {}
@@ -1178,11 +1216,12 @@ class MacroConverter(Converter):
     there), joined like any edge (subd_g2: the quad's half split at its middle). A lighter layout than
     one face per child of every face: the n-gons alone are split."""
 
-    def __init__(self, V, F, sharp, angle_tol=0.05, curv_tol=0.02):
-        V2, F2, s2 = refine_any(np.asarray(V, float), F, sharp)
+    def __init__(self, V, F, sharp, angle_tol=0.05, curv_tol=0.02, keep_corners=False):
+        V2, F2, s2 = refine_any(np.asarray(V, float), F, sharp, keep_corners)
         F2 = [tuple(int(x) for x in f) for f in F2]
         s2 = with_borders(F2, s2)
-        self.R = R = Converter(V2, F2, s2, angle_tol, curv_tol)
+        self.R = R = Converter(V2, F2, s2, angle_tol, curv_tol, keep_corners)
+        self.keep_corners, self.pin = keep_corners, R.pin
         emid, MF, off = {}, [], 0                                  # cage edge -> its edge point in R
         for f in F:
             n = len(f)
@@ -1359,11 +1398,11 @@ class MacroConverter(Converter):
         lq = max(L, 1)
         nc_ = 2 ** (lq - 1)                                        # a child's cells at R's level lq - 1
         nq_ = 2 * nc_
-        lev = Levels(R.V, R.F, R.sharp, lq - 1, base=lq - 1)
+        lev = Levels(R.V, R.F, R.sharp, lq - 1, base=lq - 1, pin=R.pin)
         Cq, kL = _clamping(nq_)
         cc = None
         if any(k_ == "c" for k_ in self.kind):
-            cc = Converter(R.V, R.F, R.sharp)
+            cc = Converter(R.V, R.F, R.sharp, keep_corners=self.keep_corners)
             nc = cc.natural(L, sliver=False)
         m = len(self.F)
         nets, fk, cor = [None] * m, [None] * m, np.zeros((m, 4, 3))
@@ -1400,7 +1439,7 @@ class MacroConverter(Converter):
 
     def limit_grid(self, level):
         R = self.R
-        cq = Converter(R.V, R.F, R.sharp)
+        cq = Converter(R.V, R.F, R.sharp, keep_corners=self.keep_corners)
         cq.natural(level - 1, sliver=False)
         limq = cq.levels.limit
         limc = None
@@ -1409,7 +1448,7 @@ class MacroConverter(Converter):
             ch = self.kids[f]
             if self.kind[f] == "c":
                 if limc is None:
-                    c2 = Converter(R.V, R.F, R.sharp)
+                    c2 = Converter(R.V, R.F, R.sharp, keep_corners=self.keep_corners)
                     c2.natural(level, sliver=False)
                     limc = c2.levels.limit
                 out.append(limc[ch[0]])
@@ -1431,24 +1470,25 @@ def _length(context, x):
     return bpy.utils.units.to_string(us.system, 'LENGTH', x * (us.scale_length or 1.0), precision=3)
 
 
-def build(V, F, sharp, g2=True, angle_tol=0.05, curv_tol=0.02, degree=None):
+def build(V, F, sharp, g2=True, angle_tol=0.05, curv_tol=0.02, degree=None, keep_corners=False):
     """(nets, knots, stats, conv) for a cage: faces without a star corner bicubic
     (the SubD exactly), the others 2 x 2 pieces joined exactly, of degree 6 in
     G2, 5 in G1 (subd_g2); the joins measured as Continuity Check would. A cage
     with triangles or n-gons: one face per quad, the n-gons split (MacroConverter,
     T-junctions where they meet quads); if that cannot be solved, every face
-    split by one subdivision step."""
+    split by one subdivision step. keep_corners: a border vertex of one face
+    stays put (Boundary Smooth: Keep Corners)."""
     if any(len(f) != 4 for f in F):
         try:
-            return _build(MacroConverter(V, F, sharp, angle_tol, curv_tol), g2, macro=True, degree=degree)
+            return _build(MacroConverter(V, F, sharp, angle_tol, curv_tol, keep_corners), g2, macro=True, degree=degree)
         except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
-            V2, F2, s2 = refine_any(np.asarray(V, float), F, sharp)
+            V2, F2, s2 = refine_any(np.asarray(V, float), F, sharp, keep_corners)
             F2 = [tuple(int(x) for x in f) for f in F2]
-            nets, knots, st, conv = _build(Converter(V2, F2, with_borders(F2, s2), angle_tol, curv_tol), g2,
-                                           degree=degree)
+            nets, knots, st, conv = _build(Converter(V2, F2, with_borders(F2, s2), angle_tol, curv_tol, keep_corners),
+                                           g2, degree=degree)
             st["layout_fallback"] = str(exc)
             return nets, knots, st, conv
-    return _build(Converter(V, F, sharp, angle_tol, curv_tol), g2, degree=degree)
+    return _build(Converter(V, F, sharp, angle_tol, curv_tol, keep_corners), g2, degree=degree)
 
 
 def _build(conv, g2, macro=False, degree=None):
@@ -1485,12 +1525,15 @@ def _build(conv, g2, macro=False, degree=None):
     return nets, knots, st, conv
 
 
-def convert(context, obj, angle_tol=0.05, g2=True, curv_tol=0.02, degree=None):
-    """(new NURBS object, summary text, note) for a SubD (or any quad) mesh object."""
+def convert(context, obj, angle_tol=0.05, g2=True, curv_tol=0.02, degree=None, keep_corners=None):
+    """(new NURBS object, summary text, note) for a SubD (or any quad) mesh object. keep_corners: the border
+    corners stay put (None: as the object's Subdivision modifier's Boundary Smooth says)."""
     V, F, sharp, M = cage(obj, context.evaluated_depsgraph_get())
     if not F:
         raise RuntimeError("the mesh has no faces")
-    nets, knots, st, conv = build(V, F, sharp, g2, angle_tol, curv_tol, degree)
+    if keep_corners is None:
+        keep_corners = keeps_corners(obj)
+    nets, knots, st, conv = build(V, F, sharp, g2, angle_tol, curv_tol, degree, keep_corners)
     patches = [{"net": [list(map(float, c)) for c in net.reshape(-1, 3)], "ku": list(map(float, ku)),
                 "kv": list(map(float, kv)), "degree": int(np.count_nonzero(ku == ku[0])) - 1}
                for net, (ku, kv) in zip(nets, knots)]
@@ -1560,6 +1603,17 @@ class NPROTO_OT_subd_to_brep(bpy.types.Operator):
     curvature: FloatProperty(name="Curvature %", default=2.0, min=0.1, max=20.0, precision=1,
                              description="G2: report a join whose curvature differs more than this, in percent of "
                                          "the faces' largest curvature (as Continuity Check measures it)")
+    boundary: EnumProperty(
+        name="Boundary Smooth", default="MODIFIER",
+        items=[("MODIFIER", "Per Object (its Modifier)", "Each object as its own Subdivision modifier's Boundary "
+                                                         "Smooth says: All or Keep Corners"),
+               ("ALL", "All Objects: Smooth All", "Every selected object: the open borders smoothed, their corners "
+                                                  "rounded (whatever its modifier says)"),
+               ("PRESERVE_CORNERS", "All Objects: Keep Corners", "Every selected object: the open borders smoothed "
+                                                                 "but their corners (a vertex of one face) kept in "
+                                                                 "place, whatever its modifier says; a grid then "
+                                                                 "converts to bicubic faces only, as a NURBS surface "
+                                                                 "would be")])
     hide_original: BoolProperty(name="Hide Meshes", default=True,
                                 description="Hide the SubD objects in the viewport and in renders (they stay)")
 
@@ -1576,6 +1630,7 @@ class NPROTO_OT_subd_to_brep(bpy.types.Operator):
         if self.continuity == "G2":
             col.prop(self, "degree", expand=True)
             col.prop(self, "curvature")
+        col.prop(self, "boundary")
         col.prop(self, "hide_original")
 
     @classmethod
@@ -1590,7 +1645,9 @@ class NPROTO_OT_subd_to_brep(bpy.types.Operator):
             try:
                 g2 = self.continuity == "G2"
                 new, summary, note = convert(context, src, self.angle, g2=g2, curv_tol=self.curvature / 100.0,
-                                             degree=int(self.degree) if g2 else None)
+                                             degree=int(self.degree) if g2 else None,
+                                             keep_corners=None if self.boundary == "MODIFIER"
+                                             else self.boundary == "PRESERVE_CORNERS")
             except (jobs.JobError, RuntimeError, np.linalg.LinAlgError) as exc:
                 warn.append(f"{src.name}: not converted ({exc})")
                 continue

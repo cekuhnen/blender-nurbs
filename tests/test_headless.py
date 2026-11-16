@@ -8451,6 +8451,37 @@ _V, _F, _S, _M = _sdb.cage(_oop, ctx.evaluated_depsgraph_get())
 _n2, _k2, _s2, _c2 = _sdb.build(_V, _F, _S)
 _sdr["an n-gon by an open border: one face per quad, the n-gon split (12 faces), not the whole cage split (30)"] = \
     len(_n2) == 12 and _s2["layout_fallback"] is None and _s2["normal"] < 1e-3 and _s2["curvature"] < 1e-4
+# open grids: a border running straight through is no star point; Keep Corners (the modifier's Boundary Smooth)
+# pins the corners, so the grid is all bicubic, Blender's own surface exactly
+def _sd_grid(b_, n_=3, m_=2):
+    vs_ = [[b_.verts.new((i_, j_, 0.4 * math.sin(1.3 * i_) * math.cos(0.9 * j_) + 0.1 * i_ * j_)) for j_ in range(m_ + 1)]
+           for i_ in range(n_ + 1)]
+    for i_ in range(n_):
+        for j_ in range(m_):
+            b_.faces.new([vs_[i_][j_], vs_[i_ + 1][j_], vs_[i_ + 1][j_ + 1], vs_[i_][j_ + 1]])
+_ogr = _sd_obj("SD_Grid", _sd_grid, levels=4)
+n_, s_, no_, b_ = _sd_run(_ogr)
+_sdr["an open grid, borders smoothed (All): only its four corners are star points"] = \
+    b_.face_count() == 6 and "by the 4 star points" in s_ and "G2 within 0.00%" in s_
+_ogr.modifiers[0].boundary_smooth = 'PRESERVE_CORNERS'
+n_, s_, no_, b_ = _sd_run(_ogr)
+_cvs = [ext.surface_cvs(f_.surface()) for f_ in b_.faces()]
+_sdr["... with Keep Corners (as its modifier says): six bicubic faces of one span, Blender's SubD surface exactly"] = \
+    b_.face_count() == 6 and "one bicubic span each" in s_ and no_ is None \
+    and all(c_["degree_u"] == 3 and c_["count_u"] == 4 and c_["count_v"] == 4 for c_ in _cvs) and _sd_dev(_ogr, b_) < 1e-5
+n_, s_, no_, b_ = _sd_run(_ogr, keep_corners=False)
+_sdr["... the modifier's setting overridden (keep_corners=False): the corners smoothed, star points again"] = \
+    "by the 4 star points" in s_
+_V, _F, _S, _M = _sdb.cage(_ogr, ctx.evaluated_depsgraph_get())
+_c0 = next(v_ for v_ in range(len(_V)) if sum(v_ in f_ for f_ in _F) == 1)
+_f0 = next(f_ for f_ in _F if _c0 in f_)
+_k0 = _f0.index(_c0)
+_F3 = [(_c0, _f0[(_k0 + 1) % 4], _f0[(_k0 + 3) % 4]), tuple(_f0[(_k0 + i_) % 4] for i_ in (1, 2, 3))] \
+    + [f_ for f_ in _F if f_ != _f0]
+_n2, _k2, _s2, _c2 = _sdb.build(_V, _F3, set(), keep_corners=True)
+_sdr["... a triangle in a corner with Keep Corners: its corner stays on the cage vertex"] = \
+    min(float(np.linalg.norm(np.asarray(net_)[c_] - _V[_c0])) for net_ in _n2
+        for c_ in ((0, 0), (-1, 0), (0, -1), (-1, -1))) < 1e-9
 # G1 and G2 on the converter's own measures (Continuity Check's): exact along every edge and at the star points,
 # close to the SubD; a face with no star corner keeps the SubD's own bicubic span, so its joins are C2
 for _nm, _ob in (("a SubD cube", _ocube), ("n-gon caps (a cylinder)", _ocyl), ("a creased cube", _ocr)):
@@ -8505,6 +8536,10 @@ ctx.view_layer.objects.active = _ocube
 _sdr["the operator offers Degree 6 (default) or 5 for G2"] = \
     [i_.identifier for i_ in bpy.ops.nproto.subd_to_brep.get_rna_type().properties["degree"].enum_items] == ["6", "5"] \
     and bpy.ops.nproto.subd_to_brep.get_rna_type().properties["degree"].default == "6"
+_sdr["the operator's Boundary Smooth: Modifier (default), All or Keep Corners"] = \
+    [i_.identifier for i_ in bpy.ops.nproto.subd_to_brep.get_rna_type().properties["boundary"].enum_items] \
+    == ["MODIFIER", "ALL", "PRESERVE_CORNERS"] \
+    and bpy.ops.nproto.subd_to_brep.get_rna_type().properties["boundary"].default == "MODIFIER"
 _r = bpy.ops.nproto.subd_to_brep(angle=0.1)
 _sel = list(ctx.selected_objects)
 _sdr["the operator converts the selected SubD meshes, hides them and selects the new bodies"] = \

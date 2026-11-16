@@ -565,12 +565,20 @@ before its Subdivision Surface modifier), with **one face per cage face**.
   Apple Silicon. G2 starts from the G1 solve (one linear step) raised to its degree, which halves its steps. The joins
   are one sparse solve per step (Apple's Accelerate on macOS; Windows and Linux use a slower solver, a few times longer).
 * **It asks first:** a dialog with **Continuity** (G1 or G2; G2 by default), in G2 **Degree** (*6 · Closer*, the
-  default, or *5 · Lighter*), **Angle** and **Curvature %** (G2: a join further off than these is reported) and **Hide Meshes** (the SubD objects stay, hidden in the viewport and in
+  default, or *5 · Lighter*), **Angle** and **Curvature %** (G2: a join further off than these is reported), **Boundary
+  Smooth** (see Open borders) and **Hide Meshes** (the SubD objects stay, hidden in the viewport and in
   renders); **Convert** runs it. The same settings stay in the Adjust Last Operation panel afterwards.
 * A cage without star points or odd creases (a torus) becomes exact faces of 16 CVs.
 * **Creases** (edge crease 1.0) become sharp edges along the SubD's own crease curves: each side follows its own
-  surface, and the smooth faces around a crease's star point join exactly within their side. Open borders stay
-  open (a sheet).
+  surface, and the smooth faces around a crease's star point join exactly within their side.
+* **Open borders** stay open (a sheet), smooth along the SubD's own border curves. A border running straight past a
+  vertex is no star point: the faces there stay bicubic. **Boundary Smooth**: *Per Object (its Modifier)*, the
+  default, converts each object as its own Subdivision modifier's Boundary Smooth says; *All Objects: Smooth All* and
+  *All Objects: Keep Corners* set it for every selected object, whatever their modifiers say. Smooth All rounds the
+  border's corners (a vertex of one face, a star point), Keep Corners keeps them where the cage vertex is, as
+  Blender's modifier does. With Keep Corners a grid
+  (a sheet without star points) becomes bicubic faces of 16 CVs only, Blender's SubD exactly: SubD as a stand-in
+  for NURBS surface modeling, each cage face one Bezier patch.
 * **Triangles and n-gons** are split, the quads are not: Catmull-Clark's first step turns an n-gon into n quads, and
   each of those becomes a face, while every cage quad stays one face (its four quads after that step, joined). A
   quad's side next to an n-gon then meets two of its faces, a **T-junction** at the side's middle, and the faces join
