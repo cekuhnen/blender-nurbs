@@ -1265,22 +1265,6 @@ bpy.ops.nproto.add_primitive(kind="SPHERE", radius=1.0, degree="0"); sp_ = ctx.a
 bpy.ops.nproto.iso_curve(iso_dir="V", param=0.5); iso = ctx.active_object
 L_iso = features.input_curve(iso, "S0").length(1e-6)
 check("iso curve (sphere equator / meridian)", abs(L_iso - 2 * math.pi) < 0.01 or abs(L_iso - math.pi) < 0.01, f"length {L_iso:.4f}")
-ctx.scene.cursor.location = (0, Y0 + 45, 0)
-bpy.ops.nproto.add_primitive(kind="PLANE", width=4, depth=4, pl_degree_u=3, pl_degree_v=3, spans_u=1, spans_v=1); pl_ = ctx.active_object
-bpy.ops.curve.primitive_bezier_circle_add(radius=1.0, location=(0, Y0 + 45, 3)); pc = ctx.active_object
-bpy.ops.object.select_all(action='DESELECT'); pc.select_set(True); pl_.select_set(True); ctx.view_layer.objects.active = pl_
-r = bpy.ops.nproto.project_curve(direction="Z")
-pcs = geom.sample_curve(features.input_curve(ctx.active_object, "S0"), 64)
-check("project curve onto a surface", r == {'FINISHED'} and np.abs(pcs[:, 2]).max() < 1e-4
-      and abs(np.linalg.norm(pcs[:, :2] - [0, Y0 + 45], axis=1).mean() - 1.0) < 1e-3)
-bpy.ops.object.select_all(action='DESELECT'); sp_.select_set(True)
-ctx.scene.cursor.location = (0, Y0 + 40, 0.5)
-bpy.ops.nproto.add_primitive(kind="PLANE", width=4, depth=4, pl_degree_u=1, pl_degree_v=1, spans_u=1, spans_v=1); cutp = ctx.active_object
-bpy.ops.object.select_all(action='DESELECT'); sp_.select_set(True); cutp.select_set(True)
-r = bpy.ops.nproto.intersect()
-ic = geom.sample_curve(features.input_curve(ctx.active_object, "S0"), 64)
-rr = np.linalg.norm(ic[:, :2] - [0, Y0 + 40], axis=1)
-check("intersect sphere x plane = circle r=sqrt(0.75)", r == {'FINISHED'} and abs(rr.mean() - math.sqrt(0.75)) < 2e-3
 # Duplicate Edge / Iso Curve keep the surface's own CVs: an exact cylinder's rim
 # comes back as its rational circle (cyclic, the ring's CV count), not a dense fit
 ctx.scene.cursor.location = (0, Y0 + 40, 0)
@@ -1310,6 +1294,22 @@ check("iso curve: exact isoparm (circle with the ring's CVs, line with the profi
       any(z_ < 1e-9 and n_ == _ring_n - 1 for n_, z_, _ in _isos) and all(e_ < 2e-5 for _, _, e_ in _isos)
       and any(abs(z_ - 2.0) < 1e-6 and n_ <= min(_cyd["count_u"], _cyd["count_v"]) for n_, z_, _ in _isos),
       f"{_isos} grid {_cyd['count_u']}x{_cyd['count_v']}")
+ctx.scene.cursor.location = (0, Y0 + 45, 0)
+bpy.ops.nproto.add_primitive(kind="PLANE", width=4, depth=4, pl_degree_u=3, pl_degree_v=3, spans_u=1, spans_v=1); pl_ = ctx.active_object
+bpy.ops.curve.primitive_bezier_circle_add(radius=1.0, location=(0, Y0 + 45, 3)); pc = ctx.active_object
+bpy.ops.object.select_all(action='DESELECT'); pc.select_set(True); pl_.select_set(True); ctx.view_layer.objects.active = pl_
+r = bpy.ops.nproto.project_curve(direction="Z")
+pcs = geom.sample_curve(features.input_curve(ctx.active_object, "S0"), 64)
+check("project curve onto a surface", r == {'FINISHED'} and np.abs(pcs[:, 2]).max() < 1e-4
+      and abs(np.linalg.norm(pcs[:, :2] - [0, Y0 + 45], axis=1).mean() - 1.0) < 1e-3)
+bpy.ops.object.select_all(action='DESELECT'); sp_.select_set(True)
+ctx.scene.cursor.location = (0, Y0 + 40, 0.5)
+bpy.ops.nproto.add_primitive(kind="PLANE", width=4, depth=4, pl_degree_u=1, pl_degree_v=1, spans_u=1, spans_v=1); cutp = ctx.active_object
+bpy.ops.object.select_all(action='DESELECT'); sp_.select_set(True); cutp.select_set(True)
+r = bpy.ops.nproto.intersect()
+ic = geom.sample_curve(features.input_curve(ctx.active_object, "S0"), 64)
+rr = np.linalg.norm(ic[:, :2] - [0, Y0 + 40], axis=1)
+check("intersect sphere x plane = circle r=sqrt(0.75)", r == {'FINISHED'} and abs(rr.mean() - math.sqrt(0.75)) < 2e-3
       and np.abs(ic[:, 2] - 0.5).max() < 1e-3, f"r={rr.mean():.5f}")
 # rebuild surface: exact sphere -> degree 3, 6x6 spans
 bpy.ops.object.select_all(action='DESELECT'); sp_.select_set(True); ctx.view_layer.objects.active = sp_
