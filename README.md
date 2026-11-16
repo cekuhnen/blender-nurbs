@@ -4,7 +4,9 @@
 [USD BRep](https://github.com/NVIDIA-Omniverse/usd-brep) kernel.
 
 NURBS Proto is a research project: it brings Class-A NURBS surface modeling to Blender, together with ideas
-from solid modeling (exact bodies, booleans, fillets and history that rebuilds).
+from solid modeling (exact bodies, booleans, fillets and history that rebuilds). The experiment explores how
+surface and solid modeling can flow together with mesh and SubD, moving freely between them, while still
+feeling like modeling in Blender: its own selection, transform tools, snapping, Edit Mode and undo.
 
 Explore a product idea, a concept form or a car body part with NURBS curves and
 surfaces right in Blender, alongside SubD. Every surface is exact: check it with
