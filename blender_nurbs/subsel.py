@@ -316,8 +316,7 @@ def face_tris(obj, i):
     polys = []
     for e in b.edges():
         try:
-            t0, t1 = e.parameter_range()
-            polys.append(np.array([e.point_at(t0 + (t1 - t0) * s / 39) for s in range(40)], float))
+            polys.append(np.array([e.point_at(t) for t in store.edge_params(e, 40)], float))
         except Exception:
             pass
     out = (pts, np.array(tris, dtype=np.int64).reshape(-1, 3), polys)

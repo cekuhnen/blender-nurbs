@@ -970,6 +970,36 @@ def _refine_single(surf, pts, nrm, tris, lmax, max_tris=120000, passes=8, max_an
     return P.astype(np.float32), Nn.astype(np.float32), T
 
 
+def corner_params(curve, t0, t1, limit=400):
+    """Parameters inside (t0, t1) where `curve` may have a corner: its knots of
+    multiplicity >= its degree (every knot of a polyline). Evenly spaced
+    samples skip them and draw a chord across the corner (an extruded
+    rectangle's rims cut every corner but the seam's)."""
+    try:
+        _, ext = _k()
+        d = ext.curve_cvs(curve)
+    except Exception:
+        return []
+    from .geom import _corner_knots
+    out = _corner_knots([float(k) for k in d["knots"]], int(d["degree"]), t0, t1)
+    return out if len(out) <= limit else []
+
+
+def edge_params(e, n=40):
+    """Sample parameters of a B-rep edge for drawing: n evenly spaced, plus
+    its curve's corners (corner_params)."""
+    t0, t1 = e.parameter_range()
+    ts = [t0 + (t1 - t0) * i / (n - 1) for i in range(n)]
+    try:
+        extra = corner_params(e.curve(), t0, t1)
+    except Exception:
+        extra = []
+    if extra:
+        tol = 1e-7 * max(abs(t1 - t0), 1e-12)
+        ts = sorted(ts + [k for k in extra if min(abs(k - t) for t in ts) > tol])
+    return ts
+
+
 def _display_data(brep):
     """Edge polylines and CV nets in local space, for the overlay."""
     _, ext = _k()
@@ -978,8 +1008,7 @@ def _display_data(brep):
     for e in brep.edges():
         poly = []
         try:
-            t0, t1 = e.parameter_range()
-            poly = [list(e.point_at(t0 + (t1 - t0) * i / (n - 1))) for i in range(n)]
+            poly = [list(e.point_at(t)) for t in edge_params(e, n)]
         except Exception:
             try:  # some edges (e.g. fillet rails) only evaluate through their curve
                 c = e.curve()

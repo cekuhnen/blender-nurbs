@@ -13,7 +13,10 @@ _label_cache = {}
 pick_overlay = {"hover": None, "picked": [], "colors": [],   # filled by the modal pick operator
                 # Trim's regions before it commits: [(world tris (n,3,3), outline (m,2,3), keep?)]
                 "regions": [], "region_hover": None,
-                "region_pal": None}     # (colour of keep, of not): Split uses its own pair
+                "region_pal": None,     # (colour of keep, of not): Split uses its own pair
+                # a command's live value preview (valuedrag.py): {"lines", "tris", "arrow", "label"}
+                "preview": None}
+COL_PREVIEW = (1.0, 0.62, 0.12)
 COL_REGION_KEEP = (0.25, 0.9, 0.4)
 COL_REGION_DROP = (1.0, 0.2, 0.2)
 # filled by the sketch tools (CV Curve / Line): world-space polylines and points
@@ -555,6 +558,9 @@ def _draw():
         _draw_lines(_lines_from_polylines([pl], _IDENT), COL_PICKS[c], 4.0)
     if pick_overlay["hover"]:
         _draw_lines(_lines_from_polylines([pick_overlay["hover"]], _IDENT), COL_HOVER, 4.0)
+    pv = pick_overlay.get("preview")
+    if pv:
+        _draw_preview(pv)
     so = sketch_overlay
     for pl, col in so.get("axes") or []:          # X / Y / Z lock: the axis (or the plane's two axes)
         _draw_lines(_lines_from_polylines([pl], _IDENT), col, 1.5)
@@ -580,6 +586,92 @@ def _draw():
         _draw_points([so["cursor"]], COL_CURSOR, 7.0)
     gpu.state.depth_test_set('NONE')
     gpu.state.blend_set('NONE')
+
+
+def _draw_preview(pv):
+    """The live value preview: a see-through fill (hidden where the model is in
+    front), then its lines over everything, bright where they are seen and
+    faint where the model hides them; the arrow's shaft and the draft guide."""
+    tris = pv.get("tris")
+    lines = _lines_from_polylines(pv.get("lines") or [], _IDENT)
+    if tris is not None and len(tris):
+        gpu.state.depth_test_set('LESS_EQUAL')
+        _draw_tris([tuple(p) for p in tris], (*COL_PREVIEW, 0.16))
+        gpu.state.depth_test_set('NONE')
+    _draw_lines(lines, (*COL_PREVIEW, 0.35), 1.5)
+    gpu.state.depth_test_set('LESS_EQUAL')
+    _draw_lines(lines, (*COL_PREVIEW, 1.0), 2.0)
+    gpu.state.depth_test_set('NONE')
+    for h in pv.get("handles") or []:
+        if h["kind"] == "arrow" and h.get("base") is not None:
+            col = COL_HANDLE_HOT if h["hot"] else COL_HANDLE
+            _draw_lines([Vector(h["base"]), Vector(h["pos"])], col, 3.0 if h["hot"] else 2.0)
+
+
+COL_HANDLE = (1.0, 1.0, 1.0, 0.95)
+COL_HANDLE_HOT = (1.0, 0.85, 0.2, 1.0)
+
+
+def _draw_preview_px(region, rv3d):
+    """The handles (a constant size on screen: the arrow's head, the draft's
+    diamond with its drag direction) and their values beside them."""
+    import blf
+    from bpy_extras.view3d_utils import location_3d_to_region_2d
+    pv = pick_overlay.get("preview")
+    if not pv:
+        return
+    to2d = lambda p: location_3d_to_region_2d(region, rv3d, Vector(p))
+    gpu.state.blend_set('ALPHA')
+    sh = gpu.shader.from_builtin('UNIFORM_COLOR')
+    for h in pv.get("handles") or []:
+        q = to2d(h["pos"])
+        if q is None:
+            continue
+        col = COL_HANDLE_HOT if h["hot"] else COL_HANDLE
+        if h["kind"] == "arrow":
+            a = to2d(h["base"]) if h.get("base") is not None else None
+            u = (q - a) if a is not None else Vector((0.0, 1.0))
+            if u.length < 1.0:          # no length yet: point along the direction it would go
+                b = to2d(Vector(h["pos"]) + Vector(h["dir"]) * 1e-3)
+                u = (b - q) if b is not None else Vector((0.0, 1.0))
+            u = u.normalized() if u.length > 1e-9 else Vector((0.0, 1.0))
+            n = Vector((-u.y, u.x))
+            L, W = (18.0, 8.0) if h["hot"] else (15.0, 6.5)
+            p0, p1, p2 = q + u * 3.0, q - u * L + n * W, q - u * L - n * W
+            sh.uniform_float("color", (0.05, 0.05, 0.05, 0.9))
+            o0, o1, o2 = q + u * 5.5, q - u * (L + 2) + n * (W + 2), q - u * (L + 2) - n * (W + 2)
+            batch_for_shader(sh, 'TRIS', {"pos": [o0[:], o1[:], o2[:]]}).draw(sh)
+            sh.uniform_float("color", col)
+            batch_for_shader(sh, 'TRIS', {"pos": [p0[:], p1[:], p2[:]]}).draw(sh)
+        else:
+            b = to2d(Vector(h["pos"]) + Vector(h["dir"]) * 1e-3)
+            if b is not None and (b - q).length > 1e-9:     # its drag direction: a short guide
+                u = (b - q).normalized()
+                _draw_px_line(q - u * 22.0, q + u * 22.0, (*col[:3], 0.6), 1.5)
+            r = 8.0 if h["hot"] else 6.5
+            _diamond(q, r + 1.5, (0.05, 0.05, 0.05, 0.9))
+            _diamond(q, r, col)
+    font = 0
+    blf.size(font, 13)
+    for pos, txt, active in pv.get("labels") or []:
+        q = to2d(pos)
+        if q is None:
+            continue
+        w, hgt = blf.dimensions(font, txt)
+        x, y = q.x + 14, q.y + 10
+        _box(x - 5, y - 4, w + 10, hgt + 8, (0.05, 0.05, 0.05, 0.8))
+        blf.color(font, *((1.0, 0.78, 0.4, 1.0) if active else (0.85, 0.85, 0.85, 1.0)))
+        blf.position(font, x, y, 0)
+        blf.draw(font, txt)
+
+
+def _draw_px_line(a, b, color, width):
+    sh = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+    region = bpy.context.region
+    sh.uniform_float("viewportSize", (region.width, region.height))
+    sh.uniform_float("lineWidth", width)
+    sh.uniform_float("color", color)
+    batch_for_shader(sh, 'LINES', {"pos": [(a.x, a.y, 0.0), (b.x, b.y, 0.0)]}).draw(sh)
 
 
 class _Ident:
@@ -632,6 +724,10 @@ def _draw_px():
     _draw_paused(ctx, region)
     _draw_face_points(region, rv3d)
     _draw_snap_label(region, rv3d)
+    try:
+        _draw_preview_px(region, rv3d)
+    except Exception as exc:
+        print("NURBS value preview:", exc)
     from . import contcheck
     try:
         contcheck.draw_px(ctx, region, rv3d, _box)

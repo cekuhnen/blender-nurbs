@@ -52,6 +52,73 @@ check("loft has history", features.history(L) is not None)
 # --- Extrude + Revolve + Planar
 r = bpy.ops.nproto.extrude(inputs=ins((A,"S0")), distance=1.5, direction="Y")
 E1 = ctx.active_object; check("extrude", r == {'FINISHED'} and len(E1.data.polygons) > 0)
+
+# --- Extrude's live preview (valuedrag.py) draws what the command builds
+from blender_nurbs import valuedrag
+from blender_nurbs.ops import extrude_rows
+check("value drag: mouse ray to arrow parameter",
+      abs(valuedrag.axis_param((2, 5, 10), (0, 0, -1), (0, 0, 0), (1, 0, 0)) - 2.0) < 1e-12
+      and abs(valuedrag.axis_param((0, 0, 10), (0, 0, -1), (1, 0, 0), (-1, 0, 0)) - 1.0) < 1e-12
+      and valuedrag.axis_param((0, 0, 10), (0, 0, -1), (0, 0, 0), (0, 0, 1)) is None)
+check("value drag: snap", valuedrag.snap(1.26, 0.25) == 1.25 and valuedrag.snap(-0.13, 0.1) == -0.1)
+
+def _poly_dist(p, poly):
+    best = 1e300
+    for a, b in zip(poly[:-1], poly[1:]):
+        ab = b - a; L = ab @ ab
+        t = 0.0 if L == 0 else min(1.0, max(0.0, (p - a) @ ab / L))
+        best = min(best, np.linalg.norm(a + t * ab - p))
+    return best
+
+_pv_open = nurbs("PvOpen", [(0, 0, 0), (1, 0.6, 0), (2, -0.4, 0), (3, 0.2, 0)])
+bpy.ops.curve.primitive_nurbs_circle_add(radius=0.7, location=(0, 4, 0))
+_pv_circ = ctx.active_object
+_pv_cu = bpy.data.curves.new("PvRect", 'CURVE'); _pv_cu.dimensions = '3D'
+_pv_sp = _pv_cu.splines.new('POLY'); _pv_sp.points.add(3); _pv_sp.use_cyclic_u = True
+for _q, _c in zip(_pv_sp.points, [(0, 8, 0), (2, 8, 0), (2, 9, 0), (0, 9, 0)]):
+    _q.co = (*_c, 1.0)
+_pv_rect = bpy.data.objects.new("PvRect", _pv_cu); ctx.collection.objects.link(_pv_rect)
+_pv_worst = []
+for _o, _p in [(_pv_open, dict(distance=1.3, direction="NORMAL")),
+               (_pv_open, dict(distance=-0.8, direction="Y", tilt=20.0, tilt_azimuth=30.0)),
+               (_pv_open, dict(distance=1.0, direction="Z", draft=10.0)),
+               (_pv_open, dict(distance=0.6, direction="Z", draft=8.0, symmetric=True)),
+               (_pv_circ, dict(distance=1.2, direction="NORMAL", draft=15.0)),
+               (_pv_circ, dict(distance=1.2, direction="Z", draft=12.0, draft_flip=True)),
+               (_pv_circ, dict(distance=0.9, direction="LOCAL_Z", symmetric=True)),
+               (_pv_rect, dict(distance=0.7, direction="Z", draft=20.0)),
+               (_pv_rect, dict(distance=0.5, direction="Z", draft=10.0, draft_flip=True, symmetric=True))]:
+    _c = features.input_curve(_o, "S0")
+    _cv = ext.curve_cvs(_c)
+    _poly = _cv["degree"] == 1 and not _cv.get("weights")      # as the tool does: a polyline's corners
+    _P = np.array(_cv["points"], float) if _poly else geom.sample_curve(_c, 97)
+    _rows = extrude_rows(_P, features.extrude_direction(_o, _c, _p), _p["distance"], _p.get("draft", 0.0),
+                         _p.get("draft_flip", False), _p.get("symmetric", False), smooth=not _poly)
+    _s = features.run("extrude", [(_o, "S0")], _p)
+    _edges = [np.array(geom.boundary_points(_s, w, 801)) for w in ("U0", "U1", "V0", "V1")]
+    _far = [_rows[0], _rows[-1]]
+    _worst = max(min(_poly_dist(q, e) for e in _edges) for r_ in _far for q in r_[::6])
+    _pv_worst.append(round(float(_worst), 6))
+# drawn edges of an extruded rectangle go through its corners (evenly spaced
+# samples cut every corner but the seam's with a chord)
+_rc_corner = []
+for _dr in (0.0, 8.0):
+    bpy.ops.nproto.extrude(inputs=ins((_pv_rect, "S0")), distance=0.5, direction="Z", draft=_dr)
+    _rx = ctx.active_object
+    _rP = [np.array(e, float) for e in store.display(_rx)["edges"]]
+    _rbot = [e for e in _rP if np.ptp(e[:, 2]) < 1e-9 and abs(e[0, 2]) < 1e-9]
+    _rc_corner.append(max(min(np.min(np.linalg.norm(b - np.array(c), axis=1)) for b in _rbot)
+                          for c in [(0, 8, 0), (2, 8, 0), (2, 9, 0), (0, 9, 0)]))
+    _rs = store.get_surfaces(_rx)[0]
+    _rb = [np.array(geom.boundary_points(_rs, w, 48, corners=True)) for w in ("U0", "U1", "V0", "V1")]
+    _rb = [b for b in _rb if np.ptp(b[:, 2]) < 1e-9 and abs(b[0, 2]) < 1e-9]
+    _rc_corner.append(max(min(np.min(np.linalg.norm(b - np.array(c), axis=1)) for b in _rb)
+                          for c in [(0, 8, 0), (2, 8, 0), (2, 9, 0), (0, 9, 0)]))
+check("extruded rectangle: drawn edges and pick outlines hit every corner (plain, draft)",
+      max(_rc_corner) < 1e-9, [round(float(x), 6) for x in _rc_corner])
+# drafts of smooth curves: the result is a fit within ~3e-4 of the true draft here
+check("extrude preview rows lie on the built surface's edges (plain, tilt, draft, symmetric, cone, polyline)",
+      max(_pv_worst) < 1e-3 and max(_pv_worst[i] for i in (0, 1, 6, 7, 8)) < 1e-5, _pv_worst)
 prof = nurbs("Prof", [(1,0,0),(1.3,0,0.5),(0.8,0,1),(1,0,1.5)])
 r = bpy.ops.nproto.revolve(inputs=ins((prof,"S0")), axis="Z", pivot="WORLD", angle=360)
 R = ctx.active_object; check("revolve", r == {'FINISHED'} and len(R.data.polygons) > 0)

@@ -1248,11 +1248,10 @@ def _sampled_blend(a, b, p, deg_in):
                            p.get("cur_a", 0.0), p.get("cur_b", 0.0), degree_v=deg_in)
 
 
-@builder("extrude")
-def build_extrude(inputs, p):
-    sm, _ = _k()
-    obj, ref = inputs[0]
-    curve = input_curve(obj, ref)
+def extrude_direction(obj, curve, p):
+    """Unit direction an extrude of `curve` (an input of `obj`) goes, before the
+    distance's sign: its Direction, then the tilt. The Extrude tool's live
+    preview uses it too, so the preview and the result always agree."""
     mode = p.get("direction", "NORMAL")
     if mode == "NORMAL":
         d, _ = geom.curve_plane_normal(curve)
@@ -1264,7 +1263,15 @@ def build_extrude(inputs, p):
             d = Vector((0, 0, 1))
     else:
         d = geom.axis_vector(mode, obj)
-    d = geom.tilt_direction(d.normalized(), float(p.get("tilt", 0.0)), float(p.get("tilt_azimuth", 0.0)))
+    return geom.tilt_direction(d.normalized(), float(p.get("tilt", 0.0)), float(p.get("tilt_azimuth", 0.0)))
+
+
+@builder("extrude")
+def build_extrude(inputs, p):
+    sm, _ = _k()
+    obj, ref = inputs[0]
+    curve = input_curve(obj, ref)
+    d = extrude_direction(obj, curve, p)
     h = float(p.get("distance", 1.0))
     draft = float(p.get("draft", 0.0))
     if abs(draft) > 1e-9:

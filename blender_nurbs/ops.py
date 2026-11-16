@@ -9,6 +9,14 @@ from bpy_extras import view3d_utils
 from mathutils import Vector
 
 from . import draw, features, geom, hints, store
+from .valuedrag import ValueDrag, draft_angle, ruled_preview
+
+
+def _seg_dist_np(p, a, b):
+    ab = b - a
+    L = float(ab @ ab)
+    t = 0.0 if L == 0 else min(1.0, max(0.0, float((p - a) @ ab) / L))
+    return float(np.linalg.norm(a + t * ab - p))
 
 MOUSE_PICK = [("MOUSE_LMB", "Pick"), ("EVENT_RETURN", "Finish"), ("EVENT_ESC", "Cancel")]
 from .kernel import load as load_kernel
@@ -90,7 +98,7 @@ def _pick_candidates(context, allow_edges=True):
                 surf = store.get_surfaces(obj)[0]
                 M = geom.world_matrix(obj)
                 for which in ("U0", "U1", "V0", "V1"):
-                    pts = [M @ Vector(p) for p in geom.boundary_points(surf, which, 48)]
+                    pts = [M @ Vector(p) for p in geom.boundary_points(surf, which, 48, corners=True)]
                     if (pts[0] - pts[len(pts) // 2]).length + (pts[-1] - pts[len(pts) // 2]).length < 1e-6:
                         continue  # degenerate edge (pole of a revolve, cone tip...)
                     cands.append((obj, which, pts))
@@ -162,6 +170,22 @@ class AskValue:
             return self.execute(context)
         return context.window_manager.invoke_props_dialog(self, width=320, title=self.bl_label,
                                                           confirm_text=self.bl_label)
+
+
+def _carry_props(op):
+    """The operator's settings, to start it again with the picks (PickMixin._finish).
+    A command started from Python gets its defaults, not the settings it ran with,
+    so without them a direction or size set when the tool started was lost."""
+    out = {"inputs": op.inputs}
+    for p in op.properties.bl_rna.properties:      # the operator's properties only
+        k = p.identifier
+        if k in ("rna_type", "inputs") or p.is_readonly or p.type in ('POINTER', 'COLLECTION'):
+            continue
+        if p.is_skip_save or not op.properties.is_property_set(k):
+            continue
+        v = getattr(op, k)
+        out[k] = v[:] if getattr(p, "is_array", False) else v
+    return out
 
 
 GIZMO = {"held": False}     # the left button went down on the navigation gizmo (PickMixin._in_view)
@@ -411,7 +435,7 @@ class PickMixin:
             # a running operator reports "NPROTO_OT_edge_fillet", its class "nproto.edge_fillet"
             idn = self.bl_idname
             mod, name = idn.split("_OT_", 1) if "_OT_" in idn else idn.split(".", 1)
-            getattr(getattr(bpy.ops, mod.lower()), name)('INVOKE_DEFAULT', inputs=self.inputs)
+            getattr(getattr(bpy.ops, mod.lower()), name)('INVOKE_DEFAULT', **_carry_props(self))
             return {'CANCELLED'}
         return self.execute(context)
 
@@ -903,8 +927,45 @@ class _CurveTool(PickMixin):
         return {'FINISHED'}
 
 
-class NPROTO_OT_extrude(AskValue, _CurveTool, bpy.types.Operator):
-    """Extrude curves (or surface edges) into surfaces"""
+def _smooth_draft_normals(P, d, closed, flip):
+    """Outward directions at samples of a smooth curve, from its tangents
+    (second-order differences, also at open ends): a chord's normal at an
+    end is off by half the turn of the last chord. Signed as _draft_normals."""
+    if closed:
+        T = np.roll(P, -1, axis=0) - np.roll(P, 1, axis=0)
+    else:
+        T = np.gradient(P, axis=0, edge_order=2)
+    n = np.cross(T, d)
+    n /= np.linalg.norm(n, axis=1, keepdims=True) + 1e-300
+    rel = P - P.mean(axis=0)
+    rel -= np.outer(rel @ d, d)
+    sgn = 1.0 if np.sum(n * rel) >= 0 else -1.0
+    return -sgn * n if flip else sgn * n
+
+
+def extrude_rows(P, d, h, draft=0.0, flip=False, symmetric=False, smooth=True):
+    """Rows of points of the extrude of samples P (world): what build_extrude
+    makes, for its live preview -- the far row moved by h along d and, with a
+    draft, outward by h tan(draft) as draft_extrude does. smooth=False: P are
+    a polyline's corners (mitred, as the builder does a degree-1 profile)."""
+    P = np.asarray(P, float)
+    d = np.asarray(d, float)
+    d = d / (np.linalg.norm(d) or 1.0)
+    if abs(draft) > 1e-9:
+        closed = len(P) > 2 and np.linalg.norm(P[0] - P[-1]) < 1e-7 * (np.ptp(P, axis=0).max() or 1.0)
+        normals = _smooth_draft_normals if smooth else geom._draft_normals
+        nrm = normals(P[:-1] if closed else P, d, closed, flip)
+        if closed:
+            nrm = np.vstack([nrm, nrm[:1]])
+        return geom._draft_rows(P, nrm, d, h, h * np.tan(np.radians(draft)), symmetric)
+    if symmetric:
+        return [P - h * d, P + h * d]
+    return [P, P + h * d]
+
+
+class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
+    """Extrude curves (or surface edges) into surfaces. From the UI the distance
+    follows the mouse with a preview; type a value, Tab for the draft, LMB to apply"""
     bl_idname = "nproto.extrude"
     bl_label = "Extrude"
     bl_options = {'REGISTER', 'UNDO'}
@@ -929,6 +990,126 @@ class NPROTO_OT_extrude(AskValue, _CurveTool, bpy.types.Operator):
         return {"distance": self.distance, "direction": self.direction, "dir_vec": list(self.dir_vec),
                 "tilt": self.tilt, "tilt_azimuth": self.tilt_azimuth, "draft": self.draft,
                 "draft_flip": self.draft_flip, "symmetric": self.symmetric}
+
+    # -- the live value stage (valuedrag.py) ----------------------------------
+    drag_fields = ("distance", "draft")
+    angle_fields = ("draft",)
+    AXES = {"x": "X", "y": "Y", "z": "Z"}
+
+    def drag_setup(self, context, mouse):
+        self._ex = []
+        from .kernel import load
+        ext = load().blender_ext
+        for obj, ref in _decode_inputs(self.inputs):
+            curve = features.input_curve(obj, ref)
+            cv = ext.curve_cvs(curve)
+            if cv["degree"] == 1 and not cv.get("weights"):     # a polyline: its corners, exact
+                self._ex.append((obj, curve, np.array(cv["points"], float), False))
+            else:
+                self._ex.append((obj, curve, geom.sample_curve(curve, 97), True))
+        if not self._ex:
+            return False
+        # the handles stand on the first curve: the arrow where it was clicked
+        # (when it was picked by a click), else halfway along it
+        obj, curve, P, smooth = self._ex[0]
+        S = P if smooth else geom.sample_curve(curve, 97)
+        n = len(S)
+        closed = np.linalg.norm(S[0] - S[-1]) < 1e-7 * (np.ptp(S, axis=0).max() or 1.0)
+        kb, self._base_at_mouse = n // 2, False
+        if mouse is not None:
+            best = None
+            for k, q in enumerate(S):
+                sq = self._screen(context, q)
+                if sq is not None and (sq - mouse).length <= 40.0 and (best is None or (sq - mouse).length < best[0]):
+                    best = ((sq - mouse).length, k)
+            if best is not None:
+                kb, self._base_at_mouse = best[1], True
+        if closed:
+            kd = (kb + (n - 1) // 5) % (n - 1)
+        else:
+            kd = kb + n // 5 if kb < n // 2 else kb - n // 5
+        self._S, self._kb, self._kd, self._closed = S, kb, kd, closed
+        return True
+
+    def _dirs(self):
+        p = self.params()
+        return [np.array(features.extrude_direction(obj, curve, p)) for obj, curve, _, _ in self._ex]
+
+    def _draft_normal(self, d):
+        """Outward direction of the draft at the diamond's foot (sample kd),
+        the way the preview and the builder move the top edge there."""
+        obj, curve, P, smooth = self._ex[0]
+        S, k, closed = self._S, self._kd, self._closed
+        if smooth:
+            nrm = _smooth_draft_normals(S[:-1] if closed else S, d, closed, self.draft_flip)
+            return nrm[k % len(nrm)]
+        # a polyline: the normal of the side the foot is on, signed as the corners' mitres
+        cl = len(P) > 2 and np.linalg.norm(P[0] - P[-1]) < 1e-7 * (np.ptp(P, axis=0).max() or 1.0)
+        mit = geom._draft_normals(P[:-1] if cl else P, d, cl, self.draft_flip)
+        if cl:
+            mit = np.vstack([mit, mit[:1]])
+        q = S[k]
+        j = min(range(len(P) - 1), key=lambda i: _seg_dist_np(q, P[i], P[i + 1]))
+        sn = np.cross(P[j + 1] - P[j], d)
+        sn /= np.linalg.norm(sn) or 1.0
+        return sn if sn @ mit[j] >= 0 else -sn
+
+    def drag_handles(self):
+        d = self._dirs()[0]
+        d = d / (np.linalg.norm(d) or 1.0)
+        h = self.distance
+        B = self._S[self._kb]
+        foot = self._S[self._kd] + d * h
+        nd = self._draft_normal(d)
+        return [{"field": "distance", "kind": "arrow", "origin": B, "dir": d, "param": h,
+                 "base": B, "to_value": lambda t: t},
+                {"field": "draft", "kind": "draft", "origin": foot, "dir": nd,
+                 "param": h * np.tan(np.radians(self.draft)),
+                 "to_value": lambda t, h=h: draft_angle(t, h)}]
+
+    def drag_preview(self):
+        lines, tris = [], []
+        for (obj, curve, P, smooth), d in zip(self._ex, self._dirs()):
+            rows = extrude_rows(P, d, self.distance, self.draft, self.draft_flip, self.symmetric, smooth)
+            L, T = ruled_preview(rows, ribs=8 if smooth else len(P) - 1)
+            lines += L
+            tris.append(T)
+        return {"lines": lines, "tris": np.vstack(tris)}
+
+    def drag_check(self):
+        size = max(float(np.ptp(np.vstack([P for _, _, P, _ in self._ex]), axis=0).max()), 1e-9)
+        if abs(self.distance) <= 1e-6 * size:
+            return "Distance 0: drag the arrow out, or type a distance"
+        return ""
+
+    def drag_key(self, context, event, ch):
+        if ch in self.AXES:         # X Y Z: that world axis; again: the object's local one
+            ax = self.AXES[ch]
+            self.direction = ("LOCAL_" + ax) if self.direction == ax else ax
+        elif ch == "n":
+            self.direction = "NORMAL"
+        elif ch == "f":
+            self.distance = -self.distance
+        elif ch == "s":
+            self.symmetric = not self.symmetric
+        elif ch == "d":
+            self.draft_flip = not self.draft_flip
+        else:
+            return False
+        return True
+
+    def drag_rows(self):
+        cur = {"NORMAL": "normal"}.get(self.direction, self.direction.replace("LOCAL_", "").lower())
+        return [("Direction", [hints.cycle("N X Y Z", ["normal", "x", "y", "z"], cur),
+                               hints.key("F", "flip"), hints.toggle("S", "symmetric", self.symmetric)]),
+                ("Draft", [hints.toggle("D", "inward", self.draft_flip)])]
+
+    def drag_state(self):
+        names = {"NORMAL": "Curve Normal", "VECTOR": "Vector"}
+        d = names.get(self.direction, self.direction.replace("LOCAL_", "Local ").replace("_", " "))
+        if d in ("X", "Y", "Z"):
+            d = "World " + d
+        return [d] + (["Symmetric"] if self.symmetric else [])
 
 
 class NPROTO_OT_revolve(_CurveTool, bpy.types.Operator):
