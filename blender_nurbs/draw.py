@@ -603,8 +603,10 @@ def _draw_preview(pv):
     _draw_lines(lines, (*COL_PREVIEW, 1.0), 2.0)
     gpu.state.depth_test_set('NONE')
     for h in pv.get("handles") or []:
-        if h["kind"] == "arrow" and h.get("base") is not None:
-            col = COL_HANDLE_HOT if h["hot"] else COL_HANDLE
+        col = COL_HANDLE_HOT if h["hot"] else COL_HANDLE
+        if h.get("path") is not None and len(h["path"]) > 1:      # a shaft along a path (an angle's arc)
+            _draw_lines(_lines_from_polylines([h["path"]], _IDENT), col, 3.0 if h["hot"] else 2.0)
+        elif h["kind"] == "arrow" and h.get("base") is not None:
             _draw_lines([Vector(h["base"]), Vector(h["pos"])], col, 3.0 if h["hot"] else 2.0)
 
 
@@ -629,9 +631,10 @@ def _draw_preview_px(region, rv3d):
             continue
         col = COL_HANDLE_HOT if h["hot"] else COL_HANDLE
         if h["kind"] == "arrow":
-            a = to2d(h["base"]) if h.get("base") is not None else None
+            tail = h.get("head_from") if h.get("head_from") is not None else h.get("base")
+            a = to2d(tail) if tail is not None else None
             u = (q - a) if a is not None else Vector((0.0, 1.0))
-            if u.length < 1.0:          # no length yet: point along the direction it would go
+            if u.length < 1.0 and h.get("dir") is not None:     # no length yet: the way it would go
                 b = to2d(Vector(h["pos"]) + Vector(h["dir"]) * 1e-3)
                 u = (b - q) if b is not None else Vector((0.0, 1.0))
             u = u.normalized() if u.length > 1e-9 else Vector((0.0, 1.0))

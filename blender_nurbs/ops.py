@@ -1,6 +1,7 @@
 """Modelling operators (viewport tools)."""
 
 import json
+import math
 
 import bpy
 import numpy as np
@@ -9,7 +10,7 @@ from bpy_extras import view3d_utils
 from mathutils import Vector
 
 from . import draw, features, geom, hints, store
-from .valuedrag import ValueDrag, draft_angle, ruled_preview
+from .valuedrag import ValueDrag, angle_pick, draft_angle, rotate_points, ruled_preview
 
 
 def _seg_dist_np(p, a, b):
@@ -1098,6 +1099,9 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
             return False
         return True
 
+    def drag_handle_hints(self):
+        return [hints.key("LMB drag", "arrow: distance"), hints.key("LMB drag", "diamond: draft")]
+
     def drag_rows(self):
         cur = {"NORMAL": "normal"}.get(self.direction, self.direction.replace("LOCAL_", "").lower())
         return [("Direction", [hints.cycle("N X Y Z", ["normal", "x", "y", "z"], cur),
@@ -1112,8 +1116,9 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
         return [d] + (["Symmetric"] if self.symmetric else [])
 
 
-class NPROTO_OT_revolve(_CurveTool, bpy.types.Operator):
-    """Revolve curves around an axis"""
+class NPROTO_OT_revolve(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
+    """Revolve curves around an axis. From the UI the angle has a handle to drag
+    around the axis on a live preview; type a value, click away or Enter to make it"""
     bl_idname = "nproto.revolve"
     bl_label = "Revolve"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1128,6 +1133,114 @@ class NPROTO_OT_revolve(_CurveTool, bpy.types.Operator):
 
     def params(self):
         return {"angle": self.angle, "axis": self.axis, "pivot": self.pivot, "seam_angle": self.seam_angle}
+
+    # -- the live value stage (valuedrag.py) ----------------------------------
+    drag_fields = ("angle",)
+    angle_fields = ("angle",)
+    ask_dialog = False          # Value Input = Dialog: revolve at once, as it always did
+    AXES = {"x": "X", "y": "Y", "z": "Z"}
+
+    def drag_setup(self, context, mouse):
+        self._rv = []
+        for obj, ref in _decode_inputs(self.inputs):
+            curve = features.input_curve(obj, ref)
+            self._rv.append((obj, geom.sample_curve(curve, 97)))
+        if not self._rv:
+            return False
+        self._mouse0 = mouse
+        self._ctx = context
+        self._place(context)
+        return True
+
+    def _axis(self):
+        obj = self._rv[0][0]
+        z = np.array(geom.axis_vector(self.axis, obj), float)
+        z /= np.linalg.norm(z) or 1.0
+        O = np.array(geom.world_matrix(obj).translation if self.pivot == "OBJECT" else (0.0, 0.0, 0.0), float)
+        return O, z
+
+    def _place(self, context):
+        """The handle's foot: the profile point clicked (when it was picked
+        by a click), else the one farthest from the axis."""
+        O, z = self._axis()
+        S = self._rv[0][1]
+        rel = S - O
+        rad = np.linalg.norm(rel - np.outer(rel @ z, z), axis=1)
+        k = int(np.argmax(rad))
+        self._base_at_mouse = False
+        if self._mouse0 is not None:
+            best = None
+            for i, q in enumerate(S):
+                sq = self._screen(context, q)
+                if sq is not None and rad[i] > 1e-6 * (rad.max() or 1.0):
+                    dd = (sq - self._mouse0).length
+                    if dd <= 40.0 and (best is None or dd < best[0]):
+                        best = (dd, i)
+            if best is not None:
+                k, self._base_at_mouse = best[1], True
+        self._k = k
+
+    def drag_handles(self):
+        O, z = self._axis()
+        P = self._rv[0][1][self._k]
+        C = O + z * float((P - O) @ z)
+        x = P - C
+        rho = float(np.linalg.norm(x))
+        if rho < 1e-12:
+            return []
+        x /= rho
+        y = np.cross(z, x)
+        a = self.angle
+        n = max(2, int(abs(a) / 3.0) + 1)
+        path = np.vstack([rotate_points(P[None], O, z, a * i / (n - 1)) for i in range(n)])
+        back = a - math.copysign(min(6.0, abs(a) * 0.5), a) if abs(a) > 1e-9 else 0.0
+        return [{"field": "angle", "kind": "arrow", "pos": rotate_points(P[None], O, z, a)[0], "param": a,
+                 "origin": C, "dir": None, "path": path, "head_from": rotate_points(P[None], O, z, back)[0],
+                 "pick": lambda o, r, prev: angle_pick(C, x, y, z, o, r, prev),
+                 "to_value": lambda t: t, "snap": (5.0, 1.0)}]
+
+    def drag_preview(self):
+        O, z = self._axis()
+        a = self.angle
+        m = max(2, int(math.ceil(abs(a) / 7.5)) + 1)
+        lines, tris = [], []
+        for obj, S in self._rv:
+            rows = [rotate_points(S, O, z, a * i / (m - 1)) for i in range(m)]
+            L, T = ruled_preview(rows, ribs=8, row_every=3)
+            lines += L
+            tris.append(T)
+        return {"lines": lines, "tris": np.vstack(tris)}
+
+    def drag_check(self):
+        if abs(self.angle) < 0.05:
+            return "Angle 0: drag the handle around the axis, or type an angle"
+        return ""
+
+    def drag_key(self, context, event, ch):
+        if ch in self.AXES:         # X Y Z: that world axis; again: the object's local one
+            ax = self.AXES[ch]
+            self.axis = ("LOCAL_" + ax) if self.axis == ax else ax
+        elif ch == "o":
+            self.pivot = "WORLD" if self.pivot == "OBJECT" else "OBJECT"
+        elif ch == "f":
+            self.angle = -self.angle
+        else:
+            return False
+        self._place(context)
+        return True
+
+    def drag_handle_hints(self):
+        return [hints.key("LMB drag", "the arrow around the axis: angle")]
+
+    def drag_rows(self):
+        cur = self.axis.replace("LOCAL_", "").lower()
+        return [("Axis", [hints.cycle("X Y Z", ["x", "y", "z"], cur),
+                          hints.cycle("O", ["object", "world"], self.pivot.lower(), "pivot"),
+                          hints.key("F", "other way"), hints.key("Ctrl", "5° steps")])]
+
+    def drag_state(self):
+        ax = self.axis.replace("LOCAL_", "Local ") if self.axis.startswith("LOCAL_") else "World " + self.axis
+        return [f"Axis {ax}", "Pivot " + ("Object Origin" if self.pivot == "OBJECT" else "World Origin")]
 
 
 def _edge_points(obj, ref):
@@ -1304,14 +1417,137 @@ class NPROTO_OT_planar(PickMixin, bpy.types.Operator):
         return {'FINISHED'}
 
 
-class NPROTO_OT_offset(AskValue, bpy.types.Operator):
-    """Offset NURBS surfaces along their normal"""
+def offset_frame(obj, cos_deg=1.0):
+    """The display mesh of obj, set up to be offset: (world vertices V (n,3),
+    their offset directions W (n,3), triangles (m,3)). V + d W is the offset
+    by d: W is the normal where the surface is smooth; where faces meet at an
+    edge or corner, W moves the point onto every face's offset at once (the
+    least-norm w with n_i . w = 1 for each face normal n_i there), so offset
+    faces meet with extended corners, as the real offset makes them."""
+    me = obj.data
+    nv, nl = len(me.vertices), len(me.loops)
+    co = np.empty(nv * 3)
+    me.vertices.foreach_get("co", co)
+    M = np.array(geom.world_matrix(obj), float)
+    V = co.reshape(-1, 3) @ M[:3, :3].T + M[:3, 3]
+    lv = np.empty(nl, np.int64)
+    me.loops.foreach_get("vertex_index", lv)
+    cn = np.empty(nl * 3)
+    me.corner_normals.foreach_get("vector", cn)
+    Nm = np.linalg.inv(M[:3, :3]).T                     # normals go by the inverse transpose
+    N = cn.reshape(-1, 3) @ Nm.T
+    N /= np.linalg.norm(N, axis=1, keepdims=True) + 1e-300
+    mean = np.zeros((nv, 3))
+    np.add.at(mean, lv, N)
+    W = mean / (np.linalg.norm(mean, axis=1, keepdims=True) + 1e-300)
+    sharp = np.zeros(nv, bool)
+    np.logical_or.at(sharp, lv, np.sum(N * W[lv], axis=1) < np.cos(np.radians(cos_deg)))
+    if sharp.any():
+        order = np.argsort(lv, kind="stable")
+        starts = np.searchsorted(lv[order], np.arange(nv))
+        ends = np.searchsorted(lv[order], np.arange(nv), side="right")
+        cmin = np.cos(np.radians(cos_deg))
+        for v in np.nonzero(sharp)[0]:
+            groups = []
+            for n in N[order[starts[v]:ends[v]]]:
+                if not any(n @ g > cmin for g in groups):
+                    groups.append(n)
+            A = np.array(groups)
+            W[v] = np.linalg.lstsq(A, np.ones(len(A)), rcond=None)[0]     # least norm: on every offset face
+    me.calc_loop_triangles()
+    T = np.empty(len(me.loop_triangles) * 3, np.int64)
+    me.loop_triangles.foreach_get("vertices", T)
+    # one plain surface is offset along ITS normal (du x dv), which the shaded
+    # face may show the other way (a sphere's points inward): follow it
+    try:
+        if store.is_natural(obj) and store.get_brep(obj).face_count() == 1:
+            surf = store.get_surfaces(obj)[0]
+            (u0, u1), (v0, v1) = surf.u_domain(), surf.v_domain()
+            D = surf.derivatives(0.5 * (u0 + u1), 0.5 * (v0 + v1))
+            p = M[:3, :3] @ np.array(D[0], float) + M[:3, 3]
+            ns = Nm @ np.cross(np.array(D[1], float), np.array(D[2], float))
+            k = int(np.argmin(np.linalg.norm(V - p, axis=1)))
+            if ns @ W[k] < 0:
+                W = -W
+    except Exception:
+        pass
+    return V, W, T.reshape(-1, 3), sharp
+
+
+class NPROTO_OT_offset(ValueDrag, AskValue, bpy.types.Operator):
+    """Offset NURBS surfaces along their normal. From the UI an arrow on the
+    surface shows which side it goes; drag it (through the surface for the
+    other side), type a value, click away or Enter to make it"""
     bl_idname = "nproto.offset"
     bl_label = "Offset"
     bl_options = {'REGISTER', 'UNDO'}
 
     distance: FloatProperty(name="Distance", default=0.1, unit='LENGTH',
                             description="Along the normals (negative: the other side)")
+
+    # -- the live value stage (valuedrag.py) ----------------------------------
+    MAX_FILL = 60000            # more triangles than this: the preview draws only the edges
+
+    def drag_setup(self, context, mouse):
+        from mathutils.kdtree import KDTree
+        objs = [o for o in context.selected_objects if store.is_nurbs(o)]
+        act = context.view_layer.objects.active
+        objs.sort(key=lambda o: o != act)               # the handle stands on the active one
+        self._of = []
+        for o in objs:
+            V, W, T, sharp = offset_frame(o)
+            if not len(V):
+                continue
+            kd = KDTree(len(V))
+            for i, v in enumerate(V):
+                kd.insert(v, i)
+            kd.balance()
+            M = geom.world_matrix(o)
+            edges = []
+            for pl in store.display(o).get("edges", []):
+                if len(pl) < 2:
+                    continue
+                E = np.array([M @ Vector(p) for p in pl], float)
+                idx = [kd.find(Vector(p))[1] for p in E]
+                edges.append((E, W[idx]))
+            self._of.append((o, V, W, T, sharp, edges))
+        if not self._of:
+            return False
+        # the arrow: on a smooth spot near the middle of the first surface
+        o, V, W, T, sharp, _ = self._of[0]
+        cand = np.nonzero(~sharp)[0]
+        if not len(cand):
+            cand = np.arange(len(V))
+        c = V.mean(axis=0)
+        self._hv = int(cand[np.argmin(np.linalg.norm(V[cand] - c, axis=1))])
+        return True
+
+    def drag_handles(self):
+        o, V, W, T, sharp, _ = self._of[0]
+        B = V[self._hv]
+        n = W[self._hv] / (np.linalg.norm(W[self._hv]) or 1.0)
+        return [{"field": "distance", "kind": "arrow", "origin": B, "dir": n, "param": self.distance,
+                 "base": B, "to_value": lambda t: t}]
+
+    def drag_preview(self):
+        d = self.distance
+        lines, tris = [], []
+        total = sum(len(T) for _, _, _, T, _, _ in self._of)
+        for o, V, W, T, sharp, edges in self._of:
+            lines += [E + d * We for E, We in edges]
+            if total <= self.MAX_FILL:
+                tris.append((V + d * W)[T].reshape(-1, 3))
+        return {"lines": lines, "tris": np.vstack(tris) if tris else np.zeros((0, 3))}
+
+    def drag_key(self, context, event, ch):
+        if ch == "f":
+            self.distance = -self.distance
+            return True
+        return False
+
+    def drag_rows(self):
+        return [("Side", [hints.key("F", "the other side"),
+                          hints.note("or drag the arrow through the surface")])]
 
     def invoke(self, context, event):
         if not any(store.is_nurbs(o) for o in context.selected_objects):

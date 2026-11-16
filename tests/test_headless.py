@@ -116,6 +116,59 @@ for _dr in (0.0, 8.0):
                           for c in [(0, 8, 0), (2, 8, 0), (2, 9, 0), (0, 9, 0)]))
 check("extruded rectangle: drawn edges and pick outlines hit every corner (plain, draft)",
       max(_rc_corner) < 1e-9, [round(float(x), 6) for x in _rc_corner])
+# --- Revolve / Offset / Edge Fillet previews (valuedrag.py) land on what the commands build
+from mathutils.bvhtree import BVHTree as _BVH
+from blender_nurbs.valuedrag import rotate_points as _rot
+from blender_nurbs.ops import offset_frame as _offr
+from blender_nurbs.ops_trim import fillet_frames as _ffr, fillet_sections as _fsec
+
+def _tree(o_):
+    M_ = o_.matrix_world
+    return _BVH.FromPolygons([M_ @ v_.co for v_ in o_.data.vertices], [p_.vertices[:] for p_ in o_.data.polygons])
+
+_pv_prof = nurbs("PvProf", [(1, 0, 0), (1.3, 0, 0.5), (0.8, 0, 1), (1, 0, 1.5)])
+_pv_prof.location = (0.5, 0.2, 9.0); ctx.view_layer.update()
+_S = geom.sample_curve(features.input_curve(_pv_prof, "S0"), 97)
+_rv_gap = []
+for _ang, _ax, _pvt in ((120.0, "Z", "WORLD"), (-75.0, "LOCAL_Z", "OBJECT"), (360.0, "Y", "WORLD")):
+    _z = np.array(geom.axis_vector(_ax, _pv_prof), float); _z /= np.linalg.norm(_z)
+    _O = np.array(geom.world_matrix(_pv_prof).translation if _pvt == "OBJECT" else (0, 0, 0), float)
+    _sf = features.run("revolve", [(_pv_prof, "S0")], {"angle": _ang, "axis": _ax, "pivot": _pvt})
+    _sm = _kl()
+    _cp = lambda q_: np.array((lambda c_: [c_.x, c_.y, c_.z] if hasattr(c_, "x") else list(c_))(
+        _sm.surface_closest_point(_sf, tuple(float(x_) for x_ in q_))[0]), float)
+    _rv_gap.append(max(np.linalg.norm(_cp(q_) - q_)
+                       for f_ in (0.5, 1.0) for q_ in _rot(_S[::8], _O, _z, _ang * f_)))
+check("revolve preview: rotated profiles lie on the built surface (world / local axis, object pivot, 360)",
+      max(_rv_gap) < 1e-6, [float(f"{x:.2g}") for x in _rv_gap])
+
+bpy.ops.nproto.extrude(inputs=ins((_pv_open, "S0")), distance=1.5, direction="Z"); _osh = ctx.active_object
+bpy.ops.nproto.add_primitive(kind="BOX", width=2, depth=1.5, height=1); _obx = ctx.active_object
+_obx.location = (0, -12, 0); ctx.view_layer.update()
+_of_gap = []
+for _o, _d in ((_osh, 0.2), (_osh, -0.15), (_obx, 0.2)):
+    bpy.ops.object.select_all(action='DESELECT'); _o.select_set(True); ctx.view_layer.objects.active = _o
+    _V, _W, _T, _sh = _offr(_o)
+    bpy.ops.nproto.offset(distance=_d); _res = ctx.active_object; ctx.view_layer.update()
+    _t = _tree(_res)
+    _of_gap.append(max(_t.find_nearest(Vector(q_))[3] for q_ in _V + _d * _W))
+    bpy.data.objects.remove(_res)
+check("offset preview: the offset mesh lies on the result (sheet both sides, box with extended corners)",
+      max(_of_gap) < 2e-3, [round(float(x), 5) for x in _of_gap])
+
+_fl_gap = []
+for _shape in ("CIRCULAR", "CHAMFER"):
+    bpy.ops.nproto.add_primitive(kind="BOX", width=2, depth=1.5, height=1); _fb = ctx.active_object
+    _fb.location = (0, -16, 0); ctx.view_layer.update()
+    _ei = store.shared_edges(_fb)[0]
+    _P, _D1, _D2 = _ffr(_fb, _ei)
+    _X = _fsec(_P, _D1, _D2, 0.2, _shape)
+    bpy.ops.nproto.edge_fillet(inputs=json.dumps([[_fb.name, f"E{_ei}"]]), radius=0.2, shape=_shape)
+    ctx.view_layer.update()
+    _t = _tree(_fb)
+    _fl_gap.append(max(_t.find_nearest(Vector(q_))[3] for q_ in _X[1:-1].reshape(-1, 3)))
+check("edge fillet preview: rolling-ball arc and chamfer line lie on the kernel's fillet (box edge)",
+      max(_fl_gap) < 1e-3, [round(float(x), 6) for x in _fl_gap])
 # drafts of smooth curves: the result is a fit within ~3e-4 of the true draft here
 check("extrude preview rows lie on the built surface's edges (plain, tilt, draft, symmetric, cone, polyline)",
       max(_pv_worst) < 1e-3 and max(_pv_worst[i] for i in (0, 1, 6, 7, 8)) < 1e-5, _pv_worst)

@@ -80,12 +80,13 @@ def fmt_length(context, x):
         return f"{x:.4g}"
 
 
-def ruled_preview(rows, ribs=8):
+def ruled_preview(rows, ribs=8, row_every=1):
     """Lines and see-through fill of a surface given by rows of points (the
-    preview of a ruled / extruded surface): every row, a few ribs across them
-    (the ends always), and triangles between neighbouring rows."""
+    preview of a ruled / extruded / revolved surface): the rows (every
+    row_every-th, the first and last always), a few ribs across them (the
+    ends always), and triangles between neighbouring rows."""
     rows = [np.asarray(r, float) for r in rows]
-    lines = [r for r in rows]
+    lines = [r for i, r in enumerate(rows) if i % row_every == 0 or i == len(rows) - 1]
     n = len(rows[0])
     for k in sorted({0, n - 1} | {int(round(i * (n - 1) / ribs)) for i in range(ribs + 1)}):
         lines.append(np.array([r[k] for r in rows]))
@@ -115,7 +116,13 @@ class ValueDrag:
       drag_handles() -> [handle]
             each {"field", "kind" ("arrow" | "draft"), "origin", "dir", "param",
             "to_value"(t) -> value, "base" (arrow: the shaft's foot)}: the
-            handle sits at origin + param * dir and is dragged along that line
+            handle sits at origin + param * dir and is dragged along that line.
+            Optional: "pos" (where it sits, when not on a line), "pick"(ray
+            origin, ray direction, current param) -> param (a handle not
+            dragged along a line, e.g. an angle around an axis), "path" (world
+            points: the shaft drawn along them), "head_from" (a point the
+            arrowhead points away from), "snap" ((step, Shift step) for Ctrl;
+            a length snaps to the grid, an angle to 1 degree by default)
       drag_preview() -> {"lines": [polylines], "tris": (n,3)}
       drag_check() -> str           why it can't be applied yet ('' when it can)
       drag_key(context, event, ch)  a key of the tool's own: True when handled
@@ -125,6 +132,9 @@ class ValueDrag:
 
     drag_fields = ("distance",)
     angle_fields = ()
+    ask_dialog = True       # False: without the stage (Value Input = Dialog) run at once, as the tool always did
+    fit_view = "both"       # a start length that is off-screen at this zoom: "both" sized to the view,
+                            # "shrink" only made smaller (a radius the part allows), "none" kept
 
     def invoke(self, context, event):
         self._start_event = (event.mouse_x, event.mouse_y, event.type, event.value)
@@ -132,7 +142,7 @@ class ValueDrag:
 
     def ask(self, context):
         if bpy.app.background or hints.value_input() == 'DIALOG':
-            return super().ask(context)      # the dialog (the preference, or no view to drag in)
+            return self._fallback(context)   # the dialog (the preference, or no view to drag in)
         self.prepare_value(context)
         region, rv3d = self._win(context)
         se = getattr(self, "_start_event", None)
@@ -148,7 +158,7 @@ class ValueDrag:
             print("NURBS value preview:", exc)
             ready = False
         if not ready:
-            return super().ask(context)
+            return self._fallback(context)
         self._dragging = True
         self._field = 0
         self._typed = ""
@@ -167,6 +177,9 @@ class ValueDrag:
         context.window_manager.modal_handler_add(self)
         self._drag_refresh(context)
         return {'RUNNING_MODAL'}
+
+    def _fallback(self, context):
+        return super().ask(context) if self.ask_dialog else self.execute(context)
 
     # -- the view ------------------------------------------------------------
     @staticmethod
@@ -252,11 +265,11 @@ class ValueDrag:
         """A starting length that fits this view: the last value used unless
         its arrow would be shorter than 40 px or longer than about half the
         view; then a round length about a quarter of the view, same sign."""
-        if self._is_angle(self.drag_fields[0]):
+        if self._is_angle(self.drag_fields[0]) or self.fit_view == "none":
             return
         region, rv3d = self._win(context)
         h = self._main_handle()
-        if rv3d is None or region is None or h is None:
+        if rv3d is None or region is None or h is None or h.get("pick") is not None:
             return
         B, d = np.asarray(h["origin"], float), np.asarray(h["dir"], float)
         d = d / (np.linalg.norm(d) or 1.0)
@@ -265,16 +278,32 @@ class ValueDrag:
             return                      # seen (almost) end-on: its length can't be judged on screen
         name = self.drag_fields[0]
         v = getattr(self, name)
+        px = abs(h["param"]) * ppu          # the handle's distance from its foot, on screen
         view = min(region.width, region.height)
-        if 40.0 <= abs(v) * ppu <= 0.45 * view:
-            return
-        from .ops_trim import nice_length
-        setattr(self, name, (-1.0 if v < 0 else 1.0) * nice_length(0.25 * view / ppu))
+        if px > 0.45 * view or (px < 40.0 and self.fit_view == "both"):
+            from .ops_trim import nice_length
+            new = h["to_value"]((-1.0 if h["param"] < 0 else 1.0) * 0.25 * view / ppu)
+            if new is not None and abs(new) > 0:
+                new = (-1.0 if new < 0 else 1.0) * nice_length(abs(new))
+                if self.fit_view == "both" or abs(new) < abs(v):
+                    setattr(self, name, new)
 
     # -- handles ----------------------------------------------------------------
     @staticmethod
     def _pos(h):
+        if h.get("pos") is not None:
+            return np.asarray(h["pos"], float)
         return np.asarray(h["origin"], float) + h["param"] * np.asarray(h["dir"], float)
+
+    def _pick(self, context, m, h, prev=None):
+        """The handle's parameter for region point m (None: can't tell from
+        here). prev: the parameter to stay near (an angle: which turn)."""
+        region, rv3d = self._win(context)
+        o = view3d_utils.region_2d_to_origin_3d(region, rv3d, m)
+        r = view3d_utils.region_2d_to_vector_3d(region, rv3d, m)
+        if h.get("pick") is not None:
+            return h["pick"](np.asarray(o, float), np.asarray(r, float), h["param"] if prev is None else prev)
+        return axis_param(o, r, h["origin"], h["dir"])
 
     def _handle_at(self, context, m):
         """Index of the handle under region point m, or None."""
@@ -296,7 +325,7 @@ class ValueDrag:
         """Grab handle i at region point m. absolute: the handle jumps to the
         cursor (a pull out of the curve); else it keeps its offset to it."""
         h = self.drag_handles()[i]
-        t = self._ray_param(context, m, h["origin"], h["dir"])
+        t = self._pick(context, m, h, 0.0 if absolute else None)
         if t is None:
             return False
         self._grab = {"i": i, "t0": t, "p0": 0.0 if absolute else h["param"], "fine": False,
@@ -311,7 +340,7 @@ class ValueDrag:
         g = self._grab
         h = self.drag_handles()[g["i"]]
         m = self._mouse(context, event)
-        t = self._ray_param(context, m, h["origin"], h["dir"])
+        t = self._pick(context, m, h)
         if t is None:
             return
         fine = bool(event.shift)
@@ -323,7 +352,9 @@ class ValueDrag:
         if v is None:
             return
         if event.ctrl:
-            if self._is_angle(name):
+            if h.get("snap"):
+                v = snap(v, h["snap"][1] if fine else h["snap"][0])
+            elif self._is_angle(name):
                 v = snap(v, 0.1 if fine else 1.0)
             else:
                 d = np.asarray(h["dir"], float)
@@ -344,7 +375,7 @@ class ValueDrag:
         if self._typed or self._is_angle(name):
             return ""
         h = self._main_handle()
-        if h is None:
+        if h is None or h.get("pick") is not None:
             return ""
         d = np.asarray(h["dir"], float)
         ppu = self._ppu_along(context, np.asarray(h["origin"], float), d / (np.linalg.norm(d) or 1.0))[0]
@@ -469,7 +500,8 @@ class ValueDrag:
                 hot = i == active_i
                 pos = self._pos(h)
                 pv["handles"].append({"kind": h["kind"], "pos": pos, "base": h.get("base"),
-                                      "dir": h["dir"], "hot": hot, "active": f == name})
+                                      "dir": h.get("dir"), "path": h.get("path"),
+                                      "head_from": h.get("head_from"), "hot": hot, "active": f == name})
                 val = f"{self._typed}|" if (f == name and self._typed) else self._fmt(context, f)
                 if f == name or hot or self._is_angle(f) and abs(getattr(self, f)) > 1e-9:
                     pv["labels"].append((pos, f"{self._label(f)} {val}", f == name))
@@ -483,9 +515,7 @@ class ValueDrag:
         if self._msg:
             state.append(self._msg)
             self._msg = ""
-        rows = [("Handles", [hints.key("LMB drag", "arrow: distance"),
-                             hints.key("LMB drag", "diamond: draft")] if "draft" in self.drag_fields
-                 else [hints.key("LMB drag", "a handle")]),
+        rows = [("Handles", list(self.drag_handle_hints())),
                 ("Value", [hints.key("0-9", "type it", on=True if self._typed else None),
                            hints.key("Ctrl", "snap to grid"), hints.key("Shift", "precise"),
                            hints.key("Backspace", "erase")])]
@@ -512,6 +542,9 @@ class ValueDrag:
     def drag_rows(self):
         return []
 
+    def drag_handle_hints(self):
+        return [hints.key("LMB drag", "the arrow")]
+
     def drag_state(self):
         return []
 
@@ -530,3 +563,29 @@ def draft_angle(off, h):
     if abs(h) < 1e-12:
         return None
     return math.degrees(math.atan(off / h))
+
+
+def rotate_points(P, O, z, deg):
+    """Points P turned by deg degrees about the axis through O along unit z
+    (right-handed, as a revolve with a positive angle)."""
+    P = np.asarray(P, float)
+    rel = P - O
+    c, s_ = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+    along = np.outer(rel @ z, z)
+    return O + along + (rel - along) * c + np.cross(z, rel) * s_
+
+
+def angle_pick(C, x, y, z, ray_o, ray_d, prev):
+    """The angle (degrees, the turn nearest prev, within +-360) of where the
+    mouse ray meets the plane through C across the axis z, measured from x
+    towards y; None when the plane is seen (almost) edge-on."""
+    den = float(ray_d @ z) / (np.linalg.norm(ray_d) or 1.0)
+    if abs(den) < 0.05:
+        return None
+    t = float((C - ray_o) @ z) / float(ray_d @ z)
+    v = ray_o + t * ray_d - C
+    if np.linalg.norm(v) < 1e-12:
+        return None
+    a = math.degrees(math.atan2(float(v @ y), float(v @ x)))
+    a += 360.0 * round((prev - a) / 360.0)
+    return max(-360.0, min(360.0, a))
