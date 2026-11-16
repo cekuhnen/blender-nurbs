@@ -306,6 +306,8 @@ class NprotoView(bpy.types.PropertyGroup):
                                                "Analyze > Continuity Check", update=lambda s, c: _redraw_views(c))
     cont_show_checks: BoolProperty(name="Show Checks", default=True, update=lambda s, c: _redraw_views(c),
                                    description="Show the labels and combs of the edges picked with Continuity Check")
+    cont_show_list: BoolProperty(name="Checked Edges", default=True,
+                                 description="Show or hide the list of checked edges (its header counts the ones that fail)")
     cont_level: EnumProperty(name="Show", update=lambda s, c: _redraw_views(c), default='G2',
                              items=[('G0', "G0", "Position: the gap between the two sides (comb = gap, magnified)"),
                                     ('G1', "G1", "Tangency: the angle between the two sides' normals (comb = angle)"),
@@ -315,7 +317,7 @@ class NprotoView(bpy.types.PropertyGroup):
                               update=lambda s, c: _redraw_views(c), description="Comb length: at 1 the longest hair is a fifth of the edge's length (+ / - in the tool)")
     cont_kcombs: BoolProperty(name="Curvature Combs", default=False, update=lambda s, c: _redraw_views(c),
                               description="G2: also draw each side's own curvature across the edge (white / magenta); "
-                                          "where the edge is G2 the two lie on each other")
+                                          "where the edge is G2 the two lie on each other (K in the tool)")
     cont_samples: IntProperty(name="Samples", default=160, min=16, max=2000, update=lambda s, c: _redraw_views(c),
                               description="Points measured along each checked edge. A dense surface needs about 4 per CV "
                                           "for its true comb (the panel says how many). More: smoother, slower")

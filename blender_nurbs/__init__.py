@@ -26,11 +26,13 @@ def register():
     step_export.register()
     step_import.register()
     subsel.register()
+    contcheck.register()
     snapping.register()
 
 
 def unregister():
     snapping.unregister()
+    contcheck.unregister()
     subsel.unregister()
     step_import.unregister()
     step_export.unregister()
