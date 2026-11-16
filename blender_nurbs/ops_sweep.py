@@ -624,6 +624,12 @@ class NPROTO_OT_merge_patches(bpy.types.Operator):
                                            "0 = the fewest within the tolerance")
     merge_knots: EnumProperty(name="Knots", items=MERGE_KNOTS, default="ADAPTIVE",
                               description="Where Refit puts its knots")
+    merge_reduce_degree: BoolProperty(name="Reduce Degree", default=False,
+                                      description="Also lower the degree (u and v on their own, e.g. 6 to 3) while "
+                                                  "the surface and the kept edges stay within their tolerances")
+    merge_keep_original: BoolProperty(name="Keep Original", default=False,
+                                      description="Merge into a new object and keep the joined patches (hidden) "
+                                                  "to compare against")
     merge_show_dev: BoolProperty(name="Deviation Map", default=True,
                                  description="Colour the result by its distance from the patches while this panel "
                                              "is open: blue below, green on, red above (the ramp spans "
@@ -647,7 +653,7 @@ class NPROTO_OT_merge_patches(bpy.types.Operator):
         p = {"merge_mode": self.merge_mode, "merge_tolerance": self.merge_tolerance, "merge_degree": self.merge_degree,
              "merge_spans_u": self.merge_spans_u, "merge_spans_v": self.merge_spans_v,
              "merge_edge_tolerance": self.merge_edge_tolerance, "merge_knots": self.merge_knots,
-             "merge_seams": self.merge_seams}
+             "merge_seams": self.merge_seams, "merge_reduce_degree": self.merge_reduce_degree}
         for s_, _ in MERGE_SIDE_NAMES:
             p[f"merge_cont_{s_}"] = getattr(self, f"merge_cont_{s_}")
         return p
@@ -666,12 +672,15 @@ class NPROTO_OT_merge_patches(bpy.types.Operator):
                 return f"{m * 1e6:.1f} µm" if m < 1e-4 else f"{m * 1e3:.4f} mm"
             return f"{x:.1e}"
         lay.prop(self, "merge_mode", expand=True)
+        lay.prop(self, "merge_keep_original")
         if self.merge_mode != "EXACT":
             row = lay.row(align=True)
             row.prop(self, "merge_tolerance")
             if self.merge_tolerance <= 0 and inf:
                 row.label(text=f"auto {dist(inf['tolerance'])}")
         refit = self.merge_mode == "REFIT" or (inf and inf.get("route") == "projected")
+        if self.merge_mode == "REDUCE" and not refit:
+            lay.prop(self, "merge_reduce_degree")
         if refit:
             lay.prop(self, "merge_degree")
             row = lay.row(align=True)
@@ -778,6 +787,12 @@ class NPROTO_OT_merge_patches(bpy.types.Operator):
     def _run(self, context, objs, p, done):
         from . import merge
         for o in objs:
+            if self.merge_keep_original:       # merge a plain copy; the joined patches stay as they are, hidden
+                src = o
+                o = store.new_object_text(context, f"{src.name} Merged", src[store.PROP_BREP], src.matrix_world.copy())
+                for mat in src.data.materials:
+                    o.data.materials.append(mat)
+                src.hide_set(True)
             try:
                 if features.history_enabled(context):
                     features.push_step(o, "merge_patches", [], p)
@@ -796,6 +811,9 @@ class NPROTO_OT_merge_patches(bpy.types.Operator):
                     except Exception:
                         pass
                 self.report({'ERROR'}, f"{o.name}: {exc}")
+                if self.merge_keep_original:      # no merge: drop the copy, show the patches again
+                    bpy.data.objects.remove(o)
+                    src.hide_set(False)
 
 
 class NPROTO_OT_rebuild_surface(bpy.types.Operator):

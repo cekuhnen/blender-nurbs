@@ -9545,7 +9545,7 @@ check("merge patches seams: spans set too few for a kink smooth it and say so",
 bpy.ops.object.select_all(action='DESELECT')
 _SJ.select_set(True)
 ctx.view_layer.objects.active = _SJ
-r = bpy.ops.nproto.merge_patches(merge_mode="REFIT", merge_knots="UNIFORM")
+r = _r_sj = bpy.ops.nproto.merge_patches(merge_mode="REFIT", merge_knots="UNIFORM")
 _dmap_ok = False
 try:
     from blender_nurbs import draw as _dr
@@ -9568,7 +9568,49 @@ check("merge patches deviation map: drawn while the panel is open, a mesh with o
       _dmap_ok is True and len(_dT) > 0 and len(_dV) == len(_dP)
       and abs(float(np.abs(_dV).max()) - _mg.LAST_INFO["deviation"]) <= 0.2 * _mg.LAST_INFO["deviation"] + 1e-12,
       (_dmap_ok, len(_dP), float(np.abs(_dV).max()) if len(_dV) else None, _mg.LAST_INFO.get("deviation")))
-check("merge patches operator: Knots option reaches the history step", r == {'FINISHED'}
+# Reduce Degree: the 2 x 2 test cubic cut in two and raised to degree 5 comes back down to the cubic net
+# (edges held at G2)
+from blender_nurbs.geom import raise_array as _ra
+_rdP = []
+for (_N, _UN) in _msplit(_mP, _mUu, 0.5, 0):
+    if sum(1 for x in _UN if x == _UN[0]) > 4:        # the right piece starts with an extra knot (a dead CV)
+        _N, _UN = _N[1:], list(_UN)[1:]
+    _q, _UU2, _A2 = _ra(3, list(_UN), _N.reshape(len(_N), -1), 5)
+    _A2 = np.asarray(_A2).reshape(len(_A2), _N.shape[1], 3).transpose(1, 0, 2)
+    _q, _VV2, _A3 = _ra(3, list(_mUv), _A2.reshape(len(_A2), -1), 5)
+    _A3 = np.asarray(_A3).reshape(len(_A3), -1, 3).transpose(1, 0, 2)
+    _rdP.append(store.new_object(ctx, f"RdPiece{len(_rdP)}", ext.surface_from_cvs(
+        5, 5, [tuple(map(float, x)) for x in _A3.reshape(-1, 3)], [float(x) for x in _UU2], [float(x) for x in _VV2])))
+_RDJ = _zjoin(*_rdP)
+_rd0 = _mg.merge_text(_RDJ[store.PROP_BREP], "REDUCE", 0, 3, cont="G2")[1]
+_rd1 = _mg.merge_text(_RDJ[store.PROP_BREP], "REDUCE", 0, 3, cont="G2", lower_degree=True)[1]
+check("merge patches Reduce Degree: degree-5 patches of a cubic come back as the cubic net, edges held",
+      _rd0["degree"] == (5, 5) and _rd1["degree"] == (3, 3) and _rd1["cvs"] == (7, 6) and _rd1["deviation"] < 1e-9
+      and _rd1["edges_ok"], (_rd0["degree"], _rd0["cvs"], _rd1["degree"], _rd1["cvs"], f"{_rd1['deviation']:.1e}"))
+# Keep Original: the merge goes to a new object, the joined patches stay (hidden) with their faces
+bpy.ops.object.select_all(action='DESELECT')
+_RDJ.select_set(True)
+ctx.view_layer.objects.active = _RDJ
+r = bpy.ops.nproto.merge_patches(merge_mode="REDUCE", merge_reduce_degree=True, merge_keep_original=True)
+_rdn = ctx.view_layer.objects.active
+check("merge patches Keep Original: a new merged object, the joined patches kept hidden and unchanged",
+      r == {'FINISHED'} and _rdn != _RDJ and _rdn.name.endswith("Merged") and store.get_brep(_rdn).face_count() == 1
+      and _RDJ.hide_get() and store.get_brep(_RDJ).face_count() == 2
+      and features.stack(_rdn)[-1]["params"].get("merge_reduce_degree") is True,
+      (r, _rdn.name, _RDJ.hide_get(), store.get_brep(_RDJ).face_count()))
+# a joined feature that lost an input (deleted) still takes a history step: it starts from its last geometry
+_lj = _zjoin(_zpatch("LostA", 5, lambda i: 0.0), _zpatch("LostB", 6, lambda i: 0.0))
+_lost = [o_ for o_ in bpy.data.objects if o_.name.startswith("LostB")][0]
+bpy.data.objects.remove(_lost)
+_lj_hist = features.history(_lj) is None
+bpy.ops.object.select_all(action='DESELECT')
+_lj.select_set(True)
+ctx.view_layer.objects.active = _lj
+r = bpy.ops.nproto.merge_patches(merge_mode="REFIT")
+check("history: a feature whose input was deleted still takes a step (Merge Patches on it works)",
+      _lj_hist and r == {'FINISHED'} and store.get_brep(_lj).face_count() == 1 and features.PROP_BASE in _lj,
+      (_lj_hist, r))
+check("merge patches operator: Knots option reaches the history step", _r_sj == {'FINISHED'}
       and features.stack(_SJ)[-1]["op"] == "merge_patches"
       and features.stack(_SJ)[-1]["params"].get("merge_knots") == "UNIFORM")
 

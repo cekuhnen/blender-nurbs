@@ -347,22 +347,61 @@ def _worst(errs):
     return w
 
 
-def _fit_dir(net, Unew, along, cont=None):
-    """Least squares of the net's CV curves (along u or v) on knots Unew,
-    keeping their end derivatives up to the continuity of the two sides the
-    curves run into (so those edges and their cross derivatives stay exact)."""
+def _fit_dir(net, Unew, along, cont=None, q=None):
+    """Least squares of the net's CV curves (along u or v) on knots Unew
+    (degree q, default the net's), keeping their end derivatives up to the
+    continuity of the two sides the curves run into (so those edges and
+    their cross derivatives stay exact)."""
     cont = cont or {}
     if along == "v":
         tc = {"u0": cont.get("v0", -1), "u1": cont.get("v1", -1)}
-        return _transpose(_fit_dir(_transpose(net), Unew, "u", tc))
+        return _transpose(_fit_dir(_transpose(net), Unew, "u", tc, q))
     p, U, P = net["pu"], net["Uu"], net["P"]
     nu, nv, _ = P.shape
     C = P.reshape(nu, nv * 4)
     t = _dense_params(U, 2 * p + 2)
     D = _basis(U, p, t) @ C
     s, e = _end_derivs(U, p, C, max(0, cont.get("u0", -1)), max(0, cont.get("u1", -1)))
-    Q, _ = fit1d(t, D, Unew, p, s, e)
-    return {"P": Q.reshape(len(Q), nv, 4), "Uu": np.asarray(Unew), "Uv": net["Uv"], "pu": p, "pv": net["pv"]}
+    q = p if q is None else int(q)
+    Q, _ = fit1d(t, D, Unew, q, s, e)
+    return {"P": Q.reshape(len(Q), nv, 4), "Uu": np.asarray(Unew), "Uv": net["Uv"], "pu": q, "pv": net["pv"]}
+
+
+def _lower_knots(U, p, q):
+    """Knot vector for degree q < p with every inner knot keeping its
+    continuity order (C^(p - mult)): multiplicity mult - (p - q), at least 1."""
+    U = np.round(np.asarray(U, float), 12)
+    inner = []
+    for k in sorted(set(U[p + 1:len(U) - p - 1])):
+        mult = int(np.sum(U == k))
+        inner += [float(k)] * max(1, mult - (p - q))
+    return _knots(q, inner)
+
+
+def reduce_degree(net, ref, surf_err, tol, cont, edge_tol, kmin=0.0, min_degree=1, knots_between=True):
+    """Lower the degree one step at a time, u or v (whichever stays closer),
+    while the surface stays within tol and the kept edges within their
+    checks; knots_between: remove knots after each step."""
+    cur = net
+    cur_err = surf_err(cur)
+    while True:
+        best = None
+        for along in ("u", "v"):
+            p = cur["pu"] if along == "u" else cur["pv"]
+            if p - 1 < min_degree:
+                continue
+            U = cur["Uu"] if along == "u" else cur["Uv"]
+            cand = _fit_dir(cur, _lower_knots(U, p, p - 1), along, cont, p - 1)
+            e = surf_err(cand)
+            if e > tol or (best is not None and e >= best[0]):
+                continue
+            if not edges_ok(side_errors(cand, ref, cont, kmin=kmin), edge_tol):
+                continue
+            best = (e, cand)
+        if best is None:
+            return cur, cur_err
+        cur = reduce_knots(best[1], ref, surf_err, tol, cont, edge_tol, kmin)[0] if knots_between else best[1]
+        cur_err = surf_err(cur)
 
 
 def reduce_knots(net, ref, surf_err, tol, cont, edge_tol, kmin=0.0, max_iter=400):
@@ -822,7 +861,7 @@ def _cont_dict(cont):
 
 
 def merge_text(text, mode="REDUCE", tol=0.0, degree=3, spans_u=0, spans_v=0, tol_rel=1e-4, cont="G2", edge_tol=0.0,
-               knots="ADAPTIVE", seams="KEEP", devmap=False):
+               knots="ADAPTIVE", seams="KEEP", devmap=False, lower_degree=False):
     """Brep text of the single merged surface. Returns (text, info).
     tol: absolute tolerance (0 = tol_rel x size); cont: edge continuity kept
     (per side or one for all); edge_tol: edge position tolerance (0 = tol/10)."""
@@ -873,6 +912,14 @@ def merge_text(text, mode="REDUCE", tol=0.0, degree=3, spans_u=0, spans_v=0, tol
             errs = {s: {"pos": 0.0} for s in SIDES if cont[s] >= 0}
         elif mode == "REDUCE":
             out, dev = reduce_knots(merged, ref, surf_err, tol, cont, edge_tol, kmin)
+            if lower_degree:
+                # degree first (on the exact net, knots removed after each step) or knots first: removing
+                # knots first can use up the tolerance the degree steps need, and the other way round
+                cands = [reduce_degree(out, ref, surf_err, tol, cont, edge_tol, kmin)]
+                d1 = reduce_degree(merged, ref, surf_err, tol, cont, edge_tol, kmin, knots_between=False)[0]
+                d1 = reduce_knots(d1, ref, surf_err, tol, cont, edge_tol, kmin)[0]
+                cands.append((d1, surf_err(d1)))
+                out, dev = min(cands, key=lambda c_: (c_[0]["P"].shape[0] * c_[0]["P"].shape[1], c_[1]))
             errs = side_errors(out, ref, cont, kmin=kmin)
         else:
             out, spans, dev, errs = refit_net(ref, degree, spans_u, spans_v, tol, cont, edge_tol, surf_err=surf_err,
@@ -949,7 +996,7 @@ def apply_merge(obj, text, inputs, p):
                            int(p.get("merge_spans_v", 0)), cont=params_cont(p),
                            edge_tol=float(p.get("merge_edge_tolerance", 0.0)),
                            knots=p.get("merge_knots", "ADAPTIVE"), seams=p.get("merge_seams", "KEEP"),
-                           devmap=want)
+                           devmap=want, lower_degree=bool(p.get("merge_reduce_degree", False)))
     dm = info.pop("devmap", None)
     if dm is not None:
         V = np.abs(dm[3])

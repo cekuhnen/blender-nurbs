@@ -1653,7 +1653,9 @@ def push_step(obj, op, inputs, params, base_text=None):
     (only used when the object has no base feature of its own)."""
     from . import store
     entries = stack(obj)
-    if PROP_HIST not in obj and PROP_BASE not in obj:
+    # no base feature, or one that can no longer run (an input was deleted:
+    # history() is None and the rebuild starts from the stored base)
+    if PROP_BASE not in obj and history(obj) is None:
         obj[PROP_BASE] = base_text if base_text is not None else obj[store.PROP_BREP]
         obj[PROP_BASE + "_natural"] = 1 if store.is_natural(obj) else 0
     entries.append({"op": op, "inputs": list(inputs), "params": params})
