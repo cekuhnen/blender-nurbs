@@ -12,7 +12,7 @@ from mathutils import Matrix
 
 from . import features, primitives, store
 from .kernel import load as load_kernel
-from .ops import AXIS_ITEMS, CONT_ITEMS
+from .ops import AXIS_ITEMS, CONT_ITEMS, REVOLVE_AXIS_ITEMS
 
 _syncing = [False]
 
@@ -27,7 +27,7 @@ FIELDS = {
              "flip_normal"],
     "blend_curve": ["cont_a", "w_a", "c_a", "flip_a", "cont_b", "w_b", "c_b", "flip_b"],
     "extrude": ["distance", "direction", "dir_vec", "tilt", "tilt_azimuth", "draft", "draft_flip", "symmetric"],
-    "revolve": ["angle", "axis", "pivot", "seam_angle"],
+    "revolve": ["angle", "axis", "pivot", "seam_angle", "axis_point", "axis_dir"],
     "offset": ["distance"],
     "thicken": ["distance", "symmetric"],
     "planar": [],
@@ -304,7 +304,9 @@ class NprotoFeature(bpy.types.PropertyGroup):
     draft: FloatProperty(name="Draft °", soft_min=-45.0, soft_max=45.0, **_F())
     draft_flip: BoolProperty(name="Flip Draft", **_F())
     angle: FloatProperty(name="Angle", min=-360.0, max=360.0, **_F())
-    axis: EnumProperty(name="Axis", items=AXIS_ITEMS, **_F())
+    axis: EnumProperty(name="Axis", items=REVOLVE_AXIS_ITEMS, **_F())
+    axis_point: FloatVectorProperty(name="Axis Point", size=3, subtype='XYZ', unit='LENGTH', **_F())
+    axis_dir: FloatVectorProperty(name="Axis Direction", size=3, subtype='XYZ', **_F())
     seam_angle: FloatProperty(name="Seam Angle", soft_min=-180.0, soft_max=180.0, **_F())
     pivot: EnumProperty(name="Pivot", items=[("OBJECT", "Object Origin", ""), ("WORLD", "World Origin", "")], **_F())
     radius: FloatProperty(name="Radius", min=1e-4, unit='LENGTH', **_F())

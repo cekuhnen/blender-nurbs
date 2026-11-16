@@ -141,6 +141,21 @@ for _ang, _ax, _pvt in ((120.0, "Z", "WORLD"), (-75.0, "LOCAL_Z", "OBJECT"), (36
                        for f_ in (0.5, 1.0) for q_ in _rot(_S[::8], _O, _z, _ang * f_)))
 check("revolve preview: rotated profiles lie on the built surface (world / local axis, object pivot, 360)",
       max(_rv_gap) < 1e-6, [float(f"{x:.2g}") for x in _rv_gap])
+# a picked line as the axis: the surface turns about it, and the Feature box keeps it when the angle changes
+_ap, _ad = (3.0, 1.0, 9.0), (0.3, 0.2, 1.0)
+r = bpy.ops.nproto.revolve(inputs=ins((_pv_prof, "S0")), angle=150.0, axis="PICKED", axis_point=_ap, axis_dir=_ad)
+_rp = ctx.active_object
+_z = np.array(_ad) / np.linalg.norm(_ad)
+_sf = store.get_surfaces(_rp)[0]
+_Mrp = np.array(_rp.matrix_world, float)
+_gap_p = max(np.linalg.norm(_cp((np.linalg.inv(_Mrp) @ np.append(q_, 1.0))[:3]) - (np.linalg.inv(_Mrp) @ np.append(q_, 1.0))[:3])
+             for q_ in _rot(_S[::8], np.array(_ap), _z, 150.0))
+_rp.nproto_feature.angle = 90.0           # edit in the Feature box: rebuilds from the history
+_hp = features.history(_rp)["params"]
+check("revolve about a picked line: on the preview's rotation; a Feature box edit keeps the line",
+      r == {'FINISHED'} and _gap_p < 1e-5 and _hp["axis"] == "PICKED" and abs(_hp["angle"] - 90.0) < 1e-9
+      and np.allclose(_hp["axis_point"], _ap) and np.allclose(_hp["axis_dir"], _ad, atol=1e-6),
+      (r, float(f"{_gap_p:.2g}"), _hp.get("axis"), _hp.get("angle"), _hp.get("axis_point")))
 
 bpy.ops.nproto.extrude(inputs=ins((_pv_open, "S0")), distance=1.5, direction="Z"); _osh = ctx.active_object
 bpy.ops.nproto.add_primitive(kind="BOX", width=2, depth=1.5, height=1); _obx = ctx.active_object

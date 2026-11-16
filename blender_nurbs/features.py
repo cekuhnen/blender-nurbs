@@ -1331,12 +1331,22 @@ def revolve_exact(curve, origin, axis, angle_deg, start_deg=0.0):
                                 [float(t) for t in cv["knots"]], wts if rational else None)
 
 
+def revolve_axis(obj, p):
+    """(point, unit direction) of a revolve's axis (world): a world or local
+    axis through the pivot, or a picked line (axis_point, axis_dir)."""
+    if p.get("axis") == "PICKED":
+        d = Vector(p.get("axis_dir", (0.0, 0.0, 1.0)))
+        return Vector(p.get("axis_point", (0.0, 0.0, 0.0))), (d.normalized() if d.length > 1e-12 else Vector((0, 0, 1)))
+    axis = geom.axis_vector(p.get("axis", "Z"), obj)
+    origin = geom.world_matrix(obj).translation if p.get("pivot", "OBJECT") == "OBJECT" else Vector()
+    return Vector(origin), axis.normalized()
+
+
 @builder("revolve")
 def build_revolve(inputs, p):
     obj, ref = inputs[0]
     curve = input_curve(obj, ref)
-    axis = geom.axis_vector(p.get("axis", "Z"), obj)
-    origin = geom.world_matrix(obj).translation if p.get("pivot", "OBJECT") == "OBJECT" else Vector()
+    origin, axis = revolve_axis(obj, p)
     angle = float(p.get("angle", 360.0))
     seam = float(p.get("seam_angle", 0.0)) if abs(abs(angle) - 360.0) < 1e-9 else 0.0
     return revolve_exact(curve, tuple(origin), tuple(axis), angle, seam)

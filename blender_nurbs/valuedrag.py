@@ -123,7 +123,7 @@ class ValueDrag:
             points: the shaft drawn along them), "head_from" (a point the
             arrowhead points away from), "snap" ((step, Shift step) for Ctrl;
             a length snaps to the grid, an angle to 1 degree by default)
-      drag_preview() -> {"lines": [polylines], "tris": (n,3)}
+      drag_preview() -> {"lines": [polylines], "tris": (n,3), "guides": [(polyline, rgba)]}
       drag_check() -> str           why it can't be applied yet ('' when it can)
       drag_key(context, event, ch)  a key of the tool's own: True when handled
       drag_rows() / drag_state()    its hint-panel rows / header words
@@ -411,6 +411,9 @@ class ValueDrag:
             return {'PASS_THROUGH'}       # a gizmo drag needs them unhandled
         if et in NAV:
             return {'PASS_THROUGH'}
+        r = self.drag_modal_hook(context, event)      # a step of the tool's own (Revolve: A picks the axis)
+        if r is not None:
+            return r
         if hints.handle(event):
             context.area.tag_redraw()
             return {'RUNNING_MODAL'}
@@ -538,6 +541,10 @@ class ValueDrag:
 
     def drag_check(self):
         return ""
+
+    def drag_modal_hook(self, context, event):
+        """A step of the tool's own taking the events (a result), or None."""
+        return None
 
     def drag_rows(self):
         return []

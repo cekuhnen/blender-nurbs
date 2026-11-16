@@ -31,6 +31,9 @@ AXIS_ITEMS = [
     ("X", "World X", ""), ("Y", "World Y", ""), ("Z", "World Z", ""),
     ("LOCAL_X", "Local X", ""), ("LOCAL_Y", "Local Y", ""), ("LOCAL_Z", "Local Z", ""),
 ]
+# Revolve: also a line picked in the view (Axis Point + Axis Direction, world)
+REVOLVE_AXIS_ITEMS = AXIS_ITEMS + [("PICKED", "Picked Line", "A line, open curve or straight edge picked for it: "
+                                                               "from its start to its end (A while revolving)")]
 
 
 def _kernel_ok(op):
@@ -149,6 +152,13 @@ def _near_candidates(context, event, cands, max_px=18.0, tie_px=4.0):
     if under is not None:
         ties.sort(key=lambda c: c[0] != under)  # stable: object under cursor first
     return ties
+
+
+class _RegionMouse:
+    """A mouse position (region pixels), standing in for an event."""
+
+    def __init__(self, m):
+        self.mouse_region_x, self.mouse_region_y = float(m[0]), float(m[1])
 
 
 def _nearest(context, event, cands, max_px=18.0):
@@ -1125,14 +1135,20 @@ class NPROTO_OT_revolve(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
     op_name = "revolve"
 
     angle: FloatProperty(name="Angle", default=360.0, min=-360.0, max=360.0)
-    axis: EnumProperty(name="Axis", items=AXIS_ITEMS, default="LOCAL_Z")
-    pivot: EnumProperty(name="Pivot", items=[("OBJECT", "Object Origin", ""), ("WORLD", "World Origin", "")])
+    axis: EnumProperty(name="Axis", items=REVOLVE_AXIS_ITEMS, default="LOCAL_Z")
+    pivot: EnumProperty(name="Pivot", items=[("OBJECT", "Object Origin", ""), ("WORLD", "World Origin", "")],
+                        description="Where a world or local axis passes through (a picked line has its own place)")
+    axis_point: FloatVectorProperty(name="Axis Point", size=3, subtype='XYZ', unit='LENGTH',
+                                    description="Picked Line: a point the axis passes through (world)")
+    axis_dir: FloatVectorProperty(name="Axis Direction", size=3, subtype='XYZ', default=(0.0, 0.0, 1.0),
+                                  description="Picked Line: the axis' direction (world)")
     seam_angle: FloatProperty(name="Seam Angle", default=0.0, soft_min=-180.0, soft_max=180.0,
                               description="Full revolves: where the surface's seam sits around the axis. Turn it "
                                           "away from openings you will trim -- fillets cannot cross a seam")
 
     def params(self):
-        return {"angle": self.angle, "axis": self.axis, "pivot": self.pivot, "seam_angle": self.seam_angle}
+        return {"angle": self.angle, "axis": self.axis, "pivot": self.pivot, "seam_angle": self.seam_angle,
+                "axis_point": list(self.axis_point), "axis_dir": list(self.axis_dir)}
 
     # -- the live value stage (valuedrag.py) ----------------------------------
     drag_fields = ("angle",)
@@ -1153,11 +1169,8 @@ class NPROTO_OT_revolve(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
         return True
 
     def _axis(self):
-        obj = self._rv[0][0]
-        z = np.array(geom.axis_vector(self.axis, obj), float)
-        z /= np.linalg.norm(z) or 1.0
-        O = np.array(geom.world_matrix(obj).translation if self.pivot == "OBJECT" else (0.0, 0.0, 0.0), float)
-        return O, z
+        O, z = features.revolve_axis(self._rv[0][0], self.params())
+        return np.array(O, float), np.array(z, float)
 
     def _place(self, context):
         """The handle's foot: the profile point clicked (when it was picked
@@ -1209,7 +1222,12 @@ class NPROTO_OT_revolve(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
             L, T = ruled_preview(rows, ribs=8, row_every=3)
             lines += L
             tris.append(T)
-        return {"lines": lines, "tris": np.vstack(tris)}
+        # the axis, a little longer than the profile reaches along it
+        h = np.concatenate([(S - O) @ z for _, S in self._rv])
+        size = float(np.ptp(np.vstack([S for _, S in self._rv]), axis=0).max()) or 1.0
+        pad = max(0.15 * float(np.ptp(h)), 0.5 * size)     # visible even when the profile hardly runs along it
+        axis = np.array([O + z * (h.min() - pad), O + z * (h.max() + pad)])
+        return {"lines": lines, "tris": np.vstack(tris), "guides": [(axis, (0.55, 0.85, 1.0, 0.9))]}
 
     def drag_check(self):
         if abs(self.angle) < 0.05:
@@ -1220,6 +1238,9 @@ class NPROTO_OT_revolve(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
         if ch in self.AXES:         # X Y Z: that world axis; again: the object's local one
             ax = self.AXES[ch]
             self.axis = ("LOCAL_" + ax) if self.axis == ax else ax
+        elif ch == "a":
+            self._start_axis_pick(context)
+            return True
         elif ch == "o":
             self.pivot = "WORLD" if self.pivot == "OBJECT" else "OBJECT"
         elif ch == "f":
@@ -1233,14 +1254,69 @@ class NPROTO_OT_revolve(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
         return [hints.key("LMB drag", "the arrow around the axis: angle")]
 
     def drag_rows(self):
-        cur = self.axis.replace("LOCAL_", "").lower()
+        picked = self.axis == "PICKED"
+        cur = None if picked else self.axis.replace("LOCAL_", "").lower()
         return [("Axis", [hints.cycle("X Y Z", ["x", "y", "z"], cur),
-                          hints.cycle("O", ["object", "world"], self.pivot.lower(), "pivot"),
+                          hints.key("A", "pick a line / edge", on=True if picked else None),
+                          hints.cycle("O", ["object", "world"], None if picked else self.pivot.lower(), "pivot"),
                           hints.key("F", "other way"), hints.key("Ctrl", "5° steps")])]
 
     def drag_state(self):
+        if self.axis == "PICKED":
+            return ["Axis: picked line"]
         ax = self.axis.replace("LOCAL_", "Local ") if self.axis.startswith("LOCAL_") else "World " + self.axis
         return [f"Axis {ax}", "Pivot " + ("Object Origin" if self.pivot == "OBJECT" else "World Origin")]
+
+    # -- A: pick the axis (a line, an open curve, a straight edge) ------------
+    def _start_axis_pick(self, context):
+        ins = {(o.name, r) for o, r in _decode_inputs(self.inputs)}
+        self._axis_cands = [c for c in _pick_candidates(context) if (c[0].name, c[1]) not in ins
+                            and np.linalg.norm(np.asarray(c[2][-1]) - np.asarray(c[2][0])) > 1e-9]
+        self._axis_hover = None
+        self._picking_axis = True
+        draw.pick_overlay["hover"] = None
+        self._axis_hints(context)
+
+    def _axis_hints(self, context):
+        hints.show(context, self.bl_label, ["click a line, open curve or edge for the axis (start to end)"],
+                   [("Axis", [hints.key("LMB", "use it"), hints.key("Esc", "back, axis unchanged")])],
+                   [("MOUSE_LMB", "Pick the axis"), ("EVENT_ESC", "Back")])
+
+    def _end_axis_pick(self, context):
+        self._picking_axis = False
+        draw.pick_overlay["hover"] = None
+
+    def drag_modal_hook(self, context, event):
+        """While A is picking the axis: hover and click a candidate."""
+        if not getattr(self, "_picking_axis", False):
+            return None
+        et = event.type
+        if et in {'LEFTMOUSE', 'RIGHTMOUSE', 'MOUSEMOVE'} and not PickMixin._in_view(context, event):
+            return {'PASS_THROUGH'}
+        if et == 'MOUSEMOVE':
+            m = self._mouse(context, event)
+            ties = _near_candidates(context, _RegionMouse(m), self._axis_cands)
+            self._axis_hover = ties[0] if ties else None
+            draw.pick_overlay["hover"] = self._axis_hover[2] if self._axis_hover else None
+            context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+        if event.value != 'PRESS':
+            return {'RUNNING_MODAL'}
+        if et in {'ESC', 'RIGHTMOUSE'}:
+            self._end_axis_pick(context)
+            self._drag_refresh(context)
+            return {'RUNNING_MODAL'}
+        if et == 'LEFTMOUSE' and self._axis_hover is not None:
+            pts = self._axis_hover[2]
+            p0, p1 = np.asarray(pts[0], float), np.asarray(pts[-1], float)
+            self.axis_point = tuple(p0)
+            self.axis_dir = tuple((p1 - p0) / np.linalg.norm(p1 - p0))
+            self.axis = "PICKED"
+            self._end_axis_pick(context)
+            self._place(context)
+            self._drag_refresh(context)
+            return {'RUNNING_MODAL'}
+        return {'RUNNING_MODAL'}
 
 
 def _edge_points(obj, ref):

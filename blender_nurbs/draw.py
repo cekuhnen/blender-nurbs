@@ -602,6 +602,8 @@ def _draw_preview(pv):
     gpu.state.depth_test_set('LESS_EQUAL')
     _draw_lines(lines, (*COL_PREVIEW, 1.0), 2.0)
     gpu.state.depth_test_set('NONE')
+    for pl, gcol in pv.get("guides") or []:          # e.g. Revolve's axis
+        _draw_lines(_lines_from_polylines([pl], _IDENT), gcol, 1.5)
     for h in pv.get("handles") or []:
         col = COL_HANDLE_HOT if h["hot"] else COL_HANDLE
         if h.get("path") is not None and len(h["path"]) > 1:      # a shaft along a path (an angle's arc)
