@@ -3,7 +3,9 @@
 Faces without a star corner stay one bicubic span: the SubD surface exactly.
 A face with one becomes 2 x 2 polynomial pieces, C1 across its middle lines:
 of degree 6 for G2 (knots [0^7, .5^5, 1^7], 12 x 12 CVs, G2 across the middle
-lines too), of degree 5 for G1 (knots [0^6, .5^4, 1^6], 10 x 10 CVs). It is
+lines too), of degree 5 for G1 (knots [0^6, .5^4, 1^6], 10 x 10 CVs). G2 also
+works at degree 5 (the same net as G1; about twice as far from the SubD as
+degree 6): the lighter option. It is
 fitted to the SubD and then moved as little and as smoothly as possible until
 it joins its neighbours exactly:
 
@@ -36,6 +38,7 @@ G1_SAMPLES = {6: 9, 5: 8, 4: 7, 3: 6}   # G1 along a half is a polynomial of deg
 NEWTON_STEPS = 14
 REUSE_STEPS = 3      # cheap steps on one factorisation after each Newton step
 ANCHORED = 6         # the first Newton steps also pull the CVs back towards the SubD fit
+ANCHORED_WARM = 2    # ... when G2 starts from the G1 solve raised to degree 6 (already near: fewer needed)
 TOL = 5e-5           # largest condition left (each normalised by its own scale): G2 then within 0.001 %
 FAIR = 3.0           # weight of the moves' second differences against their size
 
@@ -43,6 +46,17 @@ FAIR = 3.0           # weight of the moves' second differences against their siz
 def _bez(sb, x, d=0, p=6):
     """Bernstein basis of degree p (or its d-th derivative) at x: (len(x), p + 1)."""
     return sb.basis(np.r_[[0.0] * (p + 1), [1.0] * (p + 1)], np.atleast_1d(np.asarray(x, float)), d, p)
+
+
+def _elevate(p):
+    """(p + 2, p + 1): a Bezier curve's CVs of degree p -> the same curve's of degree p + 1."""
+    E = np.zeros((p + 2, p + 1))
+    for i in range(p + 2):
+        if i > 0:
+            E[i, i - 1] = i / (p + 1)
+        if i <= p:
+            E[i, i] = 1 - i / (p + 1)
+    return E
 
 
 def _split(p):
@@ -72,12 +86,13 @@ def _piece(sb, net, ku, kv, lo_u, lo_v, Pi, s):
 
 def build(sb, conv, g2=True, kernel=None, opts=None):
     """(nets, knots, info) for every cage face of conv (a subd_brep.Converter with star points): bicubic
-    one-span nets, and at star points 2 x 2 pieces of degree 6 (G2: 12 x 12 CVs) or 5 (G1: 10 x 10).
+    one-span nets, and at star points 2 x 2 pieces of degree 6 (G2: 12 x 12 CVs) or 5 (G1, or a lighter G2
+    with opts["degree"] = 5: 10 x 10).
     kernel: the B-rep kernel extension (KKTFactor)."""
     opts = opts or {}
     p = int(opts.get("degree", 6 if g2 else 5))
-    if g2 and p < 6:
-        raise ValueError("G2 needs degree 6 at the star points")
+    if g2 and p < 5:
+        raise ValueError("G2 needs degree 5 or more at the star points")
     N, Mid, R = 2 * p, p, p + 1                                    # last grid index, middle row, piece / view size
     q = int(opts.get("beta_power", 2))                            # beta's power (see above)
     T0 = time.perf_counter()
@@ -422,14 +437,17 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
     def residual(Pc, jac=True):
         nonlocal den
         g1 = dsum(Pc, VF[:HE], Wf1) + dsum(Pc, VG[:HE], W1[(0, 1)])               # (HE, S1, 3)
-        sc1 = np.maximum(np.linalg.norm(dsum(Pc, VF[:HE], W1[(0, 1)]), axis=2), 1e-300)
+        # each condition measured at the quad's speed (an n-gon face by a T-junction runs at half of it: its
+        # G1 condition is alpha times, its G2 one alpha^2 times as large as it means)
+        sc1 = np.maximum(np.linalg.norm(dsum(Pc, VF[:HE], W1[(0, 1)]), axis=2), 1e-300) * ALPHA[:HE, None]
         r1 = g1 / sc1[:, :, None]
         if H:
             fu, ft = dsum(Pc, VF[:H], W[(1, 0)]), dsum(Pc, VF[:H], W[(0, 1)])
             Q = dsum(Pc, VG[:H], W[(0, 2)]) - dsum(Pc, VF[:H], Wq)
             N = np.cross(fu, ft)
             if den is None:
-                den = np.maximum(np.linalg.norm(fu, axis=2) * np.linalg.norm(ft, axis=2) ** 3, 1e-300) / size
+                den = np.maximum(np.linalg.norm(fu, axis=2) * np.linalg.norm(ft, axis=2) ** 3, 1e-300) / size \
+                    * ALPHA[:H, None] ** 2
             g2v = ((N * Q).sum(2) / den).ravel()[keep2.ravel()]
         else:
             g2v = np.zeros(0)
@@ -550,9 +568,12 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
             rx = -np.bincount(Mr, weights=Mv * d_[Mc], minlength=3 * n)
         return np.asarray(K.solve(rx, -res[live] / sq, refine))
 
-    Pc = P.copy()
-    hist = []
-    if n:
+    def newton(Pc, warm):
+        nonlocal den
+        den = None                                                 # (each condition's scale, from its start)
+        hist = []
+        if not n:
+            return Pc, hist
         res, J = residual(Pc)
         hist.append(float(np.abs(res).max()) if len(res) else 0.0)
         tol = opts.get("tol", TOL)
@@ -562,7 +583,7 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
                 break
             K, live, sq = factor_at(res, J)
             cur = hist[-1]
-            anchored = it < opts.get("anchored", ANCHORED)
+            anchored = it < opts.get("anchored", ANCHORED_WARM if warm else ANCHORED)
             ok = True
             for inner in range(1 + opts.get("reuse", REUSE_STEPS)):
                 dx = solve_with(K, live, sq, res, Pc, anchored, 3 if inner == 0 else 1)
@@ -586,6 +607,39 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
             if (not ok and inner == 0) or cur < tol:
                 break
             res, J = residual(Pc)
+        return Pc, hist
+
+    Pc, hist = None, None
+    if g2 and p in (5, 6) and opts.get("warm", True) and n:
+        # start from the G1 solve (linear, one factorisation) raised to degree 6 exactly: already G1, so Newton
+        # has only the curvature left to do -- about half the factorisations. Where that start does not reach
+        # the tolerance (a G1 corner that G2 must bend away from), the usual start from the SubD fit
+        n1, _, _ = build(sb, conv, g2=False, kernel=kernel, opts={"degree": 5})
+        E = _elevate(5) if p == 6 else np.eye(6)
+        Pw = P.copy()
+        keep5 = [i for i in range(11) if i != 5]
+        for f in faces_i:
+            G5 = np.zeros((11, 11, 3))
+            G5[np.ix_(keep5, keep5)] = n1[f]
+            G5[5, :] = 0.5 * (G5[4, :] + G5[6, :])                 # C1 at the middle: the shared row between
+            G5[:, 5] = 0.5 * (G5[:, 4] + G5[:, 6])
+            G6 = np.zeros((N + 1, N + 1, 3))
+            for qu in (0, 1):
+                for qv in (0, 1):
+                    G6[p * qu:p * qu + p + 1, p * qv:p * qv + p + 1] = np.einsum("ia,jb,abc->ijc", E, E,
+                                                                                 G5[5 * qu:5 * qu + 6, 5 * qv:5 * qv + 6])
+            ids = np.array([[kid[key[(f, i, j)]] for j in range(N + 1)] for i in range(N + 1)])
+            mv = ~fixed[ids]
+            Pw[ids[mv]] = G6[mv]
+        for vid, ids, w in lin:
+            Pw[vid] = w @ Pw[ids]
+        Pc, hist = newton(Pw, True)
+        if hist and hist[-1] >= opts.get("tol", TOL):
+            Pc2, hist2 = newton(P.copy(), False)
+            if hist2[-1] < hist[-1]:
+                Pc, hist = Pc2, hist2
+    if Pc is None:
+        Pc, hist = newton(P.copy(), False)
     info = {"newton": hist, "unknowns": 3 * n, "conditions": HE * S1 * 3 + n2 + len(c1) * 3 + len(LV) * 3,
             "t_junctions": len(tblocks) // 2,
             "max_move": float(np.abs(Pc - P).max() / size) if len(P) else 0.0,

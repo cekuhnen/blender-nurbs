@@ -460,12 +460,30 @@ def rows(knots, u, v, du=0, dv=0, kv=None):
     return (Bu[:, :, None] * Bv[:, None, :]).reshape(len(Bu), -1)
 
 
+_BASIS_CACHE = {}
+
+
+def _basis_cached(knots, s, der, p):
+    """basis(), remembered: the faces share a few knot vectors and the checks evaluate them at the same
+    parameters again and again (read-only arrays)."""
+    knots, s = np.asarray(knots, float), np.atleast_1d(np.asarray(s, float))
+    key = (knots.tobytes(), s.tobytes(), der, p)
+    B = _BASIS_CACHE.get(key)
+    if B is None:
+        if len(_BASIS_CACHE) > 4096:
+            _BASIS_CACHE.clear()
+        B = basis(knots, s, der, p)
+        B.flags.writeable = False
+        _BASIS_CACHE[key] = B
+    return B
+
+
 def derivs(net, ku, kv, u, v, ders):
     """{(a, b): d^(a+b) S / du^a dv^b at the points (u, v)} of a face's net,
     from 1D bases (no dense rows); the degrees from the (clamped) knots."""
     pu, pv = int(np.count_nonzero(ku == ku[0])) - 1, int(np.count_nonzero(kv == kv[0])) - 1
-    Bu = {a: basis(ku, u, a, pu) for a in {a for a, _ in ders}}
-    Bv = {b: basis(kv, v, b, pv) for b in {b for _, b in ders}}
+    Bu = {a: _basis_cached(ku, u, a, pu) for a in {a for a, _ in ders}}
+    Bv = {b: _basis_cached(kv, v, b, pv) for b in {b for _, b in ders}}
     X = {a: np.tensordot(B, net, axes=(1, 0)) for a, B in Bu.items()}      # (t, nv, 3); no einsum path search
     return {(a, b): np.einsum("tj,tjc->tc", Bv[b], X[a]) for a, b in ders}  # (it was 40% of einsum's time)
 
@@ -639,10 +657,14 @@ class Converter:
         return cub
 
     def fresh_natural(self, L):
-        """(nets, knots, corner limit points) of every face at level L, no sliver knots (natural)."""
-        c = Converter(self.V, self.F, self.sharp)
-        nets = c.natural(L, sliver=False)
-        return nets, list(c.fk), c.levels.corners
+        """(nets, knots, corner limit points) of every face at level L, no sliver knots (natural); kept, as
+        G2 (and its G1 start) ask for the same levels again."""
+        cache = self.__dict__.setdefault("_fresh", {})
+        if L not in cache:
+            c = Converter(self.V, self.F, self.sharp)
+            nets = c.natural(L, sliver=False)
+            cache[L] = (nets, list(c.fk), c.levels.corners)
+        return cache[L]
 
     def limit_grid(self, level):
         """Per face its SubD limit points at (i, j) / 2^level (level 2 or more)."""
@@ -1409,7 +1431,7 @@ def _length(context, x):
     return bpy.utils.units.to_string(us.system, 'LENGTH', x * (us.scale_length or 1.0), precision=3)
 
 
-def build(V, F, sharp, g2=True, angle_tol=0.05, curv_tol=0.02):
+def build(V, F, sharp, g2=True, angle_tol=0.05, curv_tol=0.02, degree=None):
     """(nets, knots, stats, conv) for a cage: faces without a star corner bicubic
     (the SubD exactly), the others 2 x 2 pieces joined exactly, of degree 6 in
     G2, 5 in G1 (subd_g2); the joins measured as Continuity Check would. A cage
@@ -1418,23 +1440,26 @@ def build(V, F, sharp, g2=True, angle_tol=0.05, curv_tol=0.02):
     split by one subdivision step."""
     if any(len(f) != 4 for f in F):
         try:
-            return _build(MacroConverter(V, F, sharp, angle_tol, curv_tol), g2, macro=True)
+            return _build(MacroConverter(V, F, sharp, angle_tol, curv_tol), g2, macro=True, degree=degree)
         except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
             V2, F2, s2 = refine_any(np.asarray(V, float), F, sharp)
             F2 = [tuple(int(x) for x in f) for f in F2]
-            nets, knots, st, conv = _build(Converter(V2, F2, with_borders(F2, s2), angle_tol, curv_tol), g2)
+            nets, knots, st, conv = _build(Converter(V2, F2, with_borders(F2, s2), angle_tol, curv_tol), g2,
+                                           degree=degree)
             st["layout_fallback"] = str(exc)
             return nets, knots, st, conv
-    return _build(Converter(V, F, sharp, angle_tol, curv_tol), g2)
+    return _build(Converter(V, F, sharp, angle_tol, curv_tol), g2, degree=degree)
 
 
-def _build(conv, g2, macro=False):
+def _build(conv, g2, macro=False, degree=None):
+    """degree: of the faces by star points (G2: 6, or 5 for a lighter net; G1: 5); None: the mode's own."""
     import sys
     from . import subd_g2
     info, fallback = {}, None
     if conv.irr:
         try:
-            nets, knots, info = subd_g2.build(sys.modules[__name__], conv, g2=g2, kernel=store._k()[1])
+            nets, knots, info = subd_g2.build(sys.modules[__name__], conv, g2=g2, kernel=store._k()[1],
+                                              opts={"degree": degree} if degree else None)
         except (RuntimeError, ValueError, np.linalg.LinAlgError, AttributeError) as exc:
             if macro:                                              # the earlier joints know quads only
                 raise RuntimeError(str(exc)) from exc
@@ -1460,12 +1485,12 @@ def _build(conv, g2, macro=False):
     return nets, knots, st, conv
 
 
-def convert(context, obj, angle_tol=0.05, g2=True, curv_tol=0.02):
+def convert(context, obj, angle_tol=0.05, g2=True, curv_tol=0.02, degree=None):
     """(new NURBS object, summary text, note) for a SubD (or any quad) mesh object."""
     V, F, sharp, M = cage(obj, context.evaluated_depsgraph_get())
     if not F:
         raise RuntimeError("the mesh has no faces")
-    nets, knots, st, conv = build(V, F, sharp, g2, angle_tol, curv_tol)
+    nets, knots, st, conv = build(V, F, sharp, g2, angle_tol, curv_tol, degree)
     patches = [{"net": [list(map(float, c)) for c in net.reshape(-1, 3)], "ku": list(map(float, ku)),
                 "kv": list(map(float, kv)), "degree": int(np.count_nonzero(ku == ku[0])) - 1}
                for net, (ku, kv) in zip(nets, knots)]
@@ -1509,9 +1534,9 @@ def convert(context, obj, angle_tol=0.05, g2=True, curv_tol=0.02):
 class NPROTO_OT_subd_to_brep(bpy.types.Operator):
     """Convert the selected SubD models (Subdivision Surface on a cage) to NURBS bodies:
     one face per cage quad, each bicubic (the SubD exactly) but by star points, where faces
-    of degree 6 (G2) or 5 (G1) join exactly; triangles and n-gons split into quads (meeting
-    the quads beside them at T-junctions); creases (1.0) as sharp edges. The meshes are kept
-    (hidden)"""
+    of degree 6 or 5 (G2) or 5 (G1) join exactly; triangles and n-gons split into quads
+    (meeting the quads beside them at T-junctions); creases (1.0) as sharp edges. The meshes
+    are kept (hidden)"""
     bl_idname = "nproto.subd_to_brep"
     bl_label = "SubD to BREP"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1520,8 +1545,15 @@ class NPROTO_OT_subd_to_brep(bpy.types.Operator):
         name="Continuity", default="G2",
         items=[("G1", "G1", "Tangent across every edge, lighter: the faces by star points (degree 5, 10 x 10 CVs) "
                             "are solved so their normals agree exactly; the bending may differ there"),
-               ("G2", "G2", "Tangent and bending alike across every edge: the faces by star points (degree 6, "
-                            "12 x 12 CVs) are solved so normals and curvature agree exactly")])
+               ("G2", "G2", "Tangent and bending alike across every edge: the faces by star points (degree 6 "
+                            "or 5, see Degree) are solved so normals and curvature agree exactly")])
+    degree: EnumProperty(
+        name="Degree", default="6",
+        items=[("6", "6 · Closer", "G2 faces by star points of degree 6 (12 x 12 CVs): about half as far from the "
+                                   "SubD surface as degree 5"),
+               ("5", "5 · Lighter", "G2 faces by star points of degree 5 (10 x 10 CVs, as many as G1): about 30 % "
+                                    "fewer CVs and a faster solve, still exactly G2, about twice as far from the "
+                                    "SubD surface")])
     angle: FloatProperty(name="Angle", default=0.05, min=0.005, max=1.0, precision=3, step=1,
                          description="Report a join whose faces' normals differ more than this along a smooth "
                                      "edge (degrees; Continuity Check's default is 0.1)")
@@ -1542,6 +1574,7 @@ class NPROTO_OT_subd_to_brep(bpy.types.Operator):
         col.prop(self, "continuity", expand=True)
         col.prop(self, "angle")
         if self.continuity == "G2":
+            col.prop(self, "degree", expand=True)
             col.prop(self, "curvature")
         col.prop(self, "hide_original")
 
@@ -1555,8 +1588,9 @@ class NPROTO_OT_subd_to_brep(bpy.types.Operator):
         made, lines, warn = [], [], []
         for src in srcs:
             try:
-                new, summary, note = convert(context, src, self.angle, g2=self.continuity == "G2",
-                                             curv_tol=self.curvature / 100.0)
+                g2 = self.continuity == "G2"
+                new, summary, note = convert(context, src, self.angle, g2=g2, curv_tol=self.curvature / 100.0,
+                                             degree=int(self.degree) if g2 else None)
             except (jobs.JobError, RuntimeError, np.linalg.LinAlgError) as exc:
                 warn.append(f"{src.name}: not converted ({exc})")
                 continue

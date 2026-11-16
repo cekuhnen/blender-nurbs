@@ -8483,10 +8483,28 @@ _sdr["G1 builds a closed solid of degree-5 faces by the star points (10 x 10 CVs
     b_.is_manifold_solid() and "G1 within" in s_ and "G2" not in s_ and _g1 < 0.01 and no_ is None \
     and all(c_["degree_u"] == 5 and c_["count_u"] == 10 and c_["count_v"] == 10
             and np.allclose(c_["knots_v"], [0.0] * 6 + [0.5] * 4 + [1.0] * 6) for c_ in _cvs)
+# G2 at degree 5 (Degree: 5 · Lighter): G1's net, still exactly G2, a little further from the SubD than degree 6
+for _nm, _ob in (("a SubD cube", _ocube), ("n-gon caps (a cylinder)", _ocyl)):
+    _V, _F, _S, _M = _sdb.cage(_ob, ctx.evaluated_depsgraph_get())
+    _n5, _k5, _s5, _c5 = _sdb.build(_V, _F, _S, g2=True, degree=5)
+    _n6, _k6, _s6, _c6 = _sdb.build(_V, _F, _S, g2=True)
+    _sdr[f"G2 at degree 5 on {_nm}: degree-5 faces by star points, G1 within 0.001 deg (0.01 at the star points), "
+         f"G2 within 0.01 %, within 0.3 % of its size of the SubD, fewer CVs than degree 6 "
+         f"({_s5['cvs']} vs {_s6['cvs']})"] = \
+        _s5["degree"] == 5 and _s5["normal"] <= 0.001 and _s5["normal_all"] <= 0.01 and _s5["curvature"] <= 1e-4 \
+        and _s5["deviation"] < 3e-3 * _c5.size and _s5["fallback"] is None and _s5["cvs"] < 0.75 * _s6["cvs"]
+new_, s_, no_, b_ = _sd_run(_ocube, g2=True, degree=5)
+_cvs = [ext.surface_cvs(f_.surface()) for f_ in b_.faces()]
+_sdr["G2 at degree 5 builds a closed solid of 10 x 10 degree-5 faces, its summary reports G2"] = \
+    b_.is_manifold_solid() and "G2 within 0.00%" in s_ and no_ is None \
+    and all(c_["degree_u"] == 5 and c_["count_u"] == 10 for c_ in _cvs)
 # the operator: the selected meshes, originals hidden, the new bodies selected; not for NURBS objects
 for o_ in ctx.view_layer.objects:
     o_.select_set(o_ in (_ocube, _otor))
 ctx.view_layer.objects.active = _ocube
+_sdr["the operator offers Degree 6 (default) or 5 for G2"] = \
+    [i_.identifier for i_ in bpy.ops.nproto.subd_to_brep.get_rna_type().properties["degree"].enum_items] == ["6", "5"] \
+    and bpy.ops.nproto.subd_to_brep.get_rna_type().properties["degree"].default == "6"
 _r = bpy.ops.nproto.subd_to_brep(angle=0.1)
 _sel = list(ctx.selected_objects)
 _sdr["the operator converts the selected SubD meshes, hides them and selects the new bodies"] = \
