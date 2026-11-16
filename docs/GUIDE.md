@@ -578,8 +578,8 @@ before its Subdivision Surface modifier), with **one face per cage face**.
   border's corners (a vertex of one face, a star point), Keep Corners keeps them where the cage vertex is, as
   Blender's modifier does. Blender only approximates a rounded corner: at the modifier's default **Quality** 3 its
   mesh sits up to about 0.15 % of the model's size off the true SubD surface there (the body is on the true one).
-  Raise Quality to 6 or more and the two agree (0.003 % at 6, 1e-5 % at 10); star points and kept corners agree at
-  any Quality. With Keep Corners a grid
+  Raise Quality and the two agree: 0.003 % at 6, the slider's top, and 1e-5 % at 10, which you reach by typing it
+  (double-click the field, type 10). Star points and kept corners agree at any Quality. With Keep Corners a grid
   (a sheet without star points) becomes bicubic faces of 16 CVs only, Blender's SubD exactly: SubD as a stand-in
   for NURBS surface modeling, each cage face one Bezier patch.
 * **Triangles and n-gons** are split, the quads are not: Catmull-Clark's first step turns an n-gon into n quads, and
