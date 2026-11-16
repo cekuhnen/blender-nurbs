@@ -12,8 +12,11 @@ Two routes:
     REDUCE  remove knots greedily while the surface stays within tolerance
     REFIT   fewest uniform spans (chosen degree) within tolerance
 * Projected (any layout: trimmed faces, T-junctions). The outer loop is split
-  into 4 sides at its corners, a Coons grid spans them in 3D, its points are
-  snapped to the nearest face and fitted (always a refit).
+  into 4 sides at its corners, a Coons grid spans them and is fitted (always
+  a refit). When every face lies on one surface (pieces of a split) the grid
+  is built in that surface's parameter space and evaluated on it, so a split
+  surface comes back with its own few spans; otherwise it spans the sides in
+  3D and its points are snapped to the nearest face.
 
 Deviation is measured against the original faces on a dense grid.
 """
@@ -768,6 +771,83 @@ def projected_grid(brep, size, m=61, smooth=3):
     return G
 
 
+def _feet_uv(net, Q, u, v, iters=12):
+    """Newton feet of the points Q on the net from (u, v): (points, u, v)."""
+    for _ in range(iters):
+        S, Su, Sv = _eval_pts(net, u, v)
+        r = S - Q
+        a, b, c = (Su * Su).sum(1), (Su * Sv).sum(1), (Sv * Sv).sum(1)
+        gu, gv = (Su * r).sum(1), (Sv * r).sum(1)
+        det = a * c - b * b
+        det = np.where(np.abs(det) > 1e-300, det, 1e-300)
+        u = np.clip(u - (c * gu - b * gv) / det, 0.0, 1.0)
+        v = np.clip(v - (a * gv - b * gu) / det, 0.0, 1.0)
+    return _eval_pts(net, u, v)[0], u, v
+
+
+def _invert(net, Q, n=33):
+    """Parameters (u, v) of the points Q on the net (nearest of an n x n
+    seed grid, then Newton) and their distance to it."""
+    Q = np.asarray(Q, float).reshape(-1, 3)
+    t = np.linspace(0, 1, n)
+    X = eval_net(net, t, t).reshape(-1, 3)
+    k = np.array([int(np.argmin(((X - q) ** 2).sum(1))) for q in Q])
+    S, u, v = _feet_uv(net, Q, t[k // n], t[k % n])
+    return u, v, np.linalg.norm(S - Q, axis=1)
+
+
+def _resample_uv(UV, m):
+    """m points evenly spaced along a parameter-space polyline."""
+    d = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(UV, axis=0), axis=1))])
+    s = np.linspace(0, d[-1], m)
+    return np.array([np.interp(s, d, UV[:, k]) for k in range(2)]).T
+
+
+def _shared_net(nets, tol):
+    """The one surface every face lies on (samples of each face's surface
+    projected onto the candidate), or None."""
+    t = np.linspace(0, 1, 5)
+    for i, base in enumerate(nets):
+        if all(_invert(base, eval_net(o, t, t), 17)[2].max() <= tol for j, o in enumerate(nets) if j != i):
+            return base
+    return None
+
+
+def _coons(B, R, T, L):
+    """Coons patch of 4 sampled sides (B/T along the first index, L/R along
+    the second; corners shared), any point dimension."""
+    m = B.shape[0]
+    s = np.linspace(0, 1, m)
+    a, b = s[:, None, None], s[None, :, None]
+    c00, c10, c01, c11 = B[0], B[-1], T[0], T[-1]
+    return ((1 - b) * B[:, None] + b * T[:, None] + (1 - a) * L[None] + a * R[None]
+            - ((1 - a) * (1 - b) * c00 + a * (1 - b) * c10 + (1 - a) * b * c01 + a * b * c11))
+
+
+def surface_grid(brep, size, net, m=61):
+    """Grid over the 4 outer sides built in the parameter space of the one
+    surface the faces share: each side's points inverted onto it, resampled
+    evenly in (u, v), a Coons grid spanned there and evaluated on the
+    surface. Sampled at the surface's own parameters, the shape stays the
+    low-span spline it is (an even 3D spacing does not). None when a side
+    does not invert cleanly (it leaves the surface or jumps across a seam)."""
+    sides = _outer_sides(brep, size)
+    uvs = []
+    for side in (sides[0], sides[1], sides[2][::-1], sides[3][::-1]):
+        u, v, d = _invert(net, side)
+        if d.max() > 1e-5 * size:
+            return None
+        UV = np.c_[u, v]
+        if np.linalg.norm(np.diff(UV, axis=0), axis=1).max() > 0.25:
+            return None
+        uvs.append(_resample_uv(UV, m))
+    C = _coons(*uvs).reshape(-1, 2)
+    if C.min() < -1e-9 or C.max() > 1 + 1e-9:
+        return None
+    C = C.clip(0.0, 1.0)
+    return _eval_pts(net, C[:, 0], C[:, 1])[0].reshape(m, m, 3)
+
+
 def _grid_eval(G):
     """Bilinear lookup in a dense (m x m) sample grid on 0..1 x 0..1."""
     m = G.shape[0]
@@ -931,7 +1011,11 @@ def merge_text(text, mode="REDUCE", tol=0.0, degree=3, spans_u=0, spans_v=0, tol
                 info["note"] = (info["note"] + "; " if info["note"] else "") + "spans too few to keep the seams sharp"
             info["spans"] = spans
     else:
-        G = projected_grid(brep, size)
+        shared = _shared_net(nets, 1e-6 * size)
+        G = surface_grid(brep, size, shared) if shared is not None else None
+        info["grid_space"] = "surface" if G is not None else "3d"
+        if G is None:
+            G = projected_grid(brep, size)
         m = G.shape[0]
         t = np.linspace(0, 1, m)
 
