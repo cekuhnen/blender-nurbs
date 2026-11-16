@@ -97,7 +97,7 @@ everything built from it rebuilds.
 - **SubD to BREP:** Subdivision Surface models as NURBS bodies with one face per cage face: one bicubic span (the
   SubD surface exactly) wherever the cage is regular, and at star points faces of 2 x 2 pieces with even nets
   (G2: degree 6, 12 x 12; G1: degree 5, 10 x 10), solved so every face joins exactly (Continuity Check: G1 0.000°,
-  G2 0.00 %, star points included), creases as sharp edges; triangles and n-gons split into quads that meet the
+  G2 0.00 %, star points included), creases as sharp edges, open borders with or without kept corners; triangles and n-gons split into quads that meet the
   cage quads beside them at exact T-junctions
 
 ### STEP Import and Export
