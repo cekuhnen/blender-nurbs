@@ -568,7 +568,14 @@ before its Subdivision Surface modifier), with **one face per cage face**.
 * **Creases** (edge crease 1.0) become sharp edges along the SubD's own crease curves: each side follows its own
   surface, and the smooth faces around a crease's star point join exactly within their side. Open borders stay
   open (a sheet).
-* Triangles and n-gons in the cage are split into quads first (one subdivision step), like Catmull-Clark does.
+* **Triangles and n-gons** are split, the quads are not: Catmull-Clark's first step turns an n-gon into n quads, and
+  each of those becomes a face, while every cage quad stays one face (its four quads after that step, joined). A
+  quad's side next to an n-gon then meets two of its faces, a **T-junction** at the side's middle, and the faces join
+  exactly there too (G1 0.000°, G2 0.00 %). The surface is the same SubD. A model with two pentagons and 21 quads
+  becomes 31 faces (4,464 CVs in G2) instead of 94 (12,512); a cylinder with octagon caps 24 instead of 48. Bigger
+  faces by star points stay a little further from the SubD: that model 0.11 % of its size in G2 (0.23 % in G1)
+  instead of 0.03 % (0.06 %); the cylinder 0.13 %, as before. The report counts the T-junctions. If the n-gons can't be
+  joined this way, every face is split by one subdivision step, as before, and the report says so.
 * The report gives faces, how many are of the higher degree, CVs, the largest angle across an edge (and at the star points),
   in G2 the curvature difference, and how close the faces stay to the SubD surface, e.g. *38 faces · 26 of degree 6
   by the 22 star points, the rest one bicubic span · 3,936 CVs · G1 within 0.000° · G2 within 0.00% · within 2.8 mm

@@ -8432,8 +8432,25 @@ print("   creased cube:", s_, f"| measured G1 {_g1:.4f} deg, {_sh} sharp edges")
 _ocyl = _sd_obj("SD_Cyl", lambda b_: _bmx.ops.create_cone(b_, cap_ends=True, segments=8, radius1=0.5, radius2=0.5, depth=1.0))
 n_, s_, no_, b_ = _sd_run(_ocyl)
 _g1, _sh = _sd_seams(b_)
-_sdr["n-gon caps (a cylinder): quads after one subdivision step, a closed G2 solid"] = \
-    b_.face_count() == 48 and b_.is_manifold_solid() and _g1 < 0.01 and _sh == 0 and no_ is None
+_sdr["n-gon caps (a cylinder): one face per side quad, the caps split in eight (16 T-junctions where they meet), "
+     "a closed G2 solid, G1 within 0.01 degrees along every edge (the T-junctions' too)"] = \
+    b_.face_count() == 24 and b_.is_manifold_solid() and _g1 < 0.01 and _sh == 0 and no_ is None \
+    and "16 T-junctions" in s_ and _sd_dev(_ocyl, b_) < 3e-3 * math.sqrt(2)
+print("   n-gon cylinder:", s_, f"| measured G1 {_g1:.4f} deg")
+_ouvs = _sd_obj("SD_UVSphere", lambda b_: _bmx.ops.create_uvsphere(b_, u_segments=8, v_segments=6, radius=0.5))
+n_, s_, no_, b_ = _sd_run(_ouvs)
+_g1, _sh = _sd_seams(b_)
+_sdr["triangle fans (a UV sphere): 32 quad faces, the 16 triangles in three each, a closed G2 solid, G1 within "
+     "0.01 degrees"] = b_.face_count() == 80 and b_.is_manifold_solid() and _g1 < 0.01 and _sh == 0 and no_ is None
+def _open_cyl(b_):
+    _bmx.ops.create_cone(b_, cap_ends=True, segments=6, radius1=0.5, radius2=0.5, depth=1.0)
+    _bmx.ops.delete(b_, geom=[f_ for f_ in b_.faces if len(f_.verts) > 4 and f_.calc_center_median().z > 0],
+                    context='FACES_ONLY')
+_oop = _sd_obj("SD_OpenCyl", _open_cyl)
+_V, _F, _S, _M = _sdb.cage(_oop, ctx.evaluated_depsgraph_get())
+_n2, _k2, _s2, _c2 = _sdb.build(_V, _F, _S)
+_sdr["an n-gon by an open border: one face per quad, the n-gon split (12 faces), not the whole cage split (30)"] = \
+    len(_n2) == 12 and _s2["layout_fallback"] is None and _s2["normal"] < 1e-3 and _s2["curvature"] < 1e-4
 # G1 and G2 on the converter's own measures (Continuity Check's): exact along every edge and at the star points,
 # close to the SubD; a face with no star corner keeps the SubD's own bicubic span, so its joins are C2
 for _nm, _ob in (("a SubD cube", _ocube), ("n-gon caps (a cylinder)", _ocyl), ("a creased cube", _ocr)):
