@@ -296,7 +296,8 @@ def curve_cvs_shown(ctx, obj):
 
 
 _PREVIEW_OPS = ("NPROTO_OT_rebuild_surface", "nproto.rebuild_surface", "NPROTO_OT_square", "nproto.square",
-                "NPROTO_OT_refit_trim", "nproto.refit_trim")
+                "NPROTO_OT_refit_trim", "nproto.refit_trim",
+                "NPROTO_OT_merge_patches", "nproto.merge_patches")
 
 
 def _rebuild_preview_active(ctx):

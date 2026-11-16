@@ -9370,4 +9370,119 @@ ctx.preferences.view.smooth_view = _pv
 _stW.planes.clear(); _stW.active = -1; _stW.index = 0
 check("work plane view: Look at turns a 3D view onto the active plane (orthographic with Auto Perspective)", _okv)
 
+
+# --- Merge Patches: a 2 x 2 grid of patches cut from one cubic surface (one piece transposed,
+# one flipped) merges back exactly; Reduce finds the original net again, Refit stays on it
+from blender_nurbs import merge as _mg
+from blender_nurbs.kernel.classa import insert_knot as _ik
+_mP = np.array([[(i / 6, j / 5, 0.15 * math.sin(2.3 * i / 6 + 1.7 * j / 5) + 0.02 * ((i * 7 + j * 3) % 5 - 2))
+                 for j in range(6)] for i in range(7)])
+_mUu, _mUv = list(geom.clamped_uniform_knots(7, 3)), list(geom.clamped_uniform_knots(6, 3))
+
+def _msplit(P, U, t, axis):
+    A = P if axis == 0 else P.transpose(1, 0, 2)
+    sh = A.shape
+    A, U = A.reshape(sh[0], -1), list(U)
+    for _ in range(3):
+        A, U = _ik(A, U, 3, t)
+    A = np.asarray(A)
+    f = [i for i, x in enumerate(U) if abs(x - t) < 1e-12][0]
+    L, R = A[:f].reshape(f, *sh[1:]), A[f - 1:].reshape(len(A) - f + 1, *sh[1:])
+    UL, UR = U[:f + 3] + [t], [t] + U[f:]
+    UL, UR = [(x - UL[0]) / (t - UL[0]) for x in UL], [(x - t) / (UR[-1] - t) for x in UR]
+    return ((L, UL), (R, UR)) if axis == 0 else ((L.transpose(1, 0, 2), UL), (R.transpose(1, 0, 2), UR))
+
+_mobjs = []
+for (_N, _UN) in _msplit(_mP, _mUu, 0.5, 0):
+    for (_A, _VA) in _msplit(_N, _mUv, 0.4, 1):
+        _k_ = len(_mobjs)
+        _UU, _VV = _UN, _VA
+        if _k_ == 1:
+            _A, _UU, _VV = _A.transpose(1, 0, 2), _VV, _UU
+        if _k_ == 2:
+            _A, _UU = _A[::-1], [1 - x for x in _UU[::-1]]
+        _s = ext.surface_from_cvs(3, 3, [tuple(map(float, x)) for x in _A.reshape(-1, 3)],
+                                  [float(x) for x in _UU], [float(x) for x in _VV])
+        _mobjs.append(store.new_object(ctx, f"MergePiece{_k_}", _s))
+bpy.ops.object.select_all(action='DESELECT')
+for _o in _mobjs:
+    _o.select_set(True)
+ctx.view_layer.objects.active = _mobjs[0]
+bpy.ops.nproto.join()
+_MJ = ctx.active_object
+_mtext = _MJ[store.PROP_BREP]
+_mres = {m_: _mg.merge_text(_mtext, m_, 0, 3)[1] for m_ in ("EXACT", "REDUCE", "REFIT")}
+r = bpy.ops.nproto.merge_patches(merge_mode="REDUCE")
+check("merge patches: 2x2 grid merges exactly, Reduce gives the original 7x6 net back, Refit stays on it",
+      _mres["EXACT"]["route"] == "grid" and _mres["EXACT"]["grid"] == (2, 2) and _mres["EXACT"]["deviation"] == 0.0
+      and _mres["REDUCE"]["cvs"] == (7, 6) and _mres["REDUCE"]["deviation"] < 1e-9
+      and _mres["REFIT"]["deviation"] < 1e-6, {m_: (v["cvs"], f"{v['deviation']:.1e}") for m_, v in _mres.items()})
+check("merge patches operator: one untrimmed face with a merge step", r == {'FINISHED'}
+      and store.get_brep(_MJ).face_count() == 1 and store.is_natural(_MJ))
+
+
+# --- Merge Patches keeps the edges: a strip A | B | C cut from one bicubic; B + C merged and refitted
+# with G2 edges keeps the tangent plane and curvature across the edge it shares with A, Free does not
+_sP = np.array([[(i / 9 * 2, j / 5, 0.2 * math.sin(3.1 * i / 9 + 1.3 * j / 5) + 0.025 * ((i * 7 + j * 3) % 5 - 2))
+                 for j in range(6)] for i in range(10)])
+_sUu, _sUv = list(geom.clamped_uniform_knots(10, 3)), list(geom.clamped_uniform_knots(6, 3))
+(_sA, _sUA), (_sBC, _sUBC) = _msplit(_sP, _sUu, 0.3, 0)
+(_sB, _sUB), (_sC, _sUC) = _msplit(_sBC, _sUBC, 0.45, 0)
+_smk = lambda N, U_: ext.surface_from_cvs(3, 3, [tuple(map(float, x)) for x in N.reshape(-1, 3)],
+                                          [float(x) for x in U_], [float(x) for x in _sUv])
+_sobjs = [store.new_object(ctx, "StripB", _smk(_sB, _sUB)), store.new_object(ctx, "StripC", _smk(_sC, _sUC))]
+bpy.ops.object.select_all(action='DESELECT')
+for _o in _sobjs:
+    _o.select_set(True)
+ctx.view_layer.objects.active = _sobjs[0]
+bpy.ops.nproto.join()
+_SJ = ctx.active_object
+_sAs = _smk(_sA, _sUA)
+
+def _snbr(out_text):
+    """Largest normal angle (deg) and relative normal-curvature jump between surface A's u=1 edge and the
+    merged surface's matching side."""
+    f = store.brep_from_text(out_text).faces()[0].surface()
+    d = ext.surface_cvs(f)
+    net = {"P": np.concatenate([np.array(d["points"]).reshape(d["count_u"], d["count_v"], 3),
+                                np.ones((d["count_u"], d["count_v"], 1))], 2),
+           "Uu": np.array(d["knots_u"]), "Uv": np.array(d["knots_v"]), "pu": d["degree_u"], "pv": d["degree_v"]}
+    pm = np.array(_sAs.evaluate(1.0, 0.5))
+    side = min(_mg.SIDES, key=lambda s_: np.linalg.norm(_mg._side_samples(net, s_, 3)[1] - pm))
+    vs = np.linspace(0.05, 0.95, 13)
+    au_ = side[0] == "u"
+    c_ = [0.0 if side[1] == "0" else 1.0]
+    args = (c_, vs) if au_ else (vs, c_)
+    S_ = _mg.eval_d(net, *args).reshape(-1, 3)
+    Su_, Sv_ = _mg.eval_d(net, *args, 1, 0).reshape(-1, 3), _mg.eval_d(net, *args, 0, 1).reshape(-1, 3)
+    Scc = (_mg.eval_d(net, *args, 2, 0) if au_ else _mg.eval_d(net, *args, 0, 2)).reshape(-1, 3)
+    Sc = Su_ if au_ else Sv_
+    ang, dk, kr = 0.0, 0.0, 0.0
+    for q, su_, sv_, sc, scc in zip(S_, Su_, Sv_, Sc, Scc):
+        vv = min(np.linspace(0, 1, 801), key=lambda v: np.linalg.norm(np.array(_sAs.evaluate(1.0, v)) - q))
+        _, au, av = [np.array(x) for x in _sAs.derivatives(1.0, vv)[:3]]
+        h = 1e-5
+        au2 = (au - np.array(_sAs.derivatives(1.0 - h, vv)[1])) / h
+        na = np.cross(au, av); na /= np.linalg.norm(na)
+        nn = np.cross(su_, sv_); nn /= np.linalg.norm(nn)
+        ang = max(ang, math.degrees(math.acos(min(1.0, abs(float(na @ nn))))))
+        ka, km = abs(au2 @ na) / (au @ au), abs(scc @ nn) / (sc @ sc)
+        dk, kr = max(dk, abs(ka - km)), max(kr, ka)
+    return ang, dk / kr
+
+_sres = {}
+for _c in ("G2", "FREE"):
+    _t, _i = _mg.merge_text(_SJ[store.PROP_BREP], "REFIT", 0, 3, cont=_c)
+    _sres[_c] = (_snbr(_t), _i)
+_t, _i = _mg.merge_text(_SJ[store.PROP_BREP], "REDUCE", 0, 3, cont="G2")
+_sres["REDUCE"] = (_snbr(_t), _i)
+check("merge patches edges: Refit G2 keeps tangent plane and curvature at the neighbour, Free drifts",
+      _sres["G2"][0][0] < 0.005 and _sres["G2"][0][1] < 0.01 and _sres["G2"][1]["edges_ok"]
+      and (_sres["FREE"][0][0] > 0.02 or _sres["FREE"][0][1] > 0.03)
+      and _sres["REDUCE"][0][0] < 1e-4 and _sres["REDUCE"][0][1] < 0.01,
+      {k: (f"{v[0][0]:.4f} deg", f"{100 * v[0][1]:.2f}%", v[1]["cvs"]) for k, v in _sres.items()})
+_t, _i = _mg.merge_text(_SJ[store.PROP_BREP], "REFIT", 0, 3, 1, 0, cont="G2")
+check("merge patches: forced spans that cannot hold the edges stop and report it (no runaway spans)",
+      _i["spans"][0] == 1 and _i["spans"][1] <= 12 and not _i["edges_ok"], _i["spans"])
+
 print("ALL OK" if ok else "SOME FAILED")

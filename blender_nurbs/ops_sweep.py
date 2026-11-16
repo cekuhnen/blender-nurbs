@@ -575,6 +575,169 @@ class NPROTO_OT_refit_trim(bpy.types.Operator):
         return {'FINISHED'}
 
 
+MERGE_CONT = [("FREE", "Free", "The edge may move (plain fit)"),
+              ("G0", "G0", "Keep the edge where it is"),
+              ("G1", "G1", "Keep the edge and the tangent plane across it"),
+              ("G2", "G2", "Keep the edge, the tangent plane and the curvature across it")]
+MERGE_SIDE_NAMES = (("u0", "U start"), ("u1", "U end"), ("v0", "V start"), ("v1", "V end"))
+
+
+def _merge_set_all(self, context):
+    for s_, _ in MERGE_SIDE_NAMES:
+        setattr(self, f"merge_cont_{s_}", self.merge_edges)
+
+
+MERGE_MODES = [
+    ("EXACT", "Exact", "Keep every CV: identical to the patches, seams stay as knot lines"),
+    ("REDUCE", "Reduce", "Remove seam and span knots while the surface stays within the tolerance (keeps the degree)"),
+    ("REFIT", "Refit", "Fewest uniform spans of the chosen degree within the tolerance (or the spans given)"),
+]
+
+
+class NPROTO_OT_merge_patches(bpy.types.Operator):
+    """Rebuild joined faces whose outer boundary is four-sided as ONE untrimmed surface.
+    A grid of untrimmed patches merges exactly; anything else is refitted over the outer boundary"""
+    bl_idname = "nproto.merge_patches"
+    bl_label = "Merge Patches"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    merge_mode: EnumProperty(name="Match", items=MERGE_MODES, default="REDUCE")
+    merge_tolerance: FloatProperty(name="Tolerance", default=0.0, min=0.0, soft_max=0.01, precision=5, unit='LENGTH',
+                                   description="Largest allowed distance from the patches (0 = 1e-4 of the size)")
+    merge_degree: IntProperty(name="Degree", default=3, min=1, max=7)
+    merge_spans_u: IntProperty(name="Spans U (0 = auto)", default=0, min=0, max=32,
+                               description="Pieces between knots along U; 1 = one piece with no inner knot, "
+                                           "0 = the fewest within the tolerance")
+    merge_spans_v: IntProperty(name="Spans V (0 = auto)", default=0, min=0, max=32,
+                               description="Pieces between knots along V; 1 = one piece with no inner knot, "
+                                           "0 = the fewest within the tolerance")
+    merge_edges: EnumProperty(name="Edges", items=MERGE_CONT, default="G2", update=_merge_set_all,
+                              description="What the outer edges keep from the patches, on all four sides. "
+                                          "Keeping their tangents and curvature keeps the continuity they had "
+                                          "with neighbouring surfaces")
+    merge_cont_u0: EnumProperty(name="U start", items=MERGE_CONT, default="G2")
+    merge_cont_u1: EnumProperty(name="U end", items=MERGE_CONT, default="G2")
+    merge_cont_v0: EnumProperty(name="V start", items=MERGE_CONT, default="G2")
+    merge_cont_v1: EnumProperty(name="V end", items=MERGE_CONT, default="G2")
+    merge_per_side: BoolProperty(name="Each Side", default=False, description="Set the edge continuity per side")
+    merge_edge_tolerance: FloatProperty(name="Edge Tolerance", default=0.0, min=0.0, soft_max=0.001, precision=6,
+                                        unit='LENGTH', description="Largest allowed gap at the kept edges "
+                                                                   "(0 = a tenth of the tolerance)")
+
+    def _params(self):
+        p = {"merge_mode": self.merge_mode, "merge_tolerance": self.merge_tolerance, "merge_degree": self.merge_degree,
+             "merge_spans_u": self.merge_spans_u, "merge_spans_v": self.merge_spans_v,
+             "merge_edge_tolerance": self.merge_edge_tolerance}
+        for s_, _ in MERGE_SIDE_NAMES:
+            p[f"merge_cont_{s_}"] = getattr(self, f"merge_cont_{s_}")
+        return p
+
+    def draw(self, context):
+        from . import merge
+        lay = self.layout
+        inf = merge.LAST_INFO
+
+        def dist(x):
+            us = context.scene.unit_settings
+            m = x * (us.scale_length or 1.0)
+            if us.system == 'IMPERIAL':
+                return f"{m / 0.0254:.5f}\""
+            if us.system == 'METRIC':
+                return f"{m * 1e6:.1f} µm" if m < 1e-4 else f"{m * 1e3:.4f} mm"
+            return f"{x:.1e}"
+        lay.prop(self, "merge_mode", expand=True)
+        if self.merge_mode != "EXACT":
+            row = lay.row(align=True)
+            row.prop(self, "merge_tolerance")
+            if self.merge_tolerance <= 0 and inf:
+                row.label(text=f"auto {dist(inf['tolerance'])}")
+        refit = self.merge_mode == "REFIT" or (inf and inf.get("route") == "projected")
+        if refit:
+            lay.prop(self, "merge_degree")
+            row = lay.row(align=True)
+            row.prop(self, "merge_spans_u", text="Spans U")
+            row.prop(self, "merge_spans_v", text="Spans V")
+            lay.label(text="Spans: 0 = auto · 1 = one piece, no inner knot")
+        if self.merge_mode != "EXACT":
+            row = lay.row(align=True)
+            row.prop(self, "merge_edges", expand=True)
+            row.prop(self, "merge_per_side", text="", icon='MOD_EDGESPLIT')
+            if self.merge_per_side:
+                col = lay.column(align=True)
+                for s_, name in MERGE_SIDE_NAMES:
+                    r_ = col.row(align=True)
+                    r_.label(text=name)
+                    r_.prop(self, f"merge_cont_{s_}", expand=True)
+            row = lay.row(align=True)
+            row.prop(self, "merge_edge_tolerance", text="Edge Tolerance")
+            if self.merge_edge_tolerance <= 0 and inf:
+                row.label(text=f"auto {dist(inf['edge_tolerance'])}")
+        if inf:
+            if inf.get("route") == "grid":
+                lay.label(text=f"{inf['grid'][0]} x {inf['grid'][1]} patch grid · exact merge "
+                               f"{inf['exact_cvs'][0]} x {inf['exact_cvs'][1]} CVs", icon='CHECKMARK')
+            else:
+                lay.label(text=f"Refitted over the outer boundary ({inf.get('note', '')})", icon='INFO')
+            su, sv = inf["knots_u"] + 1, inf["knots_v"] + 1
+            tag = lambda fixed: "" if not refit else (" set" if fixed else " auto")
+            lay.label(text=f"{inf['cvs'][0]} x {inf['cvs'][1]} CVs · degree {inf['degree'][0]}/{inf['degree'][1]} · "
+                           f"spans {su}{tag(self.merge_spans_u)} x {sv}{tag(self.merge_spans_v)}", icon='MESH_GRID')
+            over = self.merge_mode != "EXACT" and inf["deviation"] > inf["tolerance"] * (1 + 1e-6)
+            lay.alert = over
+            lay.label(text=f"deviation {dist(inf['deviation'])}" + (f" > tolerance {dist(inf['tolerance'])}" if over else ""),
+                      icon='ERROR' if over else 'CHECKMARK')
+            lay.alert = False
+            cont = inf.get("continuity", {})
+            kept = [s_ for s_ in ("u0", "u1", "v0", "v1") if cont.get(s_, -1) >= 0]
+            if self.merge_mode != "EXACT" and kept:
+                w = inf.get("edge_worst", {})
+                txt = f"edges gap {dist(w.get('pos', 0.0))}"
+                if any(cont[s_] >= 1 for s_ in kept):
+                    txt += f" · angle {w.get('angle', 0.0):.3f}°"
+                if any(cont[s_] >= 2 for s_ in kept):
+                    txt += f" · curvature {100 * w.get('curv', 0.0):.1f}%"
+                bad = not inf.get("edges_ok", True)
+                lay.alert = bad
+                lay.label(text=txt + (" · over the edge checks" if bad else ""), icon='ERROR' if bad else 'CHECKMARK')
+                lay.alert = False
+            elif self.merge_mode != "EXACT":
+                lay.label(text="edges free: they may move by up to the deviation", icon='INFO')
+
+    def execute(self, context):
+        from . import merge
+        if not _kernel_ok(self):
+            return {'CANCELLED'}
+        objs = [o for o in context.selected_objects if store.is_nurbs(o) and store.get_brep(o).face_count() > 1]
+        if not objs:
+            self.report({'WARNING'}, "Select joined surfaces (two or more faces, four-sided outer boundary)")
+            return {'CANCELLED'}
+        p = self._params()
+        done = []
+        for o in objs:
+            try:
+                if features.history_enabled(context):
+                    features.push_step(o, "merge_patches", [], p)
+                    features.rebuild(o, context, force=True)
+                else:
+                    text = merge.apply_merge(o, o[store.PROP_BREP], [], p)
+                    store.set_geometry_text(o, text, context, keep_untrimmed=False)
+                    o[store.PROP_NATURAL] = 1
+                done.append(o)
+            except Exception as exc:
+                if features.history_enabled(context):
+                    try:
+                        st = features.stack(o)
+                        if st and st[-1]["op"] == "merge_patches":
+                            features.remove_step(o, len(st) - 1)
+                    except Exception:
+                        pass
+                self.report({'ERROR'}, f"{o.name}: {exc}")
+        if not done:
+            return {'CANCELLED'}
+        _select_only(context, done)
+        return {'FINISHED'}
+
+
 class NPROTO_OT_rebuild_surface(bpy.types.Operator):
     """Refit untrimmed surfaces with a chosen degree and number of spans (uniform knots)"""
     bl_idname = "nproto.rebuild_surface"
@@ -706,5 +869,5 @@ def _cross_curvature(surf, q, R, T):
     return float(k), n
 
 
-classes = (NPROTO_OT_extend, NPROTO_OT_refit_trim, NPROTO_OT_square, NPROTO_OT_sweep, NPROTO_OT_pipe, NPROTO_OT_boundary, NPROTO_OT_iso_curve, NPROTO_OT_dup_edge,
+classes = (NPROTO_OT_extend, NPROTO_OT_refit_trim, NPROTO_OT_merge_patches, NPROTO_OT_square, NPROTO_OT_sweep, NPROTO_OT_pipe, NPROTO_OT_boundary, NPROTO_OT_iso_curve, NPROTO_OT_dup_edge,
            NPROTO_OT_project_curve, NPROTO_OT_intersect, NPROTO_OT_rebuild_surface)

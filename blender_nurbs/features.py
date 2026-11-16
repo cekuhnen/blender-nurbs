@@ -1612,7 +1612,7 @@ def history(obj):
     return h
 
 
-NATURAL_STEPS = {"refit_trim", "rebuild_surface", "extend_surface"}   # result is an untrimmed surface
+NATURAL_STEPS = {"refit_trim", "merge_patches", "rebuild_surface", "extend_surface"}   # result is an untrimmed surface
 KEEP_STEPS = {"flip_normal"}     # result is plain / trimmed exactly when its input was
 PROP_STACK = "nproto_stack"   # JSON list of in-place steps: {"op", "refs", "params"}
 PROP_BASE = "nproto_base"     # brep text the stack starts from when there is no base feature

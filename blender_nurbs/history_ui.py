@@ -24,6 +24,8 @@ STEP_FIELDS = {
     "rebuild_surface": ["degree_u", "degree_v", "spans_u", "spans_v"],
     "extend_surface": ["distance"],
     "refit_trim": ["refit_degree", "refit_spans_u", "refit_spans_v"],
+    "merge_patches": ["merge_mode", "merge_tolerance", "merge_degree", "merge_spans_u", "merge_spans_v",
+                      "merge_cont_u0", "merge_cont_u1", "merge_cont_v0", "merge_cont_v1", "merge_edge_tolerance"],
 }
 CA_DEFAULTS = {"ca_tolerance": 1e-4, "ca_angle": 0.1, "ca_degree": 7}
 ROLE = {"trim": "trim cutter", "fillet_trim": "fillet partner"}
@@ -115,6 +117,16 @@ class NprotoStep(bpy.types.PropertyGroup):
     refit_degree: IntProperty(name="Degree", min=1, max=7, **_S())
     refit_spans_u: IntProperty(name="Spans U (0 auto)", min=0, max=32, **_S())
     refit_spans_v: IntProperty(name="Spans V (0 auto)", min=0, max=32, **_S())
+    merge_mode: EnumProperty(name="Match", items=[("EXACT", "Exact", ""), ("REDUCE", "Reduce", ""), ("REFIT", "Refit", "")], **_S())
+    merge_tolerance: FloatProperty(name="Tolerance (0 auto)", min=0.0, soft_max=0.01, precision=5, unit='LENGTH', **_S())
+    merge_degree: IntProperty(name="Degree", min=1, max=7, **_S())
+    merge_spans_u: IntProperty(name="Spans U (0 auto)", min=0, max=32, **_S())
+    merge_spans_v: IntProperty(name="Spans V (0 auto)", min=0, max=32, **_S())
+    merge_cont_u0: EnumProperty(name="Edge U start", items=[(k, k.title() if k == "FREE" else k, "") for k in ("FREE", "G0", "G1", "G2")], **_S())
+    merge_cont_u1: EnumProperty(name="Edge U end", items=[(k, k.title() if k == "FREE" else k, "") for k in ("FREE", "G0", "G1", "G2")], **_S())
+    merge_cont_v0: EnumProperty(name="Edge V start", items=[(k, k.title() if k == "FREE" else k, "") for k in ("FREE", "G0", "G1", "G2")], **_S())
+    merge_cont_v1: EnumProperty(name="Edge V end", items=[(k, k.title() if k == "FREE" else k, "") for k in ("FREE", "G0", "G1", "G2")], **_S())
+    merge_edge_tolerance: FloatProperty(name="Edge Tolerance (0 auto)", min=0.0, soft_max=0.001, precision=6, unit='LENGTH', **_S())
 
 
 def sync_step(obj, k):
@@ -378,7 +390,7 @@ def draw_steps(box, obj, only=None, bare=False):
 
 STEP_ICON = {"untrim_region": 'SELECT_SUBTRACT', "edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
              "flip_normal": 'NORMALS_FACE', "surface_align": 'SNAP_EDGE', "match_surface": 'SNAP_FACE', "extend_surface": 'FULLSCREEN_ENTER',
-             "rebuild_surface": 'MOD_REMESH', "refit_trim": 'MOD_LATTICE'}
+             "rebuild_surface": 'MOD_REMESH', "refit_trim": 'MOD_LATTICE', "merge_patches": 'MESH_GRID'}
 
 
 def _summary(obj, steps=True):
