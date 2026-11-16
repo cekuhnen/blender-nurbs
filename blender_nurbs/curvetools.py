@@ -209,10 +209,16 @@ def rebuild(spans, deg, n_cvs, closed, tol, keep_tangents=True, max_cvs=120):
     S = dense_samples(spans, 64)
     deg = max(1, min(MAX_DEGREE, int(deg)))
     tangents = None if closed or not keep_tangents else end_tangents(spans)
+    X, e = fit_auto(S, deg, closed, tangents, tol, n_cvs, max_cvs)
+    return X, deg, e
+
+
+def fit_auto(S, deg, closed, tangents, tol, n_cvs=0, max_cvs=120):
+    """(CVs, error) of the uniform spline through samples S: n_cvs CVs, or
+    (n_cvs 0) the fewest within tol."""
     lo = deg + 1
     if n_cvs:
-        X, e = fit(S, deg, max(int(n_cvs), lo), closed, tangents)
-        return X, deg, e
+        return fit(S, deg, max(int(n_cvs), lo), closed, tangents)
     cache = {}
     def f(n):
         if n not in cache:
@@ -233,8 +239,7 @@ def rebuild(spans, deg, n_cvs, closed, tol, keep_tangents=True, max_cvs=120):
             bad = m
     if f(good)[1] > tol:      # not monotone near the limit: take the best tried
         good = min(cache, key=lambda k: cache[k][1])
-    X, e = f(good)
-    return X, deg, e
+    return f(good)
 
 
 def rebuilt_spec(X, deg, closed):

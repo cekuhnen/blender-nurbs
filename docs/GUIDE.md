@@ -13,7 +13,7 @@ The sidebar tab **NURBS Proto** has one collapsible panel per group. Ctrl+click 
 | Panel | Contents |
 |---|---|
 | **Active Object** | Shown only when the active object has something to show: CV editing (Done / Cancel), its feature settings and history, its face and edge count |
-| **Create Curves** | CV Curve, Draw Line, Arc, Circle, Ellipse, Rectangle, Polygon, Slot, Profile · between curves: Blend Curve, Fillet · Helix (the other shapes, placed at the 3D cursor: Shift+A) · from surfaces: Iso Curve, Duplicate Edge, Project Curve, Intersect |
+| **Create Curves** | CV Curve, Draw Line, Arc, Circle, Ellipse, Rectangle, Polygon, Slot, Profile · between curves: Blend Curve, Fillet · from curves: Offset Curve · Helix (the other shapes, placed at the 3D cursor: Shift+A) · from surfaces: Iso Curve, Duplicate Edge, Project Curve, Intersect |
 | **Create Surfaces** | Draw Plane · Plane, Disk, Box, Cylinder, Cone, Sphere, Torus · from curves: Loft, Loft Rails, Sweep, Pipe, Extrude, Revolve, Planar · filling a gap: Boundary, Square, Patch, Dome · from surfaces: Offset, Thicken, Convert Blender Surface |
 | **Curve Edit** | Join / Unjoin Curves, Trim / Split Curves, Rebuild / Extend Curve, Align Curve |
 | **Surface Edit** | Edit CVs, Flip Normal, Rebuild Surface, Extend Surface, Surface Align, Match Surface, Refit to Trim · Trim, Split, Untrim, Join, Unjoin · Surface Fillet, Edge Fillet · solids: Union, Difference, Intersection, Boundary Fill |
@@ -230,6 +230,32 @@ and press Enter.
 * Two segments of **one polyline** (a Draw Line polyline): that corner is rounded in place, and it stays one curve.
 * A closed curve (a circle) is not trimmed, only touched by the arc. A curve with construction history loses it when
   it is trimmed (as with Trim Curves). Radius, Trim and Join are in the Adjust Last Operation panel afterwards.
+
+### Offset Curve (From Curves)
+
+Offsets the selected curves by a **Distance** within their plane. The plane is the one the curves lie in; straight
+lines and non-planar curves use the active work plane (World: XY). **Plane: Work Plane** always uses the work plane.
+A positive distance goes **outward** on a closed curve and to the **left** (seen from the plane's normal) on an open
+one; **Flip** goes to the other side, **Both Sides** makes both.
+
+* **Individual**: every selected curve object gets its own offset (corners inside one curve are still handled).
+  **Joined** (default): curves whose ends touch (within 0.001) are chained first, flipped as needed, and each chain is
+  offset as one curve (four separate lines of a rectangle give one offset rectangle).
+* **Lines and circular arcs are offset exactly**: a line moves, an arc keeps its centre and weights and changes its
+  radius. An arc that would shrink to nothing (a rounded rectangle offset inward by more than its corner radius) is
+  dropped and its neighbours meet in a sharp corner.
+* **Free-form spans** are fitted as uniform splines within **Tolerance** (default 0.0001), through the exact offset end
+  points and with the original's end directions, so they stay G1 to the exact pieces next to them. Where the distance
+  is larger than the curve's radius of curvature on that side the offset would fold into a little loop: the loop is cut
+  out and the offset gets a corner there.
+* **Corners**: on the inside of a turn the two offset pieces are trimmed where they cross; on the outside the gap is
+  closed **Sharp** (both extended by tangent lines until they meet), **Round** (an exact arc about the original
+  corner) or **Chamfer** (a straight line). A short edge between two inside corners that the offset uses up is
+  dropped (a trapezoid offset far inward becomes a triangle).
+* A warning says when the result still crosses itself (the distance is too large for the shape, e.g. two arms of a U
+  meeting); that crossing is not trimmed.
+* With construction history the offset follows its source curves, and Distance, Curves, Corners, Flip, Both Sides and
+  Tolerance stay editable in the Feature panel. The sources stay visible.
 
 ### Profile (circle, ellipse, square, rectangle perpendicular to a curve)
 

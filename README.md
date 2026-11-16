@@ -40,6 +40,7 @@ everything built from it rebuilds.
 
 - **Draw:** CV Curve, Draw Line (lines and tangent arcs), Arc, Circle, Ellipse, Rectangle (rounded corners), Polygon, Slot, Helix (3D: pitch, taper, left-handed), Profile
 - **Between curves:** Blend Curve, Fillet (trims and joins)
+- **From curves:** Offset Curve (individual or joined; sharp, round or chamfered corners)
 - **Shapes:** in Shift+A every shape at the 3D cursor (sized to the view)
 - **From surfaces:** Iso Curve, Duplicate Edge, Project Curve, Intersect
 - **Snapping:** to curves, NURBS surfaces and meshes (vertex, edge, edge center, face center; **O** onto the face), smart guides (aligned, tangent, parallel, perpendicular), sketches flat on the face you start on or on the world grid, **Alt** for a free point, **Ctrl** for the grid (a finer floor grid in perspective, on / off under Display)

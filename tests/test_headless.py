@@ -2206,6 +2206,67 @@ with ctx.temp_override(selected_objects=parts[:2], active_object=parts[0]):
     r = bpy.ops.nproto.join('INVOKE_DEFAULT')
 check("Join with curves selected joins curves", r == {'FINISHED'} and ctx.active_object.type == 'CURVE')
 
+# --- Offset Curve: exact lines / arcs, fitted free-form, corners, folds, history
+from blender_nurbs import curveoffset
+def _oc_pts(o, per=200):
+    return np.vstack([curvejoin.eval_span(s_, np.linspace(0, 1, per)) for sp_ in o.data.splines
+                      for s_ in curvejoin.transform_spans(curvejoin.spline_spans(sp_), geom.world_matrix(o))])
+def _oc_dist(P, base):
+    B_ = np.vstack([_oc_pts(b_, 2000) for b_ in (base if isinstance(base, list) else [base])])
+    return np.array([np.min(np.linalg.norm(B_ - x, axis=1)) for x in P])
+def _oc(objs, **kw):
+    r_ = bpy.ops.nproto.offset_curve(names=json.dumps([o.name for o in objs]), **kw)
+    return r_, (ctx.active_object if r_ == {'FINISHED'} else None), dict(curveoffset.LAST_INFO)
+_ocL = [nurbs(f"OcL{i}", [a, b], order=2) for i, (a, b) in enumerate(
+    [((0, 500, 0), (4, 500, 0)), ((4, 500, 0), (4, 502, 0)), ((4, 502, 0), (0, 502, 0)), ((0, 502, 0), (0, 500, 0))])]
+_r, _R, _i = _oc(_ocL, distance=0.3)
+_P = _oc_pts(_R)
+check("offset curve: 4 lines joined -> one sharp rectangle, exact", _r == {'FINISHED'} and len(_R.data.splines) == 1
+      and np.allclose(_P.min(0)[:2], [-0.3, 499.7], atol=1e-5) and np.allclose(_P.max(0)[:2], [4.3, 502.3], atol=1e-5)
+      and not _i["crossings"] and features.history(_R) is not None, str(_i))
+_r, _R, _i = _oc(_ocL, distance=0.3, oc_corner="ROUND")
+_d = _oc_dist(_oc_pts(_R), _ocL)
+check("offset curve: round corners are arcs about the corners", _r == {'FINISHED'} and np.abs(_d - 0.3).max() < 1e-3,
+      f"{np.abs(_d - 0.3).max():.1e}")
+_r, _R, _i = _oc(_ocL, distance=0.3, oc_mode="INDIVIDUAL")
+check("offset curve: individual -> one offset per curve", _r == {'FINISHED'} and len(ctx.selected_objects) == 4)
+_ocC = bpy.data.objects.new("OcCirc", bpy.data.curves.new("OcCirc", 'CURVE')); ctx.collection.objects.link(_ocC)
+primitives.write_spline_object(_ocC, primitives.exact_circle_spec(1.0)); _ocC.location = (10, 500, 0)
+ctx.view_layer.update()
+_r, _R, _i = _oc([_ocC], distance=-0.25)
+_rad = np.linalg.norm(_oc_pts(_R) - np.array([10, 500, 0]), axis=1)
+check("offset curve: a circle offsets exactly (inward)", _r == {'FINISHED'} and np.abs(_rad - 0.75).max() < 1e-6,
+      f"{np.abs(_rad - 0.75).max():.1e}")
+_ocRR = bpy.data.objects.new("OcRR", bpy.data.curves.new("OcRR", 'CURVE')); ctx.collection.objects.link(_ocRR)
+primitives.write_spline_object(_ocRR, features.run("prim_rectangle", [], {"width": 4.0, "depth": 2.0, "corner": 0.2})[1])
+_ocRR.location = (20, 500, 0); ctx.view_layer.update()
+_r, _R, _i = _oc([_ocRR], distance=-0.5)
+_P = _oc_pts(_R)
+check("offset curve: rounded rect inward drops its corner arcs (sharp inner rectangle)", _r == {'FINISHED'}
+      and _i["collapsed"] == 4 and np.allclose(_P.min(0)[:2], [18.5, 499.5], atol=1e-5)
+      and np.allclose(_P.max(0)[:2], [21.5, 500.5], atol=1e-5), str(_i))
+_ocTZ = nurbs("OcTZ", [(30, 500, 0), (36, 500, 0), (33.5, 506, 0), (32.5, 506, 0)], order=2)
+_ocTZ.data.splines[0].use_cyclic_u = True
+_r, _R, _i = _oc([_ocTZ], distance=-1.2)
+check("offset curve: an edge used up inward is dropped (trapezoid -> triangle)", _r == {'FINISHED'} and
+      _i["dropped"] == 1 and not _i["crossings"] and len(_R.data.splines[0].points) in (4, 7), str(_i))
+_ocF = nurbs("OcF", [(0, 510, 0), (1, 511, 0), (2, 510, 0), (3, 511.5, 0), (4, 510, 0)], order=4)
+_r, _R, _i = _oc([_ocF], distance=0.2)
+_d = _oc_dist(_oc_pts(_R), _ocF)
+check("offset curve: free-form fitted within tolerance", _r == {'FINISHED'} and _i["err"] <= 1e-4
+      and np.abs(_d - 0.2).max() < 2e-4, f"{np.abs(_d - 0.2).max():.1e} {len(_R.data.splines[0].points)} CVs")
+_ocF.data.splines[0].points[2].co = (2, 509, 0, 1)
+features.rebuild(_R, ctx)
+_d = _oc_dist(_oc_pts(_R), _ocF)
+check("offset curve follows its input (history)", np.abs(_d - 0.2).max() < 2e-4, f"{np.abs(_d - 0.2).max():.1e}")
+_ocB = nurbs("OcB", [(0, 520, 0), (1, 520, 0), (1.5, 521, 0), (2, 520, 0), (3, 520, 0)], order=4)
+_r, _R, _i = _oc([_ocB], distance=-0.6)
+_d = _oc_dist(_oc_pts(_R, 400), _ocB)
+check("offset curve: a fold (distance > radius) is cut out, nothing closer than the distance",
+      _r == {'FINISHED'} and _i["folds"] >= 1 and _d.min() > 0.6 - 2e-3, f"{_d.min():.4f} {_i}")
+for o_ in [o_ for o_ in bpy.data.objects if o_.name.startswith("Oc")]:
+    bpy.data.objects.remove(o_)
+
 # --- Save / reload
 path = os.path.join(tempfile.gettempdir(), "nurbs_test.blend")
 bpy.ops.wm.save_as_mainfile(filepath=path)
