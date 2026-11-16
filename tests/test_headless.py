@@ -9508,6 +9508,28 @@ _gres = {k_: _mg.refit_net(_gref, 3, 0, 0, 2.2e-4, {s_: 0 for s_ in _mg.SIDES}, 
 check("merge patches projected grid: edges pass on the grid samples, Adaptive needs fewer spans than Uniform",
       all(v[2] <= 2.2e-4 and _mg.edges_ok(v[3], 2.2e-5) for v in _gres.values())
       and _gres["ADAPTIVE"][1][0] < _gres["UNIFORM"][1][0], {k_: (v[1], f"{v[2]:.1e}") for k_, v in _gres.items()})
+# a bicubic (3 x 2 spans) split in two by a wavy curve: the trimmed halves share one surface, so the
+# projected grid is built in its parameters and Refit gets the bicubic back (an even 3D grid needed ~25 x 22)
+_wP = [(i / 5 * 2, j / 4 + 30, 0.25 * math.sin(2.1 * i / 5 + 1.4 * j / 4) + 0.04 * ((i * 7 + j * 3) % 5 - 2))
+       for i in range(6) for j in range(5)]
+_wS = store.new_object(ctx, "WavySplit", ext.surface_from_cvs(
+    3, 3, _wP, [float(x) for x in geom.clamped_uniform_knots(6, 3)], [float(x) for x in geom.clamped_uniform_knots(5, 3)]))
+_wC = poly("WavySplit_cut", [(1.0 + 0.15 * math.sin(6 * y_), y_ + 30, 2.0) for y_ in np.linspace(-0.2, 1.2, 41)])
+bpy.ops.object.select_all(action='DESELECT'); _wS.select_set(True); _wC.select_set(True); ctx.view_layer.objects.active = _wS
+r = bpy.ops.nproto.split(view_dir=(0, 0, -1))
+_wpcs = [o_ for o_ in bpy.data.objects if o_.name.startswith("WavySplit") and store.is_nurbs(o_) and not o_.hide_get()]
+bpy.ops.object.select_all(action='DESELECT')
+for _o in _wpcs:
+    _o.select_set(True)
+ctx.view_layer.objects.active = _wpcs[0]
+bpy.ops.nproto.join()
+_wres = {k_: _mg.merge_text(ctx.active_object[store.PROP_BREP], "REFIT", 0, 3, **kw_)[1]
+         for k_, kw_ in (("G0", dict(cont="G0")), ("FREE", dict(cont="FREE", knots="UNIFORM")))}
+check("merge patches projected: halves of a split bicubic refit on their surface's parameters in <= 4 x 4 spans",
+      r == {'FINISHED'} and len(_wpcs) == 2
+      and all(v["route"] == "projected" and v["grid_space"] == "surface" and v["edges_ok"]
+              and v["deviation"] <= v["tolerance"] and max(v["spans"]) <= 4 for v in _wres.values()),
+      {k_: (v["spans"], v.get("grid_space"), f"{v['deviation']:.1e}") for k_, v in _wres.items()})
 # seams: two Bezier patches meeting with a kink, two meeting tangent with a curvature jump. The check
 # names each seam; Refit keeps it sharp (a full / C1 knot there) and fits exactly, Smooth rounds it off
 _zU4 = [0, 0, 0, 0, 1, 1, 1, 1]
