@@ -152,6 +152,51 @@ def set_geometry_text(obj, text, context=None, keep_untrimmed=True):
 # Building / updating objects
 # --------------------------------------------------------------------------
 
+def _axis_angle(R):
+    """(unit axis, angle in degrees) of a 3x3 rotation matrix (float64)."""
+    c = max(-1.0, min(1.0, (float(np.trace(R)) - 1.0) / 2.0))
+    ang = math.acos(c)
+    if ang < 1e-15:
+        return (0.0, 0.0, 1.0), 0.0
+    if math.pi - ang > 1e-6:
+        a = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+    else:                                   # (about 180 degrees: the axis is R's eigenvector for 1)
+        w, v = np.linalg.eigh((R + R.T) / 2.0)
+        a = v[:, int(np.argmax(w))]
+    return tuple(a / np.linalg.norm(a)), math.degrees(ang)
+
+
+def transform(target, A):
+    """Move a kernel Brep / Surface / Curve by the affine 4x4 A (in place;
+    exact: scale, rotation, translation of the CVs). A shear (a non-uniform
+    scale on a turned frame) is refused."""
+    sm, _ = _k()
+    A = np.asarray(A, float)
+    if np.abs(A - np.eye(4)).max() <= 1e-14:
+        return target
+    L, loc = A[:3, :3], A[:3, 3]
+    if np.abs(A[3] - (0.0, 0.0, 0.0, 1.0)).max() > 1e-12:
+        raise ValueError("not an affine transform")
+    scl = np.linalg.norm(L, axis=0)
+    if np.linalg.det(L) < 0.0:
+        scl[0] = -scl[0]                     # a mirror: in the scale
+    if np.any(np.abs(scl) < 1e-12):
+        raise ValueError("a zero scale")
+    R = L / scl
+    if np.abs(R.T @ R - np.eye(3)).max() > 1e-5:      # (Blender's matrices are float32)
+        raise ValueError("a shear can't be applied exactly")
+    U, _, Vt = np.linalg.svd(R)
+    R = U @ Vt                               # the nearest exact rotation
+    if np.abs(scl - 1.0).max() > 1e-14:
+        sm.scale(target, tuple(float(x) for x in scl))
+    axis, angle = _axis_angle(R)
+    if abs(angle) > 1e-13:
+        sm.rotate(target, (0.0, 0.0, 0.0), axis, angle)
+    if np.abs(loc).max() > 0.0:
+        sm.translate(target, tuple(float(x) for x in loc))
+    return target
+
+
 def to_brep(geom):
     """Accept a kernel Surface or Brep."""
     sm, ext = _k()
@@ -970,6 +1015,36 @@ def _refine_single(surf, pts, nrm, tris, lmax, max_tris=120000, passes=8, max_an
     return P.astype(np.float32), Nn.astype(np.float32), T
 
 
+def corner_params(curve, t0, t1, limit=400):
+    """Parameters inside (t0, t1) where `curve` may have a corner: its knots of
+    multiplicity >= its degree (every knot of a polyline). Evenly spaced
+    samples skip them and draw a chord across the corner (an extruded
+    rectangle's rims cut every corner but the seam's)."""
+    try:
+        _, ext = _k()
+        d = ext.curve_cvs(curve)
+    except Exception:
+        return []
+    from .geom import _corner_knots
+    out = _corner_knots([float(k) for k in d["knots"]], int(d["degree"]), t0, t1)
+    return out if len(out) <= limit else []
+
+
+def edge_params(e, n=40):
+    """Sample parameters of a B-rep edge for drawing: n evenly spaced, plus
+    its curve's corners (corner_params)."""
+    t0, t1 = e.parameter_range()
+    ts = [t0 + (t1 - t0) * i / (n - 1) for i in range(n)]
+    try:
+        extra = corner_params(e.curve(), t0, t1)
+    except Exception:
+        extra = []
+    if extra:
+        tol = 1e-7 * max(abs(t1 - t0), 1e-12)
+        ts = sorted(ts + [k for k in extra if min(abs(k - t) for t in ts) > tol])
+    return ts
+
+
 def _display_data(brep):
     """Edge polylines and CV nets in local space, for the overlay."""
     _, ext = _k()
@@ -978,8 +1053,7 @@ def _display_data(brep):
     for e in brep.edges():
         poly = []
         try:
-            t0, t1 = e.parameter_range()
-            poly = [list(e.point_at(t0 + (t1 - t0) * i / (n - 1))) for i in range(n)]
+            poly = [list(e.point_at(t)) for t in edge_params(e, n)]
         except Exception:
             try:  # some edges (e.g. fillet rails) only evaluate through their curve
                 c = e.curve()
@@ -1030,6 +1104,8 @@ def write_mesh(obj, brep, context=None):
     except Exception as exc:
         print("NURBS normals:", exc)
     me.update()
+    from .pivot import remember
+    remember(obj)              # (Set Origin / Apply Transform move the mesh: pivot.py follows with the B-rep)
 
 
 CREASE_DEG = 30.0
@@ -1276,8 +1352,19 @@ def new_object(context, name, geom, matrix=None):
     coll.objects.link(obj)
     if matrix is not None:
         obj.matrix_world = matrix
-    set_geometry(obj, geom, context)
+    try:
+        set_geometry(obj, geom, context)
+    except Exception:
+        _discard(obj)          # no empty object left behind (and no undo step to remove it)
+        raise
     return obj
+
+
+def _discard(obj):
+    me = obj.data
+    bpy.data.objects.remove(obj)
+    if me is not None and me.users == 0:
+        bpy.data.meshes.remove(me)
 
 
 def new_object_text(context, name, text, matrix=None):
@@ -1288,7 +1375,11 @@ def new_object_text(context, name, text, matrix=None):
     coll.objects.link(obj)
     if matrix is not None:
         obj.matrix_world = matrix
-    set_geometry_text(obj, text, context, keep_untrimmed=False)
+    try:
+        set_geometry_text(obj, text, context, keep_untrimmed=False)
+    except Exception:
+        _discard(obj)
+        raise
     return obj
 
 

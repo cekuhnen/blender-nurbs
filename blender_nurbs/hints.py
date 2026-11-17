@@ -22,7 +22,7 @@ A tool calls show() whenever its state changes and clear() when it ends:
 """
 
 import bpy
-from bpy.props import BoolProperty
+from bpy.props import BoolProperty, EnumProperty
 
 HUD = {"spec": None, "area": None, "collapsed": False, "top": 0.0}
 FONT = 0
@@ -324,8 +324,25 @@ class NPROTO_AP_preferences(bpy.types.AddonPreferences):
                                   description="Show the tools' key hints in the 3D view as one line "
                                               "(? or F1 while a tool runs switches it)")
 
+    value_input: EnumProperty(
+        name="Value Input",
+        items=[("HANDLES", "Handles", "Tools that have them (Extrude) show the result as a preview with "
+                                      "handles to drag; type a value, click away or Enter to make it"),
+               ("DIALOG", "Dialog", "Ask for the values in a dialog first, then make the result "
+                                    "(the way every sized tool worked before handles)")],
+        default="HANDLES",
+        description="How sized tools take their values when started from the UI. Tools without handles "
+                    "always use the dialog; scripts and the Adjust Last Operation panel use neither")
+
     def draw(self, context):
+        self.layout.prop(self, "value_input")
         self.layout.prop(self, "hints_collapsed")
+
+
+def value_input():
+    """'HANDLES' or 'DIALOG' (the add-on's preference; Handles when it can't be read)."""
+    p = _prefs()
+    return getattr(p, "value_input", "HANDLES") if p is not None else "HANDLES"
 
 
 classes = (NPROTO_AP_preferences,)

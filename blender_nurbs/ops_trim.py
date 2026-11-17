@@ -12,8 +12,9 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProp
 from bpy_extras import view3d_utils
 from mathutils import Vector
 
-from . import draw, features, geom, jobs, steps, store
+from . import draw, features, geom, hints, jobs, steps, store
 from .ops import AskValue, PickMixin, _kernel_ok, _near_candidates, _pick_candidates, _select_only
+from .valuedrag import ValueDrag, ruled_preview
 
 
 def _ray_nurbs(context, event):
@@ -700,8 +701,10 @@ def fit_radius(op, objs, names):
                         f"using {getattr(op, names[0]):g} m")
 
 
-class NPROTO_OT_fillet(AskValue, bpy.types.Operator):
-    """Fillet or chamfer between two surfaces (select both)"""
+class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
+    """Fillet or chamfer between two surfaces (select both). Where they cross,
+    the fillet is previewed with a radius arrow: drag it, type a value, A / B
+    put it on the other side of a surface, click away or Enter to make it"""
     bl_idname = "nproto.fillet"
     bl_label = "Fillet / Chamfer"
     bl_options = {'REGISTER', 'UNDO'}
@@ -741,7 +744,133 @@ class NPROTO_OT_fillet(AskValue, bpy.types.Operator):
         sel.sort(key=lambda o: o == act)  # active = B
         self.surf_a, self.surf_b = sel[0].name, sel[1].name
         self.fit_pending = True
+        self._start_event = (event.mouse_x, event.mouse_y, event.type, event.value)
         return self.ask(context)
+
+    # -- the live value stage (valuedrag.py) ----------------------------------
+    fit_view = "shrink"         # the radius fit_radius found for the part: only ever made smaller
+    SHAPES = ("CIRCULAR", "CHAMFER", "BLEND")
+
+    @property
+    def drag_fields(self):
+        return ("radius",) if (self.same_radius or self.rail_type == "CHORD") else ("radius", "radius_b")
+
+    def _label(self, name):
+        word = "Distance" if self.shape == "CHAMFER" else "Radius"
+        if name == "radius" and self.rail_type == "CHORD":
+            return "Chord"
+        if name == "radius" and (self.same_radius or self.rail_type == "CHORD"):
+            return word
+        return f"{word} {'A' if name == 'radius' else 'B'}"
+
+    def _sides(self):
+        return (-1.0 if self.flip_a else 1.0), (-1.0 if self.flip_b else 1.0)
+
+    def drag_setup(self, context, mouse):
+        a, b = bpy.data.objects.get(self.surf_a), bpy.data.objects.get(self.surf_b)
+        if a is None or b is None:
+            return False
+        self._sf = surface_fillet_frames(a, b)
+        return bool(self._sf)          # surfaces that do not cross: the dialog
+
+    def _chord_k(self, P, NA, NB):
+        """2 sin(th/2) per sample (chord = k * ball radius), th the turn between the faces."""
+        sa, sb = self._sides()
+        ca, cb, A, B = surface_fillet_rails(P, NA, NB, sa, sb)
+        D1, D2 = ca - A + cb, ca + cb - B
+        D1 /= np.linalg.norm(D1, axis=1, keepdims=True) + 1e-300
+        D2 /= np.linalg.norm(D2, axis=1, keepdims=True) + 1e-300
+        th = np.pi - np.arccos(np.clip(np.sum(D1 * D2, axis=1), -0.9999, 0.9999))
+        return 2.0 * np.sin(0.5 * np.maximum(th, np.radians(1.0)))
+
+    def _radii(self, P, NA, NB):
+        if self.rail_type == "CHORD":
+            r = self.radius / self._chord_k(P, NA, NB)
+            return r, r
+        rb = self.radius if self.same_radius else self.radius_b
+        return np.full(len(P), self.radius), np.full(len(P), rb)
+
+    def drag_preview(self):
+        sa, sb = self._sides()
+        lines, tris = [], []
+        for P, NA, NB in self._sf:
+            ra, rb = self._radii(P, NA, NB)
+            X = surface_fillet_sections(P, NA, NB, ra, rb, sa, sb, self.shape)
+            L, T = ruled_preview(list(X), ribs=2)
+            lines += L
+            tris.append(T)
+        return {"lines": lines, "tris": np.vstack(tris)}
+
+    def _handle(self, field):
+        P, NA, NB = self._sf[0]
+        j = len(P) // 2
+        sa, sb = self._sides()
+        ca, cb, A, B = (x[0] for x in surface_fillet_rails(P[j:j + 1], NA[j:j + 1], NB[j:j + 1], sa, sb))
+        ra, rb = (x[j] for x in self._radii(P, NA, NB))
+        if field == "radius":           # the rail on A: P + ra (ca - A) + rb cb, along D1
+            D = ca - A + cb
+            D /= np.linalg.norm(D) or 1.0
+            al, be = float((ca - A) @ D), float(cb @ D)
+            if self.rail_type == "CHORD":
+                k = float(self._chord_k(P[j:j + 1], NA[j:j + 1], NB[j:j + 1])[0])
+                to_value, param = (lambda t: t * k / (al + be)), ra * (al + be)
+            elif self.same_radius:
+                to_value, param = (lambda t: t / (al + be)), ra * (al + be)
+            else:
+                to_value, param = (lambda t: (t - rb * be) / al), ra * al + rb * be
+        else:                           # the rail on B: P + ra ca + rb (cb - B), along D2
+            D = ca + cb - B
+            D /= np.linalg.norm(D) or 1.0
+            al, be = float(ca @ D), float((cb - B) @ D)
+            to_value, param = (lambda t: (t - ra * al) / be), ra * al + rb * be
+        return {"field": field, "kind": "arrow", "origin": P[j], "dir": D, "base": P[j], "param": param,
+                "to_value": to_value}
+
+    def drag_handles(self):
+        return [self._handle(f) for f in self.drag_fields]
+
+    def drag_key(self, context, event, ch):
+        if ch == "c":
+            self.shape = self.SHAPES[(self.SHAPES.index(self.shape) + 1) % len(self.SHAPES)]
+        elif ch == "r":
+            self.rail_type = "CHORD" if self.rail_type == "RADIUS" else "RADIUS"
+            self._field = 0
+        elif ch == "a":
+            self.flip_a = not self.flip_a
+        elif ch == "b":
+            self.flip_b = not self.flip_b
+        elif ch == "s":
+            self.same_radius = not self.same_radius
+            if not self.same_radius:
+                self.radius_b = self.radius
+            self._field = 0
+        elif ch == "g" and self.shape == "BLEND":
+            self.continuity = "1" if self.continuity == "2" else "2"
+        elif ch == "t":
+            self.trim_bases = not self.trim_bases
+        else:
+            return False
+        return True
+
+    def drag_handle_hints(self):
+        if len(self.drag_fields) > 1:
+            return [hints.key("LMB drag", "arrows: radius on A, on B")]
+        return [hints.key("LMB drag", "arrow: chord" if self.rail_type == "CHORD" else "arrow: radius")]
+
+    def drag_rows(self):
+        rows = [("Shape", [hints.cycle("C", ["circular", "chamfer", "blend"], self.shape.lower()),
+                           hints.cycle("R", ["rolling ball", "chord"],
+                                       "rolling ball" if self.rail_type == "RADIUS" else "chord", "size"),
+                           hints.toggle("S", "same radius", self.same_radius)]
+                 + ([hints.cycle("G", ["G1", "G2"], "G" + self.continuity)] if self.shape == "BLEND" else [])),
+                ("Side", [hints.key("A", "other side of A"), hints.key("B", "other side of B"),
+                          hints.toggle("T", "trim the surfaces", self.trim_bases)])]
+        return rows
+
+    def drag_state(self):
+        a, b = bpy.data.objects.get(self.surf_a), bpy.data.objects.get(self.surf_b)
+        return [self.shape.title(), f"A {a.name if a else '?'}, B {b.name if b else '?'}",
+                "the preview is approximate: the kernel makes the real fillet"]
 
     def prepare_value(self, context):
         a, b = bpy.data.objects.get(self.surf_a), bpy.data.objects.get(self.surf_b)
@@ -1689,10 +1818,179 @@ def tangent_chain(cand, cands, max_deg=10.0):
     return chain
 
 
-class NPROTO_OT_edge_fillet(AskValue, PickMixin, bpy.types.Operator):
+def _v3(x):
+    return np.array([x.x, x.y, x.z] if hasattr(x, "x") else list(x), float)
+
+
+def fillet_frames(obj, idx, n=15):
+    """Where a fillet of shared edge idx of obj sits, per sample along it
+    (world): (P (n,3) the edge's points, D1, D2 (n,3) unit directions into its
+    two faces, across the edge, in each face's tangent plane). The rolling
+    ball of radius r sits in the wedge between D1 and D2 (on the material side
+    of a convex edge, outside a concave one): rails at P + r / tan(a/2) D,
+    a = the angle between D1 and D2. Sampled once; any radius is then a
+    formula (the Edge Fillet preview)."""
+    from .kernel import load
+    sm = load()
+    b = store.get_brep(obj)
+    e = b.edges()[idx]
+    fs = e.faces()
+    if len(fs) != 2:
+        return None
+    M = geom.world_matrix(obj)
+    M3 = np.array(M.to_3x3(), float)
+    Mt = np.array(M.translation, float)
+    t0, t1 = e.parameter_range()
+    ts = np.linspace(t0, t1, n)
+    h = 1e-4 * (t1 - t0)
+    pts = np.array([_v3(e.point_at(t)) for t in np.linspace(t0, t1, 33)])
+    eps = 1e-3 * float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))     # a step into a face
+    Ps, D1, D2 = [], [], []
+    for t in ts:
+        P = _v3(e.point_at(t))
+        a, c = _v3(e.point_at(max(t0, t - h))), _v3(e.point_at(min(t1, t + h)))
+        T = c - a
+        T /= np.linalg.norm(T) or 1.0
+        ds = []
+        for f in fs:
+            surf = f.surface()
+            _, uvs, _ = sm.surface_closest_point(surf, tuple(P))
+            uv = uvs[0]
+            u, v = (uv.x, uv.y) if hasattr(uv, "x") else (uv[0], uv[1])
+            nrm = np.array(f.outward_normal_at_uv(u, v), float)
+            d = np.cross(nrm, T)
+            d /= np.linalg.norm(d) or 1.0
+            # into the face: a small step that way in its (u, v) must stay inside its trims
+            Dv = surf.derivatives(u, v)
+            J = np.column_stack([np.array(Dv[1], float), np.array(Dv[2], float)])
+            step = np.linalg.lstsq(J, d * eps, rcond=None)[0]
+            (u0, u1), (v0, v1) = surf.u_domain(), surf.v_domain()
+
+            def out(uu, vv):        # past the surface's own range (an untrimmed side), or outside its trims
+                tu, tv = 1e-9 * (u1 - u0), 1e-9 * (v1 - v0)
+                if not (u0 - tu <= uu <= u1 + tu and v0 - tv <= vv <= v1 + tv):
+                    return True
+                return f.classify_uv(uu, vv) == "outside"
+            if out(u + step[0], v + step[1]) and not out(u - step[0], v - step[1]):
+                d = -d
+            ds.append(d)
+        Ps.append(P)
+        D1.append(ds[0])
+        D2.append(ds[1])
+    P = np.array(Ps) @ M3.T + Mt
+    to_w = lambda D: (lambda X: X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-300))(np.array(D) @ M3.T)
+    return P, to_w(D1), to_w(D2)
+
+
+def fillet_sections(P, D1, D2, r, shape="CIRCULAR", k=9, fullness=1.0):
+    """Cross-sections of a fillet of radius r (per sample, scalar or (n,))
+    over the frames of fillet_frames: (n, k, 3), rail on face 1 first.
+    CIRCULAR: the rolling ball's arc; CHAMFER: the straight line between the
+    rails; BLEND: a curve tangent to both faces (fuller with fullness > 1)."""
+    r = np.broadcast_to(np.asarray(r, float), (len(P),))
+    cosa = np.clip(np.sum(D1 * D2, axis=1), -0.9999, 0.9999)
+    half = 0.5 * np.arccos(cosa)                     # half the wedge's angle
+    s = r / np.tan(half)                             # edge -> rail
+    T1, T2 = P + s[:, None] * D1, P + s[:, None] * D2
+    w = np.linspace(0.0, 1.0, k)[None, :, None]
+    if shape == "CHAMFER":
+        return T1[:, None] * (1 - w) + T2[:, None] * w
+    if shape == "BLEND":
+        g = np.clip(0.55 * fullness, 0.05, 1.0)
+        A, B = T1 + g * (P - T1), T2 + g * (P - T2)
+        return ((1 - w) ** 3 * T1[:, None] + 3 * (1 - w) ** 2 * w * A[:, None]
+                + 3 * (1 - w) * w ** 2 * B[:, None] + w ** 3 * T2[:, None])
+    bis = D1 + D2
+    bis /= np.linalg.norm(bis, axis=1, keepdims=True) + 1e-300
+    C = P + (r / np.sin(half))[:, None] * bis
+    a, b = (T1 - C) / r[:, None], (T2 - C) / r[:, None]
+    om = np.arccos(np.clip(np.sum(a * b, axis=1), -1.0, 1.0))
+    so = np.sin(om)
+    so = np.where(so < 1e-9, 1.0, so)
+    wa = np.sin((1 - w[..., 0]) * om[:, None]) / so[:, None]
+    wb = np.sin(w[..., 0] * om[:, None]) / so[:, None]
+    return C[:, None] + r[:, None, None] * (wa[..., None] * a[:, None] + wb[..., None] * b[:, None])
+
+
+def surface_fillet_frames(a, b, n=15):
+    """Where a fillet between surfaces a and b sits: per intersection curve,
+    (P (n,3) points on it, NA, NB (n,3) the surfaces' outward normals there),
+    world. None when they do not cross. With the ball on the normals' sides
+    (Flip A / Flip B off) its centre C has n_A . (C - P) = r_A, n_B . (C - P)
+    = r_B: any radius is then a formula (the Surface Fillet preview)."""
+    from .kernel import load
+    from .sweeps import _world_brep
+    sm = load()
+    wa, wb = _world_brep(a), _world_brep(b)
+    try:
+        curves, _ = sm.intersect_breps(wa, wb)
+    except RuntimeError:            # the kernel raises when they do not meet
+        return None
+    out = []
+    for c in curves or []:
+        t0, t1 = c.parameter_range()
+        P = np.array([_v3(c.evaluate(t)) for t in np.linspace(t0, t1, n)])
+        if float(np.sum(np.linalg.norm(np.diff(P, axis=0), axis=1))) < 1e-9:
+            continue
+        NA, NB = [], []
+        for p in P:
+            for br, acc in ((wa, NA), (wb, NB)):
+                f = min(br.faces(), key=lambda f: f.closest_point(tuple(p))[1])
+                _, uvs, _ = sm.surface_closest_point(f.surface(), tuple(p))
+                uv = uvs[0]
+                u, v = (uv.x, uv.y) if hasattr(uv, "x") else (uv[0], uv[1])
+                nn = np.array(f.outward_normal_at_uv(u, v), float)
+                acc.append(nn / (np.linalg.norm(nn) or 1.0))
+        out.append((P, np.array(NA), np.array(NB)))
+    return out or None
+
+
+def surface_fillet_rails(P, NA, NB, sa, sb):
+    """Per sample (n,3) each: (ca, cb, A, B) with the ball centre at
+    C = P + r_A ca + r_B cb and its rails at C - r_A A (on surface A) and
+    C - r_B B (on B); A, B are the normals turned to the ball's side. sa, sb:
+    +1 for the ball on that surface's normal side, -1 for the other (Flip)."""
+    A, B = sa * NA, sb * NB
+    g = np.sum(A * B, axis=1)
+    det = np.clip(1.0 - g * g, 1e-6, None)
+    # least-norm x with A.x = ra, B.x = rb: x = alpha A + beta B
+    ca = (A - g[:, None] * B) / det[:, None]          # x for (ra, rb) = (1, 0)
+    cb = (B - g[:, None] * A) / det[:, None]          # ... (0, 1)
+    return ca, cb, A, B
+
+
+def surface_fillet_sections(P, NA, NB, ra, rb, sa, sb, shape="CIRCULAR", k=9):
+    """Cross-sections (n, k, 3) of a fillet between two crossing surfaces,
+    rail on A first: the ball (radius ra from A, rb from B; an equal pair is
+    the rolling ball's arc), a straight chamfer, or a blend tangent to both."""
+    n = len(P)
+    ra = np.broadcast_to(np.asarray(ra, float), (n,))
+    rb = np.broadcast_to(np.asarray(rb, float), (n,))
+    ca, cb, A, B = surface_fillet_rails(P, NA, NB, sa, sb)
+    C = P + ra[:, None] * ca + rb[:, None] * cb
+    T1, T2 = C - ra[:, None] * A, C - rb[:, None] * B
+    w = np.linspace(0.0, 1.0, k)[None, :, None]
+    if shape == "CHAMFER":
+        return T1[:, None] * (1 - w) + T2[:, None] * w
+    if shape == "BLEND":
+        A1, B1 = T1 + 0.55 * (P - T1), T2 + 0.55 * (P - T2)
+        return ((1 - w) ** 3 * T1[:, None] + 3 * (1 - w) ** 2 * w * A1[:, None]
+                + 3 * (1 - w) * w ** 2 * B1[:, None] + w ** 3 * T2[:, None])
+    a, b = -A, -B                                    # centre -> rails, unit
+    om = np.arccos(np.clip(np.sum(a * b, axis=1), -1.0, 1.0))
+    so = np.where(np.sin(om) < 1e-9, 1.0, np.sin(om))
+    wa = np.sin((1 - w[..., 0]) * om[:, None]) / so[:, None]
+    wb = np.sin(w[..., 0] * om[:, None]) / so[:, None]
+    rr = ra[:, None] + (rb - ra)[:, None] * w[..., 0]          # equal radii: the ball's arc
+    return C[:, None] + rr[..., None] * (wa[..., None] * a[:, None] + wb[..., None] * b[:, None])
+
+
+class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
     """Fillet, chamfer or blend shared edges of joined surfaces and solids.
     Click the edges to fillet (click again to un-pick, A = all), Enter to finish.
-    Alt+click the button: all shared edges of the selected objects at once"""
+    Alt+click the button: all shared edges of the selected objects at once.
+    Then the cross-sections are previewed: drag the radius handle, type a value,
+    click away or Enter to make it"""
     bl_idname = "nproto.edge_fillet"
     bl_label = "Edge Fillet"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1804,7 +2102,115 @@ class NPROTO_OT_edge_fillet(AskValue, PickMixin, bpy.types.Operator):
         if objs:
             fit_radius(self, objs, ["radius", "end_radius"])     # a size that fits, shown in the dialog
 
+    # -- the live value stage (valuedrag.py) ----------------------------------
+    angle_fields = ()
+    fit_view = "shrink"         # the radius fit_radius found for the part: only ever made smaller
+    SHAPES = ("CIRCULAR", "CHAMFER", "BLEND")
+
+    @property
+    def drag_fields(self):
+        return ("radius", "end_radius") if self.variable and self.rail_type == "RADIUS" else ("radius",)
+
+    def drag_setup(self, context, mouse):
+        self._ef = []
+        for name, ref in json.loads(self.inputs or "[]"):
+            obj = bpy.data.objects.get(name)
+            if obj is None or not ref.startswith("E"):
+                continue
+            fr = fillet_frames(obj, int(ref[1:]))
+            if fr is not None:
+                self._ef.append(fr)
+        if not self._ef:
+            return False
+        n_all = sum(len(P) for P, _, _ in self._ef)
+        self._frac = []                 # each sample's place along the picks, 0..1 (a variable radius)
+        k = 0
+        for P, _, _ in self._ef:
+            self._frac.append(np.arange(k, k + len(P)) / max(n_all - 1, 1))
+            k += len(P)
+        return True
+
+    def _r_of(self, value, cosa):
+        """Ball radius for a field value at a wedge of cos(angle) cosa."""
+        if self.rail_type == "CHORD":
+            th = np.pi - np.arccos(np.clip(cosa, -0.9999, 0.9999))       # angle between the normals
+            return value / (2.0 * np.sin(0.5 * max(th, np.radians(1.0))))
+        return value
+
+    def _radii(self, i):
+        f = self._frac[i]
+        P, D1, D2 = self._ef[i]
+        cosa = np.sum(D1 * D2, axis=1)
+        if self.variable and self.rail_type == "RADIUS":
+            vals = self.radius + (self.end_radius - self.radius) * f
+        else:
+            vals = np.full(len(P), self.radius)
+        return np.array([self._r_of(v, c) for v, c in zip(vals, cosa)])
+
+    def drag_preview(self):
+        lines, tris = [], []
+        for i in range(len(self._ef)):
+            P, D1, D2 = self._ef[i]
+            X = fillet_sections(P, D1, D2, self._radii(i), self.shape, fullness=self.thumbweight)
+            L, T = ruled_preview(list(X), ribs=2)
+            lines += L
+            tris.append(T)
+        return {"lines": lines, "tris": np.vstack(tris)}
+
+    def _handle(self, field, i, j):
+        P, D1, D2 = self._ef[i]
+        cosa = float(D1[j] @ D2[j])
+        tan_half = np.tan(0.5 * np.arccos(np.clip(cosa, -0.9999, 0.9999)))
+        value = getattr(self, field)
+        if self.rail_type == "CHORD":     # chord -> rail distance and back
+            th = np.pi - np.arccos(np.clip(cosa, -0.9999, 0.9999))
+            k = 2.0 * np.sin(0.5 * max(th, np.radians(1.0)))
+        else:
+            k = 1.0
+        return {"field": field, "kind": "arrow", "origin": P[j], "dir": D1[j], "base": P[j],
+                "param": value / k / tan_half, "to_value": lambda t: t * tan_half * k}
+
+    def drag_handles(self):
+        P0 = self._ef[0][0]
+        hs = [self._handle("radius", 0, len(P0) // 2 if len(self._ef) == 1 or not self.variable else 1)]
+        if "end_radius" in self.drag_fields:
+            Pl = self._ef[-1][0]
+            hs.append(self._handle("end_radius", len(self._ef) - 1, len(Pl) - 2))
+        return hs
+
+    def drag_key(self, context, event, ch):
+        if ch == "c":
+            self.shape = self.SHAPES[(self.SHAPES.index(self.shape) + 1) % len(self.SHAPES)]
+        elif ch == "v":
+            self.variable = not self.variable
+            self._field = 0
+        elif ch == "r":
+            self.rail_type = "CHORD" if self.rail_type == "RADIUS" else "RADIUS"
+            self._field = 0
+        else:
+            return False
+        return True
+
+    def drag_handle_hints(self):
+        hs = [hints.key("LMB drag", "arrow: radius" if self.rail_type == "RADIUS" else "arrow: chord")]
+        if "end_radius" in self.drag_fields:
+            hs.append(hints.key("LMB drag", "2nd arrow: end radius"))
+        return hs
+
+    def drag_rows(self):
+        return [("Shape", [hints.cycle("C", ["circular", "chamfer", "blend"], self.shape.lower()),
+                           hints.cycle("R", ["rolling ball", "chord"],
+                                       "rolling ball" if self.rail_type == "RADIUS" else "chord", "size"),
+                           hints.toggle("V", "variable", self.variable)])]
+
+    def drag_state(self):
+        n = len(self._ef)
+        return [self.shape.title(), f"{n} edge" + ("s" if n != 1 else ""),
+                "the preview is approximate: the kernel makes the real fillet"]
+
     def modal(self, context, event):
+        if getattr(self, "_dragging", False):
+            return super().modal(context, event)      # the value stage (valuedrag.py)
         if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
             self._alt = event.alt
         if event.type == 'A' and event.value == 'PRESS':

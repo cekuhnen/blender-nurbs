@@ -52,6 +52,292 @@ check("loft has history", features.history(L) is not None)
 # --- Extrude + Revolve + Planar
 r = bpy.ops.nproto.extrude(inputs=ins((A,"S0")), distance=1.5, direction="Y")
 E1 = ctx.active_object; check("extrude", r == {'FINISHED'} and len(E1.data.polygons) > 0)
+
+# --- Extrude's live preview (valuedrag.py) draws what the command builds
+from blender_nurbs import valuedrag
+from blender_nurbs.ops import extrude_rows
+check("value drag: mouse ray to arrow parameter",
+      abs(valuedrag.axis_param((2, 5, 10), (0, 0, -1), (0, 0, 0), (1, 0, 0)) - 2.0) < 1e-12
+      and abs(valuedrag.axis_param((0, 0, 10), (0, 0, -1), (1, 0, 0), (-1, 0, 0)) - 1.0) < 1e-12
+      and valuedrag.axis_param((0, 0, 10), (0, 0, -1), (0, 0, 0), (0, 0, 1)) is None)
+check("value drag: snap", valuedrag.snap(1.26, 0.25) == 1.25 and valuedrag.snap(-0.13, 0.1) == -0.1)
+
+def _poly_dist(p, poly):
+    best = 1e300
+    for a, b in zip(poly[:-1], poly[1:]):
+        ab = b - a; L = ab @ ab
+        t = 0.0 if L == 0 else min(1.0, max(0.0, (p - a) @ ab / L))
+        best = min(best, np.linalg.norm(a + t * ab - p))
+    return best
+
+_pv_open = nurbs("PvOpen", [(0, 0, 0), (1, 0.6, 0), (2, -0.4, 0), (3, 0.2, 0)])
+bpy.ops.curve.primitive_nurbs_circle_add(radius=0.7, location=(0, 4, 0))
+_pv_circ = ctx.active_object
+_pv_cu = bpy.data.curves.new("PvRect", 'CURVE'); _pv_cu.dimensions = '3D'
+_pv_sp = _pv_cu.splines.new('POLY'); _pv_sp.points.add(3); _pv_sp.use_cyclic_u = True
+for _q, _c in zip(_pv_sp.points, [(0, 8, 0), (2, 8, 0), (2, 9, 0), (0, 9, 0)]):
+    _q.co = (*_c, 1.0)
+_pv_rect = bpy.data.objects.new("PvRect", _pv_cu); ctx.collection.objects.link(_pv_rect)
+_pv_worst = []
+for _o, _p in [(_pv_open, dict(distance=1.3, direction="NORMAL")),
+               (_pv_open, dict(distance=-0.8, direction="Y", tilt=20.0, tilt_azimuth=30.0)),
+               (_pv_open, dict(distance=1.0, direction="Z", draft=10.0)),
+               (_pv_open, dict(distance=0.6, direction="Z", draft=8.0, symmetric=True)),
+               (_pv_circ, dict(distance=1.2, direction="NORMAL", draft=15.0)),
+               (_pv_circ, dict(distance=1.2, direction="Z", draft=12.0, draft_flip=True)),
+               (_pv_circ, dict(distance=0.9, direction="LOCAL_Z", symmetric=True)),
+               (_pv_rect, dict(distance=0.7, direction="Z", draft=20.0)),
+               (_pv_rect, dict(distance=0.5, direction="Z", draft=10.0, draft_flip=True, symmetric=True))]:
+    _c = features.input_curve(_o, "S0")
+    _cv = ext.curve_cvs(_c)
+    _poly = _cv["degree"] == 1 and not _cv.get("weights")      # as the tool does: a polyline's corners
+    _P = np.array(_cv["points"], float) if _poly else geom.sample_curve(_c, 97)
+    _rows = extrude_rows(_P, features.extrude_direction(_o, _c, _p), _p["distance"], _p.get("draft", 0.0),
+                         _p.get("draft_flip", False), _p.get("symmetric", False), smooth=not _poly)
+    _s = features.run("extrude", [(_o, "S0")], _p)
+    _edges = [np.array(geom.boundary_points(_s, w, 801)) for w in ("U0", "U1", "V0", "V1")]
+    _far = [_rows[0], _rows[-1]]
+    _worst = max(min(_poly_dist(q, e) for e in _edges) for r_ in _far for q in r_[::6])
+    _pv_worst.append(round(float(_worst), 6))
+# drawn edges of an extruded rectangle go through its corners (evenly spaced
+# samples cut every corner but the seam's with a chord)
+_rc_corner = []
+for _dr in (0.0, 8.0):
+    bpy.ops.nproto.extrude(inputs=ins((_pv_rect, "S0")), distance=0.5, direction="Z", draft=_dr)
+    _rx = ctx.active_object
+    _rP = [np.array(e, float) for e in store.display(_rx)["edges"]]
+    _rbot = [e for e in _rP if np.ptp(e[:, 2]) < 1e-9 and abs(e[0, 2]) < 1e-9]
+    _rc_corner.append(max(min(np.min(np.linalg.norm(b - np.array(c), axis=1)) for b in _rbot)
+                          for c in [(0, 8, 0), (2, 8, 0), (2, 9, 0), (0, 9, 0)]))
+    _rs = store.get_surfaces(_rx)[0]
+    _rb = [np.array(geom.boundary_points(_rs, w, 48, corners=True)) for w in ("U0", "U1", "V0", "V1")]
+    _rb = [b for b in _rb if np.ptp(b[:, 2]) < 1e-9 and abs(b[0, 2]) < 1e-9]
+    _rc_corner.append(max(min(np.min(np.linalg.norm(b - np.array(c), axis=1)) for b in _rb)
+                          for c in [(0, 8, 0), (2, 8, 0), (2, 9, 0), (0, 9, 0)]))
+check("extruded rectangle: drawn edges and pick outlines hit every corner (plain, draft)",
+      max(_rc_corner) < 1e-9, [round(float(x), 6) for x in _rc_corner])
+# --- Revolve / Offset / Edge Fillet previews (valuedrag.py) land on what the commands build
+from mathutils.bvhtree import BVHTree as _BVH
+from blender_nurbs.valuedrag import rotate_points as _rot
+from blender_nurbs.ops import offset_frame as _offr
+from blender_nurbs.ops_trim import fillet_frames as _ffr, fillet_sections as _fsec
+
+def _tree(o_):
+    M_ = o_.matrix_world
+    return _BVH.FromPolygons([M_ @ v_.co for v_ in o_.data.vertices], [p_.vertices[:] for p_ in o_.data.polygons])
+
+_pv_prof = nurbs("PvProf", [(1, 0, 0), (1.3, 0, 0.5), (0.8, 0, 1), (1, 0, 1.5)])
+_pv_prof.location = (0.5, 0.2, 9.0); ctx.view_layer.update()
+_S = geom.sample_curve(features.input_curve(_pv_prof, "S0"), 97)
+_rv_gap = []
+for _ang, _ax, _pvt in ((120.0, "Z", "WORLD"), (-75.0, "LOCAL_Z", "OBJECT"), (360.0, "Y", "WORLD")):
+    _z = np.array(geom.axis_vector(_ax, _pv_prof), float); _z /= np.linalg.norm(_z)
+    _O = np.array(geom.world_matrix(_pv_prof).translation if _pvt == "OBJECT" else (0, 0, 0), float)
+    _sf = features.run("revolve", [(_pv_prof, "S0")], {"angle": _ang, "axis": _ax, "pivot": _pvt})
+    _sm = _kl()
+    _cp = lambda q_: np.array((lambda c_: [c_.x, c_.y, c_.z] if hasattr(c_, "x") else list(c_))(
+        _sm.surface_closest_point(_sf, tuple(float(x_) for x_ in q_))[0]), float)
+    _rv_gap.append(max(np.linalg.norm(_cp(q_) - q_)
+                       for f_ in (0.5, 1.0) for q_ in _rot(_S[::8], _O, _z, _ang * f_)))
+check("revolve preview: rotated profiles lie on the built surface (world / local axis, object pivot, 360)",
+      max(_rv_gap) < 1e-6, [float(f"{x:.2g}") for x in _rv_gap])
+# a picked line as the axis: the surface turns about it, and the Feature box keeps it when the angle changes
+_ap, _ad = (3.0, 1.0, 9.0), (0.3, 0.2, 1.0)
+r = bpy.ops.nproto.revolve(inputs=ins((_pv_prof, "S0")), angle=150.0, axis="PICKED", axis_point=_ap, axis_dir=_ad)
+_rp = ctx.active_object
+_z = np.array(_ad) / np.linalg.norm(_ad)
+_sf = store.get_surfaces(_rp)[0]
+_Mrp = np.array(_rp.matrix_world, float)
+_gap_p = max(np.linalg.norm(_cp((np.linalg.inv(_Mrp) @ np.append(q_, 1.0))[:3]) - (np.linalg.inv(_Mrp) @ np.append(q_, 1.0))[:3])
+             for q_ in _rot(_S[::8], np.array(_ap), _z, 150.0))
+_rp.nproto_feature.angle = 90.0           # edit in the Feature box: rebuilds from the history
+_hp = features.history(_rp)["params"]
+# the user's case: profile and axis line both selected, the line picked as the axis -> the line is
+# left out (turned about itself it has no surface: the kernel refused the face), the profile revolves,
+# and a failed object is not left behind
+_ucv = nurbs("UCurve", [(0.6425, 0, 0.3741), (0.3886, 0, 0.2942), (0.3517, 0, 0.0999), (0.4261, 0, -0.1368)])
+_uln = bpy.data.curves.new("ULine", 'CURVE'); _uln.dimensions = '3D'
+_usp = _uln.splines.new('POLY'); _usp.points.add(1)
+_usp.points[0].co = (0.8344, 0, 0.293, 1.0); _usp.points[1].co = (0.8344, 0, -0.1146, 1.0)
+_ulo = bpy.data.objects.new("ULine", _uln); ctx.collection.objects.link(_ulo)
+_n0 = len(bpy.data.objects)
+r_u = bpy.ops.nproto.revolve(inputs=ins((_ucv, "S0"), (_ulo, "S0")), angle=331.75, axis="PICKED",
+                             axis_point=(0.8344, 0, 0.293), axis_dir=(0, 0, -1))
+_umade = [o_ for o_ in bpy.data.objects if o_.name.startswith("Revolve") and o_ not in (_rp,)]
+_n1 = len(bpy.data.objects)
+_bad_g = features.run("revolve", [(_ulo, "S0")], {"angle": 90.0, "axis": "PICKED", "axis_point": (0.8344, 0, 0.293),
+                                                  "axis_dir": (0, 0, -1)})
+_nb = len(bpy.data.objects)
+try:
+    store.new_object(ctx, "ShouldNotStay", _bad_g); _raised = False
+except Exception:
+    _raised = True
+check("revolve: a selected curve on the picked axis is left out, the profile revolves; a failed object is removed",
+      r_u == {'FINISHED'} and _n1 == _n0 + 1 and _raised and len(bpy.data.objects) == _nb
+      and "ShouldNotStay" not in bpy.data.objects,
+      (r_u, _n1 - _n0, _raised, len(bpy.data.objects) - _nb))
+# the last selected decides: a straight active line is Revolve's axis; Sweep's active curve is the path and,
+# on two rails, the profile is the curve touching both others
+from blender_nurbs.ops import _straight_line
+from blender_nurbs.ops_sweep import sweep_profile
+_sl = _straight_line(features.input_curve(_ulo, "S0"))
+_sw_r1 = nurbs("SwR1", [(0, 20, 0), (0, 20.5, 1), (0, 21, 2), (0, 21.5, 3)])
+_sw_r2 = nurbs("SwR2", [(2, 20, 0), (2, 20.5, 1), (2, 21, 2), (2, 21.5, 3)])
+_sw_pr = nurbs("SwPr", [(0, 20, 0), (0.7, 19.6, 0), (1.3, 19.6, 0), (2, 20, 0)])
+check("two-element tools: a straight line is found (a curve is not); Sweep's profile among three curves",
+      _sl is not None and np.allclose(_sl[1], (0, 0, -1), atol=1e-6) and _straight_line(features.input_curve(_ucv, "S0")) is None
+      and sweep_profile([_sw_r1, _sw_pr, _sw_r2], _sw_r2) is _sw_pr and sweep_profile([_sw_pr, _sw_r1], _sw_r1) is _sw_pr,
+      (_sl, sweep_profile([_sw_r1, _sw_pr, _sw_r2], _sw_r2).name))
+check("revolve about a picked line: on the preview's rotation; a Feature box edit keeps the line",
+      r == {'FINISHED'} and _gap_p < 1e-5 and _hp["axis"] == "PICKED" and abs(_hp["angle"] - 90.0) < 1e-9
+      and np.allclose(_hp["axis_point"], _ap) and np.allclose(_hp["axis_dir"], _ad, atol=1e-6),
+      (r, float(f"{_gap_p:.2g}"), _hp.get("axis"), _hp.get("angle"), _hp.get("axis_point")))
+
+bpy.ops.nproto.extrude(inputs=ins((_pv_open, "S0")), distance=1.5, direction="Z"); _osh = ctx.active_object
+bpy.ops.nproto.add_primitive(kind="BOX", width=2, depth=1.5, height=1); _obx = ctx.active_object
+_obx.location = (0, -12, 0); ctx.view_layer.update()
+_of_gap = []
+for _o, _d in ((_osh, 0.2), (_osh, -0.15), (_obx, 0.2)):
+    bpy.ops.object.select_all(action='DESELECT'); _o.select_set(True); ctx.view_layer.objects.active = _o
+    _V, _W, _T, _sh = _offr(_o)
+    bpy.ops.nproto.offset(distance=_d); _res = ctx.active_object; ctx.view_layer.update()
+    _t = _tree(_res)
+    _of_gap.append(max(_t.find_nearest(Vector(q_))[3] for q_ in _V + _d * _W))
+    bpy.data.objects.remove(_res)
+check("offset preview: the offset mesh lies on the result (sheet both sides, box with extended corners)",
+      max(_of_gap) < 2e-3, [round(float(x), 5) for x in _of_gap])
+
+_fl_gap = []
+for _shape in ("CIRCULAR", "CHAMFER"):
+    bpy.ops.nproto.add_primitive(kind="BOX", width=2, depth=1.5, height=1); _fb = ctx.active_object
+    _fb.location = (0, -16, 0); ctx.view_layer.update()
+    _ei = store.shared_edges(_fb)[0]
+    _P, _D1, _D2 = _ffr(_fb, _ei)
+    _X = _fsec(_P, _D1, _D2, 0.2, _shape)
+    bpy.ops.nproto.edge_fillet(inputs=json.dumps([[_fb.name, f"E{_ei}"]]), radius=0.2, shape=_shape)
+    ctx.view_layer.update()
+    _t = _tree(_fb)
+    _fl_gap.append(max(_t.find_nearest(Vector(q_))[3] for q_ in _X[1:-1].reshape(-1, 3)))
+check("edge fillet preview: rolling-ball arc and chamfer line lie on the kernel's fillet (box edge)",
+      max(_fl_gap) < 1e-3, [round(float(x), 6) for x in _fl_gap])
+
+# --- Surface Fillet / Offset Curve / Extend Surface previews and their arrows
+from blender_nurbs import valuedrag as _vd, curveoffset as _cof, curvejoin as _cj, primitives as _prims
+from blender_nurbs.ops_trim import (NPROTO_OT_fillet as _OpSF, surface_fillet_frames as _sff,
+                                    surface_fillet_sections as _sfs)
+from blender_nurbs.ops_sweep import NPROTO_OT_extend as _OpEx
+
+def _pl_dist(q_, R_):
+    """Distance from point q_ to the polyline R_ (vectorized)."""
+    a_, ab_ = R_[:-1], np.diff(R_, axis=0)
+    t_ = np.clip(np.einsum("ij,ij->i", q_ - a_, ab_) / np.maximum(np.einsum("ij,ij->i", ab_, ab_), 1e-300), 0, 1)
+    return float(np.min(np.linalg.norm(a_ + t_[:, None] * ab_ - q_, axis=1)))
+
+_v3k = lambda c_: np.array([c_.x, c_.y, c_.z] if hasattr(c_, "x") else list(c_), float)
+
+def _plain(cls, **attrs):
+    """An object with the operator's methods (no Blender operator), for its preview code."""
+    body = {k: v for k, v in cls.__dict__.items() if not k.startswith("__") and not k.startswith("bl_")}
+    o_ = type("_Plain" + cls.__name__, (_vd.ValueDrag,), body)()
+    for k, v in attrs.items():
+        setattr(o_, k, v)
+    return o_
+
+_sf_gap, _sf_arrow = [], []
+for _kind, _fa, _fb2, _shape, _ra, _rb in ((60, False, False, "CIRCULAR", 0.2, 0.2), (60, True, True, "CIRCULAR", 0.2, 0.2),
+                                          (125, False, True, "CHAMFER", 0.15, 0.25), ("cyl", False, True, "CIRCULAR", 0.2, 0.2)):
+    bpy.ops.nproto.add_primitive(kind="PLANE"); _sa_o = ctx.active_object; _sa_o.location = (40, 0, 0)
+    if _kind == "cyl":
+        bpy.ops.nproto.add_primitive(kind="CYLINDER"); _sb_o = ctx.active_object; _sb_o.location = (40.2, 0.1, -0.3)
+    else:
+        bpy.ops.nproto.add_primitive(kind="PLANE"); _sb_o = ctx.active_object
+        _sb_o.rotation_euler = (0, math.radians(_kind), math.radians(20)); _sb_o.location = (40.3, 0, 0.2)
+    ctx.view_layer.update()
+    _fr = _sff(_sa_o, _sb_o)
+    _sg = (-1.0 if _fa else 1.0), (-1.0 if _fb2 else 1.0)
+    _Xs = [_sfs(P_, A_, B_, _ra, _rb, *_sg, _shape) for P_, A_, B_ in _fr]
+    # the arrows stand on the rails and give back the value they show
+    _f = _plain(_OpSF, _sf=_fr, flip_a=_fa, flip_b=_fb2, rail_type="RADIUS", same_radius=_ra == _rb, radius=_ra,
+                radius_b=_rb, shape=_shape)
+    _j = len(_fr[0][0]) // 2
+    for _h, _rail in zip(_f.drag_handles(), (_Xs[0][_j, 0], _Xs[0][_j, -1])):
+        _sf_arrow.append(max(float(np.linalg.norm(_vd.ValueDrag._pos(_h) - _rail)),
+                             abs(_h["to_value"](_h["param"]) - getattr(_f, _h["field"]))))
+    r = bpy.ops.nproto.fillet(surf_a=_sa_o.name, surf_b=_sb_o.name, radius=_ra, radius_b=_rb, same_radius=_ra == _rb,
+                              shape=_shape, flip_a=_fa, flip_b=_fb2, auto_flip=False, trim_bases=False)
+    _t = _tree(ctx.active_object)
+    _sf_gap.append(max(_t.find_nearest(Vector(q_))[3] for X_ in _Xs for q_ in X_[2:-2, 1:-1].reshape(-1, 3)))
+    for o_ in (_sa_o, _sb_o, ctx.active_object):
+        bpy.data.objects.remove(o_)
+check("surface fillet preview: ball arcs / chamfers on the kernel's fillet on every side (planes, cylinder, "
+      "two chamfer distances); the arrows sit on the rails", max(_sf_gap) < 2e-3 and max(_sf_arrow) < 1e-9,
+      ([round(float(x), 5) for x in _sf_gap], max(_sf_arrow)))
+bpy.ops.nproto.add_primitive(kind="PLANE"); _sa_o = ctx.active_object; _sa_o.location = (40, 0, 0)
+bpy.ops.nproto.add_primitive(kind="PLANE"); _sb_o = ctx.active_object; _sb_o.location = (40, 0, 3)
+ctx.view_layer.update()
+check("surface fillet: surfaces that do not cross have no preview (the dialog asks)", _sff(_sa_o, _sb_o) is None)
+
+_oc_free = nurbs("OcFree", [(0, 50, 0), (1, 51, 0), (2, 49.5, 0), (3, 50.8, 0), (4, 50, 0)])
+_oc_l = bpy.data.curves.new("OcL", 'CURVE'); _oc_l.dimensions = '3D'
+_oc_ls = _oc_l.splines.new('POLY'); _oc_ls.points.add(4); _oc_ls.use_cyclic_u = True
+for _q, _c in zip(_oc_ls.points, [(0, 54, 0), (3, 54, 0), (3, 55, 0), (1, 55, 0), (0, 56.5, 0)]):
+    _q.co = (*_c, 1.0)
+_oc_lo = bpy.data.objects.new("OcL", _oc_l); ctx.collection.objects.link(_oc_lo)
+_oc_dev = []
+for _o, _prm in ((_oc_free, {"distance": 0.3}), (_oc_free, {"distance": -0.2, "both_sides": True}),
+                 (_oc_lo, {"distance": 0.25, "oc_corner": "SHARP"}), (_oc_lo, {"distance": 0.25, "oc_corner": "ROUND"}),
+                 (_oc_lo, {"distance": -0.2, "oc_corner": "CHAMFER", "flip": True})):
+    _pcs = [_cj.input_spans(_o, "S0")]
+    _L = _cof.preview_polylines(_pcs, _prm, 1e-3)
+    _R = []
+    for sp_ in _cof.offset_curves(_pcs, _prm):  # noqa
+        k_ = _prims.spec_to_kernel_curve(sp_)
+        _R.append(np.array([k_.evaluate(t_) for t_ in np.linspace(*k_.parameter_range(), 3000)]))
+    _Rl = _R
+    _dev = max(min(_pl_dist(q_, R_) for R_ in _Rl) for L_ in _L for q_ in L_)
+    _R = np.vstack(_R)
+    _cov = max(min(_poly_dist(q_, L_) for L_ in _L) for q_ in _R[::25])     # and the preview covers all of it
+    # the arrow: its foot on the curve, a positive distance along it lands on the offset
+    _sp, _cl, _N, _sgn = _cof._chains(_pcs, dict(_prm, distance=1.0, both_sides=False), _cof._new_info())[0]
+    _B, _v = _cof.side_direction(_sp, _cl, _N, _sgn, _cof._start(_sp) + 0.3)
+    _arw = min(_pl_dist(_B + _prm["distance"] * _v, R_) for R_ in _Rl)
+    _oc_dev.append(round(max(_dev, _cov, _arw), 5))
+check("offset curve preview: the offset (corners sharp / round / chamfer, both sides, flipped) without the fit, "
+      "and its arrow points to the side the distance goes", max(_oc_dev) < 2e-3, _oc_dev)
+
+_ex_w = nurbs("ExW", [(0, 60, 0), (1, 60.5, 0), (2, 59.6, 0), (3, 60.1, 0)])
+bpy.ops.nproto.extrude(inputs=ins((_ex_w, "S0")), distance=1.5, direction="Z"); _ex_s = ctx.active_object
+_ex_s.scale = (1.5, 1.5, 1.5); ctx.view_layer.update()
+_ex_dev = []
+for _edge in ("U0", "U1", "V0", "V1"):
+    for _d in (0.4, -0.3):
+        _x = _plain(_OpEx, inputs=json.dumps([[_ex_s.name, _edge]]), distance=_d)
+        _ok = _x.drag_setup(ctx, None)
+        _rows, _path = _x._strip()
+        _h = _x.drag_handles()[0]
+        _sv = _ex_s.copy(); _sv.data = _ex_s.data.copy(); ctx.collection.objects.link(_sv)
+        for k_ in _ex_s.keys():
+            _sv[k_] = _ex_s[k_]
+        bpy.ops.nproto.extend(inputs=json.dumps([[_sv.name, _edge]]), distance=_d)
+        _rs = store.get_surfaces(_sv)[0]
+        _Mi = np.array(_sv.matrix_world.inverted(), float)
+        _loc = lambda q_: _Mi[:3, :3] @ q_ + _Mi[:3, 3]
+        _cpd = lambda q_: float(np.linalg.norm(_v3k(_sm.surface_closest_point(_rs, tuple(map(float, _loc(q_))))[0])
+                                               - _loc(q_)))
+        _new = _rows[-1] if _d > 0 else _rows[0]
+        _on = max(_cpd(q_) for r_ in (_rows if _d > 0 else [_new]) for q_ in r_[::4])
+        # the new edge is the result's boundary there (its far side: nothing beyond)
+        _bd = np.array(geom.boundary_points(_rs, _edge, 33)) @ np.array(_sv.matrix_world, float)[:3, :3].T \
+            + np.array(_sv.matrix_world.translation)
+        _edge_gap = max(min(_poly_dist(q_, _bd), _poly_dist(q_, _bd[::-1])) for q_ in _new[::4])
+        _ex_dev.append(round(max(_on, _edge_gap, float(np.linalg.norm(_vd.ValueDrag._pos(_h) - _new[16])))
+                             * (1 if _ok else 1e9), 7))
+        bpy.data.objects.remove(_sv)
+check("extend preview: the band lies on the extended surface, its far row is the new edge (shrink too), "
+      "the arrow head on it (U0 / U1 / V0 / V1, scaled object)", max(_ex_dev) < 1e-5, _ex_dev)
+# drafts of smooth curves: the result is a fit within ~3e-4 of the true draft here
+check("extrude preview rows lie on the built surface's edges (plain, tilt, draft, symmetric, cone, polyline)",
+      max(_pv_worst) < 1e-3 and max(_pv_worst[i] for i in (0, 1, 6, 7, 8)) < 1e-5, _pv_worst)
 prof = nurbs("Prof", [(1,0,0),(1.3,0,0.5),(0.8,0,1),(1,0,1.5)])
 r = bpy.ops.nproto.revolve(inputs=ins((prof,"S0")), axis="Z", pivot="WORLD", angle=360)
 R = ctx.active_object; check("revolve", r == {'FINISHED'} and len(R.data.polygons) > 0)
@@ -2051,6 +2337,23 @@ for pr in (sp_end, sp_start):
 check("sweep from the rail's end matches the sweep from its start",
       all(np.allclose(bb["SwProfEnd"][i], bb["SwProfStart"][i], atol=1e-3) for i in (0, 1)) and bb["SwProfEnd"][1][1] < 101.6,
       str({k: (np.round(v[0], 3).tolist(), np.round(v[1], 3).tolist()) for k, v in bb.items()}))
+
+# --- Sweep: an exact circle along a path that runs straight, then bends (a user's tube): the row fit
+# used 28 CVs on 32 rows with a first knot span holding no row; the tube folded back behind its profile
+from blender_nurbs import primitives as _prm
+_tr = nurbs("SwTubePath", [(0, 200, 0), (0, 200.3048, 0), (0, 200.9144, 0), (0.3573, 201.47, 0), (1.2798, 201.648, 0),
+                           (1.4625, 200.701, 0), (1.8627, 200.6642, 0)], order=4)
+_tc = bpy.data.objects.new("SwTubeProf", bpy.data.curves.new("SwTubeProf", 'CURVE')); ctx.collection.objects.link(_tc)
+_prm.write_spline_object(_tc, _prm.exact_circle_spec(0.1016))
+_tc.location = (0, 200, 0); _tc.rotation_euler = (math.pi / 2, 0, math.pi); ctx.view_layer.update()
+_ts = features.run("sweep", [(_tc, "S0"), (_tr, "S0")], {"samples": 32})
+_tk = features.input_curve(_tr, "S0")
+_RP = np.array([_tk.evaluate(t) for t in np.linspace(*_tk.parameter_range(), 6000)])
+(_u0, _u1), (_v0, _v1) = _ts.u_domain(), _ts.v_domain()
+_X = np.array([_ts.evaluate(u, v) for u in np.linspace(_u0, _u1, 161) for v in np.linspace(_v0, _v1, 16)])
+_rerr = max(abs(float(np.min(np.linalg.norm(_RP - x, axis=1))) - 0.1016) for x in _X)
+check("sweep: a circle along a straight-then-bent path stays a round tube, nothing behind the profile",
+      _rerr < 1e-3 and _X[:, 1].min() > 200 - 1e-6, f"radius error {_rerr:.5f}, min y {_X[:, 1].min() - 200:.5f}")
 
 
 # --- Loft Rails: profiles + 0 / 1 / 2 rails, G0 / G1 / G2
@@ -9705,5 +10008,73 @@ check("history: a feature whose input was deleted still takes a step (Merge Patc
 check("merge patches operator: Knots option reaches the history step", _r_sj == {'FINISHED'}
       and features.stack(_SJ)[-1]["op"] == "merge_patches"
       and features.stack(_SJ)[-1]["params"].get("merge_knots") == "UNIFORM")
+
+# --- Set Origin / Apply Transform on NURBS objects (pivot.py): the B-rep follows the mesh, and things built
+# from it (a G2 blend loft) and its own rebuilds stay where they were
+from blender_nurbs import pivot
+_pl1 = nurbs("PivLine1", [(0, 0, 0), (0, 1, 0)], order=2)
+_pl2 = nurbs("PivLine2", [(1, 0, 1), (1, 1, 1)], order=2)
+bpy.ops.nproto.extrude(inputs=ins((_pl1, "S0")), distance=-0.5, direction="Z")
+_pe1 = ctx.active_object
+bpy.ops.nproto.extrude(inputs=ins((_pl2, "S0")), distance=0.5, direction="Z")
+_pe2 = ctx.active_object
+def _wpts(o):
+    M = np.array(geom.world_matrix(o))
+    P = np.array([v.co[:] for v in o.data.vertices])
+    return P @ M[:3, :3].T + M[:3, 3]
+def _bpts(o):
+    M = geom.world_matrix(o)
+    return np.array([tuple(M @ Vector(e.point_at(t))) for e in store.get_brep(o).edges() for t in e.parameter_range()])
+def _near(P, Q):
+    return max(float(np.min(np.linalg.norm(Q - p, axis=1))) for p in P)
+def _edge_of(o, z):       # the extrude's edge at height z (the one on its line)
+    return min(range(len(store.get_brep(o).edges())), key=lambda i: abs(_bpts(o)[2 * i:2 * i + 2, 2].mean() - z))
+r = bpy.ops.nproto.loft(inputs=ins((_pe1, f"E{_edge_of(_pe1, 0.0)}"), (_pe2, f"E{_edge_of(_pe2, 1.0)}")),
+                        cont_a="G2", cont_b="G2")
+_plo = ctx.active_object
+_plo_w, _pe2_w, _pe2_b = _wpts(_plo), _wpts(_pe2), _bpts(_pe2)
+bpy.ops.object.select_all(action='DESELECT')
+_pe2.select_set(True); ctx.view_layer.objects.active = _pe2
+bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY')
+ctx.view_layer.update()
+_moved = (_pe2.location - Vector((0, 0, 0))).length
+check("set origin on a NURBS result: the object stays, its B-rep follows (placement stored)",
+      _moved > 0.1 and _near(_bpts(_pe2), _pe2_b) < 1e-9 and features.PROP_PLACE in _pe2
+      and _pe2.get(features.PROP_KEY) == features.build_key(_pe2), (_moved, _near(_bpts(_pe2), _pe2_b)))
+features.rebuild(_pe2, ctx, force=True)
+features.rebuild(_plo, ctx, force=True)
+check("set origin: the result's rebuild and the blend built from it stay in place",
+      _near(_bpts(_pe2), _pe2_b) < 1e-9 and _near(_wpts(_plo), _plo_w) < 1e-6 and _near(_wpts(_pe2), _pe2_w) < 1e-6,
+      (_near(_bpts(_pe2), _pe2_b), _near(_wpts(_plo), _plo_w)))
+_pe2.rotation_euler = (0.3, 0.2, 0.5); _pe2.scale = (1.5, 1.5, 1.5)
+ctx.view_layer.update()
+_rot_b = _bpts(_pe2)
+bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+ctx.view_layer.update()
+_ok_apply = _near(_bpts(_pe2), _rot_b) < 1e-6
+features.rebuild(_pe2, ctx, force=True)
+check("apply rotation / scale on a NURBS result: B-rep and rebuild stay where they were",
+      _ok_apply and _near(_bpts(_pe2), _rot_b) < 1e-6 and tuple(_pe2.location) == (0, 0, 0),
+      (_ok_apply, _near(_bpts(_pe2), _rot_b)))
+# a plain NURBS object (no history), trimmed texts included
+_pfree = store.new_object_text(ctx, "PivFree", store.get_brep(_pe1) and store.brep_to_text(store.get_brep(_pe1)))
+_pfree[store.PROP_UNTRIM] = _pfree[store.PROP_BREP]
+_pf_b = _bpts(_pfree)
+bpy.ops.object.select_all(action='DESELECT')
+_pfree.select_set(True); ctx.view_layer.objects.active = _pfree
+ctx.scene.cursor.location = (3, 2, 1)
+bpy.ops.object.origin_set(type='ORIGIN_CURSOR')
+ctx.view_layer.update()
+_pf_u = store.brep_from_text(_pfree[store.PROP_UNTRIM])
+check("set origin on a plain NURBS object: its B-rep and Untrim text follow",
+      tuple(_pfree.location) == (3, 2, 1) and _near(_bpts(_pfree), _pf_b) < 1e-9
+      and _near(np.array([tuple(geom.world_matrix(_pfree) @ Vector(e.point_at(e.parameter_range()[0])))
+                          for e in _pf_u.edges()]), _pf_b) < 1e-9, tuple(_pfree.location))
+ctx.scene.cursor.location = (0, 0, 0)
+# a G move is not an origin change
+_pfree.location = (4, 4, 4)
+ctx.view_layer.update()
+check("moving a NURBS object leaves its B-rep alone", not pivot.check(_pfree)
+      and _near(_bpts(_pfree), _pf_b + np.array([1, 2, 3])) < 1e-9)
 
 print("ALL OK" if ok else "SOME FAILED")

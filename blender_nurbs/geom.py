@@ -147,6 +147,8 @@ def fit_rows(rows, degree=3, tol=None, fallback=True, max_cvs=None, params=None)
     if tols is not None and np.all(tols > 0):
         for n_cvs in range(p + 1, N if max_cvs is None else min(N, max_cvs + 1)):
             U = _ls_knots(params, n_cvs, p)
+            if _empty_span(params, U):
+                continue
             X = _ls_fit(params, B, U, p, n_cvs)
             A = interp_matrix(params, U, p, n_cvs)
             err = np.abs(A @ X - B).reshape(N, -1, 3)
@@ -178,6 +180,20 @@ def _ls_knots(params, n_cvs, p):
         U.append((1 - a) * params[i - 1] + a * params[i])
     U += [1.0] * (p + 1)
     return U
+
+
+def _empty_span(params, U):
+    """True when a knot span holds no sample strictly inside it: nothing pins
+    the curve there, and a fit with nearly as many CVs as samples swings its
+    end CVs freely (a sweep with 28 CVs on 32 rows got a first span of 0.009
+    with no sample in it and folded back behind its profile)."""
+    t = np.asarray(params, float)
+    ks = np.unique(np.asarray(U, float))
+    eps = 1e-12 * max(1.0, float(ks[-1] - ks[0]))
+    for a, b in zip(ks[:-1], ks[1:]):
+        if not np.any((t > a + eps) & (t < b - eps)):
+            return True
+    return False
 
 
 def _ls_fit(params, B, U, p, n_cvs):
@@ -845,16 +861,44 @@ def sample_surface_edge(surface, which, matrix, n):
     return EdgeSample(np.array(P), np.array(D), np.array(DD))
 
 
-def boundary_points(surface, which, n=48):
+def _corner_knots(knots, deg, a, b):
+    """Knots inside (a, b) with multiplicity >= deg: where the edge may have a corner."""
+    eps = 1e-9 * max(abs(b - a), 1e-12)
+    out, i = [], 0
+    while i < len(knots):
+        j = i
+        while j < len(knots) and abs(knots[j] - knots[i]) <= eps:
+            j += 1
+        if j - i >= deg and a + eps < knots[i] < b - eps:
+            out.append(float(knots[i]))
+        i = j
+    return out
+
+
+def boundary_points(surface, which, n=48, corners=False):
+    """n evenly spaced points along an iso edge (U0 U1 V0 V1). corners=True
+    adds the points at the edge's corners (C0 knots, every knot of a degree-1
+    direction), so a drawn edge of an extruded rectangle doesn't cut them;
+    the result then has more than n points."""
     (u0, u1), (v0, v1) = surface.u_domain(), surface.v_domain()
-    pts = []
-    for i in range(n):
-        s = i / (n - 1)
-        if which in ("U0", "U1"):
-            pts.append(surface.evaluate(u0 if which == "U0" else u1, v0 + (v1 - v0) * s))
-        else:
-            pts.append(surface.evaluate(u0 + (u1 - u0) * s, v0 if which == "V0" else v1))
-    return pts
+    along_v = which in ("U0", "U1")
+    a, b = (v0, v1) if along_v else (u0, u1)
+    ts = [a + (b - a) * i / (n - 1) for i in range(n)]
+    if corners:
+        try:
+            _, ext = _k()
+            d = ext.surface_cvs(surface)
+            k = d["knots_v"] if along_v else d["knots_u"]
+            deg = d["degree_v"] if along_v else d["degree_u"]
+            tol = 1e-7 * max(abs(b - a), 1e-12)
+            ts = sorted(ts + [t for t in _corner_knots(k, int(deg), a, b) if min(abs(t - x) for x in ts) > tol])
+        except Exception:
+            pass
+    if along_v:
+        uu = u0 if which == "U0" else u1
+        return [surface.evaluate(uu, t) for t in ts]
+    vv = v0 if which == "V0" else v1
+    return [surface.evaluate(t, vv) for t in ts]
 
 
 # ---------------------------------------------------------------------------

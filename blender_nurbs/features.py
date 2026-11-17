@@ -1248,11 +1248,10 @@ def _sampled_blend(a, b, p, deg_in):
                            p.get("cur_a", 0.0), p.get("cur_b", 0.0), degree_v=deg_in)
 
 
-@builder("extrude")
-def build_extrude(inputs, p):
-    sm, _ = _k()
-    obj, ref = inputs[0]
-    curve = input_curve(obj, ref)
+def extrude_direction(obj, curve, p):
+    """Unit direction an extrude of `curve` (an input of `obj`) goes, before the
+    distance's sign: its Direction, then the tilt. The Extrude tool's live
+    preview uses it too, so the preview and the result always agree."""
     mode = p.get("direction", "NORMAL")
     if mode == "NORMAL":
         d, _ = geom.curve_plane_normal(curve)
@@ -1264,7 +1263,15 @@ def build_extrude(inputs, p):
             d = Vector((0, 0, 1))
     else:
         d = geom.axis_vector(mode, obj)
-    d = geom.tilt_direction(d.normalized(), float(p.get("tilt", 0.0)), float(p.get("tilt_azimuth", 0.0)))
+    return geom.tilt_direction(d.normalized(), float(p.get("tilt", 0.0)), float(p.get("tilt_azimuth", 0.0)))
+
+
+@builder("extrude")
+def build_extrude(inputs, p):
+    sm, _ = _k()
+    obj, ref = inputs[0]
+    curve = input_curve(obj, ref)
+    d = extrude_direction(obj, curve, p)
     h = float(p.get("distance", 1.0))
     draft = float(p.get("draft", 0.0))
     if abs(draft) > 1e-9:
@@ -1324,12 +1331,22 @@ def revolve_exact(curve, origin, axis, angle_deg, start_deg=0.0):
                                 [float(t) for t in cv["knots"]], wts if rational else None)
 
 
+def revolve_axis(obj, p):
+    """(point, unit direction) of a revolve's axis (world): a world or local
+    axis through the pivot, or a picked line (axis_point, axis_dir)."""
+    if p.get("axis") == "PICKED":
+        d = Vector(p.get("axis_dir", (0.0, 0.0, 1.0)))
+        return Vector(p.get("axis_point", (0.0, 0.0, 0.0))), (d.normalized() if d.length > 1e-12 else Vector((0, 0, 1)))
+    axis = geom.axis_vector(p.get("axis", "Z"), obj)
+    origin = geom.world_matrix(obj).translation if p.get("pivot", "OBJECT") == "OBJECT" else Vector()
+    return Vector(origin), axis.normalized()
+
+
 @builder("revolve")
 def build_revolve(inputs, p):
     obj, ref = inputs[0]
     curve = input_curve(obj, ref)
-    axis = geom.axis_vector(p.get("axis", "Z"), obj)
-    origin = geom.world_matrix(obj).translation if p.get("pivot", "OBJECT") == "OBJECT" else Vector()
+    origin, axis = revolve_axis(obj, p)
     angle = float(p.get("angle", 360.0))
     seam = float(p.get("seam_angle", 0.0)) if abs(abs(angle) - 360.0) < 1e-9 else 0.0
     return revolve_exact(curve, tuple(origin), tuple(axis), angle, seam)
@@ -1391,7 +1408,45 @@ def build_blend_curve(inputs, p):
 PROP_HIST = "nproto_hist"
 
 
+PROP_PLACE = "nproto_place"   # 4x4 (16 numbers): where the feature's result sits in the object's local space
+
+
+def placement(obj):
+    """The feature's placement in obj (numpy 4x4), None = as built. Set Origin /
+    Apply Transform change the object's matrix and move its mesh the other way
+    (pivot.py): the result keeps its place in the world through this."""
+    v = obj.get(PROP_PLACE)
+    if v is None:
+        return None
+    A = np.array(list(v), float).reshape(4, 4)
+    return None if np.abs(A - np.eye(4)).max() <= 1e-14 else A
+
+
+def set_placement(obj, A):
+    if A is None or np.abs(np.asarray(A, float) - np.eye(4)).max() <= 1e-14:
+        if PROP_PLACE in obj:
+            del obj[PROP_PLACE]
+    else:
+        obj[PROP_PLACE] = [float(x) for x in np.asarray(A, float).ravel()]
+
+
+def placed(obj, g):
+    """A builder's result g put where obj's feature sits (its placement)."""
+    A = placement(obj)
+    if A is None:
+        return g
+    if isinstance(g, tuple):
+        if not g or g[0] != "brep_text":
+            return g                    # curves: not moved (Blender moves a curve's own points)
+        b = store.brep_from_text(g[1])
+        store.transform(b, A)
+        return ("brep_text", store.brep_to_text(b))
+    return store.transform(g, A)        # a fresh Surface / Brep of the builder's
+
+
 def record(obj, op, inputs, params):
+    if PROP_PLACE in obj:
+        del obj[PROP_PLACE]      # the caller built it as the feature gives it
     for key in [k for k in obj.keys() if k.startswith("nproto_in_")]:
         del obj[key]
     for i, (src, _) in enumerate(inputs):
@@ -1701,6 +1756,7 @@ def base_text(obj):
         elif h["op"] == "patch":
             from .patch import store_info
             store_info(obj)
+        g = placed(obj, g)
         if isinstance(g, tuple) and g and g[0] == "brep_text":
             return g[1]
         if isinstance(g, tuple):
@@ -1729,7 +1785,7 @@ def bake(obj, step=-1):
         return freed
     # the geometry the kept steps build on
     if h is not None:
-        g = run(h["op"], h["inputs"], h["params"])
+        g = placed(obj, run(h["op"], h["inputs"], h["params"]))
         if isinstance(g, tuple) and g and g[0] == "brep_text":
             text, natural = g[1], False
         elif isinstance(g, tuple):
@@ -1765,7 +1821,7 @@ def bake(obj, step=-1):
 
 def clear_history(obj):
     for key in [k for k in obj.keys() if k.startswith(("nproto_in_", "nproto_sin_")) or
-                k in (PROP_HIST, PROP_STACK, PROP_BASE, PROP_BASE + "_natural")]:
+                k in (PROP_HIST, PROP_STACK, PROP_BASE, PROP_BASE + "_natural", PROP_PLACE)]:
         del obj[key]
 
 
@@ -1955,7 +2011,7 @@ def _remap_dependents(obj, old_marks, turned=True):
 PROP_KEY = "nproto_build_key"
 
 
-def build_key(obj, _seen=None):
+def build_key(obj, _seen=None, matrix=None, place=False):
     """Fingerprint of everything a rebuild depends on: the feature and its steps,
     the object's transform and -- recursively -- its inputs (their geometry,
     transforms and their own inputs). Equal key = the rebuild would produce what
@@ -1968,7 +2024,12 @@ def build_key(obj, _seen=None):
     hsh.update(str(obj.get(PROP_HIST, "")).encode())
     hsh.update(str(obj.get(PROP_STACK, "")).encode())
     hsh.update(hashlib.sha1(str(obj.get(PROP_BASE, "")).encode()).digest())
-    hsh.update(np.round(np.array(geom.world_matrix(obj), float), 10).tobytes())
+    # (matrix / place: the key as it was under another matrix and placement -- pivot.py)
+    M = geom.world_matrix(obj) if matrix is None else matrix
+    hsh.update(np.round(np.array(M, float), 10).tobytes())
+    C = placement(obj) if place is False else place
+    if C is not None:
+        hsh.update(np.round(np.array(C, float).ravel(), 10).tobytes())
     for src in history_inputs(obj):
         hsh.update(src.name.encode())
         hsh.update(np.round(np.array(geom.world_matrix(src), float), 10).tobytes())
@@ -2082,6 +2143,7 @@ def _rebuild_inner(obj, context, h, entries, steps, turned):
             from .primitives import write_spline_object
             write_spline_object(obj, g[1])
             return True
+        g = placed(obj, g)
         if isinstance(g, tuple) and g and g[0] == "brep_text":
             base_text = g[1]
         else:

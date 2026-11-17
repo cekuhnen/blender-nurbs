@@ -10,7 +10,10 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, St
 from mathutils import Vector
 
 from . import features, geom, store, sweeps
+from . import hints
+from .kernel import load as load_kernel
 from .ops import AskValue, PickMixin, _decode_inputs, _encode_inputs, _kernel_ok, _select_only
+from .valuedrag import BASE_PX, ValueDrag, ruled_preview
 
 
 def _new_surface(context, name, op, inputs, params):
@@ -39,7 +42,8 @@ def _new_curves(context, name, op, inputs, params):
 
 class NPROTO_OT_sweep(PickMixin, bpy.types.Operator):
     """Sweep a profile along one rail, two rails (Shift+click the 1st rail), or a
-    surface edge (tangent to that surface). Pick the profile first"""
+    surface edge (tangent to that surface). Select the profile, then the path
+    (last); or with nothing selected click the profile, then the path"""
     bl_idname = "nproto.sweep"
     bl_label = "Sweep"
     bl_options = {'REGISTER', 'UNDO'}
@@ -63,10 +67,17 @@ class NPROTO_OT_sweep(PickMixin, bpy.types.Operator):
         crv = [o for o in context.selected_objects if o.type == 'CURVE']
         act = context.active_object
         if len(crv) in (2, 3) and act in crv and not event.alt:
-            rails = [o for o in crv if o != act]
-            self.inputs = _encode_inputs([(act, "S0")] + [(o, "S0") for o in rails])
+            prof = sweep_profile(crv, act)
+            rails = [o for o in crv if o != prof]
+            rails.sort(key=lambda o: o == act)          # the path selected last
+            self.inputs = _encode_inputs([(prof, "S0")] + [(o, "S0") for o in rails])
             return self.execute(context)
         return self.start_picking(context, event)
+
+    def pick_state(self):
+        n = len(self._picks)
+        return ["click the profile", "click the path (Shift+click: a first rail of two)",
+                "click the second rail"][min(n, 2)]
 
     def _params(self):
         return {k: getattr(self, k) for k in ("samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height")}
@@ -84,6 +95,22 @@ class NPROTO_OT_sweep(PickMixin, bpy.types.Operator):
             return {'CANCELLED'}
         _select_only(context, [obj])
         return {'FINISHED'}
+
+
+def sweep_profile(crv, act):
+    """The profile among selected curves, the path selected last (active):
+    with two, the one not active; with three (a profile on two rails), the
+    one that touches both others, as a profile spans its rails."""
+    others = [o for o in crv if o != act]
+    if len(crv) == 2:
+        return others[0]
+    from . import features
+    pts = {o: geom.sample_curve(features.input_curve(o, "S0"), 64) for o in crv}
+
+    def gap(a, b):
+        A, B = pts[a], pts[b]
+        return float(np.min(np.linalg.norm(A[:, None, :] - B[None, :, :], axis=2)))
+    return min(crv, key=lambda c: sum(gap(c, o) for o in crv if o != c))
 
 
 class NPROTO_OT_pipe(AskValue, PickMixin, bpy.types.Operator):
@@ -454,9 +481,11 @@ class NPROTO_OT_intersect(bpy.types.Operator):
 # Rebuild Surface, Continuity Check
 # --------------------------------------------------------------------------
 
-class NPROTO_OT_extend(AskValue, PickMixin, bpy.types.Operator):
+class NPROTO_OT_extend(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
     """Extend (or with a negative distance shrink) a surface at one boundary edge,
-    continuing its own shape exactly (Alias "Natural" extend). Pick the edge"""
+    continuing its own shape exactly (Alias "Natural" extend). Pick the edge,
+    then drag the arrow on it (back into the surface: shrink), type a value,
+    click away or Enter to make it"""
     bl_idname = "nproto.extend"
     bl_label = "Extend Surface"
     bl_options = {'REGISTER', 'UNDO'}
@@ -478,8 +507,117 @@ class NPROTO_OT_extend(AskValue, PickMixin, bpy.types.Operator):
         if not _kernel_ok(self):
             return {'CANCELLED'}
         if self.inputs:                     # picked already (see PickMixin._finish)
+            self._start_event = (event.mouse_x, event.mouse_y, event.type, event.value)
             return self.ask(context)
         return self.start_picking(context, event)
+
+    # -- the live value stage (valuedrag.py) ----------------------------------
+    def drag_setup(self, context, mouse):
+        from .extend import EDGES
+        picks = _decode_inputs(self.inputs)
+        if not picks:
+            return False
+        obj, edge = picks[0]
+        if edge not in EDGES or not store.is_natural(obj) or store.get_brep(obj).face_count() != 1:
+            return False
+        from .kernel import load
+        self._ext = load().blender_ext
+        surf = store.get_surfaces(obj)[0]
+        self._xd = self._ext.surface_cvs(surf)
+        self._xs, self._xobj, self._xedge = surf, obj, edge
+        self._M = geom.world_matrix(obj)
+        self._scale = sum(self._M.to_scale()) / 3.0 or 1.0
+        # the arrow: where the edge was clicked (else its middle), along the surface out of it
+        (u0, u1), (v0, v1) = surf.u_domain(), surf.v_domain()
+        across_u = edge in ("U0", "U1")
+        at_end = edge in ("U1", "V1")
+
+        def uv_at(f):
+            if across_u:
+                return (u1 if at_end else u0), v0 + (v1 - v0) * f
+            return u0 + (u1 - u0) * f, (v1 if at_end else v0)
+        self._xj, self._base_at_mouse = 16, False
+        if mouse is not None:
+            best = None
+            for j in range(33):
+                q = self._screen(context, self._M @ Vector(surf.evaluate(*uv_at(j / 32))))
+                if q is not None and (q - mouse).length <= BASE_PX and (best is None or (q - mouse).length < best[0]):
+                    best = ((q - mouse).length, j)
+            if best is not None:
+                self._xj, self._base_at_mouse = best[1], True
+        pt, du, dv = surf.derivatives(*uv_at(self._xj / 32))
+        d = np.array(du if across_u else dv, float) * (1.0 if at_end else -1.0)
+        M3 = np.array(self._M.to_3x3(), float)
+        dw = M3 @ d
+        self._xB = np.array(self._M @ Vector(pt), float)
+        self._xD = dw / (np.linalg.norm(dw) or 1.0)
+        self._xcache = None
+        return True
+
+    def _strip(self):
+        """(rows of world points from the old edge to the new one, the new edge
+        surface's arrow path): the band the extension adds (or, shrinking, cuts)."""
+        from .extend import extend_grid
+        key = round(float(self.distance), 12)
+        if self._xcache is not None and self._xcache[0] == key:
+            return self._xcache[1]
+        sm = load_kernel()
+        ext = self._ext
+        dist = float(self.distance) / self._scale
+        edge = self._xedge
+        across_u = edge in ("U0", "U1")
+        at_end = edge in ("U1", "V1")
+        new = ext.surface_from_cvs(*extend_grid(self._xd, edge, dist))
+        big = new if dist >= 0 else self._xs           # the surface the band lies on
+        small = self._xs if dist >= 0 else new
+        (bu0, bu1), (bv0, bv1) = big.u_domain(), big.v_domain()
+        (su0, su1), (sv0, sv1) = small.u_domain(), small.v_domain()
+        # the band's inner end: the small surface's edge, found on the big one
+        sm_u = (su1 if at_end else su0) if across_u else 0.5 * (su0 + su1)
+        sm_v = 0.5 * (sv0 + sv1) if across_u else (sv1 if at_end else sv0)
+        q = small.evaluate(sm_u, sm_v)
+        _, uvs, _ = sm.surface_closest_point(big, tuple(q))
+        uv = uvs[0]
+        cu, cv = (uv.x, uv.y) if hasattr(uv, "x") else (uv[0], uv[1])
+        if across_u:
+            a, b = cu, (bu1 if at_end else bu0)
+            grid = [[big.evaluate(a + (b - a) * i / 8, bv0 + (bv1 - bv0) * j / 32) for j in range(33)] for i in range(9)]
+        else:
+            a, b = cv, (bv1 if at_end else bv0)
+            grid = [[big.evaluate(bu0 + (bu1 - bu0) * j / 32, a + (b - a) * i / 8) for j in range(33)] for i in range(9)]
+        M = np.array(self._M, float)
+        # inner end first: the old edge (extending) or the new one (shrinking), out to the big surface's edge
+        rows = [np.asarray(r, float) @ M[:3, :3].T + M[:3, 3] for r in grid]
+        path = np.array([r[self._xj] for r in rows])
+        self._xcache = (key, (rows, path))
+        return rows, path
+
+    def drag_handles(self):
+        h = {"field": "distance", "kind": "arrow", "origin": self._xB, "dir": self._xD, "param": self.distance,
+             "base": self._xB, "to_value": lambda t: t}
+        try:
+            rows, path = self._strip()
+            if self.distance >= 0:
+                h["pos"], h["path"] = path[-1], path
+                h["head_from"] = path[-2]
+            else:                             # shrinking: the arrow points back into the surface
+                h["pos"], h["path"] = path[0], path[::-1]
+                h["head_from"] = path[1]
+        except Exception as exc:
+            print("NURBS extend preview:", exc)
+        return [h]
+
+    def drag_preview(self):
+        rows, _ = self._strip()
+        lines, tris = ruled_preview(rows, ribs=8, row_every=8)
+        new_edge = rows[-1] if self.distance >= 0 else rows[0]
+        return {"lines": lines + [new_edge], "tris": tris}
+
+    def drag_check(self):
+        return "" if abs(self.distance) > 1e-12 else "Distance 0: drag the arrow out, or type a value"
+
+    def drag_rows(self):
+        return [("Shrink", [hints.note("drag the arrow back into the surface, or type a negative value")])]
 
     def execute(self, context):
         from . import extend
