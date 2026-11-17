@@ -4162,6 +4162,84 @@ check("surface align G3: one edge -- curvature rate within 1% (it was 40%); its 
       r == {'FINISHED'} and _b["rate"] > 0.1 and _a["gap"] < 1e-4 and _a["curv"] < 0.01 and _a["rate"] < 0.01
       and len(_lab) == 1 and _lab[0]["value"] == "G3" and _lab[0]["check"]["ok"], f"{_b} -> {_a} {_lab and _lab[0]['check']}")
 
+# Loft G3: between natural edges exact on the inputs' layout (the same, or two raised to one), degree 7 across;
+# G3 / G0 and G2 / G3 mixes hold what they ask for, and no more
+from blender_nurbs import contcheck as _cc3
+def _lwavy(name, x0, nv, seed):
+    r_ = np.random.default_rng(seed)
+    X_, Y_ = np.meshgrid(np.linspace(x0, x0 + 4, 6), np.linspace(0, 5, nv), indexing="ij")
+    Z_ = 0.6 * np.sin(0.8 * X_ + 0.3) * np.cos(0.6 * Y_) + 0.15 * r_.standard_normal(X_.shape)
+    return _mk(name, np.stack([X_, Y_ + 600, Z_], -1), geom.clamped_uniform_knots(6, 3), geom.clamped_uniform_knots(nv, 3))
+def _lg3(lo, src, e_src, lo_e):
+    r_ = _cc3.analyze({"a": _cc3.side_key(lo, lo_e), "b": _cc3.side_key(src, e_src)}, 60)
+    return float(r_["gap"].max()), float(r_["crel"].max()), float(np.nanmax(r_["g3rel"]))
+lgA, lgB, lgB9 = _lwavy("LG3_A", 0, 7, 1), _lwavy("LG3_B", 7, 7, 2), _lwavy("LG3_B9", 7, 9, 3)
+_lres = {}
+for _nm, _bb in (("same", lgB), ("raised", lgB9)):
+    for _ca, _cb in (("G3", "G3"), ("G3", "G0"), ("G2", "G3")):
+        r = bpy.ops.nproto.loft(inputs=ins((lgA, "U1"), (_bb, "U0")), cont_a=_ca, cont_b=_cb)
+        _lo = ctx.active_object
+        _lres[_nm, _ca, _cb] = (r, ext.surface_cvs(store.get_surfaces(_lo)[0])["degree_u"],
+                                _lg3(_lo, lgA, "U1", "U0"), _lg3(_lo, _bb, "U0", "U1"))
+_okl = lambda g, lvl: g[0] < 1e-8 and (lvl < 2 or g[1] < 1e-7) and (lvl < 3 or g[2] < 1e-7)
+check("loft G3 between surface edges: exact (Continuity Check ~1e-10) on one layout or two raised to one, degree 7 "
+      "across; G3 / G0 and G2 / G3 hold G3 only where asked",
+      all(v[0] == {'FINISHED'} for v in _lres.values())
+      and all(_lres[k, "G3", "G3"][1] == 7 and _okl(_lres[k, "G3", "G3"][2], 3) and _okl(_lres[k, "G3", "G3"][3], 3)
+              and _lres[k, "G3", "G0"][1] == 4 and _okl(_lres[k, "G3", "G0"][2], 3)
+              and _lres[k, "G2", "G3"][1] == 6 and _okl(_lres[k, "G2", "G3"][2], 2) and _lres[k, "G2", "G3"][2][2] > 0.05
+              and _okl(_lres[k, "G2", "G3"][3], 3) for k in ("same", "raised")),
+      f"{_lres}")
+
+# Loft G3 to a trimmed edge (sampled: the face's third-order form) -- Free / Align Edges / Align to Surface,
+# Bezier Spans and Fitted: both labels G3 and hold
+_X, _Y = np.meshgrid(np.linspace(0, 4, 6), np.linspace(-2, 2, 6), indexing="ij")
+lgBowl = _mk("LG3_Bowl", np.stack([_X, _Y + 620, 0.4 * np.sin(0.9 * _X) * np.cos(0.7 * _Y) + 0.05 * _X * _Y], -1),
+             geom.clamped_uniform_knots(6, 3), geom.clamped_uniform_knots(6, 3))
+_lgcut = nurbs("LG3_Cut", [(3.0, 617, 5), (2.7, 619, 5), (3.2, 621, 5), (3.0, 623, 5)])
+bpy.ops.object.select_all(action='DESELECT')
+bpy.ops.nproto.trim(action="KEEP", target=lgBowl.name, cutters=ins((_lgcut, "S0")), ref_point=(1, 620, 0.3),
+                    normal=(0, 0, 1), view_dir=(0, 0, -1), projection="Z")
+_lge = _trim_edge(lgBowl, lambda m: 2.6 < m.x < 3.3 and abs(m.y - 620) < 1.5)
+_X, _Y = np.meshgrid(np.linspace(5, 8, 5), np.linspace(-1.5, 1.5, 5), indexing="ij")
+lgPl = _mk("LG3_Plate", np.stack([_X, _Y + 620, 0.3 + 0.2 * np.sin(1.1 * _Y) + 0.1 * (_X - 5) ** 2], -1),
+           geom.clamped_uniform_knots(5, 3), geom.clamped_uniform_knots(5, 3))
+_lbad = []
+for _fit in ("SPANS", "DENSE"):
+    for _mode in ("FREE", "EDGES", "SURFACE"):
+        _cl._cache.clear()
+        r = bpy.ops.nproto.loft(inputs=json.dumps([[lgBowl.name, _lge], [lgPl.name, "U0"]]), cont_a="G3", cont_b="G3",
+                                fit=_fit, edges_a=_mode, edges_b=_mode)
+        _lo = ctx.active_object
+        _lb3 = _cl.labels(_lo)
+        if r != {'FINISHED'} or len(_lb3) != 2 or not all(L_["value"] == "G3" and L_["check"]["ok"]
+                                                            and L_["check"]["rate"] < 0.01 for L_ in _lb3):
+            _lbad.append((_fit, _mode, [L_["check"] and L_["check"]["text"] for L_ in _lb3]))
+check("loft G3 to a trimmed edge: Free / Align Edges / Align to Surface, Spans and Fitted -- both labels G3, "
+      "curvature rate within 1%", _lge and not _lbad, f"{_lge} {_lbad}")
+
+# Loft's labels and Feature panel go to G3; a Blend Curve's stay G0 - G2
+r = bpy.ops.nproto.loft(inputs=ins((lgA, "U1"), (lgB, "U0")), cont_a="G2", cont_b="G2")
+_lo = ctx.active_object
+_cl._cache.clear()
+_vals = [L_["values"] for L_ in _cl.labels(_lo)]
+r1 = bpy.ops.nproto.cycle_continuity(obj_name=_lo.name, index=0)
+_c1 = features.history(_lo)["params"]["cont_a"]
+_cl._cache.clear()
+_g3after = _lg3(_lo, lgA, "U1", "U0")
+from blender_nurbs import feature_ui as _fui
+_fui.sync_from_history(_lo)
+_lbc = [nurbs(f"LG3_BC{k}", [(k * 3.0, 640, 0), (k * 3.0 + 1, 640.5, 0.2), (k * 3.0 + 2, 640, 0)]) for k in (0, 1)]
+bpy.ops.nproto.blend_curve(inputs=ins((_lbc[0], "S0"), (_lbc[1], "S0")), end_a=1, end_b=0, cont_a="G2", cont_b="G2")
+bcf = ctx.active_object
+_li = [it[0] for it in _fui._side_cont_items(_lo.nproto_feature, ctx)]
+_bi = [it[0] for it in _fui._side_cont_items(bcf.nproto_feature, ctx)]
+check("loft labels offer G0 - G3 and a click steps G2 -> G3 (rebuilt G3); the Feature panel offers G3 for a loft, "
+      "not for a blend curve",
+      _vals == [["G0", "G1", "G2", "G3"]] * 2 and r1 == {'FINISHED'} and _c1 == "G3" and _g3after[2] < 1e-7
+      and _li == ["G0", "G1", "G2", "G3"] and _bi == ["G0", "G1", "G2"] and _lo.nproto_feature.cont_a == "G3",
+      f"{_vals} {_c1} {_g3after} {_li} {_bi} {_lo.nproto_feature.cont_a}")
+
 # --- Boundary: exact Coons edges, degree / spans ------------------------------
 _bx = 40.0
 bdB = nurbs("BD_B", [(_bx + 0, 0, 0), (_bx + 1, -0.2, 0.3), (_bx + 2, 0.3, -0.2), (_bx + 2.5, -0.1, 0.4), (_bx + 3, 0, 0)])

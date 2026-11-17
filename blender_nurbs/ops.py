@@ -27,6 +27,11 @@ CONT_ITEMS = [
     ("G1", "G1 Tangent", "Tangent continuous with the source surface"),
     ("G2", "G2 Curvature", "Curvature continuous with the source surface"),
 ]
+# Loft's sides: also G3 (the curvature's rate of change carries on too)
+LOFT_CONT_ITEMS = CONT_ITEMS + [
+    ("G3", "G3 Curvature Rate", "Curvature continuous, and the curvature changes across the edge at the source "
+                                "surface's rate (a source with a CV net; up to G2 with rails)"),
+]
 AXIS_ITEMS = [
     ("X", "World X", ""), ("Y", "World Y", ""), ("Z", "World Z", ""),
     ("LOCAL_X", "Local X", ""), ("LOCAL_Y", "Local Y", ""), ("LOCAL_Z", "Local Z", ""),
@@ -603,7 +608,7 @@ CHAIN_ITEMS = [("TANGENT", "Tangent Chain", "A click picks the edge and every ed
 
 
 class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
-    """Loft a surface between curves or surface edges (G0 / G1 / G2). A side
+    """Loft a surface between curves or surface edges (G0 / G1 / G2 / G3). A side
     can be several edges end to end: picked edges that touch form one side
     (Tangent Chain picks a smooth run of edges with one click)"""
     bl_idname = "nproto.loft"
@@ -625,13 +630,13 @@ class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
                                description="Tangent Chain: edges meeting within this angle (degrees) are one run")
     use_selection: BoolProperty(name="Use Selection", default=False, options={'SKIP_SAVE'},
                                 description="Loft the selected curves instead of picking")
-    cont_a: EnumProperty(name="Continuity A", items=CONT_ITEMS, default="G0")
-    cont_b: EnumProperty(name="Continuity B", items=CONT_ITEMS, default="G0")
+    cont_a: EnumProperty(name="Continuity A", items=LOFT_CONT_ITEMS, default="G0")
+    cont_b: EnumProperty(name="Continuity B", items=LOFT_CONT_ITEMS, default="G0")
     tan_a: FloatProperty(name="Tangent A", default=1.0, min=0.0, soft_max=3.0,
                          description="G1 magnitude at input A (relative to loft span)")
     tan_b: FloatProperty(name="Tangent B", default=1.0, min=0.0, soft_max=3.0)
     cur_a: FloatProperty(name="Curvature A", default=0.0, soft_min=-2.0, soft_max=2.0,
-                         description="G2 shape at input A (moves the 3rd CV row along the tangent)")
+                         description="G2 / G3 shape at input A (moves the 3rd CV row along the tangent)")
     cur_b: FloatProperty(name="Curvature B", default=0.0, soft_min=-2.0, soft_max=2.0)
     auto_align: BoolProperty(name="Auto Align", default=True,
                              description="Flip inputs, and start closed sections in the same direction, so the loft does not twist")
@@ -641,7 +646,7 @@ class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
                          description="Loft through the sections and back to the first: a closed ring, smooth all "
                                      "round, the seam included (3 or more sections)")
     samples: IntProperty(name="Samples", default=24, min=6, max=200,
-                         description="Samples along the edges for G1/G2 lofts")
+                         description="Samples along the edges for G1 / G2 / G3 lofts")
     fit: EnumProperty(name="Fit", items=[
         ("SPANS", "Bezier Spans", "G1 / G2 to trimmed edges: a few Bezier spans of one degree, knots where the "
          "continuity needs them (light, symmetric nets)"),
@@ -880,7 +885,7 @@ class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
         if nr:
             col = lay.column()
             row = col.row()
-            row.active = nr == 2 and "G2" in (self.cont_a, self.cont_b)
+            row.active = nr == 2 and bool({"G2", "G3"} & {self.cont_a, self.cont_b})
             row.prop(self, "corner_ease")
             col.prop(self, "even_net")
             col.prop(self, "span_faces")

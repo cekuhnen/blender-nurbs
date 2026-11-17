@@ -60,7 +60,7 @@ everything built from it rebuilds.
 
 - **Draw:** Draw Plane
 - **Primitives:** Plane, Disk, Box, Cylinder, Cone, Sphere, Torus
-- **From curves:** Loft, Loft Rails, Sweep, Pipe, Extrude, Revolve, Planar
+- **From curves:** Loft (G0 to G3 to surface edges), Loft Rails, Sweep, Pipe, Extrude, Revolve, Planar
 - **Fill a gap:** Boundary, Square, Patch, Dome
 - **From surfaces:** Offset, Thicken, Convert Blender Surface
 

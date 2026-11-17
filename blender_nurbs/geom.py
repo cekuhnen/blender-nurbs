@@ -806,36 +806,63 @@ def curve_plane_normal(curve, n=32):
 
 
 # ---------------------------------------------------------------------------
-# Surface edge sampling for G0/G1/G2 lofts
+# Surface edge sampling for G0/G1/G2/G3 lofts
 # ---------------------------------------------------------------------------
 
 class EdgeSample:
     """Samples along a loft input: positions P, outward cross tangent D,
-    outward cross second derivative DD (None for plain curves)."""
+    outward cross second derivative DD (None for plain curves), and the
+    third DDD for G3 -- the third derivative of the same cross curve on the
+    source (only its part along the normal matters for G3). DDD is worked out
+    on first use (_ddd_fn) and is None when the source has no CV net."""
 
-    def __init__(self, P, D=None, DD=None, joints=None):
+    def __init__(self, P, D=None, DD=None, joints=None, DDD=None):
         self.P = P
         self.D = D
         self.DD = DD
         self.joints = list(joints or [])     # sample indices where the pieces of a chained side meet
         self.N = None                        # the source's unit normals, when known (Align Edges / Surface)
+        self._DDD = DDD
+        self._ddd_fn = None                  # () -> DDD, called on first use
 
     @property
     def has_surface(self):
         return self.D is not None
+
+    @property
+    def DDD(self):
+        if self._DDD is None and self._ddd_fn is not None:
+            fn, self._ddd_fn = self._ddd_fn, None
+            try:
+                self._DDD = fn()
+            except Exception as exc:
+                print("NURBS loft third derivative:", exc)
+        return self._DDD
+
+    @DDD.setter
+    def DDD(self, v):
+        self._DDD, self._ddd_fn = v, None
+
+    def _pass_ddd(self, out, f):
+        """out's DDD as f of ours -- lazily, when ours is not worked out yet."""
+        if self._DDD is not None:
+            out._DDD = f(self._DDD)
+        elif self._ddd_fn is not None:
+            out._ddd_fn = lambda: (lambda d: None if d is None else f(d))(self.DDD)
+        return out
 
     def reversed(self):
         r = lambda a: None if a is None else a[::-1].copy()
         n = len(self.P)
         out = EdgeSample(self.P[::-1].copy(), r(self.D), r(self.DD), sorted(n - 1 - j for j in self.joints))
         out.N = r(self.N)
-        return out
+        return self._pass_ddd(out, r)
 
     def piece(self, i0, i1):
         c = lambda a: None if a is None else a[i0:i1 + 1].copy()
         out = EdgeSample(c(self.P), c(self.D), c(self.DD))
         out.N = c(self.N)
-        return out
+        return self._pass_ddd(out, c)
 
 
 def sample_surface_edge(surface, which, matrix, n):
@@ -843,7 +870,7 @@ def sample_surface_edge(surface, which, matrix, n):
     M = np.array(matrix)
     R = M[:3, :3]
     T = M[:3, 3]
-    P, D, DD = [], [], []
+    P, D, DD, UV = [], [], [], []
     along_v = which in ("U0", "U1")
     span = (u1 - u0) if along_v else (v1 - v0)
     h = 1e-4 * span
@@ -859,6 +886,7 @@ def sample_surface_edge(surface, which, matrix, n):
             d2 = (np.array(du) - np.array(du2)) / (sign * h)  # one-sided d2/du2
             d = sign * d1
             dd = d2
+            UV.append((u, v))
         else:
             v = v0 if which == "V0" else v1
             u = u0 + (u1 - u0) * s
@@ -869,10 +897,24 @@ def sample_surface_edge(surface, which, matrix, n):
             d2 = (np.array(dv) - np.array(dv2)) / (sign * h)
             d = sign * d1
             dd = d2
+            UV.append((u, v))
         P.append(R @ np.array(pt) + T)
         D.append(R @ d)
         DD.append(R @ dd)
-    return EdgeSample(np.array(P), np.array(D), np.array(DD))
+    es = EdgeSample(np.array(P), np.array(D), np.array(DD))
+
+    def ddd():
+        # the exact third derivative across (odd: outward is sign times it) --
+        # its part along the normal: the rest is a reparameterisation, and
+        # kept, it set the fit's tolerance (a share of the row) 30x too loose
+        from . import surfeval
+        uv = np.array(UV, float)
+        D3 = {kl: x @ R.T for kl, x in surfeval.Surf(surface).at(uv[:, 0], uv[:, 1], 3).items()}
+        n, _ = surfeval.normals(D3)
+        d3 = sign * (D3[3, 0] if along_v else D3[0, 3])
+        return np.sum(d3 * n, axis=1, keepdims=True) * n
+    es._ddd_fn = ddd
+    return es
 
 
 def _corner_knots(knots, deg, a, b):
@@ -916,10 +958,10 @@ def boundary_points(surface, which, n=48, corners=False):
 
 
 # ---------------------------------------------------------------------------
-# Blend loft between two inputs with G0 / G1 / G2 at each side
+# Blend loft between two inputs with G0 / G1 / G2 / G3 at each side
 # ---------------------------------------------------------------------------
 
-CONT_ORDER = {"G0": 0, "G1": 1, "G2": 2}
+CONT_ORDER = {"G0": 0, "G1": 1, "G2": 2, "G3": 3}
 
 
 def _side_rows(es, cont, tangent, curvature, n_deg, scale):
@@ -940,21 +982,34 @@ def _side_rows(es, cont, tangent, curvature, n_deg, scale):
         S2 = (lam ** 2) * es.DD + (curvature * scale) * Th
         P2 = 2 * P1 - es.P + S2 / (n_deg * (n_deg - 1))
         rows.append(P2)
+    if k >= 3:
+        # the source's cross curve c reparameterised by f (f' = lam, f'' = c_):
+        # S''' = f'^3 c''' + 3 f' f'' c'' + f''' c', with f''' = 0
+        DDD = es.DDD
+        if DDD is None:
+            raise ValueError("G3 needs the source's third derivative (a surface with a CV net)")
+        c_ = curvature * scale / Dn
+        S3 = (lam ** 3) * DDD + 3.0 * lam * c_ * es.DD
+        rows.append(S3 / (n_deg * (n_deg - 1) * (n_deg - 2)) + 3 * P2 - 3 * P1 + es.P)
     return rows
 
 
 def _difference_rows(rows_a, rows_b, tol, size, normals=(None, None)):
-    """Side rows [R0, R1, R2] as [R0, R1 - R0, R2 - 2 R1 + R0] (b's reversed,
-    as in the surface) and a tolerance for each: for an edge row tol, at most
-    1e-5 of that edge's length (the continuity check allows a gap of 1e-4 of
-    it; tol, 1e-4 of the whole loft, let a trimmed edge's row stray past
-    that); a 1e-4 angle for the tangent rows, 0.1 % for the curvature rows."""
+    """Side rows [R0, R1, R2, R3] as their differences [R0, R1 - R0,
+    R2 - 2 R1 + R0, R3 - 3 R2 + 3 R1 - R0] (b's reversed, as in the surface)
+    and a tolerance for each: for an edge row tol, at most 1e-5 of that
+    edge's length (the continuity check allows a gap of 1e-4 of it; tol, 1e-4
+    of the whole loft, let a trimmed edge's row stray past that); a 1e-4
+    angle for the tangent rows, 0.1 % for the curvature and the curvature
+    rate rows."""
     def side(R):
         out = [R[0]]
         if len(R) > 1:
             out.append(R[1] - R[0])
         if len(R) > 2:
             out.append(R[2] - 2 * R[1] + R[0])
+        if len(R) > 3:
+            out.append(R[3] - 3 * R[2] + 3 * R[1] - R[0])
         return out
     def tols(F, N):
         if tol is None:
@@ -968,9 +1023,10 @@ def _difference_rows(rows_a, rows_b, tol, size, normals=(None, None)):
             # normals are known: a part in the tangent plane (Align Edges' bend
             # towards the corners) does not change the curvature, and measured
             # with it the curvature was fitted 10x looser (4.5 % off there)
-            big = np.abs(np.sum(F[2] * N, axis=1)) if N is not None and len(N) == len(F[2]) else \
-                np.linalg.norm(F[2], axis=1)
-            t.append(max(1e-3 * float(np.max(big)), 1e-7 * size))
+            for Fk in F[2:]:
+                big = np.abs(np.sum(Fk * N, axis=1)) if N is not None and len(N) == len(Fk) else \
+                    np.linalg.norm(Fk, axis=1)
+                t.append(max(1e-3 * float(np.max(big)), 1e-7 * size))
         return t
     Fa, Fb = side(rows_a), side(rows_b)
     ta, tb = tols(Fa, normals[0]), tols(Fb, normals[1])
@@ -987,6 +1043,8 @@ def _undifference_rows(G, na, nb):
             out.append(H[1] + H[0])
         if len(H) > 2:
             out.append(H[2] + 2 * out[1] - out[0])
+        if len(H) > 3:
+            out.append(H[3] + 3 * out[2] - 3 * out[1] + out[0])
         return out
     return side(G[:na]) + side(G[na:][::-1])[::-1]
 
@@ -1046,14 +1104,14 @@ def _knot_vector(p, inner):
 
 
 def blend_loft_spans(a, b, breaks, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.0, cur_a=0.0, cur_b=0.0,
-                     degree=5, tol_angle=0.1, tol_curv=0.05, tol_gap_rel=1e-4, scale=None):
-    """The G0 / G1 / G2 blend between two sides' samples as a few Bezier
+                     degree=5, tol_angle=0.1, tol_curv=0.05, tol_gap_rel=1e-4, scale=None, tol_rate=0.05):
+    """The G0 / G1 / G2 / G3 blend between two sides' samples as a few Bezier
     spans of one degree along the side, not a dense least-squares net.
     Knots go where they are needed, not where the samples are: full
     multiplicity at the side's joints `breaks` (sample indices -- the faces
     there meet as they meet), then a G2 (C2) knot in the middle of every span
     that does not hold, until each holds half the labels' tolerances (gap,
-    angle, curvature, as contlabels measures them). Symmetric sides give
+    angle, curvature, curvature rate, as contlabels measures them). Symmetric sides give
     symmetric knots. Returns (surface, number of spans, worst error over its
     tolerance)."""
     _, ext = _k()
@@ -1073,7 +1131,7 @@ def blend_loft_spans(a, b, breaks, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.
 
     # what each fitted row is, and how far it may stray (half the labels' tolerances)
     def kinds(n_rows, normals):
-        return [("edge", None), ("tan", None), ("curv", normals)][:n_rows]
+        return [("edge", None), ("tan", None), ("curv", normals), ("rate", normals)][:n_rows]
     kk = kinds(len(rows_a), getattr(a, "N", None)) + kinds(len(rows_b), getattr(b, "N", None))[::-1]
     tols = []
     for Fi, (kind, nrm) in zip(F, kk):
@@ -1084,7 +1142,8 @@ def blend_loft_spans(a, b, breaks, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.
             tols.append(np.maximum(np.tan(np.radians(0.5 * tol_angle)) * np.linalg.norm(Fi, axis=1), 1e-9 * size))
         else:
             big = np.abs(np.sum(Fi * nrm, axis=1)) if nrm is not None and len(nrm) == N else np.linalg.norm(Fi, axis=1)
-            tols.append(np.full(N, max(0.5 * tol_curv * float(np.max(big)), 1e-9 * size)))
+            tk = tol_curv if kind == "curv" else tol_rate
+            tols.append(np.full(N, max(0.5 * tk * float(np.max(big)), 1e-9 * size)))
     params = row_params(rows)
     B = np.hstack(F)
     joints = sorted({int(j) for j in breaks if 0 < j < N - 1})
@@ -1295,10 +1354,10 @@ def _mean_row_length(D, deg, knots, n=17):
 
 def blend_loft_exact(sa, sb, a, b, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.0, cur_a=0.0, cur_b=0.0):
     """Blend loft on the inputs' OWN layout along the edge: sa / sb are exact
-    sides {"deg", "knots", "P", "D", "DD"} (CV rows, D / DD = outward cross
-    derivative rows or None) sharing degree and knots. Rows are built with a
+    sides {"deg", "knots", "P", "D", "DD", "DDD"} (CV rows, D / DD / DDD =
+    outward cross derivative rows or None) sharing degree and knots. Rows are built with a
     constant scale per side, so they stay linear in the CVs and the result has
-    exactly the inputs' degree and knots along v (G1 / G2 exact: a constant
+    exactly the inputs' degree and knots along v (G1 / G2 / G3 exact: a constant
     reparameterisation of each neighbour). a / b are the EdgeSamples (for the
     distance and the mean cross-tangent length)."""
     _, ext = _k()
@@ -1322,6 +1381,13 @@ def blend_loft_exact(sa, sb, a, b, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.
         if k >= 2:
             S2 = lam ** 2 * s["DD"] + (curvature * scale / dm) * s["D"]
             rows.append(2 * P1 - s["P"] + S2 / (n_deg * (n_deg - 1)))
+        if k >= 3:
+            # S''' = f'^3 DDD + 3 f' f'' DD (f''' = 0): a constant reparameterisation
+            # plus the curvature slider's f'', exact G3 on the inputs' own layout
+            if s.get("DDD") is None:
+                raise ValueError("G3 needs the source's third derivative (a surface with a CV net)")
+            S3 = lam ** 3 * s["DDD"] + 3.0 * lam * (curvature * scale / dm) * s["DD"]
+            rows.append(S3 / (n_deg * (n_deg - 1) * (n_deg - 2)) + 3 * rows[2] - 3 * rows[1] + rows[0])
         return rows
 
     rows = side(sa, a, ka, tan_a, cur_a) + side(sb, b, kb, tan_b, cur_b)[::-1]

@@ -111,6 +111,8 @@ def _compute_base(obj):
             roles += [(rails[0][0], "cont_ra"), (rails[1][0], "cont_rb")]
         for (src, ref), param in roles:
             vals = _edge_values(src, ref)
+            if param in ("cont_a", "cont_b") and not nr and "G2" in vals:
+                vals = vals + ["G3"]          # the profiles of a loft without rails: G3 too
             cur = p.get(param, "G0")
             out.append({"pos": _mid(src, ref), "param": param, "value": cur if cur in vals else vals[0],
                         "values": vals, "name": f"{src.name} {ref}", "src": (src, ref)})
