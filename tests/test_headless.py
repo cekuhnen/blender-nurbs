@@ -883,6 +883,17 @@ check("split: areas preserved", abs(sum(area(o) for o in fl) - 16) < 1e-3 and ab
 bpy.ops.object.select_all(action='DESELECT'); fl[-1].select_set(True); ctx.view_layer.objects.active = fl[-1]
 bpy.ops.nproto.untrim()
 check("split: untrim a piece restores the whole surface", abs(area(fl[-1]) - 16) < 1e-6)
+features.rebuild(fl[-1], ctx, force=True)       # (a split piece's feature gives the piece: the untrim is a step)
+check("split: the untrimmed piece stays whole through a rebuild", abs(area(fl[-1]) - 16) < 1e-6 and store.is_natural(fl[-1]))
+_sp = fl[0]
+_sp.location = (0.5, -0.25, 0.75); ctx.view_layer.update()      # moved: Untrim Region counts the cuts in world space
+_prev = steps.untrim_preview(_sp[store.PROP_BREP], steps.untrim_reference(_sp), jobs.xform(_sp))
+r = bpy.ops.nproto.untrim_region(points=json.dumps({_sp.name: [p for _, p in _prev]}))
+features.rebuild(_sp, ctx, force=True)
+check("split: Untrim Region on a moved piece gives the whole plain surface, kept through a rebuild",
+      r == {'FINISHED'} and len(_prev) == 1 and abs(area(_sp) - 16) < 1e-6 and store.is_natural(_sp),
+      f"{area(_sp):.4f} natural={store.is_natural(_sp)}")
+_sp.location = (0, 0, 0); ctx.view_layer.update()
 # curve splits a surface
 cf = make_floor("SpC", loc=(0, 90, 0))
 bpy.ops.curve.primitive_bezier_circle_add(radius=0.5, location=(1, 90, 1)); scc = ctx.active_object

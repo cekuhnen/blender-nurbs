@@ -408,7 +408,7 @@ def draw_steps(box, obj, only=None, bare=False):
                 inner.label(text=pg.error, icon='ERROR')
 
 
-STEP_ICON = {"untrim_region": 'SELECT_SUBTRACT', "edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
+STEP_ICON = {"untrim_region": 'SELECT_SUBTRACT', "untrim": 'LOOP_BACK', "edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
              "flip_normal": 'NORMALS_FACE', "surface_align": 'SNAP_EDGE', "match_surface": 'SNAP_FACE', "extend_surface": 'FULLSCREEN_ENTER',
              "rebuild_surface": 'MOD_REMESH', "refit_trim": 'MOD_LATTICE', "merge_patches": 'MESH_GRID'}
 

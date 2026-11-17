@@ -320,9 +320,18 @@ def untrim_preview(text, untrimmed_text, xf):
     return [(breps[f"region{i}"], info["points"][i]) for i in range(info["regions"])]
 
 
-def apply_untrim_region(obj, text, inputs, p):
+def untrim_reference(obj):
+    """The surface Untrim Region cuts the trimmed-away areas from: the one a
+    split piece was cut out of, else the object's base (before its steps)."""
     from . import features
-    base = REBUILD_BASE[0] or features.base_text(obj)
+    whole = features.untrimmed_base(obj)
+    if whole is not None:
+        return whole[0]
+    return REBUILD_BASE[0] or features.base_text(obj)
+
+
+def apply_untrim_region(obj, text, inputs, p):
+    base = untrim_reference(obj)
     M = _world(obj)
     if p.get("points_local"):
         out, _ = untrim_region_text(text, base, jobs.xform(obj), points=[M @ Vector(q) for q in p["points_local"]])
@@ -331,8 +340,15 @@ def apply_untrim_region(obj, text, inputs, p):
     return out
 
 
+def apply_untrim(obj, text, inputs, p):
+    """A split piece back to the whole surface it was cut out of."""
+    from . import features
+    whole = features.untrimmed_base(obj)
+    return whole[0] if whole is not None else text
+
+
 APPLY = {"trim": apply_trim, "edge_fillet": apply_edge_fillet, "fillet_trim": apply_fillet_trim,
-         "flip_normal": apply_flip, "untrim_region": apply_untrim_region}
+         "flip_normal": apply_flip, "untrim_region": apply_untrim_region, "untrim": apply_untrim}
 LABEL = {
     "trim": lambda p: "Trim · " + {"KEEP": "Keep", "DELETE": "Discard"}.get(p.get("action"), p.get("action", "")),
     "edge_fillet": lambda p: f"Edge {p.get('shape', 'CIRCULAR').title()} · "
@@ -341,6 +357,7 @@ LABEL = {
     "fillet_trim": lambda p: "Fillet trim",
     "flip_normal": lambda p: "Flip Normal",
     "untrim_region": lambda p: "Untrim Region",
+    "untrim": lambda p: "Untrim",
 }
 
 

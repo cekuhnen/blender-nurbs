@@ -443,6 +443,7 @@ class NPROTO_OT_trim(bpy.types.Operator):
         if self.action == "SPLIT":
             other = store.new_object_text(context, tgt.name + "_split", breps["DELETE"], geom.world_matrix(tgt))
             other[store.PROP_UNTRIM] = tgt[store.PROP_UNTRIM]
+            other[store.PROP_UNTRIM + "_natural"] = tgt.get(store.PROP_UNTRIM + "_natural", 0)
             if keep_history:  # same history, last step keeps the other side
                 features.copy_history(tgt, other)
                 entries = features.stack(other)
@@ -456,8 +457,21 @@ class NPROTO_OT_trim(bpy.types.Operator):
 TRIM_OPS = {"trim", "fillet_trim", "untrim_region"}
 
 
+def _split_piece(o):
+    """A piece of a Split with history: its feature gives the trimmed piece,
+    so untrims are history steps (set straight on it, a rebuild undoes them)."""
+    return store.is_nurbs(o) and features.untrimmed_base(o) is not None
+
+
 def untrim_all(o, context):
     """Back to the surface before its first trim. False: nothing to undo."""
+    if _split_piece(o):
+        if store.is_natural(o):
+            return False
+        entries = [e for e in features.stack(o) if e["op"] not in TRIM_OPS | {"untrim"}]
+        features._write_stack(o, [{"op": "untrim", "inputs": [], "params": {}}] + entries)
+        features.rebuild(o, context, force=True)
+        return True
     if store.is_nurbs(o) and features.PROP_STACK in o and any(
             e["op"] in ("trim", "fillet_trim") for e in features.stack(o)):
         features.remove_steps(o, TRIM_OPS)
@@ -499,7 +513,18 @@ def _trim_history(o):
 
 
 def _untrimmable(o):
+    if _split_piece(o):
+        return not store.is_natural(o)
     return store.is_nurbs(o) and (store.PROP_UNTRIM in o or _trim_history(o))
+
+
+def _untrim_reference(o):
+    """(untrimmed text, as a history step?) for Untrim Region on o."""
+    if _split_piece(o):
+        return steps.untrim_reference(o), True
+    if _trim_history(o):
+        return features.base_text(o), True
+    return o[store.PROP_UNTRIM], False
 
 
 class NPROTO_OT_untrim_region(bpy.types.Operator):
@@ -518,9 +543,8 @@ class NPROTO_OT_untrim_region(bpy.types.Operator):
     def untrim(self, context, obj, point=None, points=None):
         """Give back the area at the cut edge nearest `point`, or the areas
         nearest `points`. Returns an error text or None."""
-        hist = _trim_history(obj)
         try:
-            untrimmed = features.base_text(obj) if hist else obj[store.PROP_UNTRIM]
+            untrimmed, hist = _untrim_reference(obj)
             text, info = steps.untrim_region_text(obj[store.PROP_BREP], untrimmed, jobs.xform(obj), point, points)
         except (jobs.JobError, KeyError) as exc:
             return str(exc)
@@ -576,7 +600,7 @@ class NPROTO_OT_untrim_region(bpy.types.Operator):
         context.window.cursor_set('WAIT')
         for o in objs:
             try:
-                untrimmed = features.base_text(o) if _trim_history(o) else o[store.PROP_UNTRIM]
+                untrimmed, _ = _untrim_reference(o)
                 for text, pt in steps.untrim_preview(o[store.PROP_BREP], untrimmed, jobs.xform(o)):
                     tris, border = steps.region_mesh(text, o.matrix_world)
                     self._regions.append({"target": o.name, "point": pt, "tris": tris, "border": border})
@@ -1518,6 +1542,8 @@ class NPROTO_OT_split(bpy.types.Operator):
         for name, (inputs, info, pieces) in results.items():
             tgt = bpy.data.objects[name]
             original = tgt.get(store.PROP_UNTRIM, tgt[store.PROP_BREP])
+            original_nat = tgt.get(store.PROP_UNTRIM + "_natural", 0) if store.PROP_UNTRIM in tgt \
+                else (1 if store.is_natural(tgt) else 0)
             if not keep:                  # no history: the first piece stays in the surface itself
                 _frozen(tgt, self)
                 store.set_geometry_text(tgt, pieces[0][0], context)
@@ -1526,6 +1552,7 @@ class NPROTO_OT_split(bpy.types.Operator):
             for i, (text, idx) in enumerate(pieces if keep else pieces[1:], 1):
                 o = store.new_object_text(context, f"{name}_split{i}", text, geom.world_matrix(tgt))
                 o[store.PROP_UNTRIM] = original
+                o[store.PROP_UNTRIM + "_natural"] = original_nat
                 if tgt.data.materials:
                     for m in tgt.data.materials:
                         o.data.materials.append(m)
