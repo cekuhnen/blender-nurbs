@@ -243,6 +243,40 @@ def _plain(cls, **attrs):
         setattr(o_, k, v)
     return o_
 
+from blender_nurbs.ops import NPROTO_OT_thicken as _OpTk
+_tk_la = nurbs("TkLa", [(0, -20, 0), (2, -20, 0)], order=2)
+_tk_lb = nurbs("TkLb", [(2, -20, 0), (2, -20, 1.5)], order=2)
+bpy.ops.nproto.extrude(inputs=ins((_tk_la, "S0")), distance=1.0, direction="Y"); _tka = ctx.active_object
+bpy.ops.nproto.extrude(inputs=ins((_tk_lb, "S0")), distance=1.0, direction="Y"); _tkb = ctx.active_object
+bpy.ops.object.select_all(action='DESELECT'); _tka.select_set(True); _tkb.select_set(True)
+ctx.view_layer.objects.active = _tka
+bpy.ops.nproto.join(); _tkl = ctx.active_object
+_tk_gap = []
+for _base, _d, _sym in ((_osh, 0.2, False), (_osh, -0.15, False), (_osh, 0.3, True), (_tkl, 0.1, False),
+                        (_tkl, -0.1, True)):
+    _src = _base.copy(); _src.data = _base.data.copy(); ctx.collection.objects.link(_src)
+    for k_ in _base.keys():
+        _src[k_] = _base[k_]
+    bpy.ops.object.select_all(action='DESELECT'); _src.select_set(True); ctx.view_layer.objects.active = _src
+    _x = _plain(_OpTk, distance=_d, symmetric=_sym)
+    _ok = _x.drag_setup(ctx, None)
+    _pv = _x.drag_preview()
+    _h = _x.drag_handles()[0]
+    _tip = _h["origin"] + _h["param"] * _h["dir"]
+    _pts = np.vstack([_pv["tris"]] + list(_pv["lines"]))
+    bpy.ops.nproto.thicken(distance=_d, symmetric=_sym); _res = ctx.active_object; ctx.view_layer.update()
+    _t = _tree(_res)
+    _g = max(_t.find_nearest(Vector(q_))[3] for q_ in _pts)
+    _tk_gap.append(round(float(max(_g, _t.find_nearest(Vector(_tip))[3])) if _ok else 9.0, 5))
+    bpy.data.objects.remove(_res)
+    if _src.name in bpy.data.objects:
+        bpy.data.objects.remove(_src)
+for o_ in (_tk_la, _tk_lb, _tka, _tkb, _tkl):
+    if o_.name in bpy.data.objects:
+        bpy.data.objects.remove(o_)
+check("thicken preview: skins, side walls and the arrow tip lie on the solid (sheet both sides, symmetric, "
+      "joined L with its corner extended)", max(_tk_gap) < 2e-3, _tk_gap)
+
 _sf_gap, _sf_arrow = [], []
 for _kind, _fa, _fb2, _shape, _ra, _rb in ((60, False, False, "CIRCULAR", 0.2, 0.2), (60, True, True, "CIRCULAR", 0.2, 0.2),
                                           (125, False, True, "CHAMFER", 0.15, 0.25), ("cyl", False, True, "CIRCULAR", 0.2, 0.2)):
@@ -1150,6 +1184,11 @@ cage = ctx.active_object
 d0 = ext.surface_cvs(store.get_surfaces(cs)[0])
 check("edit CVs opens a cage in edit mode", r == {'FINISHED'} and ncvs.is_cage(cage) and cage.mode == 'EDIT'
       and len(cage.data.vertices) == d0["count_u"] * d0["count_v"], f"{d0['count_u']}x{d0['count_v']} CVs, mode={cage.mode}")
+from blender_nurbs import diagnostics as _ndiag
+_vw = ctx.window_manager.nproto_view; _so = _vw.diag_selected_only; _vw.diag_selected_only = True
+check("Selected Only analysis keeps the surface whose CVs are being edited",
+      not cs.select_get() and cs in _ndiag.analysis_objects(ctx, _vw) and lofted not in _ndiag.analysis_objects(ctx, _vw))
+_vw.diag_selected_only = _so
 # move the last CV (a surface corner on the top edge) up by 0.5 like a G-grab would
 bm = bmesh.from_edit_mesh(cage.data); bm.verts.ensure_lookup_table()
 moved_idx = d0["count_u"] * d0["count_v"] - 1
