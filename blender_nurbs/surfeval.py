@@ -144,16 +144,18 @@ class Surf:
         """Homogeneous derivatives {(k, l): (..., 4)} -> Euclidean {(k, l): (..., 3)}."""
         if not self.rational:
             return {kl: a[..., :3] for kl, a in A.items()}
+        from math import comb
         w = {kl: a[..., 3:4] for kl, a in A.items()}
         S = {}
-        S[0, 0] = A[0, 0][..., :3] / w[0, 0]
-        if nd >= 1:
-            S[1, 0] = (A[1, 0][..., :3] - w[1, 0] * S[0, 0]) / w[0, 0]
-            S[0, 1] = (A[0, 1][..., :3] - w[0, 1] * S[0, 0]) / w[0, 0]
-        if nd >= 2:
-            S[2, 0] = (A[2, 0][..., :3] - 2.0 * w[1, 0] * S[1, 0] - w[2, 0] * S[0, 0]) / w[0, 0]
-            S[0, 2] = (A[0, 2][..., :3] - 2.0 * w[0, 1] * S[0, 1] - w[0, 2] * S[0, 0]) / w[0, 0]
-            S[1, 1] = (A[1, 1][..., :3] - w[1, 0] * S[0, 1] - w[0, 1] * S[1, 0] - w[1, 1] * S[0, 0]) / w[0, 0]
+        # S_kl = (A_kl - sum over (i, j) != (0, 0) of C(k, i) C(l, j) w_ij S_(k-i)(l-j)) / w_00
+        # (Piegl & Tiller A4.4), in order of total degree so every S on the right is known
+        for k, l in sorted(self._orders(nd), key=sum):
+            v = A[k, l][..., :3].copy()
+            for i in range(k + 1):
+                for j in range(l + 1):
+                    if i or j:
+                        v -= comb(k, i) * comb(l, j) * w[i, j] * S[k - i, l - j]
+            S[k, l] = v / w[0, 0]
         return S
 
     @staticmethod
@@ -265,6 +267,46 @@ def normals(D):
     n = np.cross(D[1, 0], D[0, 1])
     ln = np.linalg.norm(n, axis=-1)
     return n / np.where(ln > 0, ln, 1.0)[..., None], ln
+
+
+def forms(D):
+    """(n, Q, C) of an evaluation dict with third derivatives (nd >= 3): the
+    unit su x sv normal, and the surface's height over its tangent plane,
+    h(x) = 1/2 x.Q.x + 1/6 C(x, x, x) + ..., as world-space tensors acting on
+    tangent vectors: Q (..., 3, 3) the second fundamental form, C (..., 3, 3, 3)
+    the third-order one (symmetric). C(c, c, c) for a unit tangent c is the
+    rate of change dk/ds of the normal curvature along the normal section in
+    direction c -- what G3 compares across an edge.
+
+    Along a parameter line c(s) through the point with c' = x (tangent):
+        C(x, x, x) = n . c''' - 3 Q(x, P c'')       (P: the tangent part)
+    which is the expansion below in the (u, v) coordinates of x."""
+    su, sv = D[1, 0], D[0, 1]
+    n, _ = normals(D)
+    J = np.stack([su, sv], axis=-1)                                     # (..., 3, 2)
+    JtJ = np.einsum("...ia,...ib->...ab", J, J)
+    det = JtJ[..., 0, 0] * JtJ[..., 1, 1] - JtJ[..., 0, 1] ** 2
+    det = np.where(np.abs(det) > 1e-300, det, 1e-300)
+    inv = np.stack([np.stack([JtJ[..., 1, 1], -JtJ[..., 0, 1]], -1),
+                    np.stack([-JtJ[..., 1, 0], JtJ[..., 0, 0]], -1)], -2) / det[..., None, None]
+    Jp = np.einsum("...ab,...ib->...ai", inv, J)                        # (..., 2, 3): x -> (u, v) coords
+    S2 = np.stack([np.stack([D[2, 0], D[1, 1]], -2), np.stack([D[1, 1], D[0, 2]], -2)], -3)   # (..., 2, 2, 3)
+    d3 = {0: D[3, 0], 1: D[2, 1], 2: D[1, 2], 3: D[0, 3]}               # by the number of v's
+    S3 = np.stack([np.stack([np.stack([d3[a + b + c] for c in (0, 1)], -2) for b in (0, 1)], -3)
+                   for a in (0, 1)], -4)                                # (..., 2, 2, 2, 3)
+    H = np.einsum("...abi,...i->...ab", S2, n)
+    JpS2 = np.einsum("...di,...bci->...bcd", Jp, S2)
+    raw = np.einsum("...abci,...i->...abc", S3, n) - 3.0 * np.einsum("...ad,...bcd->...abc", H, JpS2)
+    T3 = sum(np.moveaxis(raw, (-3, -2, -1), perm) for perm in
+             ((-3, -2, -1), (-3, -1, -2), (-2, -3, -1), (-2, -1, -3), (-1, -3, -2), (-1, -2, -3))) / 6.0
+    Q = np.einsum("...ab,...ai,...bj->...ij", H, Jp, Jp)
+    C = np.einsum("...abc,...ai,...bj,...ck->...ijk", T3, Jp, Jp, Jp)
+    return n, Q, C
+
+
+def cubic(C, x):
+    """C(x, x, x) of third-order forms C (..., 3, 3, 3) and vectors x (..., 3)."""
+    return np.einsum("...ijk,...i,...j,...k->...", C, x, x, x)
 
 
 def curvatures(D):

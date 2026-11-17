@@ -214,6 +214,29 @@ def clear_all(scene):
 _stepf = {}    # session_uid -> (key, [indices])
 
 
+def surface_key(face):
+    """A short id of the surface under a face: the same while later steps only
+    trim or split the face (they keep its surface), new when it is rebuilt."""
+    import hashlib
+    d = store._k()[1].surface_cvs(face.surface())
+    s = repr((d["degree_u"], d["degree_v"], d["count_u"], d["count_v"],
+              [round(c, 7) + 0.0 for p in d["points"] for c in p]))
+    return hashlib.md5(s.encode()).hexdigest()[:16]
+
+
+def face_keys(brep, pts):
+    """The surface key of the face of `brep` each point lies on (None: none there)."""
+    faces = brep.faces()
+    lo, hi = (np.array(v, float) for v in brep.bounding_box())
+    tol = 1e-4 * (float(np.linalg.norm(hi - lo)) or 1.0)
+    out = []
+    for p in pts:
+        ds = [f.closest_point(tuple(p))[1] for f in faces]
+        k = int(np.argmin(ds)) if ds else -1
+        out.append(surface_key(faces[k]) if k >= 0 and ds[k] < tol else None)
+    return out
+
+
 def step_faces(obj):
     """The faces the history step open in the panel made (an edge fillet:
     its fillet faces), while that body is the active one; [] otherwise."""
@@ -231,17 +254,24 @@ def step_faces(obj):
     from . import steps
     info = steps.rims_of(obj, e["params"].get("mids_local", [])) or {}
     pts = info.get("faces") or []
-    key = (obj.get(store.PROP_REV, 0), pg.index, json.dumps(pts))
+    skeys = info.get("keys") or []
+    key = (obj.get(store.PROP_REV, 0), pg.index, json.dumps(pts), json.dumps(skeys))
     hit = _stepf.get(obj.session_uid)
     if hit and hit[0] == key:
         return hit[1]
     idx = []
     try:
         size = _size(obj)
-        for p in pts:
-            j = _locate(obj, "FACE", -1, p, size)
-            if j is not None and j not in idx:
-                idx.append(j)
+        now = [surface_key(f) for f in store.get_brep(obj).faces()] if skeys else []
+        for n, p in enumerate(pts):
+            # by its surface first (a later step may have cut away the point,
+            # or split the face: every piece counts); else the point
+            sk = skeys[n] if n < len(skeys) else None
+            js = [j for j, k in enumerate(now) if sk and k == sk]
+            if not js:
+                j = _locate(obj, "FACE", -1, p, size)
+                js = [] if j is None else [j]
+            idx += [j for j in js if j not in idx]
     except Exception as exc:
         print("NURBS step faces:", exc)
     _stepf[obj.session_uid] = (key, idx)
@@ -671,6 +701,11 @@ def mode_changed(view, context):
 def _on_load(_):
     RUN["on"] = False                       # loading a file ends every running operator
     HOVER["key"] = None
+    TREE_PICK["name"] = None
+    for o in bpy.data.objects:              # (nothing is picked in the History list after loading)
+        pg = getattr(o, "nproto_step", None)
+        if pg is not None and pg.focus:
+            pg.focus = False
     _sync_modes()
     ensure_running()
 
@@ -737,10 +772,137 @@ def _draw_edge(ctx, ob, i, color, width, draw_lines, edge_bias):
     draw_lines([tuple(W[k // 2 + k % 2]) for k in range(2 * (len(W) - 1))], color, width)
 
 
+# the object last clicked in the History list: drawn in the step blue (a body
+# filled, a sketch as a thick curve) while it stays the active, selected one
+TREE_PICK = {"name": None}
+_mtris = {}    # session_uid -> (rev, points (n,3) local, triangles (m,3))
+_cpoly = {}    # session_uid -> (signature, [world polylines])
+
+
+def picked_in_tree(ctx):
+    """The object clicked in the History list while it is still active and
+    selected (a hidden input can't be selected: active is enough), else None."""
+    act = ctx.view_layer.objects.active
+    if act is None or act.name != TREE_PICK["name"]:
+        return None
+    try:
+        if not act.select_get() and act.visible_get():
+            return None
+    except RuntimeError:
+        pass
+    return act
+
+
+def tree_pick(ctx):
+    """The History-picked object to draw blue, or None (also while one of its
+    steps is open: then only that step's faces are blue)."""
+    act = picked_in_tree(ctx)
+    if act is None or getattr(getattr(act, "nproto_step", None), "focus", False):
+        return None
+    return act
+
+
+def clear_tree_pick():
+    """Nothing in the History list is picked any more: the object shows its
+    own feature again (an open step closes)."""
+    ob = bpy.data.objects.get(TREE_PICK["name"] or "")
+    TREE_PICK["name"] = None
+    pg = getattr(ob, "nproto_step", None) if ob is not None else None
+    if pg is not None and pg.focus:
+        pg.focus = False
+
+
+@bpy.app.handlers.persistent
+def _tree_pick_watch(scene, depsgraph=None):
+    """Selecting something else in the viewport (or nothing) ends the History pick."""
+    if TREE_PICK["name"] is None:
+        return
+    try:
+        if picked_in_tree(bpy.context) is None:
+            clear_tree_pick()
+    except Exception as exc:
+        print("NURBS history pick:", exc)
+
+
+def _mesh_tris(ob):
+    """The body's own display mesh (already tessellated): local points, triangles."""
+    rev = ob.get(store.PROP_REV, 0)
+    hit = _mtris.get(ob.session_uid)
+    if hit and hit[0] == rev:
+        return hit[1], hit[2]
+    me = ob.data
+    me.calc_loop_triangles()
+    pts = np.empty(len(me.vertices) * 3, np.float32)
+    me.vertices.foreach_get("co", pts)
+    tris = np.empty(len(me.loop_triangles) * 3, np.int32)
+    me.loop_triangles.foreach_get("vertices", tris)
+    out = (pts.reshape(-1, 3).astype(float), tris.reshape(-1, 3))
+    _mtris[ob.session_uid] = (rev, *out)
+    return out
+
+
+def _curve_polys(ob):
+    """The curve object's splines as world polylines (cached on its points and placement)."""
+    M = ob.matrix_world
+    sig = (tuple(round(x, 9) for r in M for x in r),
+           tuple((s.type, s.use_cyclic_u, s.order_u, s.use_endpoint_u,
+                  tuple(round(c, 9) for p in (s.bezier_points if s.type == 'BEZIER' else s.points)
+                        for c in (tuple(p.co) + (tuple(p.handle_left) + tuple(p.handle_right)
+                                                 if s.type == 'BEZIER' else ()))))
+                 for s in ob.data.splines))
+    hit = _cpoly.get(ob.session_uid)
+    if hit and hit[0] == sig:
+        return hit[1]
+    from . import geom
+    polys = []
+    for s in ob.data.splines:
+        try:
+            polys.append(geom.sample_curve(geom.spline_to_kernel_curve(s, M), 200))
+        except Exception:
+            pts = s.bezier_points if s.type == 'BEZIER' else s.points
+            P = [M @ p.co.to_3d() if len(p.co) == 4 else M @ p.co for p in pts]
+            if s.use_cyclic_u and P:
+                P.append(P[0])
+            polys.append(np.array(P, float))
+    _cpoly[ob.session_uid] = (sig, polys)
+    return polys
+
+
+def _draw_tree_pick(ctx, ob, draw_lines, draw_tris, edge_bias):
+    import gpu
+    if ob.type == 'CURVE':
+        gpu.state.depth_test_set('NONE')         # a sketch inside a body still shows
+        lines = []
+        for W in _curve_polys(ob):
+            lines += [tuple(W[k // 2 + k % 2]) for k in range(2 * (len(W) - 1))]
+        draw_lines(lines, COL_STEP_LINE, 4.0)
+        gpu.state.depth_test_set('LESS_EQUAL')
+        return
+    if not store.is_nurbs(ob):
+        return
+    bias = edge_bias(ctx, ob, store.tess_settings(ctx)[0])
+    pts, tris = _mesh_tris(ob)
+    if len(tris):
+        W = _biased(pts, ob.matrix_world, bias).astype(np.float32)
+        draw_tris(W[tris.reshape(-1)], COL_STEP)
+    lines = []
+    for P in store.display(ob).get("edges", []):
+        if len(P) > 1:
+            W = _biased(np.asarray(P, float), ob.matrix_world, bias)
+            lines += [tuple(W[k // 2 + k % 2]) for k in range(2 * (len(W) - 1))]
+    draw_lines(lines, COL_STEP_LINE, 2.5)
+
+
 def draw_view(ctx, draw_lines, draw_tris, edge_bias):
     import gpu
     if ctx.mode != 'OBJECT':
         return
+    tp = tree_pick(ctx)
+    if tp is not None and not get(tp)[1]:
+        try:
+            _draw_tree_pick(ctx, tp, draw_lines, draw_tris, edge_bias)
+        except Exception as exc:
+            print("NURBS history pick: draw", exc)
     gpu.state.depth_test_set('LESS_EQUAL')
     gpu.state.blend_set('ALPHA')
     for ob in ctx.selected_objects:
@@ -782,6 +944,8 @@ classes = (NPROTO_OT_subsel_picker,)
 def register():
     if _on_load not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_on_load)
+    if _tree_pick_watch not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_tree_pick_watch)
     bpy.app.timers.register(_sync_modes, first_interval=0.05)
     ensure_running()
 
@@ -790,5 +954,7 @@ def unregister():
     RUN["on"] = False                       # a running picker ends at its next event
     if _on_load in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_on_load)
+    if _tree_pick_watch in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_tree_pick_watch)
     if bpy.app.timers.is_registered(_start_picker):
         bpy.app.timers.unregister(_start_picker)

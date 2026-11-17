@@ -1,11 +1,12 @@
 """Match Surface (Rhino MatchSrf; Alias Align onto the Master's layout): make a
-boundary edge of an untrimmed surface exactly G0 / G1 / G2 to a target edge by
-setting its first 1 / 2 / 3 CV rows from the target's own CV rows.
+boundary edge of an untrimmed surface exactly G0 / G1 / G2 / G3 to a target
+edge by setting its first 1 / 2 / 3 / 4 CV rows from the target's own CV rows.
 
 The target's rows (features.exact_side; world space, edge parameter t in 0..1):
     P(t)  = sum N_j(t) P_j      the target edge
     D(t)  = sum N_j(t) D_j      its cross derivative, pointing out of the target
     DD(t) = sum N_j(t) DD_j     its cross second derivative
+    DDD(t) = sum N_j(t) DDD_j   its cross third derivative
 The surface's edge at a = 0 of its cross direction (salign._to_std: degree p,
 knots Ua), rows G0, G1, G2 on the same basis N_j along the edge:
     S(0, t)   = sum N_j G0_j
@@ -15,16 +16,20 @@ Match sets them CV by CV:
     G0  G0_j = P_j
     G1  c1 (G1_j - G0_j) = lam D_j                       (lam > 0, one per edge)
     G2  c2 ((G2_j - G1_j) / d2 - (G1_j - G0_j) / d1) = lam^2 DD_j + rho c1 (G1_j - G0_j)
-so Sa = lam D and Saa = lam^2 DD + rho Sa all along the edge: one tangent
-plane, and the same normal curvature across the edge (II(w, w) / |w|^2 is the
-same for w and lam w; rho Sa is tangential). The surface continues the
-target's isocurves: the CV hull lines run on straight across the edge, as if
-the two were one surface split there.
+    G3  sum_i w_i G_i,j (i = 0..3) = lam^3 DDD_j + 3 rho lam^2 DD_j + sigma c1 (G1_j - G0_j)
+        (w: geom.start_coeffs, the third derivative's weights)
+so Sa = lam D, Saa = lam^2 DD + rho Sa and Saaa = lam^3 DDD + 3 rho lam^2 DD
++ sigma Sa all along the edge: S(a, t) = target(f(a), t) to third order for
+the cross reparameterisation f' = lam, f'' = rho lam, f^(3) = sigma lam -- one
+tangent plane, the same normal curvature across the edge (II(w, w) / |w|^2 is
+the same for w and lam w; rho Sa is tangential) and the same curvature rate.
+The surface continues the target's isocurves: the CV hull lines run on
+straight across the edge, as if the two were one surface split there.
 lam keeps the surface's own cross tangent length (times Tangent); rho slides
-row 2 along the hull lines to where it sat relative to row 1. Where another
-matched edge meets the edge at a corner, that edge's row already holds this
-one's corner CVs: lam and rho are read from them instead, so edges cut from
-one surface come back exactly.
+row 2 along the hull lines to where it sat relative to row 1, sigma row 3
+likewise. Where another matched edge meets the edge at a corner, that edge's
+row already holds this one's corner CVs: lam, rho and sigma are read from
+them instead, so edges cut from one surface come back exactly.
 
 Layouts that differ along the edge are made one first, exactly: the lower
 degree raised (each knot's multiplicity up by the same amount: the fewest CVs)
@@ -45,7 +50,7 @@ from . import features, geom, salign, store
 
 EDGES = salign.EDGES
 CONT = salign.CONT
-KEEP = {"NONE": 0, "G0": 1, "G1": 2, "G2": 3}    # rows at the far edge that must not move
+KEEP = {"NONE": 0, "G0": 1, "G1": 2, "G2": 3, "G3": 4}    # rows at the far edge that must not move
 CROSS = {"U0": 0, "U1": 0, "V0": 1, "V1": 1}     # the axis the edge's rows step along
 SNAP = 1e-6       # an edge end this close to the target's end (relative to its length) sits on it
 
@@ -293,6 +298,8 @@ def _consts(Ua, p):
     if p >= 2:
         k["d2"] = Ua[p + 2] - Ua[2]
         k["c2"] = p * (p - 1) / (Ua[p + 1] - Ua[2])
+    if p >= 3:
+        k["w3"] = geom.start_coeffs(Ua, p, 3)          # Saaa(0) = sum_i w3_i row_i
     return k
 
 
@@ -306,12 +313,13 @@ def solve(net, work, tangent=1.0, notes=None):
     gets their mean, and one a lower level placed stays. work: [(edge, level,
     side)], each side on the net's layout along its edge, running its way.
 
-    lam (the tangent length) and rho (row 2's slide) are one number per edge.
-    Where another matched edge meets this one, its edge row already holds
-    this edge's row 1 / row 2 CV at that corner: lam and rho are taken from
-    those CVs, so both edges keep their rows (two edges cut from one surface
-    are matched exactly). Elsewhere lam keeps the surface's own tangent
-    length and rho keeps row 2 where it sat relative to row 1."""
+    lam (the tangent length), rho (row 2's slide) and sigma (row 3's) are one
+    number per edge. Where another matched edge meets this one, its edge row
+    already holds this edge's row 1 / 2 / 3 CV at that corner: lam, rho and
+    sigma are taken from those CVs, so both edges keep their rows (two edges
+    cut from one surface are matched exactly). Elsewhere lam keeps the
+    surface's own tangent length, and rho / sigma keep row 2 / 3 where it sat
+    relative to the row before it."""
     nu, nv = net.G.shape[:2]
     X0 = net.G.reshape(-1, 3).copy()
     X = X0.copy()
@@ -324,9 +332,10 @@ def solve(net, work, tangent=1.0, notes=None):
         if len(sd["P"]) != n_e:
             raise RuntimeError(f"{edge}: the layouts along the edge differ ({len(sd['P'])} / {n_e} CVs)")
         e = {"edge": edge, "c": c, "k": _consts(Ua, p), "ix": salign._grid_index(edge, nu, nv), "n": n_e,
-             "P": np.asarray(sd["P"], float), "lam": 1.0,
+             "P": np.asarray(sd["P"], float), "lam": 1.0, "rho": 0.0,
              "D": None if sd.get("D") is None else np.asarray(sd["D"], float),
-             "DD": None if sd.get("DD") is None else np.asarray(sd["DD"], float)}
+             "DD": None if sd.get("DD") is None else np.asarray(sd["DD"], float),
+             "DDD": None if sd.get("DDD") is None else np.asarray(sd["DDD"], float)}
         if c >= 1:
             Ne = salign.basis_matrix(Ue, q, n_e, ts)
             own, tgt = _speed(Ne, e["k"]["c1"] * (Gs[1] - Gs[0])), _speed(Ne, e["D"])
@@ -355,16 +364,24 @@ def solve(net, work, tangent=1.0, notes=None):
             else:
                 x0, x1 = X[rows[0]], X[rows[1]]
                 lam = e["lam"]
-                base = x1 + k["d2"] * ((x1 - x0) / k["d1"] + lam * lam * e["DD"] / k["c2"])
-                slide = (k["d2"] / k["c2"]) * k["c1"] * (x1 - x0)     # row 2 along the hull lines
+                if level == 2:
+                    base = x1 + k["d2"] * ((x1 - x0) / k["d1"] + lam * lam * e["DD"] / k["c2"])
+                    slide = (k["d2"] / k["c2"]) * k["c1"] * (x1 - x0)     # row 2 along the hull lines
+                else:
+                    w3, x2 = k["w3"], X[rows[2]]
+                    rate = lam ** 3 * e["DDD"] + 3.0 * e["rho"] * lam * lam * e["DD"]
+                    base = (rate - w3[0] * x0 - w3[1] * x1 - w3[2] * x2) / w3[3]
+                    slide = k["c1"] * (x1 - x0) / w3[3]                  # row 3 along the hull lines
                 use = np.zeros(n_e, bool)
                 if corners:
-                    ref, use[corners] = X[rows[2]], True
+                    ref, use[corners] = X[rows[level]], True
                 else:
-                    ref = X0[rows[2]] + (x1 - X0[rows[1]])
-                    use[:] = [r not in fixed for r in rows[2]]
+                    ref = X0[rows[level]] + (X[rows[level - 1]] - X0[rows[level - 1]])
+                    use[:] = [r not in fixed for r in rows[level]]
                 den = float(np.sum(slide[use] ** 2))
                 rho = float(np.sum((ref - base)[use] * slide[use])) / den if den > 1e-300 else 0.0
+                if level == 2:
+                    e["rho"] = rho
                 vals = base + rho * slide
             for j in range(n_e):
                 kk = rows[level][j]
@@ -426,6 +443,9 @@ def match_nets(S, jobs_, tangent=1.0, keep="G0", ends="EDGE", average=False, not
             if sd["D"] is None and c > 0:
                 notes.append(f"{edge}: {tobj.name} is a curve -- matched G0")
                 c = 0
+            if c >= 3 and sd.get("DDD") is None:
+                notes.append(f"{edge}: {tobj.name} {tref} has no exact third derivative rows -- matched G2")
+                c = 2
             work.append({"edge": edge, "c": c, "side": fit_side(sd, E0, E1, ends), "name": tobj.name})
 
     conts = {w["edge"]: w["c"] for w in work}
@@ -492,7 +512,7 @@ def _halfway(S, w):
     if w["flip"]:
         Hs = Hs[:, ::-1]
     n_e = Gs.shape[1]
-    out = {"deg": q, "knots": list(Ue), "P": 0.5 * (Gs[0] + Hs[0]), "D": None, "DD": None}
+    out = {"deg": q, "knots": list(Ue), "P": 0.5 * (Gs[0] + Hs[0]), "D": None, "DD": None, "DDD": None}
     if c >= 1:
         ks, kt = _consts(Ua, p), _consts(Va, pt)
         Ne = salign.basis_matrix(Ue, q, n_e, np.linspace(0.0, 1.0, 65))
@@ -506,13 +526,19 @@ def _halfway(S, w):
             DS = ks["c2"] * ((Gs[2] - Gs[1]) / ks["d2"] - (Gs[1] - Gs[0]) / ks["d1"])
             DT = kt["c2"] * ((Hs[2] - Hs[1]) / kt["d2"] - (Hs[1] - Hs[0]) / kt["d1"])
             out["DD"] = 0.5 * (DS / aS ** 2 + DT / aT ** 2)
+        if c >= 3:              # odd: the target's own one points into it, so it enters with a minus
+            TS = sum(wi * Gs[i] for i, wi in enumerate(ks["w3"]))
+            TT = sum(wi * Hs[i] for i, wi in enumerate(kt["w3"]))
+            out["DDD"] = 0.5 * (TS / aS ** 3 - TT / aT ** 3)
     tside = dict(out)
     if out["D"] is not None:
         tside["D"] = -out["D"]
+    if out["DDD"] is not None:
+        tside["DDD"] = -out["DDD"]
     if w["flip"]:
         r = lambda X: None if X is None else X[::-1].copy()
         tside = {"deg": q, "knots": [1.0 - x for x in reversed(Ue)], "P": r(tside["P"]),
-                 "D": r(tside["D"]), "DD": r(tside["DD"])}
+                 "D": r(tside["D"]), "DD": r(tside["DD"]), "DDD": r(tside["DDD"])}
     return out, tside
 
 
@@ -528,13 +554,14 @@ def match_text(obj, text, jobs_, tangent=1.0, keep="G0", ends="EDGE", report=Non
 # --------------------------------------------------------------------------
 
 def measure(obj, edge, tobj, tref):
-    """Worst {"gap", "angle" (degrees), "curv" (relative)} along the edge
-    against its target, as Continuity Check measures them; angle / curv None
-    for a curve target."""
+    """Worst {"gap", "angle" (degrees), "curv" (relative), "rate" (relative,
+    G3)} along the edge against its target, as Continuity Check measures them;
+    angle / curv / rate None for a curve target."""
     from . import contcheck
     if tobj.type != 'CURVE':
         r = contcheck.analyze({"a": contcheck.side_key(obj, edge), "b": contcheck.side_key(tobj, tref)})
-        return {"gap": float(r["gap"].max()), "angle": float(r["ang"].max()), "curv": float(r["crel"].max())}
+        return {"gap": float(r["gap"].max()), "angle": float(r["ang"].max()), "curv": float(r["crel"].max()),
+                "rate": contcheck._worst(r["g3rel"])}
     kc = features.input_curve(tobj, tref)
     t0, t1 = kc.parameter_range()
     ts = np.linspace(t0, t1, 801)
@@ -555,7 +582,7 @@ def measure(obj, edge, tobj, tref):
             else:
                 a = c_
         gap = max(gap, f(0.5 * (a + b)))
-    return {"gap": gap, "angle": None, "curv": None}
+    return {"gap": gap, "angle": None, "curv": None, "rate": None}
 
 
 # --------------------------------------------------------------------------
@@ -589,11 +616,14 @@ from .ops import _kernel_ok, _select_only  # noqa: E402
 
 _ITEMS = [("G0", "G0", "Position: the edge row is the target's edge row"),
           ("G1", "G1", "Tangent: the next row continues the target's tangent rows"),
-          ("G2", "G2", "Curvature: the third row continues the target's curvature rows")]
+          ("G2", "G2", "Curvature: the third row continues the target's curvature rows"),
+          ("G3", "G3", "Curvature rate: the fourth row continues the target's third-derivative rows "
+                       "(degree 3 or more across, 4 rows at the edge)")]
 _KEEP_ITEMS = [("NONE", "None", "The far edge may change"),
                ("G0", "Position", "The far edge stays where it is"),
                ("G1", "Tangent", "The far edge keeps its position and tangent"),
-               ("G2", "Curvature", "The far edge keeps its position, tangent and curvature")]
+               ("G2", "Curvature", "The far edge keeps its position, tangent and curvature"),
+               ("G3", "Curvature Rate", "The far edge keeps its position, tangent, curvature and curvature rate")]
 _END_ITEMS = [("EDGE", "Whole Edge", "The edge runs end to end along the whole target edge"),
               ("CLOSEST", "Closest Points", "The edge runs along the stretch of the target between the points "
                                             "nearest its ends (part of a longer edge)")]
@@ -606,8 +636,8 @@ def _cont_prop(edge):
 
 class NPROTO_OT_match_surface(salign.EdgePicking, bpy.types.Operator):
     """Match boundary edges of an untrimmed surface to target edges by their CVs:
-    the edge row, tangent row and curvature row are set from the target's rows,
-    exactly G0 / G1 / G2 (layouts that differ are made one first). Pick one or
+    the edge row, tangent row, curvature row and curvature-rate row are set from
+    the target's rows, exactly G0 / G1 / G2 / G3 (layouts that differ are made one first). Pick one or
     more edges of the surface (Enter to finish); picking another surface's edge
     right after one sets its target, otherwise the touching edge is found"""
     bl_idname = "nproto.match_surface"
@@ -705,7 +735,7 @@ class NPROTO_OT_match_surface(salign.EdgePicking, bpy.types.Operator):
         """(level, text): what each edge reaches, as Continuity Check measures it."""
         from . import contcheck
         v = getattr(context.window_manager, "nproto_view", None)
-        tol = contcheck.tolerances(v) if v is not None else {"G0": 1e-5, "G1": 0.1, "G2": 0.05}
+        tol = contcheck.tolerances(v) if v is not None else {"G0": 1e-5, "G1": 0.1, "G2": 0.05, "G3": 0.05}
         parts, bad = [], []
         for e, (t, r), c in jobs_:
             lv = _level(c) if t.type != 'CURVE' else 0
@@ -722,6 +752,9 @@ class NPROTO_OT_match_surface(salign.EdgePicking, bpy.types.Operator):
             if lv >= 2 and m["curv"] is not None:
                 txt += f", curvature {100 * m['curv']:.2g}%"
                 fails |= m["curv"] > tol["G2"]
+            if lv >= 3 and m["rate"] is not None:
+                txt += f", curvature rate {contcheck.fmt('G3', m['rate'])}"
+                fails |= not m["rate"] <= tol["G3"]
             try:
                 if salign.overlaps(obj, e, t, r):
                     txt += " (the target lies on the surface's own side: overlapping)"

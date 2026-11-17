@@ -15,6 +15,13 @@ the tolerance height when it is in range):
 * G1: the angle between the two sides' normals.
 * G2: the difference of the two sides' curvature across the edge. Optionally (Curvature Combs) each side's own curvature comb too
   (white / magenta): where the edge is G2 they lie on each other.
+* G3: the difference of the two sides' curvature RATE across the edge: dk/ds
+  of the normal section straight across it, C(c, c, c) of each side's
+  third-order form (surfeval.forms), from the exact third derivatives of the
+  CV net. Once G2 holds, the edge and the curvature along it fix every other
+  third-order term, so this one number per point is all G3 adds. It is judged
+  against the largest curvature rate along the edge (or, where the curvature
+  hardly changes, against the largest curvature per edge length).
 
 G0 measures the SURFACES: across a seam, how far the surface's two ends are
 apart (a program that compares the shared edge with itself reports 0 there).
@@ -61,7 +68,7 @@ def stop(context=None):
     _drop_pending()
     draw.pick_overlay["hover"] = None
 N_SAMPLES = 160
-LEVELS = ("G0", "G1", "G2")
+LEVELS = ("G0", "G1", "G2", "G3")
 from .diagnostics import COMB_BAD, COMB_ENV_W, COMB_ENVELOPE, COMB_HAIR, COMB_HAIR_W, COMB_SPAN  # noqa: E402
 
 COL_OK = (0.3, 0.95, 0.45, 1.0)          # the edge line / label: holds
@@ -70,7 +77,8 @@ COL_B = (0.3, 0.75, 1.0, 0.9)            # Curvature Combs: the second side
 COL_SKIP = (0.55, 0.55, 0.55, 0.8)
 COL_TOL = (1.0, 0.75, 0.2, 0.55)      # the tolerance height over a comb
 COL_LOW = (1.0, 0.55, 0.1, 1.0)       # holds at this level, but a lower level fails there
-LEVEL_COL = {"G0": (0.9, 0.9, 0.9, 1), "G1": (0.35, 0.8, 1.0, 1), "G2": (0.4, 1.0, 0.5, 1)}
+LEVEL_COL = {"G0": (0.9, 0.9, 0.9, 1), "G1": (0.35, 0.8, 1.0, 1), "G2": (0.4, 1.0, 0.5, 1),
+             "G3": (1.0, 0.82, 0.3, 1)}
 
 
 # --------------------------------------------------------------------------
@@ -219,9 +227,10 @@ class _Side:
         return t, self.world(t)
 
 
-def _eval(face, side, p, T, uv0):
+def _eval(face, side, p, T, uv0, se=None):
     """Foot of p (world) on the face's surface: (uv, point, unit normal -- the
-    face's outward one when the kernel knows it --, normal curvature across T)."""
+    face's outward one when the kernel knows it --, normal curvature across T,
+    curvature rate across T). se: the face's surfeval.Surf (None: no rate, nan)."""
     from .square import _foot, _second
     surf = face.surface()
     q = side.Ri @ (p - side.T)
@@ -244,20 +253,48 @@ def _eval(face, side, p, T, uv0):
     a, c = np.linalg.lstsq(np.array([su, sv]).T, w, rcond=None)[0]
     du = a * su + c * sv
     k = (a * a * (suu @ n) + 2 * a * c * (suv @ n) + c * c * (svv @ n)) / max(du @ du, 1e-300)
-    return uv, pt, n, float(k)
+    return uv, pt, n, float(k), _rate(se, uv, side.R, n, w)
 
 
-def _fresh_if_lost(face, side, p, T, uv0, tol):
+def _rate(se, uv, R, n, w):
+    """C(w, w, w): the face's curvature rate in the unit world direction w
+    (tangent), relative to the normal n; nan without a CV net."""
+    if se is None:
+        return float("nan")
+    from . import surfeval
+    D = se.at([uv[0]], [uv[1]], 3)
+    D = {kl: x @ R.T for kl, x in D.items()}
+    ns, _, C = surfeval.forms(D)
+    k3 = float(surfeval.cubic(C, w[None])[0])
+    return -k3 if float(ns[0] @ n) < 0 else k3
+
+
+def _surfs():
+    """face -> its surfeval.Surf (None when it has no CV net), cached per call."""
+    from . import surfeval
+    cache = {}
+
+    def get(face):
+        if id(face) not in cache:
+            try:
+                cache[id(face)] = (face, surfeval.Surf(face.surface()))
+            except Exception:
+                cache[id(face)] = (face, None)
+        return cache[id(face)][1]
+    return get
+
+
+def _fresh_if_lost(face, side, p, T, uv0, tol, se=None):
     """_eval started from the previous sample's foot (it follows the edge);
     when that lands off p -- the face is closed and its seam lies elsewhere
     than the edge's start, or it runs the other way: the search jams against
     the seam -- search the whole face again, and from across the seam (a foot
     stuck on one end of the domain starts again from the other end), and
     keep the nearest foot."""
-    r = _eval(face, side, p, T, uv0)
+    r = _eval(face, side, p, T, uv0, se)
     if np.linalg.norm(r[1] - p) <= tol:
         return r
-    tried = [r] + ([_eval(face, side, p, T, None)] if uv0 is not None else [])
+    tried = [r] + ([_eval(face, side, p, T, None, se)] if uv0 is not None else [])
     (u0, u1), (v0, v1) = face.surface().u_domain(), face.surface().v_domain()
     eu, ev = 1e-9 * (u1 - u0), 1e-9 * (v1 - v0)
     for q in list(tried):
@@ -266,7 +303,7 @@ def _fresh_if_lost(face, side, p, T, uv0, tol):
                    (u, (v1 if abs(v - v0) <= ev else v0)) if min(abs(v - v0), abs(v - v1)) <= ev else None):
             if uv is not None:
                 try:
-                    tried.append(_eval(face, side, p, T, uv))
+                    tried.append(_eval(face, side, p, T, uv, se))
                 except Exception:
                     pass
     return min(tried, key=lambda q: np.linalg.norm(q[1] - p))
@@ -326,6 +363,7 @@ def _measure(A, fa, B, fb, separate, n):
     reach = 0.02 * L
     rows = []
     uv = {"a": None, "b": None}
+    se = _surfs()
 
     def sample(t):
         p = A.world(t)
@@ -340,17 +378,18 @@ def _measure(A, fa, B, fb, separate, n):
         try:
             # an untrimmed surface's own boundary: start on it -- the two ends of a
             # closed surface lie on each other and a free search may take either
-            uva, pa, na, ka = _fresh_if_lost(fa, A, p, T, A.uv_at(t) if A.uv_at else uv["a"], 1e-6 * L)
-            uvb, pb, nb, kb = _fresh_if_lost(fb, B, qb if separate else p, T,
-                                             B.uv_at(tb) if separate and B.uv_at else uv["b"], 1e-6 * L)
+            uva, pa, na, ka, ra = _fresh_if_lost(fa, A, p, T, A.uv_at(t) if A.uv_at else uv["a"], 1e-6 * L, se(fa))
+            uvb, pb, nb, kb, rb = _fresh_if_lost(fb, B, qb if separate else p, T,
+                                                 B.uv_at(tb) if separate and B.uv_at else uv["b"], 1e-6 * L, se(fb))
         except Exception:
             return None
         uv["a"], uv["b"] = uva, uvb
         gv = (qb - p) if separate else (pb - pa)
         if na @ nb < 0:          # sides oriented apart (separate surfaces): compare like for like
+            # (the rate is odd in the cross direction w = n x T, which turned with n: it stays)
             nb, kb = -nb, -kb
         ang = math.degrees(math.acos(min(1.0, max(-1.0, float(na @ nb)))))
-        return (p, na, gv, float(np.linalg.norm(gv)), ang, ka, kb)
+        return (p, na, gv, float(np.linalg.norm(gv)), ang, ka, kb, ra, rb)
 
     span = A.t1 - A.t0
     for i, t in enumerate(tsel):
@@ -404,6 +443,7 @@ def _measure_seam(A, face, n):
     in_u = du <= dv
     rows = []
     last = None
+    se = _surfs()(face)
     for t in tsel:
         p = A.world(t)
         dt = 1e-4 * (A.t1 - A.t0)
@@ -414,14 +454,14 @@ def _measure_seam(A, face, n):
             u, v = _foot(surf, q, last)
             last = (u, v)
             sa, sb = ((u0, v), (u1, v)) if in_u else ((u, v0), (u, v1))
-            _, pa, na, ka = _eval(face, A, p, T, sa)
-            _, pb, nb, kb = _eval(face, A, p, T, sb)
+            _, pa, na, ka, ra = _eval(face, A, p, T, sa, se)
+            _, pb, nb, kb, rb = _eval(face, A, p, T, sb, se)
         except Exception:
             rows.append(None)
             continue
         gv = pb - pa
         ang = math.degrees(math.acos(min(1.0, max(-1.0, float(na @ nb)))))
-        rows.append((p, na, gv, float(np.linalg.norm(gv)), ang, ka, kb))
+        rows.append((p, na, gv, float(np.linalg.norm(gv)), ang, ka, kb, ra, rb))
     return rows, L, False
 
 
@@ -443,7 +483,7 @@ def side_obj(pair, k):
 
 
 def analyze(pair, n=None):
-    """{P, N, D (gap vectors), gap, ang, kA, kB, crel, L, mid, ok mask}."""
+    """{P, N, D (gap vectors), gap, ang, kA, kB, crel, rA, rB (curvature rates), g3rel, L, mid, ok mask}."""
     n = n or samples()
     a = pair["a"]
     oa = side_obj(pair, "a")
@@ -474,13 +514,22 @@ def analyze(pair, n=None):
     good = [r for r in rows if r is not None]
     if len(good) < max(3, 0.2 * n):
         raise ValueError("the edges don't meet")
-    P, N, D, gap, ang, kA, kB = (np.array(x, float) for x in zip(*good))
+    P, N, D, gap, ang, kA, kB, rA, rB = (np.array(x, float) for x in zip(*good))
     used = np.array([r is not None for r in rows])
     Lc = L * float(used.mean())
     kref = max(float(np.max(np.abs(kA))), float(np.max(np.abs(kB))))
     kscale = max([kref] + [_face_kmax(f, sd) for sd, f in ((faces[0], faces[1]), (faces[2], faces[3]))])
     crel = np.abs(kA - kB) / max(kscale, 0.05 / (Lc or 1.0))
+    # G3: the curvature rates, against the largest rate along the edge -- or,
+    # where the curvature hardly changes there, against the edge's largest
+    # curvature per edge length. Not the faces' largest (as G2): a rate is a
+    # third derivative, and one wrinkle anywhere in a face would hide any jump.
+    with np.errstate(invalid="ignore"):
+        rref = float(np.nanmax(np.abs(np.concatenate([rA, rB])), initial=0.0))
+    r3scale = max(rref, max(kref, 0.05 / (Lc or 1.0)) / (Lc or 1.0))
+    g3rel = np.abs(rA - rB) / r3scale              # nan where a side has no CV net: G3 can't be told
     return {"P": P, "N": N, "D": D, "gap": gap, "ang": ang, "kA": kA, "kB": kB, "crel": crel,
+            "rA": rA, "rB": rB, "g3rel": g3rel, "r3scale": r3scale,
             "L": Lc, "kref": kref, "kscale": kscale, "mid": P[len(P) // 2], "covered": float(used.mean()),
             "closed": bool(closed and used.all()), "recommended": rec}
 
@@ -514,18 +563,33 @@ def result(pair):
 
 
 def tolerances(v):
-    return {"G0": v.cont_gap_tol, "G1": v.cont_angle_tol, "G2": v.cont_curv_tol / 100.0}
+    return {"G0": v.cont_gap_tol, "G1": v.cont_angle_tol, "G2": v.cont_curv_tol / 100.0,
+            "G3": getattr(v, "cont_g3_tol", 5.0) / 100.0}
+
+
+def values(res):
+    """{level: per-sample value} of an analysis (G3 nan where it can't be told)."""
+    return {"G0": res["gap"], "G1": res["ang"], "G2": res["crel"], "G3": res["g3rel"]}
+
+
+def _over(val, tol):
+    """Samples past the tolerance (nan, not measurable, counts as past)."""
+    return ~(val <= tol)
+
+
+def _worst(val):
+    return float("nan") if np.isnan(val).all() else float(np.nanmax(val))
 
 
 def judge(res, v):
     """{level: (worst value, holds, per-sample failing mask)}; a level holds
     only when the levels below it hold too."""
     tol = tolerances(v)
-    vals = {"G0": res["gap"], "G1": res["ang"], "G2": res["crel"]}
+    vals = values(res)
     out, below_ok, below_bad = {}, True, np.zeros(len(res["gap"]), bool)
     for lv in LEVELS:
-        bad = vals[lv] > tol[lv]
-        worst = float(vals[lv].max())
+        bad = _over(vals[lv], tol[lv])
+        worst = _worst(vals[lv])
         ok = below_ok and not bad.any()
         below_bad = below_bad | bad
         out[lv] = (worst, ok, below_bad.copy())
@@ -542,16 +606,18 @@ def why_not(res, v, lv):
     """The lower level that makes lv fail although lv's own value is within
     tolerance (G2 ✗ with a fine curvature but a gap), else None."""
     tol = tolerances(v)
-    vals = {"G0": res["gap"], "G1": res["ang"], "G2": res["crel"]}
-    if vals[lv].max() > tol[lv]:
+    vals = values(res)
+    if _over(vals[lv], tol[lv]).any():
         return None
     for low in LEVELS[:LEVELS.index(lv)]:
-        if vals[low].max() > tol[low]:
+        if _over(vals[low], tol[low]).any():
             return low
     return None
 
 
 def fmt(lv, value, context=None):
+    if value != value:                       # nan: a side without a CV net (G3)
+        return "n/a"
     if lv == "G0":
         us = (context or bpy.context).scene.unit_settings
         x = value * us.scale_length
@@ -800,7 +866,7 @@ def draw_view(ctx, draw_lines):
         # the line: red where THIS level fails, orange where only a lower level
         # does (a G2 view over a gap: the curvature is fine, G0 is not), green
         # where everything up to this level holds
-        own = {"G0": res["gap"], "G1": res["ang"], "G2": res["crel"]}[lv] > tolerances(v)[lv]
+        own = _over(values(res)[lv], tol[lv])
         k = LEVELS.index(lv)
         low = J[LEVELS[k - 1]][2] if k > 0 else np.zeros(len(own), bool)
         P, N, L = res["P"], res["N"], res["L"]
@@ -816,12 +882,12 @@ def draw_view(ctx, draw_lines):
         # tolerance are red; a faint line marks the tolerance height when it is
         # in range. A deviation far below the tolerance (< 5% of it: noise)
         # stays small instead of being blown up.
-        val = {"G0": res["gap"], "G1": res["ang"], "G2": res["crel"]}[lv]
+        val = np.nan_to_num(values(res)[lv], nan=0.0)
         H = COMB_SPAN * L * v.cont_scale
         norm = max(float(val.max()), 0.05 * tol[lv], 1e-30)
         h = val / norm * H
         tips = P + N * h[:, None]
-        own_bad = val > tol[lv]
+        own_bad = own
         hg, hb, env = [], [], []
         for i in range(len(P)):
             (hb if own_bad[i] else hg).extend([_v(P[i]), _v(tips[i])])
@@ -1030,7 +1096,7 @@ class NPROTO_OT_continuity(bpy.types.Operator):
         else:
             msg = ("click an edge (a joined edge, or a surface edge); click a checked edge to remove it; "
                    "drag a box to add, Ctrl+drag to remove")
-        rows = [("Show", [hints.cycle("0 1 2", ["G0", "G1", "G2"], v.cont_level),
+        rows = [("Show", [hints.cycle("0 1 2 3", ["G0", "G1", "G2", "G3"], v.cont_level),
                           hints.key("+ -", "comb size"),
                           hints.toggle("K", "combs", v.cont_kcombs)]),
                 ("Edges", [hints.key("Tab", f"cycle overlapping ({self._cycle % len(self._ties) + 1} of {len(self._ties)})"
@@ -1093,8 +1159,9 @@ class NPROTO_OT_continuity(bpy.types.Operator):
             draw.pick_overlay["hover"] = cur[2]
             self._status(context, f"   ({cur[0].name} {cur[1]})")
             _redraw(context)
-        elif event.type in {'ZERO', 'NUMPAD_0', 'ONE', 'NUMPAD_1', 'TWO', 'NUMPAD_2'}:
-            v.cont_level = {"ZERO": "G0", "NUMPAD_0": "G0", "ONE": "G1", "NUMPAD_1": "G1"}.get(event.type, "G2")
+        elif event.type in {'ZERO', 'NUMPAD_0', 'ONE', 'NUMPAD_1', 'TWO', 'NUMPAD_2', 'THREE', 'NUMPAD_3'}:
+            v.cont_level = {"ZERO": "G0", "NUMPAD_0": "G0", "ONE": "G1", "NUMPAD_1": "G1",
+                            "THREE": "G3", "NUMPAD_3": "G3"}.get(event.type, "G2")
             self._status(context)
             _redraw(context)
         elif event.type in {'NUMPAD_PLUS', 'EQUAL', 'PLUS'}:
@@ -1302,6 +1369,7 @@ def draw_panel(col, context):
     sub.prop(v, "cont_gap_tol")
     sub.prop(v, "cont_angle_tol")
     sub.prop(v, "cont_curv_tol")
+    sub.prop(v, "cont_g3_tol")
     box.operator("nproto.continuity_clear", text="Clear All", icon='TRASH').index = -1
 
 

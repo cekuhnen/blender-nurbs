@@ -42,6 +42,8 @@ class Side:
         self.src = None             # (object name, ref) of the input this side came from
         self.Nout = None            # the neighbour FACE's outward normal (orientation of the shading)
         self.Q = None               # neighbour's second fundamental form per sample (3x3)
+        self._C = None              # ... and its third-order form (3x3x3, see C)
+        self._c_src = None          # (kernel surface, [(u, v)], R): where C comes from, lazily
         self.fade1 = self.fade2 = None  # per-sample weight of the G1 / G2 rows (eased at conflicting corners)
         self.free = False           # Loft with rails: a side with no condition (P is only the initial guess)
         self.B, self.N, self.K = B, N, K
@@ -59,9 +61,33 @@ class Side:
         out.src = self.src
         out.Nout = r(self.Nout)
         out.Q = r(self.Q)
+        out._C = r(self._C)
+        if self._C is None and self._c_src is not None:
+            out._c_src = (self._c_src[0], self._c_src[1][::-1], self._c_src[2])
         out.fade1, out.fade2 = r(self.fade1), r(self.fade2)
         out.free = self.free
         return out
+
+    @property
+    def C(self):
+        """The neighbour's third-order form per sample (m, 3, 3, 3; world, on
+        tangent vectors, relative to N; surfeval.forms): from the exact third
+        derivatives of its CV net, evaluated on first use. None for a curve or
+        a surface without a CV net."""
+        if self._C is None and self._c_src is not None:
+            surf, uv, R = self._c_src
+            self._c_src = None
+            try:
+                from . import surfeval
+                se = surfeval.Surf(surf)
+                uv = np.asarray(uv, float)
+                D = {kl: x @ R.T for kl, x in se.at(uv[:, 0], uv[:, 1], 3).items()}
+                n, _, C = surfeval.forms(D)
+                sgn = np.sign(np.einsum("ij,ij->i", n, np.asarray(self.N, float)))
+                self._C = C * np.where(sgn == 0, 1.0, sgn)[:, None, None, None]
+            except Exception as exc:
+                print("NURBS side third-order form:", exc)
+        return self._C
 
 
 def _by_arclength(f, t0, t1, m):
@@ -293,6 +319,7 @@ def sample_side(obj, ref, m):
         sd_ = Side(Pw, np.array(NB) * lam, np.array(N), np.array(K), t_norm, np.array(ND2) * lam * lam, kn, deg)
         sd_.Nout = Nout
         sd_.Q = np.array(QF)
+        sd_._c_src = (surf, list(uv), R)
         return sd_
     if own_layout is not None:
         sd_ = Side(Pw, np.array(B), np.array(N), np.array(K), t_norm, None, own_layout[1], own_layout[0])
@@ -300,6 +327,7 @@ def sample_side(obj, ref, m):
         sd_ = Side(Pw, np.array(B), np.array(N), np.array(K), t_norm)
     sd_.Nout = Nout
     sd_.Q = np.array(QF)
+    sd_._c_src = (surf, list(uv), R)
     return sd_
 
 

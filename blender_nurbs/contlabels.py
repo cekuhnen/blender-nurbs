@@ -22,8 +22,8 @@ from . import features, store
 
 OPS = ("square", "loft", "loft_rails", "blend_curve", "patch")
 STACK_OPS = ("surface_align", "match_surface")   # history steps with a label per edge
-ORDER = ("FREE", "G0", "G1", "G2")
-SHORT = {"FREE": "Free", "G0": "G0", "G1": "G1", "G2": "G2"}
+ORDER = ("FREE", "G0", "G1", "G2", "G3")
+SHORT = {"FREE": "Free", "G0": "G0", "G1": "G1", "G2": "G2", "G3": "G3"}
 RADIUS_PX = 13.0
 
 _cache = {}          # session_uid -> (key, labels)
@@ -67,7 +67,8 @@ def _compute(obj):
         for i, (edge, grp) in enumerate(zip(e["params"]["edges"], groups)):
             src, ref = grp[0]
             pts = geom.boundary_points(surf, edge, 21)
-            vals = ["G0", "G1", "G2"] if features.is_surface_edge(ref) and src.type != 'CURVE' else ["G0"]
+            # Match / Align: G3 too (the curvature rate)
+            vals = ["G0", "G1", "G2", "G3"] if features.is_surface_edge(ref) and src.type != 'CURVE' else ["G0"]
             cur = e["params"]["cont"][i]
             out.append({"pos": M @ Vector(pts[int(round(at * 20))]), "param": f"stack:{k}:{i}",
                         "value": cur if cur in vals else vals[0], "values": vals,
@@ -110,6 +111,8 @@ def _compute_base(obj):
             roles += [(rails[0][0], "cont_ra"), (rails[1][0], "cont_rb")]
         for (src, ref), param in roles:
             vals = _edge_values(src, ref)
+            if param in ("cont_a", "cont_b") and not nr and "G2" in vals:
+                vals = vals + ["G3"]          # the profiles of a loft without rails: G3 too
             cur = p.get(param, "G0")
             out.append({"pos": _mid(src, ref), "param": param, "value": cur if cur in vals else vals[0],
                         "values": vals, "name": f"{src.name} {ref}", "src": (src, ref)})
@@ -305,7 +308,7 @@ def labels(obj):
                     c1 = L["check"]
                     worse = c1 if not c1["ok"] else c2
                     L["check"] = dict(worse, gap=max(c1["gap"], c2["gap"]), angle=max(c1["angle"], c2["angle"]),
-                                      curv=max(c1["curv"], c2["curv"]))
+                                      curv=max(c1["curv"], c2["curv"]), rate=max(c1["rate"], c2["rate"]))
             except Exception as exc:
                 print("NURBS continuity check:", obj.name, L["name"], exc)
     _cache[obj.session_uid] = (key, out)
@@ -319,6 +322,12 @@ def labels(obj):
 TOL_GAP_REL = 1e-4      # gap, relative to the edge's length
 TOL_ANGLE = 0.1         # degrees between the normals
 TOL_CURV = 0.05         # normal curvature across the edge, relative to the neighbour's largest
+TOL_G3 = 0.05           # curvature rate across the edge, relative to the largest (or curvature / length)
+
+
+def _tol_g3():
+    v = getattr(bpy.context.window_manager, "nproto_view", None)
+    return TOL_G3 if v is None else float(getattr(v, "cont_g3_tol", 100.0 * TOL_G3)) / 100.0
 
 
 def _tols():
@@ -343,9 +352,10 @@ def guide_skip(obj, ref_pts=None):
 
 
 def measure(obj, src, ref, cont, n=33, ease=None, skip_near=None, brep=None):
-    """Gap / normal angle / cross curvature of obj's surface along the input
-    (src, ref), sampled away from the very ends: {"gap", "angle", "curv",
-    "ok", "text", "eased"}. cont = 0 / 1 / 2: which conditions are checked.
+    """Gap / normal angle / cross curvature / curvature rate of obj's surface
+    along the input (src, ref), sampled away from the very ends: {"gap",
+    "angle", "curv", "rate", "ok", "text", "eased"}. cont = 0 / 1 / 2 / 3:
+    which conditions are checked.
     ease: [(end 0/1, fraction, note)] -- zones toward a corner where the
     feature eased this edge on purpose (no surface can follow both
     neighbours there): angle / curvature there don't count against the edge;
@@ -372,6 +382,9 @@ def measure(obj, src, ref, cont, n=33, ease=None, skip_near=None, brep=None):
     surf, fi_prev = surfs[fi_mid], fi_mid
     gap = ang = ang_e = 0.0
     kerr, kref, kerr_e = [], 0.0, []
+    rerr, rref, rerr_e = [], 0.0, []
+    ses = {}
+    Ct = sd.C if cont >= 3 and sd.has_surface else None
     prev = None
     frac = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))]) / length
     zone = np.zeros(len(P), bool)
@@ -430,7 +443,29 @@ def measure(obj, src, ref, cont, n=33, ease=None, skip_near=None, brep=None):
         k_own = (a * a * (suu @ nrm) + 2 * a * c * (suv @ nrm) + c * c * (svv @ nrm))
         (kerr_e if zone[k] else kerr).append(abs(k_own - float(sd.K[k])))
         kref = max(kref, abs(float(sd.K[k])))
+        if cont < 3:
+            continue
+        r_own = r_t = float("nan")
+        if Ct is not None:
+            from . import surfeval
+            if fi_prev not in ses:
+                try:
+                    ses[fi_prev] = surfeval.Surf(surf)
+                except Exception:
+                    ses[fi_prev] = None
+            se = ses[fi_prev]
+            if se is not None:
+                D = {kl: x @ R.T for kl, x in se.at([prev[0]], [prev[1]], 3).items()}
+                ns, _, Co = surfeval.forms(D)
+                r_own = float(surfeval.cubic(Co, b[None])[0]) * (1.0 if float(ns[0] @ nrm) >= 0 else -1.0)
+                r_t = float(surfeval.cubic(Ct[k], b))
+        (rerr_e if zone[k] else rerr).append(abs(r_own - r_t))
+        if r_t == r_t:
+            rref = max(rref, abs(r_t))
     curv = (max(kerr) / max(kref, 0.05 / length)) if kerr else 0.0
+    rscale = max(rref, max(kref, 0.05 / length) / length)
+    rate = ((float("nan") if any(x != x for x in rerr) else max(rerr) / rscale)   # nan: no CV net to tell G3 by
+            if rerr else 0.0)
     fails = []
     # a guide curve inside a Patch: relative to the opening, not to itself
     if gap > TOL_GAP_REL * max(length, skip_near[2] if skip_near is not None and len(skip_near) > 2 else 0.0):
@@ -439,8 +474,11 @@ def measure(obj, src, ref, cont, n=33, ease=None, skip_near=None, brep=None):
         fails.append(f"angle {ang:.2g}°")
     if cont >= 2 and sd.has_surface and curv > TOL_CURV:
         fails.append(f"curvature {100 * curv:.2g}%")
+    if cont >= 3 and sd.has_surface and not rate <= _tol_g3():
+        fails.append("curvature rate " + (f"{100 * rate:.2g}%" if rate == rate else "not measurable (no CV net)"))
     parts = [f"gap {gap:.2g}"] + ([f"angle {ang:.2g}°"] if cont >= 1 and sd.has_surface else []) + \
-            ([f"curvature {100 * curv:.2g}%"] if cont >= 2 and sd.has_surface else [])
+            ([f"curvature {100 * curv:.2g}%"] if cont >= 2 and sd.has_surface else []) + \
+            ([f"curvature rate {100 * rate:.2g}%"] if cont >= 3 and sd.has_surface else [])
     curv_e = (max(kerr_e) / max(kref, 0.05 / length)) if kerr_e else 0.0
     eased_off = (cont >= 1 and sd.has_surface and ang_e > TOL_ANGLE) or \
         (cont >= 2 and sd.has_surface and curv_e > TOL_CURV)
@@ -449,9 +487,11 @@ def measure(obj, src, ref, cont, n=33, ease=None, skip_near=None, brep=None):
         what = (f"angle up to {ang_e:.2g}°" if ang_e > TOL_ANGLE else "") + \
             (", " if ang_e > TOL_ANGLE and curv_e > TOL_CURV else "") + \
             (f"curvature up to {100 * curv_e:.2g}%" if curv_e > TOL_CURV else "")
-        return {"gap": gap, "angle": max(ang, ang_e), "curv": max(curv, curv_e), "ok": False, "eased": True,
+        return {"gap": gap, "angle": max(ang, ang_e), "curv": max(curv, curv_e), "rate": rate, "ok": False,
+                "eased": True,
                 "text": f"holds except at the corner ({', '.join(parts)}); eased there, {what}: {notes}"}
-    return {"gap": gap, "angle": max(ang, ang_e), "curv": max(curv, curv_e), "ok": not fails, "eased": False,
+    return {"gap": gap, "angle": max(ang, ang_e), "curv": max(curv, curv_e), "rate": rate, "ok": not fails,
+            "eased": False,
             "text": ("FAILS: " + ", ".join(fails)) if fails else "holds: " + ", ".join(parts)}
 
 

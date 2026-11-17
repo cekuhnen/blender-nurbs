@@ -247,6 +247,11 @@ class NPROTO_OT_history_focus(bpy.types.Operator):
         obj = bpy.data.objects.get(self.name)
         if obj is None:
             return {'CANCELLED'}
+        from . import subsel
+        if not self.reveal and subsel.picked_in_tree(context) is obj and not obj.nproto_step.focus:
+            subsel.clear_tree_pick()           # clicked again: nothing picked in the list
+            _redraw(context)
+            return {'FINISHED'}
         _focus(context, obj, self.root, self.reveal)
         obj.nproto_step.focus = False          # the object itself: its feature and all steps
         return {'FINISHED'}
@@ -264,9 +269,14 @@ def _focus(context, obj, root, reveal=False):
     except RuntimeError:
         pass
     context.view_layer.objects.active = obj
-    from . import draw
+    from . import draw, subsel
     draw.ghost["name"] = obj.name if not features.is_shown(obj) else None
+    subsel.TREE_PICK["name"] = obj.name        # drawn blue while it stays the active one
     context.scene["nproto_tree_root"] = root or obj.name
+    _redraw(context)
+
+
+def _redraw(context):
     for area in context.screen.areas if context.screen else []:
         area.tag_redraw()
 
@@ -286,6 +296,12 @@ class NPROTO_OT_tree_step(bpy.types.Operator):
         obj = bpy.data.objects.get(self.name)
         if obj is None:
             return {'CANCELLED'}
+        from . import subsel
+        pg = obj.nproto_step
+        if subsel.picked_in_tree(context) is obj and pg.focus and pg.index == self.index:
+            subsel.clear_tree_pick()           # clicked again: the step closes, nothing picked
+            _redraw(context)
+            return {'FINISHED'}
         _focus(context, obj, self.root)
         sync_step(obj, self.index)
         obj.nproto_step.focus = True           # the panel shows just this step
@@ -453,12 +469,13 @@ def build_order(root, limit=400):
     return out
 
 
-def _row_object(col, obj, active, root):
-    """One feature that makes an object: name (click = edit it) | what it is | eye."""
+def _row_object(col, obj, picked, root):
+    """One feature that makes an object: name (click = edit it) | what it is | eye.
+    Pressed (blue) while it is the one picked in the list (`picked`)."""
     split = col.split(factor=0.5, align=True)
     icon = 'OUTLINER_OB_SURFACE' if store.is_nurbs(obj) else ('OUTLINER_OB_CURVE' if obj.type == 'CURVE' else 'OBJECT_DATA')
-    op = split.row(align=True).operator("nproto.history_focus", text=obj.name, icon=icon, emboss=False,
-                                        depress=obj == active and not obj.nproto_step.focus)
+    on = obj == picked and not obj.nproto_step.focus     # the one picked in the list: a pressed (blue) button
+    op = split.row(align=True).operator("nproto.history_focus", text=obj.name, icon=icon, emboss=on, depress=on)
     op.name, op.root = obj.name, root.name
     right = split.row(align=True)
     right.label(text=_summary(obj, steps=False))
@@ -466,7 +483,7 @@ def _row_object(col, obj, active, root):
                    emboss=False).name = obj.name
 
 
-def _row_step(col, obj, k, e, active, root):
+def _row_step(col, obj, k, e, picked, root):
     """One step applied to that object (a fillet, trim ...): name | settings | eye
     (on / off: the object without it)."""
     sp = col.split(factor=0.5, align=True)
@@ -474,8 +491,9 @@ def _row_step(col, obj, k, e, active, root):
     lft.separator(factor=1.2)
     head, _, rest = step_label(e).partition(" · ")
     off = e["params"].get("_off")
+    on = obj == picked and obj.nproto_step.focus and obj.nproto_step.index == k
     op = lft.operator("nproto.tree_step", text=f"{k + 1}. {head}", icon=STEP_ICON.get(e["op"], 'MODIFIER'),
-                      emboss=False, depress=obj == active and obj.nproto_step.focus and obj.nproto_step.index == k)
+                      emboss=on, depress=on)
     op.name, op.root, op.index = obj.name, root.name, k
     r = sp.row(align=True)
     r.active = not off
@@ -527,16 +545,18 @@ def draw_tree(layout, context, obj):
     if not s.show_tree:
         return
     col = box.column(align=True)
+    from . import subsel
+    picked = subsel.picked_in_tree(context)    # None: nothing picked (a body selected in the viewport)
     for o in build_order(root):
-        _row_object(col, o, obj, root)
+        _row_object(col, o, picked, root)
         try:
             entries = features.stack(o)
         except RuntimeError:
             entries = []
             col.label(text="a history step lost an input", icon='ERROR')
         for k, e in enumerate(entries):
-            _row_step(col, o, k, e, obj, root)
-    box.label(text="Click a feature to edit it · Shift+click shows it", icon='INFO')
+            _row_step(col, o, k, e, picked, root)
+    box.label(text="Click a feature to edit it (again: unpick) · Shift+click shows it", icon='INFO')
 
 
 def from_feeds(obj, scene):

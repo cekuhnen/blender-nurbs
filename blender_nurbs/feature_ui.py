@@ -12,7 +12,7 @@ from mathutils import Matrix
 
 from . import features, primitives, store
 from .kernel import load as load_kernel
-from .ops import AXIS_ITEMS, CONT_ITEMS, REVOLVE_AXIS_ITEMS
+from .ops import AXIS_ITEMS, CONT_ITEMS, LOFT_CONT_ITEMS, REVOLVE_AXIS_ITEMS
 
 _syncing = [False]
 
@@ -98,6 +98,22 @@ def _on_change(self, context):
         features.edit_rebuild(obj, context)
     except Exception as exc:
         print(f"NURBS feature edit ({obj.name}): {exc}")
+
+
+# numbered (an items callback's enum keeps its value by number): G0 - G2, and G3 for a Loft
+_CONT_N = [(*it, i) for i, it in enumerate(CONT_ITEMS)]
+_LOFT_CONT_N = [(*it, i) for i, it in enumerate(LOFT_CONT_ITEMS)]
+
+
+def _side_cont_items(self, context):
+    """Continuity A / B: a Loft's sides go to G3, a Blend Curve's to G2."""
+    try:
+        h = features.history(self.id_data)
+        if h is not None and h.get("op") == "loft":
+            return _LOFT_CONT_N
+    except Exception:
+        pass
+    return _CONT_N
 
 
 def _F(**kw):
@@ -263,8 +279,8 @@ class NprotoFeature(bpy.types.PropertyGroup):
                                            "less: flatter, more: taller", **_F())
     dome_fullness: FloatProperty(name="Fullness", min=0.3, max=2.0,
                                  description="How far the rim's direction carries into the dome", **_F())
-    cont_a: EnumProperty(name="Continuity A", items=CONT_ITEMS, **_F())
-    cont_b: EnumProperty(name="Continuity B", items=CONT_ITEMS, **_F())
+    cont_a: EnumProperty(name="Continuity A", items=_side_cont_items, **_F())
+    cont_b: EnumProperty(name="Continuity B", items=_side_cont_items, **_F())
     cont_ra: EnumProperty(name="Rail A", items=CONT_ITEMS, **_F())
     cont_rb: EnumProperty(name="Rail B", items=CONT_ITEMS, **_F())
     tan_ra: FloatProperty(name="Rail A Weight", min=0.05, soft_max=3.0, **_F())

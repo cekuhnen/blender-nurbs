@@ -60,7 +60,7 @@ everything built from it rebuilds.
 
 - **Draw:** Draw Plane
 - **Primitives:** Plane, Disk, Box, Cylinder, Cone, Sphere, Torus
-- **From curves:** Loft, Loft Rails, Sweep, Pipe, Extrude, Revolve, Planar
+- **From curves:** Loft (G0 to G3 to surface edges), Loft Rails, Sweep, Pipe, Extrude, Revolve, Planar
 - **Fill a gap:** Boundary, Square, Patch, Dome
 - **From surfaces:** Offset, Thicken, Convert Blender Surface
 
@@ -79,7 +79,7 @@ everything built from it rebuilds.
 
 ### Analyze
 
-- **Continuity Check:** G0, G1 and G2 between surfaces
+- **Continuity Check:** G0, G1, G2 and G3 between surfaces
 - **Feature Labels:** each feature's edges show the continuity it holds, live; click one to change it
 - **Overlays:** Zebra, Curvature Map, Draft Angle, Matcap
 - **Combs and sections:** Curvature Comb, Surface Combs, Dynamic Section
