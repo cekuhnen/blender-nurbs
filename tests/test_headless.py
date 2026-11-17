@@ -1150,6 +1150,11 @@ cage = ctx.active_object
 d0 = ext.surface_cvs(store.get_surfaces(cs)[0])
 check("edit CVs opens a cage in edit mode", r == {'FINISHED'} and ncvs.is_cage(cage) and cage.mode == 'EDIT'
       and len(cage.data.vertices) == d0["count_u"] * d0["count_v"], f"{d0['count_u']}x{d0['count_v']} CVs, mode={cage.mode}")
+from blender_nurbs import diagnostics as _ndiag
+_vw = ctx.window_manager.nproto_view; _so = _vw.diag_selected_only; _vw.diag_selected_only = True
+check("Selected Only analysis keeps the surface whose CVs are being edited",
+      not cs.select_get() and cs in _ndiag.analysis_objects(ctx, _vw) and lofted not in _ndiag.analysis_objects(ctx, _vw))
+_vw.diag_selected_only = _so
 # move the last CV (a surface corner on the top edge) up by 0.5 like a G-grab would
 bm = bmesh.from_edit_mesh(cage.data); bm.verts.ensure_lookup_table()
 moved_idx = d0["count_u"] * d0["count_v"] - 1

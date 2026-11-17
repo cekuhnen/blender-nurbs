@@ -202,12 +202,31 @@ def kernel_comb(kc, samples, scale):
     return comb_geometry(P, Kv, knot_marks(kc, ks, float(np.linalg.norm(Kv, axis=1).max())), scale)
 
 
+def analysis_objects(ctx, v):
+    """The objects the analysis overlays draw on: all visible ones, or with
+    Selected Only the selected ones -- plus a surface whose CVs are being
+    edited, since Edit CVs selects only its temporary cage."""
+    if not v.diag_selected_only:
+        return list(ctx.visible_objects)
+    objs = list(ctx.selected_objects)
+    from .cvs import CAGE_OF
+    seen = {o.name for o in objs}
+    for c in list(objs) + list(getattr(ctx, "objects_in_mode", None) or ()):
+        name = c.get(CAGE_OF) if c is not None and c.type == 'MESH' else None
+        if name and name not in seen:
+            o = ctx.scene.objects.get(name)
+            if o is not None and o.visible_get():
+                objs.append(o)
+                seen.add(name)
+    return objs
+
+
 def draw_combs(ctx, draw_lines):
     s = ctx.scene.nproto_settings
     v = ctx.window_manager.nproto_view
     if not v.show_comb:
         return
-    objs = [o for o in (ctx.selected_objects if v.diag_selected_only else ctx.visible_objects) if o.type == 'CURVE']
+    objs = [o for o in analysis_objects(ctx, v) if o.type == 'CURVE']
     if not objs:
         return
     gpu.state.depth_test_set('NONE')
@@ -716,8 +735,7 @@ def draw_zebra(ctx):
     except Exception as exc:
         print("NURBS diagnostics shader:", exc)
         return
-    objs = [o for o in (ctx.selected_objects if v.diag_selected_only else ctx.visible_objects)
-            if store.is_nurbs(o) and o.type == 'MESH']
+    objs = [o for o in analysis_objects(ctx, v) if store.is_nurbs(o) and o.type == 'MESH']
     if not objs:
         return
     vinv = rv3d.view_matrix.inverted()

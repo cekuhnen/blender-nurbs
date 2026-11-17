@@ -101,8 +101,8 @@ def draw_view(ctx, draw_lines):
     if v is None or not v.show_iso_combs:
         return
     import gpu
-    objs = [o for o in (ctx.selected_objects if v.diag_selected_only else ctx.visible_objects)
-            if store.is_nurbs(o) and o.visible_get()]
+    from .diagnostics import analysis_objects
+    objs = [o for o in analysis_objects(ctx, v) if store.is_nurbs(o) and o.visible_get()]
     gpu.state.depth_test_set('LESS_EQUAL')
     for obj in objs:
         try:
