@@ -9,7 +9,10 @@ and its worst value -- and a comb along it:
 
 Each level draws its deviation as a comb standing on the surface, scaled to
 the edge's own largest value (red past the tolerance; a faint orange line at
-the tolerance height when it is in range):
+the tolerance height when it is in range). It stands outside: on a closed
+solid along its outward normal, on open surfaces on their convex side at the
+edge -- not on whichever way a sheet happens to face (a loft whose normals
+point into its tube would put it inside):
 
 * G0: the gap between the two sides.
 * G1: the angle between the two sides' normals.
@@ -256,6 +259,18 @@ def _eval(face, side, p, T, uv0, se=None):
     return uv, pt, n, float(k), _rate(se, uv, side.R, n, w)
 
 
+def _along(side, t, n):
+    """Normal curvature of the surface ALONG the edge at t, relative to the
+    normal n (Meusnier: the edge curve's curvature vector on n); positive where
+    the edge bends towards n."""
+    h = 1e-3 * (side.t1 - side.t0)
+    t = min(max(t, side.t0 + h), side.t1 - h)
+    p0, p1, p2 = side.world(t - h), side.world(t), side.world(t + h)
+    d1 = (p2 - p0) / (2.0 * h)
+    d2 = (p2 - 2.0 * p1 + p0) / (h * h)
+    return float(d2 @ n) / max(float(d1 @ d1), 1e-300)
+
+
 def _rate(se, uv, R, n, w):
     """C(w, w, w): the face's curvature rate in the unit world direction w
     (tangent), relative to the normal n; nan without a CV net."""
@@ -389,7 +404,7 @@ def _measure(A, fa, B, fb, separate, n):
             # (the rate is odd in the cross direction w = n x T, which turned with n: it stays)
             nb, kb = -nb, -kb
         ang = math.degrees(math.acos(min(1.0, max(-1.0, float(na @ nb)))))
-        return (p, na, gv, float(np.linalg.norm(gv)), ang, ka, kb, ra, rb)
+        return (p, na, gv, float(np.linalg.norm(gv)), ang, ka, kb, ra, rb, _along(A, t, na))
 
     span = A.t1 - A.t0
     for i, t in enumerate(tsel):
@@ -461,7 +476,7 @@ def _measure_seam(A, face, n):
             continue
         gv = pb - pa
         ang = math.degrees(math.acos(min(1.0, max(-1.0, float(na @ nb)))))
-        rows.append((p, na, gv, float(np.linalg.norm(gv)), ang, ka, kb, ra, rb))
+        rows.append((p, na, gv, float(np.linalg.norm(gv)), ang, ka, kb, ra, rb, _along(A, t, na)))
     return rows, L, False
 
 
@@ -483,7 +498,8 @@ def side_obj(pair, k):
 
 
 def analyze(pair, n=None):
-    """{P, N, D (gap vectors), gap, ang, kA, kB, crel, rA, rB (curvature rates), g3rel, L, mid, ok mask}."""
+    """{P, N, D (gap vectors), gap, ang, kA, kB, crel, rA, rB (curvature rates), g3rel, L, mid,
+    out (+1 / -1: the side of N the combs stand on), ok mask}."""
     n = n or samples()
     a = pair["a"]
     oa = side_obj(pair, "a")
@@ -511,10 +527,11 @@ def analyze(pair, n=None):
             if sum(r is not None for r in rows2) > sum(r is not None for r in rows):
                 rows, L, closed = rows2, L2, closed2
     faces = (A, A.faces[0], A, A.faces[-1]) if pair["b"] is None else (A, A.faces[0], B, B.faces[0])
+    sides = (A,) if pair["b"] is None else (A, B)
     good = [r for r in rows if r is not None]
     if len(good) < max(3, 0.2 * n):
         raise ValueError("the edges don't meet")
-    P, N, D, gap, ang, kA, kB, rA, rB = (np.array(x, float) for x in zip(*good))
+    P, N, D, gap, ang, kA, kB, rA, rB, kT = (np.array(x, float) for x in zip(*good))
     used = np.array([r is not None for r in rows])
     Lc = L * float(used.mean())
     kref = max(float(np.max(np.abs(kA))), float(np.max(np.abs(kB))))
@@ -528,10 +545,30 @@ def analyze(pair, n=None):
         rref = float(np.nanmax(np.abs(np.concatenate([rA, rB])), initial=0.0))
     r3scale = max(rref, max(kref, 0.05 / (Lc or 1.0)) / (Lc or 1.0))
     g3rel = np.abs(rA - rB) / r3scale              # nan where a side has no CV net: G3 can't be told
+    out = _outside(sides, kT, kA, kB, Lc)
     return {"P": P, "N": N, "D": D, "gap": gap, "ang": ang, "kA": kA, "kB": kB, "crel": crel,
             "rA": rA, "rB": rB, "g3rel": g3rel, "r3scale": r3scale,
-            "L": Lc, "kref": kref, "kscale": kscale, "mid": P[len(P) // 2], "covered": float(used.mean()),
+            "out": out, "L": Lc, "kref": kref, "kscale": kscale, "mid": P[len(P) // 2], "covered": float(used.mean()),
             "closed": bool(closed and used.all()), "recommended": rec}
+
+
+def _outside(sides, kT, kA, kB, L):
+    """Which side of N (side A's normal) is outside: +1 / -1. A closed solid
+    knows (its outward normal, which N already is). Open surfaces only face the
+    way they were built, so there the convex side counts: the surface's normal
+    curvature along the edge plus across it (twice its mean curvature), averaged
+    over the edge -- a tube's rim bends round its axis, so the comb stands off
+    the tube whichever way its sheets face. Nearly flat there: N as it is."""
+    for sd in sides:
+        try:
+            if store.get_brep(sd.obj).is_manifold_solid():
+                return 1.0
+        except Exception:
+            pass
+    bend = float(np.mean(kT + 0.5 * (kA + kB)))
+    if abs(bend) * (L or 1.0) < 0.01:
+        return 1.0
+    return -1.0 if bend > 0 else 1.0
 
 
 def _key(pair):
@@ -876,8 +913,8 @@ def draw_view(ctx, draw_lines):
             seg = bad_seg if own[i] or own[j] else low_seg if low[i] or low[j] else ok_seg
             seg.extend([_v(P[i]), _v(P[j])])
         # every level: the DEVIATION between the two sides (gap, normal angle,
-        # curvature difference) as a comb standing on the surface (outward
-        # normal), scaled to this edge's own largest value so its shape always
+        # curvature difference) as a comb standing on the surface (outside:
+        # a solid's outward normal, else the surfaces' convex side), scaled to this edge's own largest value so its shape always
         # shows -- also well within tolerance, as in Plasticity. Hairs past the
         # tolerance are red; a faint line marks the tolerance height when it is
         # in range. A deviation far below the tolerance (< 5% of it: noise)
@@ -886,7 +923,8 @@ def draw_view(ctx, draw_lines):
         H = COMB_SPAN * L * v.cont_scale
         norm = max(float(val.max()), 0.05 * tol[lv], 1e-30)
         h = val / norm * H
-        tips = P + N * h[:, None]
+        No = N * res.get("out", 1.0)
+        tips = P + No * h[:, None]
         own_bad = own
         hg, hb, env = [], [], []
         for i in range(len(P)):
@@ -898,7 +936,7 @@ def draw_view(ctx, draw_lines):
         draw_lines(env, COMB_ENVELOPE, COMB_ENV_W)
         ht = tol[lv] / norm * H
         if ht <= 2.0 * H:
-            tl = P + N * ht
+            tl = P + No * ht
             line = []
             for i, j in links:
                 line.extend([_v(tl[i]), _v(tl[j])])
