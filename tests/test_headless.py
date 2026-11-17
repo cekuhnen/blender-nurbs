@@ -277,6 +277,35 @@ bpy.ops.nproto.add_primitive(kind="PLANE"); _sb_o = ctx.active_object; _sb_o.loc
 ctx.view_layer.update()
 check("surface fillet: surfaces that do not cross have no preview (the dialog asks)", _sff(_sa_o, _sb_o) is None)
 
+# two extruded lines meeting at their ends (a tent): only the inside has room, so
+# the preview starts there (not on the default side, off the surfaces' ends) and
+# A / B can't move it; the kernel makes it on that side with Auto Side off
+from blender_nurbs.ops_trim import surface_fillet_sides as _sfsides, part_size as _psize
+_tl = nurbs("TentL", [(39.7, 0, 0), (40, 0, 0.33)], order=2)
+_tr = nurbs("TentR", [(40, 0, 0.33), (40.3, 0, 0)], order=2)
+bpy.ops.nproto.extrude(inputs=ins((_tl, "S0")), distance=0.2, direction="Y"); _ta = ctx.active_object
+bpy.ops.nproto.extrude(inputs=ins((_tr, "S0")), distance=0.2, direction="Y"); _tb = ctx.active_object
+_fr = _sff(_ta, _tb)
+_fits = _sfsides(_ta, _tb, _fr, _psize([_ta, _tb]))
+_f = _plain(_OpSF, surf_a=_ta.name, surf_b=_tb.name, flip_a=True, flip_b=True, rail_type="RADIUS",
+            same_radius=True, radius=0.03, radius_b=0.03, shape="CIRCULAR", _msg="")
+_f.drag_setup(ctx, None)
+_side = (_f.flip_a, _f.flip_b)
+_f._toggle_side("a")
+_kept = (_f.flip_a, _f.flip_b) == _side and bool(_f._msg)
+_X = _sfs(*_fr[0], 0.03, 0.03, -1.0 if _side[0] else 1.0, -1.0 if _side[1] else 1.0)
+_zmax = float(_X[..., 2].max())
+r = bpy.ops.nproto.fillet(surf_a=_ta.name, surf_b=_tb.name, radius=0.03, flip_a=_side[0], flip_b=_side[1],
+                          auto_flip=False, trim_bases=False)
+_t = _tree(ctx.active_object) if r == {'FINISHED'} else None
+_gap = _t and max(_t.find_nearest(Vector(q_))[3] for q_ in _X[2:-2, 1:-1].reshape(-1, 3))
+check("surface fillet on a tent: one side has room, the preview starts there (inside, under the apex), A can't "
+      "leave it, the kernel's fillet matches it",
+      [k for k, v in _fits.items() if v > 0] == [_side] and _fits[_side] == 1.0 and _kept
+      and _zmax < 0.33 and _gap is not None and _gap < 2e-3, (_fits, _side, _kept, round(_zmax, 4), r, _gap))
+for o_ in (_tl, _tr, _ta, _tb) + ((ctx.active_object,) if r == {'FINISHED'} else ()):
+    bpy.data.objects.remove(o_)
+
 _oc_free = nurbs("OcFree", [(0, 50, 0), (1, 51, 0), (2, 49.5, 0), (3, 50.8, 0), (4, 50, 0)])
 _oc_l = bpy.data.curves.new("OcL", 'CURVE'); _oc_l.dimensions = '3D'
 _oc_ls = _oc_l.splines.new('POLY'); _oc_ls.points.add(4); _oc_ls.use_cyclic_u = True
