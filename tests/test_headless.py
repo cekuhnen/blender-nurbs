@@ -5498,6 +5498,96 @@ check("edge fillet by chord: ball radius chord / sqrt 2 on a 90 deg edge (area c
       _r11 == {'FINISHED'} and abs((_ea0 - A(_L4)) - _re * 4 * (2 - math.pi / 2)) < 2e-3,
       f"dA {_ea0 - A(_L4):.5f} vs {_re * 4 * (2 - math.pi / 2):.5f}")
 
+# G3 blend fillets: degree 7 sections whose fourth CV carries each surface's curvature rate (exact third
+# derivatives). A straight crossing of two curved surfaces: G3 to both at rounding, rolling ball and chord;
+# a G2 blend leaves G3 open; a history rebuild keeps it
+from blender_nurbs import contcheck as _ccf, surfeval as _sev
+def _fmk(name, G, Uu, Uv):
+    pts_ = [tuple(map(float, x_)) for x_ in G.reshape(-1, 3)]
+    return store.new_object(ctx, name, ext.surface_from_cvs(3, 3, pts_, list(Uu), list(Uv)))
+def _fw(tag, y0, vary=False):
+    X_, Y_ = np.meshgrid(np.linspace(0, 4, 7), np.linspace(-2, 2, 9), indexing="ij")
+    Zf = 0.25 * np.sin(1.1 * X_) + (0.12 * (1 - (Y_ / 2) ** 2) ** 2 * (X_ - 2) if vary else 0.0)
+    fl_ = _fmk(tag + "F", np.stack([X_, Y_ + y0, Zf], -1), geom.clamped_uniform_knots(7, 3), geom.clamped_uniform_knots(9, 3))
+    Yw, Zw = np.meshgrid(np.linspace(-2, 2, 9), np.linspace(-1, 2, 6), indexing="ij")
+    Xw = 2.2 + 0.25 * np.sin(1.3 * Zw) * ((1 + 0.4 * (1 - (Yw / 2) ** 2) ** 2) if vary else 1.0)
+    wa_ = _fmk(tag + "W", np.stack([Xw, Yw + y0, Zw], -1), geom.clamped_uniform_knots(9, 3), geom.clamped_uniform_knots(6, 3))
+    return fl_, wa_
+def _fil_pairs(fil, base):
+    bf, bb = store.get_brep(fil), store.get_brep(base)
+    Mf, Mb = geom.world_matrix(fil), geom.world_matrix(base)
+    mid = lambda M_, e_: np.array(M_ @ Vector(e_.point_at(0.5 * sum(e_.parameter_range()))))
+    out = []
+    for i_, e_ in enumerate(bf.edges()):
+        m_ = mid(Mf, e_)
+        j_, d_ = min(((j_, np.linalg.norm(mid(Mb, f_) - m_)) for j_, f_ in enumerate(bb.edges())), key=lambda t_: t_[1])
+        if d_ < 1e-3:
+            out.append((f"E{i_}", f"E{j_}"))
+    return out
+def _fil_g3(fil, bases):
+    worst = [0.0, 0.0, 0.0]
+    n_ = 0
+    for base in bases:
+        for ef, eb in _fil_pairs(fil, base):
+            r_ = _ccf.analyze({"a": _ccf.side_key(fil, ef), "b": _ccf.side_key(base, eb)}, 60)
+            worst = [max(worst[0], float(r_["ang"].max())), max(worst[1], float(r_["crel"].max())),
+                     max(worst[2], float(np.nanmax(r_["g3rel"])))]
+            n_ += 1
+    return n_, worst
+_fg = {}
+for _k, (_c, _rt) in enumerate((("3", "RADIUS"), ("3", "CHORD"), ("2", "RADIUS"))):
+    _f, _w = _fw(f"FG3_{_k}", 1100 + 10 * _k)
+    r = bpy.ops.nproto.fillet(surf_a=_f.name, surf_b=_w.name, radius=0.3, shape="BLEND", continuity=_c, rail_type=_rt,
+                              trim_bases=True)
+    _fo = ctx.active_object
+    _fg[_c, _rt] = (r, ext.surface_cvs(store.get_surfaces(_fo)[0])["degree_v"], _fil_g3(_fo, (_f, _w)), _fo, _f, _w)
+_fo, _f, _w = _fg["3", "RADIUS"][3:]
+features.rebuild(_fo, ctx, force=True)
+_fre = _fil_g3(_fo, (_f, _w))
+check("surface fillet G3 blend: degree 7 across, G3 to both surfaces at rounding (rolling ball and chord); a G2 blend "
+      "leaves G3 open; a history rebuild keeps it",
+      all(v_[0] == {'FINISHED'} for v_ in _fg.values())
+      and all(_fg[k_][1] == 7 and _fg[k_][2][0] == 2 and _fg[k_][2][1][1] < 1e-6 and _fg[k_][2][1][2] < 1e-8
+              for k_ in (("3", "RADIUS"), ("3", "CHORD")))
+      and _fg["2", "RADIUS"][1] == 5 and _fg["2", "RADIUS"][2][1][1] < 1e-6 and _fg["2", "RADIUS"][2][1][2] > 0.1
+      and _fre[0] == 2 and _fre[1][2] < 1e-8 and features.history(_fo)["params"].get("blend") == 3,
+      f"{[(k_, v_[:3]) for k_, v_ in _fg.items()]} rebuilt {_fre}")
+# a crossing whose sections change along it: G3 between the sections as close as G2 (the skin through them)
+def _rail_err(fil, base):
+    sf, sb = _sev.Surf(store.get_surfaces(fil)[0]), _sev.Surf(store.get_surfaces(base)[0])
+    best = None
+    for v_ in sf.v_domain:
+        us = np.linspace(*sf.u_domain, 41)[2:-2]
+        Df = sf.at(us, np.full_like(us, v_), 3)
+        nf, Qf, Cf = _sev.forms(Df)
+        uv = [_kl().surface_closest_point(store.get_surfaces(base)[0], tuple(map(float, q_)))[1][0] for q_ in Df[0, 0]]
+        uv = np.array([(a_.x, a_.y) if hasattr(a_, "x") else (a_[0], a_[1]) for a_ in uv])
+        Db = sb.at(uv[:, 0], uv[:, 1], 3)
+        nb, Qb, Cb = _sev.forms(Db)
+        gap = float(np.linalg.norm(Df[0, 0] - Db[0, 0], axis=1).max())
+        sg = np.sign(np.sum(nf * nb, axis=1))
+        x_ = Df[0, 1] - np.sum(Df[0, 1] * nf, axis=1, keepdims=True) * nf
+        x_ /= np.linalg.norm(x_, axis=1, keepdims=True)
+        kf, kb = np.einsum("ni,nij,nj->n", x_, Qf, x_), sg * np.einsum("ni,nij,nj->n", x_, Qb, x_)
+        rf, rb = _sev.cubic(Cf, x_), sg * _sev.cubic(Cb, x_)
+        e_ = (gap, float(np.abs(kf - kb).max() / max(np.abs(kb).max(), 1e-9)),
+              float(np.abs(rf - rb).max() / max(np.abs(rb).max(), 1e-9)))
+        if best is None or e_[0] < best[0]:
+            best = e_
+    return best
+_f, _w = _fw("FG3_v", 1140, vary=True)
+r = bpy.ops.nproto.fillet(surf_a=_f.name, surf_b=_w.name, radius=0.3, shape="BLEND", continuity="3", trim_bases=False)
+_fo = ctx.active_object
+_fv = [_rail_err(_fo, b_) for b_ in (_f, _w)]
+check("surface fillet G3 blend along a crossing whose sections change: G2 and G3 within 0.1 % at both rails",
+      r == {'FINISHED'} and all(g_ < 1e-4 and c_ < 1e-3 and r_ < 1e-3 for g_, c_, r_ in _fv), f"{_fv}")
+# Edge Fillet's chord blend takes the same G3 sections
+_L5 = make_L("FG3_L", loc=(0, 1160, 0))
+r = fillet_all(_L5, shape="BLEND", radius=0.3, rail_type="CHORD", continuity="3")
+_degs = sorted({int(ext.surface_cvs(f_.surface())["degree_v"]) for f_ in store.get_brep(_L5).faces()} |
+               {int(ext.surface_cvs(f_.surface())["degree_u"]) for f_ in store.get_brep(_L5).faces()})
+check("edge fillet by chord, G3 blend: exact sections of degree 7", r == {'FINISHED'} and 7 in _degs, f"{r} {_degs}")
+
 from blender_nurbs import history_ui as _hui
 _hui.sync_step(_L4, 0)
 _pg = _L4.nproto_step
@@ -5841,13 +5931,14 @@ _top = [i for i in store.shared_edges(_cs)
         and _bb.edges()[i].length() > 0.5]
 _cs_plain = _cs.copy(); _cs_plain.data = _cs.data.copy(); ctx.collection.objects.link(_cs_plain)
 _rca = bpy.ops.nproto.edge_fillet(inputs=json.dumps([[_cs.name, f"E{i}"] for i in _top]), shape="BLEND",
-                                  continuity="3", radius=0.15, rail_type="CHORD", class_a=True, ca_tolerance=1e-3)
+                                  continuity="3", radius=0.15, class_a=True, ca_tolerance=1e-3)
+# (rolling ball: a chord blend, G1 - G3, is built from exact sections, which Class-A leaves as they are)
 _rep = json.loads(_cs.get("nproto_class_a", "{}"))
 _bf2 = store.get_brep(_cs)
 _dense = [f for f in _bf2.faces() if max(ext.surface_cvs(f.surface())["count_u"], ext.surface_cvs(f.surface())["count_v"]) > 69]
 from blender_nurbs.ops_trim import class_a_summary as _cas
 _rings_ca = _rep.get("rings") or []
-check("class-A on a closed (not round) rim, blend G3, chord: the rim is ONE even periodic ring (as without Class-A), "
+check("class-A on a closed (not round) rim, blend G3: the rim is ONE even periodic ring (as without Class-A), "
       "no patches, no kernel fallback, and the report says so",
       _rca == {'FINISHED'} and len(_top) >= 1 and "error" not in _rep and _rep.get("patches", 1) == 0
       and len(_rings_ca) == 1 and _rings_ca[0]["ring"] == "periodic" and _rings_ca[0]["round"] <= 69 and not _dense

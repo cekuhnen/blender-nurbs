@@ -812,8 +812,8 @@ def _orient_fillet(f, bases):
 def job_fillet(job):
     """Surface fillet. A rolling-ball circle or chamfer: the kernel's fillet.
     With job['chord'] (the rails that far apart, the ball radius changing
-    with the angle between the surfaces) or job['blend'] (1 / 2: a G1 / G2
-    blend between the rolling ball's rails): built from exact sections
+    with the angle between the surfaces) or job['blend'] (1 / 2 / 3: a G1 / G2 /
+    G3 blend between the rolling ball's rails): built from exact sections
     (secfillet.py). Either way the bases are trimmed back to its rails."""
     A = world_brep(job, "a_base" if "a_base" in job["breps"] else "a")
     B = world_brep(job, "b_base" if "b_base" in job["breps"] else "b")
@@ -826,7 +826,7 @@ def job_fillet(job):
         import secfillet
         sa = 1.0 if float(job["radius_a"]) >= 0 else -1.0
         sb = 1.0 if float(job["radius_b"]) >= 0 else -1.0
-        shape = {1: "G1", 2: "G2"}.get(blend) or ("LINEAR" if int(job["xsect"]) == 0 else "CIRCULAR")
+        shape = {1: "G1", 2: "G2", 3: "G3"}.get(blend) or ("LINEAR" if int(job["xsect"]) == 0 else "CIRCULAR")
         f, info = secfillet.build(sm, A, B, sa, sb, abs(float(job["radius_a"])), abs(float(job["radius_b"])),
                                   chord=float(chord) if chord else None, shape=shape,
                                   tolerance=float(job.get("tolerance", 1e-4)))
@@ -1898,7 +1898,7 @@ def job_edge_fillet(job):
     r1 = job.get("end_radius")
     chord_info = chord_note = None
     if job.get("chord") and not (r1 is not None and abs(float(r1) - r0) > 1e-12):
-        shape = {0: "LINEAR", 1: "CIRCULAR"}.get(xsect) or {1: "G1", 2: "G2"}.get(int(job.get("continuity", 1)))
+        shape = {0: "LINEAR", 1: "CIRCULAR"}.get(xsect) or {1: "G1", 2: "G2", 3: "G3"}.get(int(job.get("continuity", 1)))
         sec, chord_note = None, None
         if shape and abs(float(job.get("thumbweight", 1.0)) - 1.0) < 1e-9:
             try:

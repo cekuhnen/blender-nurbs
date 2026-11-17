@@ -716,10 +716,12 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
     shape: EnumProperty(name="Shape", items=[
         ("CIRCULAR", "Circular", "Exact circular cross-section"),
         ("CHAMFER", "Chamfer", "Straight (linear) cross-section"),
-        ("BLEND", "Blend", "Free-form blend, G1 or G2 to both surfaces"),
+        ("BLEND", "Blend", "Free-form blend, G1, G2 or G3 to both surfaces"),
     ], default="CIRCULAR")
     continuity: EnumProperty(name="Continuity", items=[("1", "G1", "Tangent to both surfaces"),
-                                                       ("2", "G2", "Curvature continuous to both surfaces")],
+                                                       ("2", "G2", "Curvature continuous to both surfaces"),
+                                                       ("3", "G3", "Curvature continuous, and changing at the "
+                                                               "surfaces' rate (degree 7 across)")],
                              default="2")
     rail_type: EnumProperty(name="Rail", items=[
         ("RADIUS", "Rolling Ball", "The size is the radius of a ball rolling between the faces"),
@@ -949,7 +951,7 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
                 self.radius_b = self.radius
             self._field = 0
         elif ch == "g" and self.shape == "BLEND":
-            self.continuity = "1" if self.continuity == "2" else "2"
+            self.continuity = {"1": "2", "2": "3"}.get(self.continuity, "1")
         elif ch == "t":
             self.trim_bases = not self.trim_bases
         else:
@@ -966,7 +968,7 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
                            hints.cycle("R", ["rolling ball", "chord"],
                                        "rolling ball" if self.rail_type == "RADIUS" else "chord", "size"),
                            hints.toggle("S", "same radius", self.same_radius)]
-                 + ([hints.cycle("G", ["G1", "G2"], "G" + self.continuity)] if self.shape == "BLEND" else [])),
+                 + ([hints.cycle("G", ["G1", "G2", "G3"], "G" + self.continuity)] if self.shape == "BLEND" else [])),
                 ("Side", [hints.key("A", "other side of A"), hints.key("B", "other side of B"),
                           hints.toggle("T", "trim the surfaces", self.trim_bases)])]
         return rows
@@ -2094,8 +2096,8 @@ def surface_fillet_sections(P, NA, NB, ra, rb, sa, sb, shape="CIRCULAR", k=9, co
     """Cross-sections (n, k, 3) of a fillet between two crossing surfaces,
     rail on A first: the ball (radius ra from A, rb from B; an equal pair is
     the rolling ball's arc), a straight chamfer, or a blend tangent to both
-    (the worker's G1 cubic / G2 quintic, secfillet.py, with the surfaces'
-    curvature left out)."""
+    (the worker's G1 cubic / G2 quintic / G3 degree 7, secfillet.py, with the
+    surfaces' curvature left out)."""
     n = len(P)
     ra = np.broadcast_to(np.asarray(ra, float), (n,))
     rb = np.broadcast_to(np.asarray(rb, float), (n,))
@@ -2112,12 +2114,10 @@ def surface_fillet_sections(P, NA, NB, ra, rb, sa, sb, shape="CIRCULAR", k=9, co
         tb = -D - np.sum(-D * B, axis=1, keepdims=True) * B
         ta /= np.linalg.norm(ta, axis=1, keepdims=True) + 1e-300
         tb /= np.linalg.norm(tb, axis=1, keepdims=True) + 1e-300
-        deg = 3 if int(continuity) == 1 else 5
+        deg = {1: 3, 3: 7}.get(int(continuity), 5)
         h = d / deg
-        if deg == 3:
-            cv = [T1, T1 + h * ta, T2 + h * tb, T2]
-        else:
-            cv = [T1, T1 + h * ta, T1 + 2 * h * ta, T2 + 2 * h * tb, T2 + h * tb, T2]
+        k = (deg + 1) // 2                          # CVs from each side: on along its tangent
+        cv = [T1 + i * h * ta for i in range(k)] + [T2 + i * h * tb for i in range(k)][::-1]
         from math import comb
         return sum(comb(deg, i) * w ** i * (1 - w) ** (deg - i) * c[:, None] for i, c in enumerate(cv))
     a, b = -A, -B                                    # centre -> rails, unit
