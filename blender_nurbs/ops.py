@@ -1671,6 +1671,66 @@ def offset_frame(obj, cos_deg=1.0):
     return V, W, T.reshape(-1, 3), sharp
 
 
+def _directions_at(bvh, V, W, T, P):
+    """Offset directions at points P on the mesh (V, W, T as offset_frame
+    gives them), blended over the nearest triangle: a point on an edge takes
+    the directions of the edge's own vertices, not those of a vertex inside
+    the face that happens to be nearer (a curved sheet turns in between)."""
+    out = np.empty((len(P), 3))
+    for i, p in enumerate(P):
+        loc, _, f, _ = bvh.find_nearest(Vector(p))
+        if f is None:
+            out[i] = W[int(np.argmin(np.linalg.norm(V - p, axis=1)))]
+            continue
+        a, b, c = V[T[f]]
+        q = np.array(loc, float)
+        v0, v1, v2 = b - a, c - a, q - a
+        d00, d01, d11 = v0 @ v0, v0 @ v1, v1 @ v1
+        den = d00 * d11 - d01 * d01
+        if den <= 0.0:
+            out[i] = W[T[f][0]]
+            continue
+        y = (d11 * (v2 @ v0) - d01 * (v2 @ v1)) / den
+        z = (d00 * (v2 @ v1) - d01 * (v2 @ v0)) / den
+        out[i] = (1.0 - y - z) * W[T[f][0]] + y * W[T[f][1]] + z * W[T[f][2]]
+    return out
+
+
+def offset_frames(context):
+    """The selected NURBS objects set up for an offset preview (the active one
+    first): [(obj, V, W, T, sharp, edges)] with V, W, T, sharp as offset_frame
+    gives them and edges [(world polyline E, its offset directions, open: on
+    one face only)], and the vertex of the first one the arrow stands on (a
+    smooth spot near its middle)."""
+    from mathutils.bvhtree import BVHTree
+    objs = [o for o in context.selected_objects if store.is_nurbs(o)]
+    act = context.view_layer.objects.active
+    objs.sort(key=lambda o: o != act)               # the handle stands on the active one
+    out = []
+    for o in objs:
+        V, W, T, sharp = offset_frame(o)
+        if not len(V):
+            continue
+        bvh = BVHTree.FromPolygons([Vector(v) for v in V], T.tolist())
+        M = geom.world_matrix(o)
+        shared = set(store.shared_edges(o))
+        edges = []
+        for k, pl in enumerate(store.display(o).get("edges", [])):
+            if len(pl) < 2:
+                continue
+            E = np.array([M @ Vector(p) for p in pl], float)
+            edges.append((E, _directions_at(bvh, V, W, T, E), k not in shared))
+        out.append((o, V, W, T, sharp, edges))
+    if not out:
+        return out, 0
+    _, V, W, T, sharp, _ = out[0]
+    cand = np.nonzero(~sharp)[0]
+    if not len(cand):
+        cand = np.arange(len(V))
+    c = V.mean(axis=0)
+    return out, int(cand[np.argmin(np.linalg.norm(V[cand] - c, axis=1))])
+
+
 class NPROTO_OT_offset(ValueDrag, AskValue, bpy.types.Operator):
     """Offset NURBS surfaces along their normal. From the UI an arrow on the
     surface shows which side it goes; drag it (through the surface for the
@@ -1686,38 +1746,8 @@ class NPROTO_OT_offset(ValueDrag, AskValue, bpy.types.Operator):
     MAX_FILL = 60000            # more triangles than this: the preview draws only the edges
 
     def drag_setup(self, context, mouse):
-        from mathutils.kdtree import KDTree
-        objs = [o for o in context.selected_objects if store.is_nurbs(o)]
-        act = context.view_layer.objects.active
-        objs.sort(key=lambda o: o != act)               # the handle stands on the active one
-        self._of = []
-        for o in objs:
-            V, W, T, sharp = offset_frame(o)
-            if not len(V):
-                continue
-            kd = KDTree(len(V))
-            for i, v in enumerate(V):
-                kd.insert(v, i)
-            kd.balance()
-            M = geom.world_matrix(o)
-            edges = []
-            for pl in store.display(o).get("edges", []):
-                if len(pl) < 2:
-                    continue
-                E = np.array([M @ Vector(p) for p in pl], float)
-                idx = [kd.find(Vector(p))[1] for p in E]
-                edges.append((E, W[idx]))
-            self._of.append((o, V, W, T, sharp, edges))
-        if not self._of:
-            return False
-        # the arrow: on a smooth spot near the middle of the first surface
-        o, V, W, T, sharp, _ = self._of[0]
-        cand = np.nonzero(~sharp)[0]
-        if not len(cand):
-            cand = np.arange(len(V))
-        c = V.mean(axis=0)
-        self._hv = int(cand[np.argmin(np.linalg.norm(V[cand] - c, axis=1))])
-        return True
+        self._of, self._hv = offset_frames(context)
+        return bool(self._of)
 
     def drag_handles(self):
         o, V, W, T, sharp, _ = self._of[0]
@@ -1731,7 +1761,7 @@ class NPROTO_OT_offset(ValueDrag, AskValue, bpy.types.Operator):
         lines, tris = [], []
         total = sum(len(T) for _, _, _, T, _, _ in self._of)
         for o, V, W, T, sharp, edges in self._of:
-            lines += [E + d * We for E, We in edges]
+            lines += [E + d * We for E, We, _ in edges]
             if total <= self.MAX_FILL:
                 tris.append((V + d * W)[T].reshape(-1, 3))
         return {"lines": lines, "tris": np.vstack(tris) if tris else np.zeros((0, 3))}
@@ -1770,8 +1800,11 @@ class NPROTO_OT_offset(ValueDrag, AskValue, bpy.types.Operator):
         return {'FINISHED'}
 
 
-class NPROTO_OT_thicken(AskValue, bpy.types.Operator):
-    """Thicken surfaces (single or joined) into closed solids"""
+class NPROTO_OT_thicken(ValueDrag, AskValue, bpy.types.Operator):
+    """Thicken surfaces (single or joined) into closed solids. From the UI the
+    solid shows as a preview with an arrow on the surface for the thickness;
+    drag it (through the surface for the other side), type a value, click away
+    or Enter to make it"""
     bl_idname = "nproto.thicken"
     bl_label = "Thicken"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1779,6 +1812,66 @@ class NPROTO_OT_thicken(AskValue, bpy.types.Operator):
     distance: FloatProperty(name="Thickness", default=0.01, unit='LENGTH',
                             description="Wall thickness along the normals (negative: the other side)")
     symmetric: BoolProperty(name="Symmetric", default=False, description="Half the thickness on each side")
+
+    # -- the live value stage (valuedrag.py) ----------------------------------
+    MAX_FILL = 60000            # more triangles than this: the preview draws only the edges
+    fit_view = "shrink"         # a wall: the last thickness, made smaller only if it runs off the view
+
+    def drag_setup(self, context, mouse):
+        self._of, self._hv = offset_frames(context)
+        return bool(self._of)
+
+    def _sides(self):
+        """The offsets of the two skins: the sheet and its offset, or half
+        the thickness each way."""
+        d = self.distance
+        return (-0.5 * d, 0.5 * d) if self.symmetric else (0.0, d)
+
+    def drag_handles(self):
+        o, V, W, T, sharp, _ = self._of[0]
+        B = V[self._hv]
+        n = W[self._hv] / (np.linalg.norm(W[self._hv]) or 1.0)
+        a, b = self._sides()
+        k = 2.0 if self.symmetric else 1.0             # symmetric: the arrow tip is half the thickness out
+        return [{"field": "distance", "kind": "arrow", "origin": B, "dir": n, "param": b,
+                 "base": B + a * n, "to_value": lambda t, k=k: k * t}]
+
+    def drag_preview(self):
+        a, b = self._sides()
+        skins = [s for s in (a, b) if s != 0.0]        # the sheet itself is drawn already
+        lines, tris = [], []
+        total = sum(len(T) for _, _, _, T, _, _ in self._of) * len(skins)
+        for o, V, W, T, sharp, edges in self._of:
+            for E, We, open_ in edges:
+                lines += [E + s * We for s in skins]
+                if open_:                              # a side wall along it
+                    L, Tw = ruled_preview([E + a * We, E + b * We], ribs=6)
+                    lines += L[2:]
+                    tris.append(Tw)
+            if total <= self.MAX_FILL:
+                tris += [(V + s * W)[T].reshape(-1, 3) for s in skins]
+        return {"lines": lines, "tris": np.vstack(tris) if tris else np.zeros((0, 3))}
+
+    def drag_check(self):
+        if abs(self.distance) <= 0.0:
+            return "Thickness 0: drag the arrow out, or type a thickness"
+        return ""
+
+    def drag_key(self, context, event, ch):
+        if ch == "f":
+            self.distance = -self.distance
+        elif ch == "s":
+            self.symmetric = not self.symmetric
+        else:
+            return False
+        return True
+
+    def drag_rows(self):
+        return [("Side", [hints.key("F", "the other side"), hints.toggle("S", "symmetric", self.symmetric),
+                          hints.note("or drag the arrow through the surface")])]
+
+    def drag_state(self):
+        return ["Symmetric"] if self.symmetric else []
 
     def invoke(self, context, event):
         if not any(store.is_nurbs(o) for o in context.selected_objects):
