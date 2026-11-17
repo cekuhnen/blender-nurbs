@@ -4,7 +4,8 @@ history surfaces: Square, Loft, Loft Rails and Blend Curve.
 Each label sits at the middle of the input it belongs to (Blend Curve: at the
 end it blends from). A click steps that edge's setting to the next value
 (Ctrl / Shift+click: the previous one), through the Feature panel's property,
-so the surface rebuilds from its history like any other edit (one undo step).
+so the surface rebuilds from its history like any other edit (one undo step;
+right after the feature was made: its Adjust Last Operation panel is redone).
 
 Picking is done by a 3D-view gizmo group whose gizmos only hit-test the label
 discs in screen space (test_select); the discs themselves are drawn by
@@ -495,40 +496,55 @@ def redo_operator(context, obj):
     return op if op.bl_idname.lower() == f"nproto_ot_{h['op']}" else None
 
 
-class NPROTO_OT_cycle_continuity(bpy.types.Operator):
+def _label_tip(cls, props):
+    obj = bpy.data.objects.get(props.obj_name)
+    if obj is None:
+        return cls.__doc__
+    ls = labels(obj)
+    if 0 <= props.index < len(ls):
+        L = ls[props.index]
+        nxt = next_value(L["values"], L["value"], 1)
+        prv = next_value(L["values"], L["value"], -1)
+        chk = L.get("check")
+        state = " -- waiting for Rebuild (paused)" if L.get("pending") else (f" -- {chk['text']}" if chk else "")
+        return f"{L['name']}: {SHORT[L['value']]}{state} (click: {SHORT[nxt]}; Ctrl+click: {SHORT[prv]})"
+    return cls.__doc__
+
+
+class NPROTO_OT_click_continuity(bpy.types.Operator):
     """Step this edge's continuity (Free → G0 → G1 → G2); Ctrl or Shift+click steps back"""
-    bl_idname = "nproto.cycle_continuity"
+    bl_idname = "nproto.click_continuity"
     bl_label = "Edge Continuity"
-    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
+    # No UNDO here, on purpose: what a click does makes its own undo step. Run
+    # inside an UNDO operator, Blender's redo of the last operator (the
+    # feature's Adjust Last Operation panel) pushes no step for the redone
+    # feature; the stack is left on the step before it, and the next click's
+    # redo searches back for an older step of the same name ("Loft") and
+    # restores the scene from before THAT one -- all later work gone.
+    bl_options = {'INTERNAL'}
 
     obj_name: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     index: IntProperty(default=-1, options={'HIDDEN', 'SKIP_SAVE'})
-    step: IntProperty(default=1, options={'HIDDEN', 'SKIP_SAVE'})
 
     @classmethod
     def description(cls, context, props):
-        obj = bpy.data.objects.get(props.obj_name)
-        if obj is None:
-            return cls.__doc__
-        ls = labels(obj)
-        if 0 <= props.index < len(ls):
-            L = ls[props.index]
-            nxt = next_value(L["values"], L["value"], 1)
-            prv = next_value(L["values"], L["value"], -1)
-            chk = L.get("check")
-            state = " -- waiting for Rebuild (paused)" if L.get("pending") else (f" -- {chk['text']}" if chk else "")
-            return f"{L['name']}: {SHORT[L['value']]}{state} (click: {SHORT[nxt]}; Ctrl+click: {SHORT[prv]})"
-        return cls.__doc__
+        return _label_tip(cls, props)
 
     def invoke(self, context, event):
-        if event.ctrl or event.shift:
-            self.step = -1
-        if self._redo_panel(context):
-            # not registered: the feature's own Adjust Last Operation panel stays up
-            return {'CANCELLED'}
-        return self.execute(context)
+        return self._click(context, -1 if (event.ctrl or event.shift) else 1)
 
-    def _redo_panel(self, context):
+    def execute(self, context):
+        return self._click(context, 1)
+
+    def _click(self, context, step):
+        if self._redo_panel(context, step):
+            return {'FINISHED'}
+        # the history edit: an UNDO operator run at depth 0 ('EXEC_DEFAULT', undo=True)
+        # makes its own "Edge Continuity" step and closes the last operation's panel
+        r = bpy.ops.nproto.cycle_continuity('EXEC_DEFAULT', True, obj_name=self.obj_name, index=self.index, step=step)
+        return {'FINISHED'} if 'FINISHED' in r else {'CANCELLED'}
+
+    def _redo_panel(self, context, step):
         """Right after the feature was made its Adjust Last Operation panel is
         still up: change the value in it and redo the operator (as the panel
         does), instead of editing the history, which would replace the panel.
@@ -544,24 +560,30 @@ class NPROTO_OT_cycle_continuity(bpy.types.Operator):
         param = L["param"]
         if len(L["values"]) < 2 or ":" in param or param not in op.properties.bl_rna.properties:
             return False
+        kind = features.history(obj)["op"]
         old = getattr(op.properties, param)
-        new = next_value(L["values"], L["value"], self.step)
+        new = next_value(L["values"], L["value"], step)
         before = set(bpy.data.objects.keys())
         try:
             setattr(op.properties, param, new)
-            done = 'FINISHED' in bpy.ops.ed.undo_redo()
+            # undo=True: no undo depth added, so the redone operator pushes its
+            # own step, exactly as the panel's redo does
+            done = 'FINISHED' in bpy.ops.ed.undo_redo('EXEC_DEFAULT', True)
         except Exception as exc:
             print("NURBS continuity: redo of the last operator failed, editing the history", exc)
             done = False
         if done:
-            # A redo undoes the newest undo step and runs the operator again. When
-            # that step was not the feature's own (something pushed one after it),
-            # the feature stays and the redo makes a second one beside it: a copy
-            # in the Outliner, both drawn in the same place. Then the copy goes and
-            # the history is edited instead (the feature rebuilds in place).
+            # A redo undoes back to before the operator's own undo step and runs it
+            # again. When that step is missing, the feature stays and the redo makes
+            # a second one beside it: a copy in the Outliner, both drawn in the same
+            # place. Then the copy goes and the history is edited instead. Only new
+            # features of the same kind count as copies: anything else that appears
+            # is the user's (an undo restores objects too).
             made = [n_ for n_ in bpy.data.objects.keys() if n_ not in before]
+            copies = [n_ for n_ in made
+                      if (features.history(bpy.data.objects[n_]) or {}).get("op") == kind]
             if made and self.obj_name in bpy.data.objects:
-                for n_ in made:
+                for n_ in copies:
                     o_ = bpy.data.objects.get(n_)
                     if o_ is None:
                         continue
@@ -574,7 +596,7 @@ class NPROTO_OT_cycle_continuity(bpy.types.Operator):
                     o_.select_set(False)
                 keep.select_set(True)
                 context.view_layer.objects.active = keep
-                print(f"NURBS continuity: the redo left {self.obj_name} in place and made {made}: removed, "
+                print(f"NURBS continuity: the redo left {self.obj_name} in place and made {made}: removed {copies}, "
                       f"editing the history instead")
                 done = False
         if not done:
@@ -588,6 +610,21 @@ class NPROTO_OT_cycle_continuity(bpy.types.Operator):
             if area.type == 'VIEW_3D':
                 area.tag_redraw()
         return True
+
+
+class NPROTO_OT_cycle_continuity(bpy.types.Operator):
+    """Step this edge's continuity (Free → G0 → G1 → G2) by editing the feature's history"""
+    bl_idname = "nproto.cycle_continuity"
+    bl_label = "Edge Continuity"
+    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
+
+    obj_name: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    index: IntProperty(default=-1, options={'HIDDEN', 'SKIP_SAVE'})
+    step: IntProperty(default=1, options={'HIDDEN', 'SKIP_SAVE'})
+
+    @classmethod
+    def description(cls, context, props):
+        return _label_tip(cls, props)
 
     def execute(self, context):
         from . import feature_ui
@@ -779,7 +816,7 @@ class NPROTO_GGT_cont_labels(bpy.types.GizmoGroup):
         for kind, name, i in want:
             if kind == "L":
                 g = self.gizmos.new(NPROTO_GT_cont_label.bl_idname)
-                props = g.target_set_operator("nproto.cycle_continuity")
+                props = g.target_set_operator("nproto.click_continuity")
             else:
                 g = self.gizmos.new(NPROTO_GT_patch_corner.bl_idname)
                 props = g.target_set_operator("nproto.patch_corner")
@@ -799,4 +836,4 @@ class NPROTO_GGT_cont_labels(bpy.types.GizmoGroup):
         self._sync(context)
 
 
-classes = (NPROTO_OT_cycle_continuity, NPROTO_GT_cont_label, NPROTO_GT_patch_corner, NPROTO_GGT_cont_labels)
+classes = (NPROTO_OT_click_continuity, NPROTO_OT_cycle_continuity, NPROTO_GT_cont_label, NPROTO_GT_patch_corner, NPROTO_GGT_cont_labels)

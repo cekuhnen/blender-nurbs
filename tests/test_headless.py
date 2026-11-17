@@ -1765,6 +1765,20 @@ check("continuity labels: click steps the side and the square rebuilds; step bac
       r == {'FINISHED'} and _after == _cl.next_value(_cl.ORDER, _before, 1) and r2 == {'FINISHED'}
       and features.history(sqo)["params"]["e1"] == _before and store.get_brep(sqo).face_count() == 1,
       f"{_before} -> {_after} -> {features.history(sqo)['params']['e1']}")
+# the label's click operator must not be an UNDO operator: Blender's redo of the last operator (the
+# feature's Adjust Last Operation panel) run inside one pushes no step for the redone feature, and the
+# next click's redo then restores the scene from before an OLDER step of the same name (all later
+# work gone: "Input object 'Extrude.001' not found"). The history edit is its own UNDO operator.
+_gz_ops = set(_cl.NPROTO_GGT_cont_labels._sync.__code__.co_consts)
+_before = features.history(sqo)["params"]["e1"]
+r = bpy.ops.nproto.click_continuity(obj_name=sqo.name, index=1)
+_after = features.history(sqo)["params"]["e1"]
+bpy.ops.nproto.cycle_continuity(obj_name=sqo.name, index=1, step=-1)
+check("continuity labels: the click operator has no UNDO flag, the history edit has; the gizmos run the click",
+      'UNDO' not in _cl.NPROTO_OT_click_continuity.bl_options and 'UNDO' in _cl.NPROTO_OT_cycle_continuity.bl_options
+      and "nproto.click_continuity" in _gz_ops and "nproto.cycle_continuity" not in _gz_ops
+      and r == {'FINISHED'} and _after == _cl.next_value(_cl.ORDER, _before, 1)
+      and features.history(sqo)["params"]["e1"] == _before, f"{r} {_before} -> {_after}")
 _c1 = nurbs("CL_A", [(0, 500, 0), (1, 500, 0.3), (2, 500, 0)]); _c2 = nurbs("CL_B", [(0, 502, 0), (1, 502, -0.3), (2, 502, 0)])
 bpy.ops.nproto.loft(inputs=ins((_c1, "S0"), (_c2, "S0"))); _lo = ctx.active_object
 _lf = _cl.labels(_lo)
@@ -4728,7 +4742,7 @@ for _op in set(_in_panels):
         getattr(bpy.ops.nproto, _op.split(".")[1]).get_rna_type()
     except Exception:
         _missing.append(_op)
-_not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "cycle_continuity", "delete_history", "collect_inputs", "export_step",
+_not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cycle_continuity", "delete_history", "collect_inputs", "export_step",
               "import_step", "open_step", "history_focus", "history_toggle_hide", "tree_step", "step_unfocus", "mute_step", "patch_add_guides",
               "patch_auto_corners", "patch_corner", "patch_remove_guide", "rebuild", "rebuild_waiting", "remove_step",
               "restore_inputs", "sync_feature", "tab_edit", "continuity", "continuity_clear", "section_add", "section_orient",
