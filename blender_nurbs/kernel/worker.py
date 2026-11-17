@@ -809,56 +809,35 @@ def _orient_fillet(f, bases):
         return f
 
 
-def _fillet_chord(f, A, B, n=15):
-    """(min, mean, max) distance between the fillet's two rails, section by
-    section (the fillet face's own across parameter), or None."""
-    np = _np()
-    try:
-        face = f.faces()[0]
-        s = face.surface()
-        (u0, v0), (u1, v1) = face.uv_domain()
-    except Exception:
-        return None
-    on = lambda base, p: dist_to_brep(tuple(p), base)
-    um, vm = 0.5 * (u0 + u1), 0.5 * (v0 + v1)
-    ea = min(on(A, s.evaluate(u0, vm)) + on(B, s.evaluate(u1, vm)), on(B, s.evaluate(u0, vm)) + on(A, s.evaluate(u1, vm)))
-    ev = min(on(A, s.evaluate(um, v0)) + on(B, s.evaluate(um, v1)), on(B, s.evaluate(um, v0)) + on(A, s.evaluate(um, v1)))
-    if ea <= ev:
-        ch = [np.linalg.norm(np.array(s.evaluate(u0, v)) - np.array(s.evaluate(u1, v))) for v in np.linspace(v0, v1, n)]
-    else:
-        ch = [np.linalg.norm(np.array(s.evaluate(u, v0)) - np.array(s.evaluate(u, v1))) for u in np.linspace(u0, u1, n)]
-    return float(min(ch)), float(np.mean(ch)), float(max(ch))
-
-
 def job_fillet(job):
-    """Surface fillet. With job['chord']: the rolling-ball radius is found so
-    that the distance between the two rails (the chord) is that length --
-    exact where the angle between the surfaces stays the same, the average
-    chord otherwise (reported)."""
+    """Surface fillet. A rolling-ball circle or chamfer: the kernel's fillet.
+    With job['chord'] (the rails that far apart, the ball radius changing
+    with the angle between the surfaces) or job['blend'] (1 / 2: a G1 / G2
+    blend between the rolling ball's rails): built from exact sections
+    (secfillet.py). Either way the bases are trimmed back to its rails."""
     A = world_brep(job, "a_base" if "a_base" in job["breps"] else "a")
     B = world_brep(job, "b_base" if "b_base" in job["breps"] else "b")
     chord = job.get("chord")
-    if chord:
-        np = _np()
-        c = float(chord)
+    blend = int(job.get("blend") or 0)
+    if chord or blend:
+        # our own sections (secfillet.py): the kernel's fillet has one ball
+        # radius, a chord needs one per section; a blend is built between the
+        # rails directly (no circular fillet, trim and loft between its edges)
+        import secfillet
         sa = 1.0 if float(job["radius_a"]) >= 0 else -1.0
         sb = 1.0 if float(job["radius_b"]) >= 0 else -1.0
-        r = c / np.sqrt(2.0)                 # exact for surfaces at 90 deg
-        f = None
-        for _ in range(4):
-            job["radius_a"], job["radius_b"] = sa * r, sb * r
-            f = _surface_fillet(job, A, B)
-            ch = _fillet_chord(f, A, B)
-            if ch is None or ch[1] <= 0:
-                break
-            if abs(ch[1] - c) <= 1e-6 * c:
-                break
-            r *= c / ch[1]
-        job["radius_a"], job["radius_b"] = sa * r, sb * r
-        f = _surface_fillet(job, A, B)
+        shape = {1: "G1", 2: "G2"}.get(blend) or ("LINEAR" if int(job["xsect"]) == 0 else "CIRCULAR")
+        f, info = secfillet.build(sm, A, B, sa, sb, abs(float(job["radius_a"])), abs(float(job["radius_b"])),
+                                  chord=float(chord) if chord else None, shape=shape,
+                                  tolerance=float(job.get("tolerance", 1e-4)))
+        f = _orient_fillet(f, (A, B))
         res = _fillet_finish(job, f, A, B)
-        res["radius"] = r
-        res["chord"] = _fillet_chord(f, A, B)
+        res["radius"] = info["radius"][1]
+        res["radius_range"] = info["radius"]
+        res["chord"] = info["chord"]
+        res["sections"] = info["sections"]
+        if info.get("note"):
+            res["note"] = info["note"]
         return res
     return _fillet_finish(job, _surface_fillet(job, A, B), A, B)
 

@@ -10334,4 +10334,50 @@ check("move pivot on a CV cage: the surface's origin moves, the cage stays open,
       _moved == [_cs.name] and _still and (Vector(_cs.location) - Vector((0.5, -5.5, 0))).length < 1e-6
       and _near(_bpts(_cs), _cs_b) < 1e-9, (_moved, _still, tuple(_cs.location), _near(_bpts(_cs), _cs_b)))
 
+# Surface fillet round a cylinder through a tilted plane (the angle between them
+# goes 59 -> 121 deg round the crossing): a chord keeps the rails that far apart
+# all round (the ball radius changes), and a G2 blend is a closed ring, G2 to both
+from blender_nurbs.ops_sweep import continuity_report as _crt
+def _tilt_pair(tag, y):
+    ln = poly(tag + "_pl", [(-1.2, y - 1.2, -0.72), (1.2, y - 1.2, 0.72)])
+    bpy.ops.nproto.extrude(inputs=ins((ln, "S0")), distance=2.4, direction="Y")
+    pl = ctx.active_object; pl.name = tag + "_plane"
+    bpy.ops.curve.primitive_nurbs_circle_add(radius=0.3, location=(0, y, 0))
+    ci = ctx.active_object
+    bpy.ops.nproto.extrude(inputs=ins((ci, "S0")), distance=1.0, direction="NORMAL", symmetric=True)
+    cy = ctx.active_object; cy.name = tag + "_cyl"
+    return cy, pl
+def _rails_apart(o):
+    s_ = store.get_surfaces(o)[0]; (u0, u1), (v0, v1) = s_.u_domain(), s_.v_domain()
+    du = [np.linalg.norm(np.array(s_.evaluate(u, v0)) - np.array(s_.evaluate(u, v1))) for u in np.linspace(u0, u1, 97)]
+    dv = [np.linalg.norm(np.array(s_.evaluate(u0, v)) - np.array(s_.evaluate(u1, v))) for v in np.linspace(v0, v1, 97)]
+    return du if np.mean(du) > np.mean(dv) else dv
+_tc = {}
+for _tag, _shape, _rail in (("TCc", "CIRCULAR", "CHORD"), ("TCb", "BLEND", "CHORD"), ("TCr", "BLEND", "RADIUS")):
+    _cy, _pl = _tilt_pair(_tag, 1100 + 10 * len(_tc))
+    _r = bpy.ops.nproto.fillet(surf_a=_cy.name, surf_b=_pl.name, radius=0.1, shape=_shape, rail_type=_rail,
+                               continuity="2", trim_bases=True)
+    _f = ctx.active_object
+    _d = _rails_apart(_f)
+    _c = [_crt(_f, o_) or _crt(o_, _f) for o_ in (_cy, _pl)]
+    _tc[_tag] = (_r, _f, min(_d), max(_d), _c, [e["op"] for e in features.stack(_cy)], [e["op"] for e in features.stack(_pl)])
+_r, _f, _lo, _hi, _c, _s1, _s2 = _tc["TCc"]
+check("surface fillet by chord round a cylinder through a tilted plane: rails 0.1 apart all round, tangent to both, "
+      "both trimmed", _r == {'FINISHED'} and abs(_lo - 0.1) < 1e-4 and abs(_hi - 0.1) < 1e-4 and all(_c)
+      and max(c["angle"] for c in _c) < 0.05 and "fillet_trim" in _s1 and "fillet_trim" in _s2,
+      f"chord {_lo:.6f}..{_hi:.6f} {[c and round(c['angle'], 4) for c in _c]} {_s1} {_s2}")
+for _tag, _what in (("TCb", "chord"), ("TCr", "rolling ball")):
+    _r, _f, _lo, _hi, _c, _s1, _s2 = _tc[_tag]
+    check(f"surface fillet G2 blend ({_what}) round a cylinder through a tilted plane: a closed ring, G2 to both",
+          _r == {'FINISHED'} and all(_c) and max(c["gap"] for c in _c) < 1e-4 and max(c["angle"] for c in _c) < 0.05
+          and max(c["curv_diff"] for c in _c) < 0.02 and (_what != "chord" or abs(_lo - 0.1) < 1e-4 and abs(_hi - 0.1) < 1e-4),
+          f"apart {_lo:.5f}..{_hi:.5f} {[c and (round(c['gap'], 6), round(c['angle'], 4), round(c['curv_diff'], 4)) for c in _c]}")
+_f = _tc["TCb"][1]
+features.rebuild(_f, ctx, force=True)
+_c = [_crt(_f, o_) or _crt(o_, _f) for o_ in (bpy.data.objects["TCb_cyl"], bpy.data.objects["TCb_plane"])]
+check("surface fillet G2 blend by chord: a history rebuild keeps it G2 and the chord",
+      all(_c) and max(c["curv_diff"] for c in _c) < 0.02 and abs(max(_rails_apart(_f)) - 0.1) < 1e-4
+      and features.history(_f)["params"].get("blend") == 2 and features.history(_f)["params"].get("chord"),
+      f"{[c and round(c['curv_diff'], 4) for c in _c]}")
+
 print("ALL OK" if ok else "SOME FAILED")

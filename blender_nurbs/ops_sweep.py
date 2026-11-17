@@ -1006,9 +1006,13 @@ def continuity_report(a, b, samples=60):
     """Exact (kernel) max gap and max normal angle where surface a's edges
     touch surface b."""
     from .sweeps import _normal_near
-    Ma, Mb = geom.world_matrix(a), geom.world_matrix(b)
-    Mbi = Mb.inverted()
-    Ra, Rb = np.array(Ma.to_3x3()), np.array(Mb.to_3x3())
+    # in double precision: mathutils is float32, ~6e-5 off at 1000 m from the
+    # origin -- a "gap" that is only rounding, and a G2 blend's curvature read
+    # that far inside it (where it is already rising) failed the check
+    Ma, Mb = (np.array(geom.world_matrix(o), dtype=float) for o in (a, b))
+    Mai, Mbi = np.linalg.inv(Ma), np.linalg.inv(Mb)
+    Ra, Rb = Ma[:3, :3], Mb[:3, :3]
+    xf = lambda M, p: M[:3, :3] @ np.asarray(p, float) + M[:3, 3]
     ba, bb = store.get_brep(a), store.get_brep(b)
     per_edge = []
     for e in ba.edges():
@@ -1016,7 +1020,7 @@ def continuity_report(a, b, samples=60):
         pts = []
         for k in range(1, samples):
             try:
-                pts.append(np.array(Ma @ Vector(e.point_at(t0 + (t1 - t0) * k / samples))))
+                pts.append(xf(Ma, e.point_at(t0 + (t1 - t0) * k / samples)))
             except Exception:
                 pass
         if pts:
@@ -1029,18 +1033,17 @@ def continuity_report(a, b, samples=60):
     for pts in per_edge:          # only edges that run ALONG the other surface count
         hits = []
         for p in pts:
-            pl = tuple(Mbi @ Vector(p))
+            pl = tuple(float(x) for x in xf(Mbi, p))
             fb, (q, d) = min(((f, f.closest_point(pl)) for f in bb.faces()), key=lambda x: x[1][1])
             hits.append((p, d, fb, np.array(q)))
         if sum(1 for h in hits if h[1] < 0.01 * span) >= 0.8 * len(hits):
             near += hits
     if not near:
         return None
-    Mai = Ma.inverted()
     gap, ang = 0.0, 0.0
     curv = []                 # (relative difference, k_a, k_b) of the curvature across the edge
     for idx, (p, d, fb, q) in enumerate(near):
-        pa = np.array(Mai @ Vector(p))
+        pa = xf(Mai, p)
         fa = min(ba.faces(), key=lambda f: f.closest_point(tuple(pa))[1])
         na = Ra @ _normal_near(fa.surface(), np.array(fa.closest_point(tuple(pa))[0]))
         nb = Rb @ _normal_near(fb.surface(), q)
@@ -1073,7 +1076,13 @@ def _cross_curvature(surf, q, R, T):
     direction across the edge running along T (world). Returns (k, normal):
     k > 0 when the surface bends towards that normal."""
     from .square import _foot, _second
-    u, v = _foot(surf, np.asarray(q, float), None)
+    from .kernel import load
+    try:        # started at the kernel's global foot: a grid start can sit across a closed surface's seam
+        _, uvs, _ = load().surface_closest_point(surf, tuple(float(x) for x in q))
+        uv0 = (uvs[0].x, uvs[0].y) if hasattr(uvs[0], "x") else (uvs[0][0], uvs[0][1])
+    except Exception:
+        uv0 = None
+    u, v = _foot(surf, np.asarray(q, float), uv0)
     su, sv, suu, suv, svv = (R @ x for x in _second(surf, u, v))
     n = np.cross(su, sv)
     n /= np.linalg.norm(n) or 1.0

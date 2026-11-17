@@ -901,7 +901,7 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         lines, tris = [], []
         for P, NA, NB in self._sf:
             ra, rb = self._radii(P, NA, NB)
-            X = surface_fillet_sections(P, NA, NB, ra, rb, sa, sb, self.shape)
+            X = surface_fillet_sections(P, NA, NB, ra, rb, sa, sb, self.shape, continuity=self.continuity)
             L, T = ruled_preview(list(X), ribs=2)
             lines += L
             tris.append(T)
@@ -993,8 +993,8 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         return jobs.run("fillet", {"a": a, "b": b}, ["fillet", "a", "b"],
                         radius_a=-self.radius if fa else self.radius,
                         radius_b=-rb if fb else rb,
-                        xsect=0 if self.shape == "CHAMFER" else 2, chord=chord,
-                        tolerance=1e-4, trim_bases=self.trim_bases or self.shape == "BLEND")
+                        xsect=0 if self.shape == "CHAMFER" else 2, chord=chord, blend=self._used["blend"],
+                        tolerance=1e-4, trim_bases=self.trim_bases)
 
     def execute(self, context):
         if not _kernel_ok(self):
@@ -1042,20 +1042,14 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
                     features.push_step(obj, "fillet_trim", [(partner, "SURF")], dict(u, role=key), base_text=pre)
         for key, err in res.get("trim_errors", {}).items():
             self.report({'WARNING'}, f"Could not trim {(a if key == 'a' else b).name}: {err}")
-        if u["blend"]:
-            # the circular fillet trimmed both surfaces back to its rails: the
-            # blend is a G1 / G2 loft between those two new edges
-            try:
-                store.set_geometry(fil, steps.blend_between(a, b, breps["fillet"], u["blend"]), context)
-            except Exception as exc:
-                self.report({'WARNING'}, f"Blend failed ({exc}): kept the circular fillet")
-                u["blend"] = 0
+        if res.get("note"):
+            self.report({'WARNING'}, res["note"])
         if keep_history:
             features.record(fil, "surface_fillet", [(a, "SURF"), (b, "SURF")], dict(u))
-        if res.get("chord"):
-            lo, mean, hi = res["chord"]
+        if u["chord"] and res.get("radius_range"):
+            lo, mean, hi = res["radius_range"]
             spread = (f"{lo:.4g}..{hi:.4g}" if hi - lo > 1e-3 * mean else f"{mean:.4g}")
-            self.report({'INFO'}, f"Chord {spread} m (ball radius {res['radius']:.4g} m)")
+            self.report({'INFO'}, f"Chord {res['chord'][1]:.4g} m (ball radius {spread} m)")
         if keep_history:          # all three are final now: no history re-run needed
             features.mark_built(fil, a, b)
         _select_only(context, [fil])
@@ -2096,10 +2090,12 @@ def surface_fillet_rails(P, NA, NB, sa, sb):
     return ca, cb, A, B
 
 
-def surface_fillet_sections(P, NA, NB, ra, rb, sa, sb, shape="CIRCULAR", k=9):
+def surface_fillet_sections(P, NA, NB, ra, rb, sa, sb, shape="CIRCULAR", k=9, continuity=2):
     """Cross-sections (n, k, 3) of a fillet between two crossing surfaces,
     rail on A first: the ball (radius ra from A, rb from B; an equal pair is
-    the rolling ball's arc), a straight chamfer, or a blend tangent to both."""
+    the rolling ball's arc), a straight chamfer, or a blend tangent to both
+    (the worker's G1 cubic / G2 quintic, secfillet.py, with the surfaces'
+    curvature left out)."""
     n = len(P)
     ra = np.broadcast_to(np.asarray(ra, float), (n,))
     rb = np.broadcast_to(np.asarray(rb, float), (n,))
@@ -2110,9 +2106,20 @@ def surface_fillet_sections(P, NA, NB, ra, rb, sa, sb, shape="CIRCULAR", k=9):
     if shape == "CHAMFER":
         return T1[:, None] * (1 - w) + T2[:, None] * w
     if shape == "BLEND":
-        A1, B1 = T1 + 0.55 * (P - T1), T2 + 0.55 * (P - T2)
-        return ((1 - w) ** 3 * T1[:, None] + 3 * (1 - w) ** 2 * w * A1[:, None]
-                + 3 * (1 - w) * w ** 2 * B1[:, None] + w ** 3 * T2[:, None])
+        D = T2 - T1
+        d = np.linalg.norm(D, axis=1, keepdims=True)
+        ta = D - np.sum(D * A, axis=1, keepdims=True) * A
+        tb = -D - np.sum(-D * B, axis=1, keepdims=True) * B
+        ta /= np.linalg.norm(ta, axis=1, keepdims=True) + 1e-300
+        tb /= np.linalg.norm(tb, axis=1, keepdims=True) + 1e-300
+        deg = 3 if int(continuity) == 1 else 5
+        h = d / deg
+        if deg == 3:
+            cv = [T1, T1 + h * ta, T2 + h * tb, T2]
+        else:
+            cv = [T1, T1 + h * ta, T1 + 2 * h * ta, T2 + 2 * h * tb, T2 + h * tb, T2]
+        from math import comb
+        return sum(comb(deg, i) * w ** i * (1 - w) ** (deg - i) * c[:, None] for i, c in enumerate(cv))
     a, b = -A, -B                                    # centre -> rails, unit
     om = np.arccos(np.clip(np.sum(a * b, axis=1), -1.0, 1.0))
     so = np.where(np.sin(om) < 1e-9, 1.0, np.sin(om))

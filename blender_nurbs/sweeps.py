@@ -104,6 +104,19 @@ def _surface_edge_frames(obj, ref, n):
 
 
 def _normal_near(surf, q):
+    # the kernel's global foot: a seeded Newton started on the wrong side of a
+    # closed surface's seam (v = 0 for a point at v = 0.97) stops at the
+    # domain's edge, centimetres away -- the Continuity Check then showed a
+    # 9.8 deg kink on a fillet that met a cylinder within 0.003 deg
+    try:
+        sm, _ = _k()
+        _, uvs, _ = sm.surface_closest_point(surf, tuple(float(x) for x in q))
+        uv = uvs[0]
+        u, v = (uv.x, uv.y) if hasattr(uv, "x") else (uv[0], uv[1])
+        n = np.array(surf.normal(u, v), float)
+        return n / (np.linalg.norm(n) or 1.0)
+    except Exception:
+        pass
     (u0, u1), (v0, v1) = surf.u_domain(), surf.v_domain()
     best = None
     for i in range(17):

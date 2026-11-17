@@ -245,41 +245,10 @@ def apply_fillet_trim(obj, text, inputs, p):
         objs = {"a": partner, "b": me, "a_base": pa_base, "b_base": me_base}
     res, breps = jobs.run("fillet", objs, ["fillet", "a", "b"], radius_a=p["radius_a"], radius_b=p["radius_b"],
                           xsect=p["xsect"], chord=abs(p["radius_a"]) if p.get("chord") else None,
-                          tolerance=1e-4, trim_bases=True)
+                          blend=p.get("blend", 0), tolerance=1e-4, trim_bases=True)
     if role not in breps:
         raise RuntimeError(res.get("trim_errors", {}).get(role, "fillet trim failed"))
     return breps[role]
-
-
-def blend_between(a, b, fillet_text, cont):
-    """G1 / G2 blend surface (world space) from a's edge to b's edge where the
-    circular fillet `fillet_text` (world space) meets them -- a and b already
-    trimmed back to those rails. cont: 1 or 2."""
-    import numpy as np
-    from . import features
-    fb = store.brep_from_text(fillet_text)
-    rails = []
-    for e in fb.edges():
-        t0, t1 = e.parameter_range()
-        rails.append(np.array([e.point_at(t0 + (t1 - t0) * k / 40.0) for k in range(41)], float))
-
-    def match(obj):
-        M = geom.world_matrix(obj)
-        best = None
-        for i, e in enumerate(store.get_brep(obj).edges()):
-            t0, t1 = e.parameter_range()
-            P = np.array([tuple(M @ Vector(e.point_at(t0 + (t1 - t0) * k / 6.0))) for k in range(7)], float)
-            for R in rails:
-                d = max(float(np.min(np.linalg.norm(R - q, axis=1))) for q in P)
-                if best is None or d < best[0]:
-                    best = (d, i)
-        if best is None:
-            raise RuntimeError(f"{obj.name} has no edge along the fillet")
-        return f"E{best[1]}"
-    g = f"G{int(cont)}"
-    p = {"cont_a": g, "cont_b": g, "tan_a": 1.0, "tan_b": 1.0, "cur_a": 0.0, "cur_b": 0.0,
-         "auto_align": True, "flip_b": False, "ruled": False, "closed": False, "samples": 24}
-    return features.run("loft", [(a, match(a)), (b, match(b))], p)
 
 
 IDENT = {"loc": [0.0, 0.0, 0.0], "axis": [0.0, 0.0, 1.0], "angle": 0.0, "scale": [1.0, 1.0, 1.0]}
@@ -520,10 +489,8 @@ def _register():
                 "b": (features.base_text(b) or b[store.PROP_BREP], jobs.xform(b))}
         _, breps = jobs.run("fillet", objs, ["fillet"], radius_a=p["radius_a"],
                             radius_b=p["radius_b"], xsect=p["xsect"],
-                            chord=abs(p["radius_a"]) if p.get("chord") else None,
+                            chord=abs(p["radius_a"]) if p.get("chord") else None, blend=p.get("blend", 0),
                             tolerance=1e-4, trim_bases=False)
-        if p.get("blend"):
-            return blend_between(a, b, breps["fillet"], p["blend"])
         return ("brep_text", breps["fillet"])
 
 
