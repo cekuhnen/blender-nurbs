@@ -572,8 +572,35 @@ before its Subdivision Surface modifier), with **one face per cage face**.
 * **Speed:** the jack about 1.3 s in G2 (1.0 s at degree 5, 0.5 s in G1), the boot about 1 s (0.75 s, 0.5 s), on
   Apple Silicon. G2 starts from the G1 solve (one linear step) raised to its degree, which halves its steps. The joins
   are one sparse solve per step (Apple's Accelerate on macOS; Windows and Linux use a slower solver, a few times longer).
+* **Fast** (G2, off by default): each star point's first ring of CVs is shaped directly (one curvature shared by
+  all its faces, so G1 and G2 hold there by construction) and held, and the solve does only the rest: one step fewer
+  and a smaller system, about a third faster (the jack 3.3 s instead of 5.1 s with the Windows / Linux solver, 0.53 s
+  instead of 0.78 s on Apple Silicon). Still exactly G2. How close it stays depends on the cage: the jack and the
+  boot come out closer to the SubD (0.09 % and 0.05 %), a plain cube and a cylinder with 8-edge poles about 1.5 to
+  2 times as far as without it. Cages with triangles or n-gons ignore it.
+* **Local Re-solve** (on by default): converting the same SubD again after moving some cage vertices solves
+  again only the faces whose surface moved, one layer of faces around them and every face around a star point they
+  touch; all other faces keep their CVs from the last conversion, and every join stays exact. On a 152-face jack
+  (the jack subdivided once) moving one vertex re-solves 34 of its 80 star faces: the conversion takes 1.6 s
+  instead of 4.2 s on Apple Silicon. The result differs from a full solve by a few hundredths of a percent of the
+  model's size, mostly near the moved vertex. On small cages (most faces near every vertex) all faces are solved
+  again, still starting from the last conversion: the jack (38 faces) in 0.36 s instead of 0.76 s. Changed faces
+  or creases, other settings, n-gon cages and a local solve that does not close solve it all from scratch. The summary says how
+  many faces were solved again. Each Blender session remembers only the last conversion of each object.
+* **Live Link** (on by default): the body keeps its construction history and follows its SubD, as Alias' SubD
+  bodies do. Move cage vertices (in Object Mode or while editing the mesh in Edit Mode) or change creases, and the
+  body is built again on its own, with Local Re-solve, so only the faces near what moved are solved. Trims and fillets
+  made on the body are applied again on top: a SubD cut by a surface stays cut where the surface is while its cage
+  changes. Live rebuilds skip the join and distance measurements (convert again to see them), and the body is
+  built by one kernel worker kept running (no start-up per rebuild). A rebuild of the jack or the boot takes about
+  0.5 s on Apple Silicon, Peter (50 faces) about 0.9 s. **SubD Wait** (History panel, 0.3 s by default): the
+  body is built again once the cage has been still that long, not on every step of a drag, so dragging stays smooth
+  and the body catches up when you stop (0 rebuilds right away, as other features do). **Pause Rebuild** holds
+  every rebuild back until you press Rebuild: move several vertices, then build once. To edit
+  the cage, show the SubD again (Hide Meshes hides it). The body is built in the SubD's object space and stays where it
+  was made: moving the SubD object does not move it. **Bake** (Delete History) cuts the link.
 * **It asks first:** a dialog with **Continuity** (G1 or G2; G2 by default), in G2 **Degree** (*6 · Closer*, the
-  default, or *5 · Lighter*), **Angle** and **Curvature %** (G2: a join further off than these is reported), **Boundary
+  default, or *5 · Lighter*) and **Fast**, **Local Re-solve**, **Live Link**, **Angle** and **Curvature %** (G2: a join further off than these is reported), **Boundary
   Smooth** (see Open borders) and **Hide Meshes** (the SubD objects stay, hidden in the viewport and in
   renders); **Convert** runs it. The same settings stay in the Adjust Last Operation panel afterwards.
 * A cage without star points or odd creases (a torus) becomes exact faces of 16 CVs.

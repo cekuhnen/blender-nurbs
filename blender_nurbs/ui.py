@@ -179,6 +179,11 @@ class NprotoSettings(bpy.types.PropertyGroup):
     live_update: BoolProperty(
         name="Live Update", default=True,
         description="Rebuild surfaces while their input curves are edited")
+    subd_delay: FloatProperty(
+        name="SubD Wait", default=0.3, min=0.0, max=5.0, precision=2, step=10, unit='TIME_ABSOLUTE',
+        description="Live SubD to BREP bodies are built again once their cage has been still this long (seconds), "
+                    "not while it is being dragged: dragging stays smooth, the body follows when you stop. "
+                    "0: right away, as other features")
     show_tree: BoolProperty(name="Construction Tree", default=True,
                             description="Show what the active object is built from and what uses it")
     chord_tolerance: FloatProperty(
@@ -758,6 +763,9 @@ class VIEW3D_PT_nproto_history(_SidePanel, bpy.types.Panel):
         sub = col.row()
         sub.enabled = s.construction_history
         sub.prop(s, "live_update")
+        sub = col.row()
+        sub.enabled = s.construction_history and s.live_update
+        sub.prop(s, "subd_delay")
         draw_pause(col, context)
         row = col.row(align=True)
         row.operator("nproto.delete_history", text="Delete History").scope = 'SELECTED'

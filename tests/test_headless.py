@@ -8832,6 +8832,117 @@ _cvs = [ext.surface_cvs(f_.surface()) for f_ in b_.faces()]
 _sdr["G2 at degree 5 builds a closed solid of 10 x 10 degree-5 faces, its summary reports G2"] = \
     b_.is_manifold_solid() and "G2 within 0.00%" in s_ and no_ is None \
     and all(c_["degree_u"] == 5 and c_["count_u"] == 10 for c_ in _cvs)
+# Fast (G2): the star points' first rings shaped directly and held, the solve only the rest; n-gon cages ignore it
+_V, _F, _S, _M = _sdb.cage(_ocube, ctx.evaluated_depsgraph_get())
+_nf, _kf, _sf, _cf = _sdb.build(_V, _F, _S, g2=True, fast=True)
+_n6, _k6, _s6, _c6 = _sdb.build(_V, _F, _S, g2=True)
+_sdr[f"Fast on a SubD cube: degree-6 faces, G1 within 0.001 deg (0.01 at the star points), G2 within 0.01 %, within "
+     f"0.3 % of its size of the SubD ({100 * _sf['deviation'] / _cf.size:.3f} %), fewer unknowns "
+     f"({_sf['solver']['unknowns']} vs {_s6['solver']['unknowns']})"] = \
+    _sf["degree"] == 6 and _sf["normal"] <= 0.001 and _sf["normal_all"] <= 0.01 and _sf["curvature"] <= 1e-4 \
+    and _sf["deviation"] < 3e-3 * _cf.size and _sf["fallback"] is None \
+    and _sf["solver"]["unknowns"] < _s6["solver"]["unknowns"]
+for _d in (6, 5):
+    _V, _F, _S, _M = _sdb.cage(_ocyl, ctx.evaluated_depsgraph_get())
+    _nf, _kf, _sf, _cf = _sdb.build(_V, _F, _S, g2=True, degree=_d, fast=True)
+    _n6, _k6, _s6, _c6 = _sdb.build(_V, _F, _S, g2=True, degree=_d)
+    _sdr[f"Fast on n-gon caps (a cylinder), degree {_d}: ignored, the same faces as without it"] = \
+        len(_nf) == len(_n6) and all(np.allclose(a_, b_, rtol=0.0, atol=1e-7 * _cf.size) for a_, b_ in zip(_nf, _n6))   # (the sparse solve repeats only to ~1e-9)
+_sdr["the operator offers Fast for G2, off by default"] = \
+    bpy.ops.nproto.subd_to_brep.get_rna_type().properties["fast"].default is False
+# Local Re-solve: the same cage with a vertex moved solves again only the faces near it, from the last solve
+_lrV, _lrF, _lrS, _lrM = _sdb.cage(_ocube, ctx.evaluated_depsgraph_get())
+for _ in range(2):                                                 # a finer cage: star points far apart
+    _lrV, _lrF, _lrS = _sdb.refine_any(np.asarray(_lrV, float), _lrF, _lrS, False)
+    _lrF = [tuple(int(x) for x in f_) for f_ in _lrF]
+    _lrS = _sdb.with_borders(_lrF, _lrS)
+_lrn0, _lrk0, _lrs0, _lrc0 = _sdb.build(_lrV, _lrF, _lrS, g2=True)
+_lrx = sorted(_lrc0.irr)[0]
+_lry = [y_ for f_ in _lrc0.vf[_lrx] for y_ in _lrF[f_] if y_ not in _lrc0.irr][0]   # a vertex next to a star point
+_lrV2 = np.array(_lrV, float)
+_lrV2[_lry] += 0.03 * _lrc0.size * _lrc0.cage_normals[_lry]
+_lrnl, _lrkl, _lrsl, _lrcl = _sdb.build(_lrV2, _lrF, _lrS, g2=True, prev=_lrs0["solver"]["state"])
+_lrnf, _lrkf, _lrsf, _lrcf = _sdb.build(_lrV2, _lrF, _lrS, g2=True)
+_lrlo = _lrsl["solver"]["local"]
+_lrfar = [f_ for f_ in range(len(_lrF)) if min(np.linalg.norm(np.asarray(_lrV)[list(_lrF[f_])] - _lrV2[_lry], axis=1)) > 0.3 * _lrc0.size]
+_sdr[f"Local Re-solve on a finer cube ({len(_lrF)} faces), a vertex by a star point moved: "
+     f"{_lrlo and _lrlo['faces']} of {_lrlo and _lrlo['of']} star faces solved again, G1 within 0.001 deg (0.01 at the star "
+     f"points), G2 within 0.01 %, as near the SubD as a full solve, faces far off unchanged, within 0.1 % of the "
+     f"full solve's CVs"] = \
+    _lrlo is not None and not _lrlo["fallback"] and _lrlo["faces"] < 0.5 * _lrlo["of"] \
+    and _lrsl["normal"] <= 0.001 and _lrsl["normal_all"] <= 0.01 and _lrsl["curvature"] <= 1e-4 \
+    and _lrsl["deviation"] <= 1.1 * _lrsf["deviation"] + 1e-6 * _lrcf.size and bool(_lrfar) \
+    and all(np.array_equal(_lrnl[f_], _lrn0[f_]) for f_ in _lrfar) \
+    and max(float(np.abs(a_ - b_).max()) for a_, b_ in zip(_lrnl, _lrnf)) < 1e-3 * _lrcf.size
+_sdr["the operator offers Local Re-solve, on by default"] = \
+    bpy.ops.nproto.subd_to_brep.get_rna_type().properties["reuse"].default is True
+# Live Link: the body keeps following its SubD (construction history), trims on it applied again on top
+_lvo = _sd_obj("SD_Live", lambda b_: _bmx.ops.create_cube(b_, size=2.0), levels=2)
+_lvb, _lvs, _lvn = _sdb.convert(ctx, _lvo, live=True)[:3]
+_lvh = features.history(_lvb)
+_sdr["Live Link: the body records SubD to BREP with its SubD as input; nothing changed, nothing rebuilt"] = \
+    _lvh is not None and _lvh["op"] == "subd_to_brep" and _lvh["inputs"][0][0] is _lvo \
+    and features.rebuild(_lvb) is False
+_lvt0 = _lvb[store.PROP_BREP]
+_lvo.data.vertices[0].co.z -= 0.4
+_lvo.data.update()
+_lvr = features.rebuild(_lvb)
+_lvg, _lvsh = _sd_seams(store.get_brep(_lvb))
+_sdr[f"Live Link: a cage vertex moved (Object Mode): built again, still G1 ({_lvg:.4f} deg)"] = \
+    _lvr is True and _lvb[store.PROP_BREP] != _lvt0 and _lvg < 0.01 and _lvsh == 0
+for o_ in ctx.view_layer.objects:
+    o_.select_set(o_ is _lvo)
+ctx.view_layer.objects.active = _lvo
+bpy.ops.object.mode_set(mode='EDIT')
+_lvbm = _bmx.from_edit_mesh(_lvo.data)
+_lvbm.verts.ensure_lookup_table()
+_lvbm.verts[1].co.x += 0.3
+_bmx.update_edit_mesh(_lvo.data)
+_lvt1 = _lvb[store.PROP_BREP]
+_lvr = features.rebuild(_lvb)
+bpy.ops.object.mode_set(mode='OBJECT')
+_sdr["Live Link: a cage vertex moved in Edit Mode: built again from the mesh being edited"] = \
+    _lvr is True and _lvb[store.PROP_BREP] != _lvt1
+_lvl = poly("SD_LiveCut_ln", [(-3, -3, 0.3), (3, -3, 0.3)])
+bpy.ops.nproto.extrude(inputs=ins((_lvl, "S0")), distance=6.0, direction="Y")
+_lvw = ctx.active_object
+bpy.ops.nproto.trim(target=_lvb.name, cutters=json.dumps([[_lvw.name, "SURF"]]), ref_point=(0, 0, -0.7),
+                    normal=(0, 0, 1), action="KEEP")
+def _lvz(o_):
+    zs_ = [(o_.matrix_world @ v_.co).z for v_ in o_.data.vertices]
+    return max(zs_), min(zs_)
+_lvz0 = _lvz(_lvb)
+_lvlow = min(range(len(_lvo.data.vertices)), key=lambda i_: _lvo.data.vertices[i_].co.z)
+_lvo.data.vertices[_lvlow].co.z -= 0.5
+_lvo.data.update()
+features.rebuild(_lvb)
+_lvz1 = _lvz(_lvb)
+_sdr[f"Live Link: trimmed by a plane at z 0.3, then a low cage vertex moved: built again with the trim on top "
+     f"(top {_lvz1[0]:.4f}, bottom {_lvz0[1]:.3f} -> {_lvz1[1]:.3f})"] = \
+    [e_["op"] for e_ in features.stack(_lvb)] == ["trim"] and abs(_lvz0[0] - 0.3) < 1e-4 and abs(_lvz1[0] - 0.3) < 1e-4 \
+    and _lvz1[1] < _lvz0[1] - 0.05
+_lvp = _sd_obj("SD_LivePlain", lambda b_: _bmx.ops.create_cube(b_, size=2.0))
+_lvp.modifiers.remove(_lvp.modifiers[0])                           # a plain quad mesh, no Subdivision modifier
+_lvpb = _sdb.convert(ctx, _lvp, live=True)[0]
+_lvpt = _lvpb[store.PROP_BREP]
+_lvp.data.vertices[0].co.z -= 0.4
+_lvp.data.update()
+_sdr["Live Link from a plain quad mesh (no Subdivision modifier): a cage vertex moved, built again"] = \
+    features.rebuild(_lvpb) is True and _lvpb[store.PROP_BREP] != _lvpt
+# SubD Wait: a live SubD body is built again only once its cage has been still a while (not mid-drag)
+_lvpt = _lvpb[store.PROP_BREP]
+_lvp.data.vertices[1].co.z += 0.3
+_lvp.data.update()
+ctx.view_layer.update()                                            # (the depsgraph handler notes the change)
+_lvq = history._process()                                          # right after the change: it waits
+_lvq_waited = _lvpb[store.PROP_BREP] == _lvpt and isinstance(_lvq, float) and _lvq > 0 and _lvpb.name in history._dirty
+history._last_change[0] -= 10.0                                    # ... the cage has been still since
+_lvq2 = history._process()
+_sdr[f"SubD Wait: a cage change rebuilds the live body only after a pause (waited {_lvq or 0:.2f} s, then built)"] = \
+    _lvq_waited and _lvpb[store.PROP_BREP] != _lvpt and _lvpb.name not in history._dirty \
+    and abs(ctx.scene.nproto_settings.subd_delay - 0.3) < 1e-6
+_sdr["the operator offers Live Link, on by default"] = \
+    bpy.ops.nproto.subd_to_brep.get_rna_type().properties["live"].default is True
 # the operator: the selected meshes, originals hidden, the new bodies selected; not for NURBS objects
 for o_ in ctx.view_layer.objects:
     o_.select_set(o_ in (_ocube, _otor))

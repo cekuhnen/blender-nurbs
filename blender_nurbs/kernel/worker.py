@@ -2528,13 +2528,35 @@ JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_tr
         "mesh_to_brep": job_mesh_to_brep}
 
 
-def main():
-    with open(sys.argv[1]) as f:
+RESULT_MARK = "@@nproto-result@@ "   # (serve mode: the line that carries a job's result)
+
+
+def _run(path):
+    with open(path) as f:
         job = json.load(f)
     try:
-        res = {"ok": True, "result": JOBS[job["op"]](job)}
+        return {"ok": True, "result": JOBS[job["op"]](job)}
     except Exception as exc:
-        res = {"ok": False, "error": str(exc), "trace": traceback.format_exc()}
+        return {"ok": False, "error": str(exc), "trace": traceback.format_exc()}
+
+
+def serve():
+    """Stay up: one job file path per line on stdin, each answered by a RESULT_MARK line on stdout (jobs.py
+    keeps one of these running so a job does not pay for starting Python and loading the kernel)."""
+    for line in sys.stdin:
+        path = line.strip()
+        if not path:
+            continue
+        res = _run(path)
+        sys.stdout.write("\n" + RESULT_MARK + json.dumps(res) + "\n")
+        sys.stdout.flush()
+
+
+def main():
+    if sys.argv[1] == "--serve":
+        serve()
+        return
+    res = _run(sys.argv[1])
     sys.stdout.write("\n" + json.dumps(res) + "\n")
     sys.stdout.flush()
 

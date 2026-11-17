@@ -237,6 +237,127 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
                     for d in range(1 if hard else (3 if g2 else 2)):
                         di, dj = (0, -d, 0, d)[k], (d, 0, -d, 0)[k]
                         fixed[kid[key[(f, i + di, j + dj)]]] = True
+    def star_jets(Pc):
+        """One second fundamental form at every smooth star point, shared by all its faces: the least change
+        of their normal second derivatives there (each edge's second cell, each face's (1, 1) cell, moved
+        along the normal only). G2 then holds at the star point itself, and so does the normal part of the
+        G1 conditions' first derivative along each edge (f_tu + g_su = beta f_uu + beta' f_u)."""
+        Pc = Pc.copy()
+        for x in smooth_star:
+            fs = conv.vf[x]
+            if not all(sext[f] for f in fs):
+                continue
+            views = []
+            for f in fs:
+                fv = F[f]
+                if len(fv) != 4 or x not in fv:
+                    break
+                k = fv.index(x)
+                y = fv[(k + 1) % 4]
+                views.append(np.array(half_view(f, x, y)))
+            else:
+                v0 = views[0]
+                o = Pc[v0[0, 0]]
+                n_ = np.cross(Pc[v0[1, 0]] - o, Pc[v0[0, 1]] - o)
+                if not np.linalg.norm(n_):
+                    continue
+                n_ /= np.linalg.norm(n_)
+                e1 = Pc[v0[1, 0]] - o
+                e1 -= (e1 @ n_) * n_
+                e1 /= np.linalg.norm(e1)
+                e2 = np.cross(n_, e1)
+                rows_, rhs_, sets = [], [], []
+                for Vw in views:
+                    if fixed[Vw[1, 1]] or fixed[Vw[2, 0]] or fixed[Vw[0, 2]]:
+                        break
+                    fa, fb = p * (Pc[Vw[1, 0]] - o), p * (Pc[Vw[0, 1]] - o)
+                    a2 = np.array([fa @ e1, fa @ e2])
+                    b2 = np.array([fb @ e1, fb @ e2])
+                    for v_, w_, d2, cell, scl in (
+                            (a2, a2, p * (p - 1) * (Pc[Vw[2, 0]] - 2 * Pc[Vw[1, 0]] + o), Vw[2, 0], p * (p - 1)),
+                            (a2, b2, p * p * (Pc[Vw[1, 1]] - Pc[Vw[1, 0]] - Pc[Vw[0, 1]] + o), Vw[1, 1], p * p)):
+                        rows_.append([v_[0] * w_[0], v_[0] * w_[1] + v_[1] * w_[0], v_[1] * w_[1]])
+                        rhs_.append(float(n_ @ d2))
+                        sets.append((cell, v_, w_, scl))
+                else:
+                    A = np.linalg.lstsq(np.array(rows_), np.array(rhs_), rcond=None)[0]
+                    for (cell, v_, w_, scl), now in zip(sets, rhs_):
+                        want = A[0] * v_[0] * w_[0] + A[1] * (v_[0] * w_[1] + v_[1] * w_[0]) + A[2] * v_[1] * w_[1]
+                        Pc[cell] += n_ * (want - now) / scl
+        return Pc
+
+    # ---- a local re-solve (opts["prev"]: info["state"] of the last solve of this cage, the same faces and settings,
+    # some vertices moved): only the faces whose SubD surface moved, and one layer of faces around them, are solved
+    # again, from the last solve moved as their fit moved; every other face keeps its CVs, the joins stay exact
+    P_fit = P.copy()
+    inc, moved = None, ()
+    prev = opts.get("prev")
+    if (prev is not None and not conv.tedges and prev.get("g2") == g2 and prev.get("p") == p
+            and len(prev["V"]) == len(V) and prev.get("keys") == uniq):
+        moved = np.nonzero(np.linalg.norm(np.asarray(V, float) - prev["V"], axis=1) > 1e-12 * size)[0]
+        near = {y for v in moved for f in conv.vf[v] for y in F[f]}
+        hit = {f for y in near for f in conv.vf[y]}                # faces whose surface depends on a moved vertex
+        grow = hit
+        for _ in range(int(opts.get("local_layers", 1))):         # ... and layers of faces around them: room to blend
+            grow = {g for f in grow for y in F[f] for g in conv.vf[y]}
+        region = {f for f in grow if sext[f]}
+        while True:
+            # a star point the region touches is the region's all round: G2 there needs every face around it to move
+            more = {g for f in region for y in F[f] if y in irr for g in conv.vf[y] if sext[g]} - region
+            if not more:
+                break
+            region |= more
+        if len(region) > opts.get("local_max", 0.6) * len(faces_i):
+            region = set(faces_i)          # most of it moves (a small cage): all of it, still from the last solve
+        if True:
+            inc = region
+            kept = np.zeros(len(uniq), bool)                       # the cells of the faces kept as they were
+            for f in faces_i:
+                if f not in inc:
+                    kept[[kid[key[(f, i, j)]] for i in range(N + 1) for j in range(N + 1)]] = True
+            Ps = prev["Pc"] + (P - prev["P"])                      # the last solve, moved as the fit moved
+            Ps[fixed] = P[fixed]                                   # (held cells: the new fit's)
+            fixed |= kept
+            P[kept] = Ps[kept] = prev["Pc"][kept]
+
+    # ---- the start for G2: the G1 solve (linear, one factorisation) raised to degree 6 exactly
+    Pw, held_ring = None, False
+    if inc is None and g2 and p in (5, 6) and opts.get("warm", True):
+        n1, _, _ = build(sb, conv, g2=False, kernel=kernel, opts={"degree": 5})
+        E = _elevate(5) if p == 6 else np.eye(6)
+        Pw = P.copy()
+        keep5 = [i for i in range(11) if i != 5]
+        for f in faces_i:
+            G5 = np.zeros((11, 11, 3))
+            G5[np.ix_(keep5, keep5)] = n1[f]
+            G5[5, :] = 0.5 * (G5[4, :] + G5[6, :])                 # C1 at the middle: the shared row between
+            G5[:, 5] = 0.5 * (G5[:, 4] + G5[:, 6])
+            G6 = np.zeros((N + 1, N + 1, 3))
+            for qu in (0, 1):
+                for qv in (0, 1):
+                    G6[p * qu:p * qu + p + 1, p * qv:p * qv + p + 1] = np.einsum("ia,jb,abc->ijc", E, E,
+                                                                                 G5[5 * qu:5 * qu + 6, 5 * qv:5 * qv + 6])
+            ids = np.array([[kid[key[(f, i, j)]] for j in range(N + 1)] for i in range(N + 1)])
+            mv = ~fixed[ids]
+            Pw[ids[mv]] = G6[mv]
+        for vid, ids, w in lin:
+            Pw[vid] = w @ Pw[ids]
+        if opts.get("hold_jet", False) and not conv.tedges:      # (n-gon cages: the split cells are not handled)
+            Pw = star_jets(Pw)
+            for vid, ids, w in lin:
+                Pw[vid] = w @ Pw[ids]
+            # the star points' first ring and second-order cells, as star_jets made them, held: G1 and G2 at the
+            # star point itself then hold by construction and the solve works only away from it
+            for x in smooth_star:
+                for f in conv.vf[x]:
+                    if not sext[f] or len(F[f]) != 4:
+                        continue
+                    k = F[f].index(x)
+                    Vw = np.array(half_view(f, x, F[f][(k + 1) % 4]))
+                    for c_ in (Vw[1, 0], Vw[0, 1], Vw[1, 1], Vw[2, 0], Vw[0, 2]):
+                        fixed[c_] = True
+                        P[c_] = Pw[c_]
+            held_ring = True
     free = np.nonzero(~fixed)[0]
     col = -np.ones(len(uniq), int)
     col[free] = np.arange(len(free))
@@ -583,7 +704,9 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
                 break
             K, live, sq = factor_at(res, J)
             cur = hist[-1]
-            anchored = it < opts.get("anchored", ANCHORED_WARM if warm else ANCHORED)
+            # (from the G1 start with the star points' rings held one anchored step is enough: they keep it near)
+            anchored = it < opts.get("anchored", 0 if inc is not None else
+                                     (1 if held_ring else ANCHORED_WARM) if warm else ANCHORED)
             ok = True
             for inner in range(1 + opts.get("reuse", REUSE_STEPS)):
                 dx = solve_with(K, live, sq, res, Pc, anchored, 3 if inner == 0 else 1)
@@ -610,29 +733,18 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
         return Pc, hist
 
     Pc, hist = None, None
-    if g2 and p in (5, 6) and opts.get("warm", True) and n:
+    if inc is not None:
+        Pc, hist = newton(Ps, True)
+        if hist and hist[-1] >= opts.get("tol", TOL):              # the local solve did not close: all of it
+            o2 = dict(opts)
+            o2.pop("prev", None)
+            nets, knots, info = build(sb, conv, g2=g2, kernel=kernel, opts=o2)
+            info["local"] = {"fallback": True, "faces": len(inc), "of": len(faces_i), "moved": len(moved)}
+            return nets, knots, info
+    if Pc is None and Pw is not None and n:
         # start from the G1 solve (linear, one factorisation) raised to degree 6 exactly: already G1, so Newton
         # has only the curvature left to do -- about half the factorisations. Where that start does not reach
         # the tolerance (a G1 corner that G2 must bend away from), the usual start from the SubD fit
-        n1, _, _ = build(sb, conv, g2=False, kernel=kernel, opts={"degree": 5})
-        E = _elevate(5) if p == 6 else np.eye(6)
-        Pw = P.copy()
-        keep5 = [i for i in range(11) if i != 5]
-        for f in faces_i:
-            G5 = np.zeros((11, 11, 3))
-            G5[np.ix_(keep5, keep5)] = n1[f]
-            G5[5, :] = 0.5 * (G5[4, :] + G5[6, :])                 # C1 at the middle: the shared row between
-            G5[:, 5] = 0.5 * (G5[:, 4] + G5[:, 6])
-            G6 = np.zeros((N + 1, N + 1, 3))
-            for qu in (0, 1):
-                for qv in (0, 1):
-                    G6[p * qu:p * qu + p + 1, p * qv:p * qv + p + 1] = np.einsum("ia,jb,abc->ijc", E, E,
-                                                                                 G5[5 * qu:5 * qu + 6, 5 * qv:5 * qv + 6])
-            ids = np.array([[kid[key[(f, i, j)]] for j in range(N + 1)] for i in range(N + 1)])
-            mv = ~fixed[ids]
-            Pw[ids[mv]] = G6[mv]
-        for vid, ids, w in lin:
-            Pw[vid] = w @ Pw[ids]
         Pc, hist = newton(Pw, True)
         if hist and hist[-1] >= opts.get("tol", TOL):
             Pc2, hist2 = newton(P.copy(), False)
@@ -643,7 +755,10 @@ def build(sb, conv, g2=True, kernel=None, opts=None):
     info = {"newton": hist, "unknowns": 3 * n, "conditions": HE * S1 * 3 + n2 + len(c1) * 3 + len(LV) * 3,
             "t_junctions": len(tblocks) // 2,
             "max_move": float(np.abs(Pc - P).max() / size) if len(P) else 0.0,
-            "seconds": time.perf_counter() - T0, "degree": p}
+            "seconds": time.perf_counter() - T0, "degree": p,
+            "local": None if inc is None else {"fallback": False, "faces": len(inc), "of": len(faces_i),
+                                               "moved": len(moved)},
+            "state": {"keys": uniq, "P": P_fit, "Pc": Pc.copy(), "V": np.array(V, float), "g2": g2, "p": p}}
 
     nets, knots = [], []
     for f in range(m):

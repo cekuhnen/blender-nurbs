@@ -2042,6 +2042,9 @@ def build_key(obj, _seen=None, matrix=None, place=False):
             hsh.update(str(_curve_key(src)).encode())
             if src.name not in seen and has_history(src):
                 hsh.update(build_key(src, seen).encode())
+        elif src.type == 'MESH' and '"subd_to_brep"' in str(obj.get(PROP_HIST, "")):
+            from .subd_brep import cage_key          # a live SubD to BREP body: its cage (any quad mesh)
+            hsh.update(cage_key(src).encode())
     return hsh.hexdigest()
 
 
