@@ -256,7 +256,7 @@ def _base_brep(obj):
             return None
         key = (obj.session_uid, obj.get(features.PROP_HIST), obj.get("nproto_build_key"))
         if key not in _base_cache:
-            g = features.run(h["op"], h["inputs"], h["params"])
+            g = features.placed(obj, features.run(h["op"], h["inputs"], h["params"]))
             if isinstance(g, tuple):
                 g = g[1] if g and g[0] == "brep_text" else None
             elif g is not None:

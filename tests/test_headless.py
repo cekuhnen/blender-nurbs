@@ -10009,4 +10009,72 @@ check("merge patches operator: Knots option reaches the history step", _r_sj == 
       and features.stack(_SJ)[-1]["op"] == "merge_patches"
       and features.stack(_SJ)[-1]["params"].get("merge_knots") == "UNIFORM")
 
+# --- Set Origin / Apply Transform on NURBS objects (pivot.py): the B-rep follows the mesh, and things built
+# from it (a G2 blend loft) and its own rebuilds stay where they were
+from blender_nurbs import pivot
+_pl1 = nurbs("PivLine1", [(0, 0, 0), (0, 1, 0)], order=2)
+_pl2 = nurbs("PivLine2", [(1, 0, 1), (1, 1, 1)], order=2)
+bpy.ops.nproto.extrude(inputs=ins((_pl1, "S0")), distance=-0.5, direction="Z")
+_pe1 = ctx.active_object
+bpy.ops.nproto.extrude(inputs=ins((_pl2, "S0")), distance=0.5, direction="Z")
+_pe2 = ctx.active_object
+def _wpts(o):
+    M = np.array(geom.world_matrix(o))
+    P = np.array([v.co[:] for v in o.data.vertices])
+    return P @ M[:3, :3].T + M[:3, 3]
+def _bpts(o):
+    M = geom.world_matrix(o)
+    return np.array([tuple(M @ Vector(e.point_at(t))) for e in store.get_brep(o).edges() for t in e.parameter_range()])
+def _near(P, Q):
+    return max(float(np.min(np.linalg.norm(Q - p, axis=1))) for p in P)
+def _edge_of(o, z):       # the extrude's edge at height z (the one on its line)
+    return min(range(len(store.get_brep(o).edges())), key=lambda i: abs(_bpts(o)[2 * i:2 * i + 2, 2].mean() - z))
+r = bpy.ops.nproto.loft(inputs=ins((_pe1, f"E{_edge_of(_pe1, 0.0)}"), (_pe2, f"E{_edge_of(_pe2, 1.0)}")),
+                        cont_a="G2", cont_b="G2")
+_plo = ctx.active_object
+_plo_w, _pe2_w, _pe2_b = _wpts(_plo), _wpts(_pe2), _bpts(_pe2)
+bpy.ops.object.select_all(action='DESELECT')
+_pe2.select_set(True); ctx.view_layer.objects.active = _pe2
+bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY')
+ctx.view_layer.update()
+_moved = (_pe2.location - Vector((0, 0, 0))).length
+check("set origin on a NURBS result: the object stays, its B-rep follows (placement stored)",
+      _moved > 0.1 and _near(_bpts(_pe2), _pe2_b) < 1e-9 and features.PROP_PLACE in _pe2
+      and _pe2.get(features.PROP_KEY) == features.build_key(_pe2), (_moved, _near(_bpts(_pe2), _pe2_b)))
+features.rebuild(_pe2, ctx, force=True)
+features.rebuild(_plo, ctx, force=True)
+check("set origin: the result's rebuild and the blend built from it stay in place",
+      _near(_bpts(_pe2), _pe2_b) < 1e-9 and _near(_wpts(_plo), _plo_w) < 1e-6 and _near(_wpts(_pe2), _pe2_w) < 1e-6,
+      (_near(_bpts(_pe2), _pe2_b), _near(_wpts(_plo), _plo_w)))
+_pe2.rotation_euler = (0.3, 0.2, 0.5); _pe2.scale = (1.5, 1.5, 1.5)
+ctx.view_layer.update()
+_rot_b = _bpts(_pe2)
+bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+ctx.view_layer.update()
+_ok_apply = _near(_bpts(_pe2), _rot_b) < 1e-6
+features.rebuild(_pe2, ctx, force=True)
+check("apply rotation / scale on a NURBS result: B-rep and rebuild stay where they were",
+      _ok_apply and _near(_bpts(_pe2), _rot_b) < 1e-6 and tuple(_pe2.location) == (0, 0, 0),
+      (_ok_apply, _near(_bpts(_pe2), _rot_b)))
+# a plain NURBS object (no history), trimmed texts included
+_pfree = store.new_object_text(ctx, "PivFree", store.get_brep(_pe1) and store.brep_to_text(store.get_brep(_pe1)))
+_pfree[store.PROP_UNTRIM] = _pfree[store.PROP_BREP]
+_pf_b = _bpts(_pfree)
+bpy.ops.object.select_all(action='DESELECT')
+_pfree.select_set(True); ctx.view_layer.objects.active = _pfree
+ctx.scene.cursor.location = (3, 2, 1)
+bpy.ops.object.origin_set(type='ORIGIN_CURSOR')
+ctx.view_layer.update()
+_pf_u = store.brep_from_text(_pfree[store.PROP_UNTRIM])
+check("set origin on a plain NURBS object: its B-rep and Untrim text follow",
+      tuple(_pfree.location) == (3, 2, 1) and _near(_bpts(_pfree), _pf_b) < 1e-9
+      and _near(np.array([tuple(geom.world_matrix(_pfree) @ Vector(e.point_at(e.parameter_range()[0])))
+                          for e in _pf_u.edges()]), _pf_b) < 1e-9, tuple(_pfree.location))
+ctx.scene.cursor.location = (0, 0, 0)
+# a G move is not an origin change
+_pfree.location = (4, 4, 4)
+ctx.view_layer.update()
+check("moving a NURBS object leaves its B-rep alone", not pivot.check(_pfree)
+      and _near(_bpts(_pfree), _pf_b + np.array([1, 2, 3])) < 1e-9)
+
 print("ALL OK" if ok else "SOME FAILED")

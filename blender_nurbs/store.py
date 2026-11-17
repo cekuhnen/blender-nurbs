@@ -152,6 +152,51 @@ def set_geometry_text(obj, text, context=None, keep_untrimmed=True):
 # Building / updating objects
 # --------------------------------------------------------------------------
 
+def _axis_angle(R):
+    """(unit axis, angle in degrees) of a 3x3 rotation matrix (float64)."""
+    c = max(-1.0, min(1.0, (float(np.trace(R)) - 1.0) / 2.0))
+    ang = math.acos(c)
+    if ang < 1e-15:
+        return (0.0, 0.0, 1.0), 0.0
+    if math.pi - ang > 1e-6:
+        a = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+    else:                                   # (about 180 degrees: the axis is R's eigenvector for 1)
+        w, v = np.linalg.eigh((R + R.T) / 2.0)
+        a = v[:, int(np.argmax(w))]
+    return tuple(a / np.linalg.norm(a)), math.degrees(ang)
+
+
+def transform(target, A):
+    """Move a kernel Brep / Surface / Curve by the affine 4x4 A (in place;
+    exact: scale, rotation, translation of the CVs). A shear (a non-uniform
+    scale on a turned frame) is refused."""
+    sm, _ = _k()
+    A = np.asarray(A, float)
+    if np.abs(A - np.eye(4)).max() <= 1e-14:
+        return target
+    L, loc = A[:3, :3], A[:3, 3]
+    if np.abs(A[3] - (0.0, 0.0, 0.0, 1.0)).max() > 1e-12:
+        raise ValueError("not an affine transform")
+    scl = np.linalg.norm(L, axis=0)
+    if np.linalg.det(L) < 0.0:
+        scl[0] = -scl[0]                     # a mirror: in the scale
+    if np.any(np.abs(scl) < 1e-12):
+        raise ValueError("a zero scale")
+    R = L / scl
+    if np.abs(R.T @ R - np.eye(3)).max() > 1e-5:      # (Blender's matrices are float32)
+        raise ValueError("a shear can't be applied exactly")
+    U, _, Vt = np.linalg.svd(R)
+    R = U @ Vt                               # the nearest exact rotation
+    if np.abs(scl - 1.0).max() > 1e-14:
+        sm.scale(target, tuple(float(x) for x in scl))
+    axis, angle = _axis_angle(R)
+    if abs(angle) > 1e-13:
+        sm.rotate(target, (0.0, 0.0, 0.0), axis, angle)
+    if np.abs(loc).max() > 0.0:
+        sm.translate(target, tuple(float(x) for x in loc))
+    return target
+
+
 def to_brep(geom):
     """Accept a kernel Surface or Brep."""
     sm, ext = _k()
@@ -1059,6 +1104,8 @@ def write_mesh(obj, brep, context=None):
     except Exception as exc:
         print("NURBS normals:", exc)
     me.update()
+    from .pivot import remember
+    remember(obj)              # (Set Origin / Apply Transform move the mesh: pivot.py follows with the B-rep)
 
 
 CREASE_DEG = 30.0

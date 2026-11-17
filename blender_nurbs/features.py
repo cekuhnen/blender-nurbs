@@ -1408,7 +1408,45 @@ def build_blend_curve(inputs, p):
 PROP_HIST = "nproto_hist"
 
 
+PROP_PLACE = "nproto_place"   # 4x4 (16 numbers): where the feature's result sits in the object's local space
+
+
+def placement(obj):
+    """The feature's placement in obj (numpy 4x4), None = as built. Set Origin /
+    Apply Transform change the object's matrix and move its mesh the other way
+    (pivot.py): the result keeps its place in the world through this."""
+    v = obj.get(PROP_PLACE)
+    if v is None:
+        return None
+    A = np.array(list(v), float).reshape(4, 4)
+    return None if np.abs(A - np.eye(4)).max() <= 1e-14 else A
+
+
+def set_placement(obj, A):
+    if A is None or np.abs(np.asarray(A, float) - np.eye(4)).max() <= 1e-14:
+        if PROP_PLACE in obj:
+            del obj[PROP_PLACE]
+    else:
+        obj[PROP_PLACE] = [float(x) for x in np.asarray(A, float).ravel()]
+
+
+def placed(obj, g):
+    """A builder's result g put where obj's feature sits (its placement)."""
+    A = placement(obj)
+    if A is None:
+        return g
+    if isinstance(g, tuple):
+        if not g or g[0] != "brep_text":
+            return g                    # curves: not moved (Blender moves a curve's own points)
+        b = store.brep_from_text(g[1])
+        store.transform(b, A)
+        return ("brep_text", store.brep_to_text(b))
+    return store.transform(g, A)        # a fresh Surface / Brep of the builder's
+
+
 def record(obj, op, inputs, params):
+    if PROP_PLACE in obj:
+        del obj[PROP_PLACE]      # the caller built it as the feature gives it
     for key in [k for k in obj.keys() if k.startswith("nproto_in_")]:
         del obj[key]
     for i, (src, _) in enumerate(inputs):
@@ -1718,6 +1756,7 @@ def base_text(obj):
         elif h["op"] == "patch":
             from .patch import store_info
             store_info(obj)
+        g = placed(obj, g)
         if isinstance(g, tuple) and g and g[0] == "brep_text":
             return g[1]
         if isinstance(g, tuple):
@@ -1746,7 +1785,7 @@ def bake(obj, step=-1):
         return freed
     # the geometry the kept steps build on
     if h is not None:
-        g = run(h["op"], h["inputs"], h["params"])
+        g = placed(obj, run(h["op"], h["inputs"], h["params"]))
         if isinstance(g, tuple) and g and g[0] == "brep_text":
             text, natural = g[1], False
         elif isinstance(g, tuple):
@@ -1782,7 +1821,7 @@ def bake(obj, step=-1):
 
 def clear_history(obj):
     for key in [k for k in obj.keys() if k.startswith(("nproto_in_", "nproto_sin_")) or
-                k in (PROP_HIST, PROP_STACK, PROP_BASE, PROP_BASE + "_natural")]:
+                k in (PROP_HIST, PROP_STACK, PROP_BASE, PROP_BASE + "_natural", PROP_PLACE)]:
         del obj[key]
 
 
@@ -1972,7 +2011,7 @@ def _remap_dependents(obj, old_marks, turned=True):
 PROP_KEY = "nproto_build_key"
 
 
-def build_key(obj, _seen=None):
+def build_key(obj, _seen=None, matrix=None, place=False):
     """Fingerprint of everything a rebuild depends on: the feature and its steps,
     the object's transform and -- recursively -- its inputs (their geometry,
     transforms and their own inputs). Equal key = the rebuild would produce what
@@ -1985,7 +2024,12 @@ def build_key(obj, _seen=None):
     hsh.update(str(obj.get(PROP_HIST, "")).encode())
     hsh.update(str(obj.get(PROP_STACK, "")).encode())
     hsh.update(hashlib.sha1(str(obj.get(PROP_BASE, "")).encode()).digest())
-    hsh.update(np.round(np.array(geom.world_matrix(obj), float), 10).tobytes())
+    # (matrix / place: the key as it was under another matrix and placement -- pivot.py)
+    M = geom.world_matrix(obj) if matrix is None else matrix
+    hsh.update(np.round(np.array(M, float), 10).tobytes())
+    C = placement(obj) if place is False else place
+    if C is not None:
+        hsh.update(np.round(np.array(C, float).ravel(), 10).tobytes())
     for src in history_inputs(obj):
         hsh.update(src.name.encode())
         hsh.update(np.round(np.array(geom.world_matrix(src), float), 10).tobytes())
@@ -2099,6 +2143,7 @@ def _rebuild_inner(obj, context, h, entries, steps, turned):
             from .primitives import write_spline_object
             write_spline_object(obj, g[1])
             return True
+        g = placed(obj, g)
         if isinstance(g, tuple) and g and g[0] == "brep_text":
             base_text = g[1]
         else:
