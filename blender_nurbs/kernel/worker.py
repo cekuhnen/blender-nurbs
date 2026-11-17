@@ -1671,6 +1671,197 @@ def job_unjoin(job):
     return {"faces": n, "areas": areas}
 
 
+# ---------------------------------------------------------------------------
+# Edge fillet by chord: exact sections (secfillet.py) where the kernel's one
+# radius per edge cannot keep the rails the chord apart
+# ---------------------------------------------------------------------------
+
+class _EdgeCurve:
+    """An edge as a curve over its own range (for secfillet's crossing)."""
+
+    def __init__(self, e):
+        self.e = e
+
+    def parameter_range(self):
+        return self.e.parameter_range()
+
+    def evaluate(self, t):
+        return self.e.point_at(t)
+
+
+def _face_key(f):
+    q = f.interior_point()
+    q = (q.x, q.y, q.z) if hasattr(q, "x") else tuple(q)
+    return tuple(round(float(x), 7) for x in q)
+
+
+def _surface_copy(s):
+    d = ext.surface_cvs(s)
+    return ext.surface_from_cvs(d["degree_u"], d["degree_v"], [tuple(p) for p in d["points"]],
+                                list(d["knots_u"]), list(d["knots_v"]), d.get("weights") or None)
+
+
+def _surface_extended(s, distance):
+    """A copy of s carried on naturally by distance past each open edge (a
+    closed direction is left alone)."""
+    out = _surface_copy(s)
+    for edge, direction in (("U0", "u"), ("U1", "u"), ("V0", "v"), ("V1", "v")):
+        if _is_closed(out, direction):
+            continue
+        try:
+            out = ext.surface_from_cvs(*extend_grid(ext.surface_cvs(out), edge, distance))
+        except Exception:
+            pass
+    return out
+
+
+def _section_groups(b, sel, tol):
+    """[(face P, face Q, [edges])]: the picked edges by the two faces they
+    join, when every chain is closed or ends where no other face meets (a
+    sheet's boundary). None otherwise: fillets that end against a face or
+    meet at a corner are the kernel's."""
+    np = _np()
+    groups = {}
+    for e in sel:
+        fs = e.faces()
+        k = tuple(sorted(_face_key(f) for f in fs))
+        groups.setdefault(k, [fs[0], fs[1], []])[2].append(e)
+    shared = [e for e in b.edges() if len(e.faces()) == 2]
+    for fp, fq, es in groups.values():
+        own = [np.array(_edge_mid(e), float) for e in es]
+        pts = []
+        for e in es:
+            t0, t1 = e.parameter_range()
+            pts += [np.array(e.point_at(t0), float), np.array(e.point_at(t1), float)]
+        free = [p for p in pts if sum(float(np.linalg.norm(p - q)) <= tol for q in pts) == 1]
+        for p in free:
+            for e in shared:
+                m = np.array(_edge_mid(e), float)
+                if any(float(np.linalg.norm(m - q)) <= tol for q in own):
+                    continue                # this chain's own edge
+                t0, t1 = e.parameter_range()
+                if min(float(np.linalg.norm(np.array(e.point_at(t), float) - p)) for t in (t0, t1)) <= tol:
+                    return None
+    return list(groups.values())
+
+
+def _section_edge_fillet(b, sel, chord, shape):
+    """(body, info) with the picked edges filleted from exact sections at a
+    constant chord, or None when the kernel has to do it (see _section_groups)."""
+    np = _np()
+    import os
+    import tempfile
+    import secfillet
+    lo, hi = (np.array(v) for v in b.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    groups = _section_groups(b, sel, 1e-5 * size)
+    if groups is None:
+        return None
+    fillets, radii, chords, sections = [], [], [], 0
+    for fp, fq, es in groups:
+        # the faces' surfaces carried on past their edges: a face that ends at
+        # the filleted edge has no foot for the ball there otherwise (nor a
+        # twisted one at the sheet's ends, where the section leans past it)
+        A = ext.brep_from_surface(_surface_extended(fp.surface(), 2.0 * chord))
+        B = ext.brep_from_surface(_surface_extended(fq.surface(), 2.0 * chord))
+        f, info = secfillet.build(sm, A, B, None, None, chord, chord, chord=chord, shape=shape,
+                                  curves=[_EdgeCurve(e) for e in es], on_faces=(fp, fq))
+        fillets.append((f, A, B, fp, fq))
+        radii += list(info["radius"])
+        chords += list(info["chord"])
+        sections += info["sections"]
+    # each face the fillets touch is trimmed on its own (a trim of the joined
+    # body by the rail cutter fails in the kernel's intersector), then the
+    # faces, the fillets and the rest of the body are stitched again
+    faces = b.faces()
+    keys = [_face_key(f) for f in faces]
+    involved = sorted({keys.index(_face_key(f)) for _, _, _, fp, fq in fillets for f in (fp, fq)})
+
+    def alone(i):
+        part = b.copy()
+        ext.delete_faces(part, [f for j, f in enumerate(part.faces()) if j != i])
+        return part
+    pieces = {i: alone(i) for i in involved}
+    tmp = []
+
+    def temp(brep=None):
+        fd, path = tempfile.mkstemp(suffix=".sm")
+        os.close(fd)
+        if brep is not None:
+            save(brep, path)
+        tmp.append(path)
+        return path
+    try:
+        for f, A, B, fp, fq in fillets:
+            rails = {}
+            for key, face in (("a", fp), ("b", fq)):
+                rails[key] = min(f.edges(), key=lambda e: face.closest_point(tuple(mid(e)))[1])
+            for key, other, base, face in (("a", "b", A, fp), ("b", "a", B, fq)):
+                i = keys.index(_face_key(face))
+                pa, pb = mid(rails[key]), mid(rails[other])
+                probe = tuple(pa[k] + 0.5 * (pb[k] - pa[k]) for k in range(3))
+                ref = face.closest_point(probe)[0]
+                sheet = _rail_sheet(rails[key], base, max(0.25 * chord, 1e-4))
+                out = temp()
+                job_trim({"breps": {"target": temp(pieces[i]), "sheet": temp(sheet)}, "xforms": {"target": None},
+                          "cutter_breps": ["sheet"], "ref_point": [float(x) for x in ref], "action": "DELETE",
+                          "scope": "PICKED", "direction": [0.0, 0.0, 1.0], "out": {"DELETE": out},
+                          "extend": True})          # an open rail ends on the face's edge: carried on across it
+                pieces[i] = load(out)
+        parts = [pieces[i] for i in involved] + [f for f, *_ in fillets]
+        if len(involved) < len(faces):
+            rest = b.copy()
+            ext.delete_faces(rest, [f for j, f in enumerate(rest.faces()) if j in involved])
+            parts.insert(0, rest)
+        before = sum(_shared_edges(x) for x in parts)
+        merged = sm.merge_breps(parts, operation=sm.BooleanOp.MERGE)
+        res = sm.stitch_advanced(merged, max(1e-5, 2e-4 * size), squeeze_small_edges=False,
+                                 making_manifold_solid=False)
+        r = res[0]
+        if _shared_edges(r) - before < 2 * len(fillets):
+            raise RuntimeError("the chord fillet did not stitch to both faces")
+        try:
+            sm.unify_normals(r, max(r.faces(), key=lambda fc: fc.area()), 100)
+        except Exception:
+            pass
+    finally:
+        for path in tmp:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    return r, {"radius": (min(radii), float(np.mean(radii)), max(radii)),
+               "chord": (min(chords), float(np.mean(chords)), max(chords)), "sections": sections}
+
+
+def _measured_chords(before, r):
+    """(min, mean, max) distance between the rails of the fillet faces the
+    kernel made (across each face, the direction whose ends lie on the
+    original faces), or None."""
+    np = _np()
+    try:
+        on_in = _input_test(before)
+        out = []
+        for f in r.faces():
+            if on_in(f):
+                continue
+            s = f.surface()
+            (u0, v0), (u1, v1) = f.uv_domain()
+            um, vm = 0.5 * (u0 + u1), 0.5 * (v0 + v1)
+            on = lambda q: dist_to_brep(tuple(q), before)
+            eu = on(s.evaluate(u0, vm)) + on(s.evaluate(u1, vm))
+            ev = on(s.evaluate(um, v0)) + on(s.evaluate(um, v1))
+            if eu <= ev:
+                out += [float(np.linalg.norm(np.array(s.evaluate(u0, v)) - np.array(s.evaluate(u1, v))))
+                        for v in np.linspace(v0, v1, 9)]
+            else:
+                out += [float(np.linalg.norm(np.array(s.evaluate(u, v0)) - np.array(s.evaluate(u, v1))))
+                        for u in np.linspace(u0, u1, 9)]
+        return (min(out), float(np.mean(out)), max(out)) if out else None
+    except Exception:
+        return None
+
+
 def job_edge_fillet(job):
     """Fillet / chamfer / blend the edges whose world-space midpoints are given.
     Works on joined sheets and on solids; written back in the object's local space."""
@@ -1705,7 +1896,36 @@ def job_edge_fillet(job):
     xsect = {"CHAMFER": 0, "CIRCULAR": 1, "BLEND": 2}[job.get("shape", "CIRCULAR")]
     r0 = float(job["radius"])
     r1 = job.get("end_radius")
-    chord_info = None
+    chord_info = chord_note = None
+    if job.get("chord") and not (r1 is not None and abs(float(r1) - r0) > 1e-12):
+        shape = {0: "LINEAR", 1: "CIRCULAR"}.get(xsect) or {1: "G1", 2: "G2"}.get(int(job.get("continuity", 1)))
+        sec, chord_note = None, None
+        if shape and abs(float(job.get("thumbweight", 1.0)) - 1.0) < 1e-9:
+            try:
+                sec = _section_edge_fillet(b, sel, float(job["chord"]), shape)
+                if sec is None:
+                    chord_note = "the fillets meet another face or each other: one ball radius per edge"
+            except Exception as exc:
+                chord_note = f"exact chord failed ({exc}): one ball radius per edge"
+        if sec is not None:
+            r, info = sec
+            try:
+                solid = bool(r.is_manifold_solid())
+            except Exception:
+                solid = False
+            new_faces = []
+            try:
+                on_in = _input_test(b_ring)
+                for f in r.faces():
+                    if not on_in(f):
+                        q = f.interior_point()
+                        new_faces.append([float(q.x), float(q.y), float(q.z)] if hasattr(q, "x") else [float(x) for x in q])
+            except Exception:
+                new_faces = []
+            save(to_local(r, job.get("xforms", {}).get("target")), job["out"]["result"])
+            return {"edges": len(sel), "faces": r.face_count(), "solid": solid, "new_faces": new_faces, "rings": [],
+                    "rims_only": False, "radius": info["radius"][1], "radius_range": info["radius"],
+                    "chord": info["chord"], "sections": info["sections"]}
     if job.get("chord"):
         # chord = distance between the rails = 2 r sin(theta / 2), theta = the
         # angle between the two faces' normals across the edge
@@ -1720,8 +1940,7 @@ def job_edge_fillet(job):
         th = np.maximum(np.array(th), np.radians(1.0))       # (a smooth edge needs no fillet)
         rs = c / (2.0 * np.sin(0.5 * th))
         r0, r1 = float(np.mean(rs)), None
-        ch = 2.0 * r0 * np.sin(0.5 * th)
-        chord_info = (float(ch.min()), float(ch.mean()), float(ch.max()))
+        chord_info = True             # measured on the kernel's fillet below
     if r1 is not None and abs(float(r1) - r0) > 1e-12:
         r = sm.variable_radius_fillet(b, sel, start_radius=r0, end_radius=float(r1), xsect_type=xsect,
                                       continuity=int(job.get("continuity", 1)))
@@ -1768,7 +1987,12 @@ def job_edge_fillet(job):
     out = {"edges": len(sel), "faces": r.face_count(), "solid": solid, "new_faces": new_faces,
            "rings": [{k: v for k, v in g.items() if k != "at"} for g in rings], "rims_only": rims_only}
     if chord_info is not None:
-        out["radius"], out["chord"] = r0, chord_info
+        out["radius"] = r0
+        ch = _measured_chords(b_ring, r)
+        if ch is not None:
+            out["chord"] = ch
+            if chord_note and ch[2] - ch[0] > 1e-3 * ch[1]:     # one radius is exact where the angle holds
+                out["chord_note"] = chord_note
     if class_a is not None:
         out["class_a"] = class_a
     return out

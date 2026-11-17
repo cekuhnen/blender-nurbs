@@ -10472,4 +10472,68 @@ check("surface fillet G2 blend by chord: a history rebuild keeps it G2 and the c
       and features.history(_f)["params"].get("blend") == 2 and features.history(_f)["params"].get("chord"),
       f"{[c and round(c['curv_diff'], 4) for c in _c]}")
 
+# the kernel returns a crossing in pieces where it passes an edge (here the joint of a
+# two-face sheet, in the user's scene a split region's edge): the pieces are one ring
+_y2 = 1140
+_h1 = poly("TJ1_ln", [(-1.2, _y2 - 1.2, -0.72), (0.0, _y2 - 1.2, 0.0)])
+bpy.ops.nproto.extrude(inputs=ins((_h1, "S0")), distance=2.4, direction="Y"); _hs1 = ctx.active_object
+_h2 = poly("TJ2_ln", [(0.0, _y2 - 1.2, 0.0), (1.2, _y2 - 1.2, 0.72)])
+bpy.ops.nproto.extrude(inputs=ins((_h2, "S0")), distance=2.4, direction="Y"); _hs2 = ctx.active_object
+bpy.ops.object.select_all(action='DESELECT'); _hs1.select_set(True); _hs2.select_set(True)
+ctx.view_layer.objects.active = _hs1
+bpy.ops.nproto.join(); _hj = ctx.active_object; _hj.name = "TJ_sheet"
+bpy.ops.curve.primitive_nurbs_circle_add(radius=0.3, location=(0, _y2, 0))
+_hc = ctx.active_object
+bpy.ops.nproto.extrude(inputs=ins((_hc, "S0")), distance=1.0, direction="NORMAL", symmetric=True)
+_hcy = ctx.active_object
+_r = bpy.ops.nproto.fillet(surf_a=_hcy.name, surf_b=_hj.name, radius=0.1, shape="CIRCULAR", rail_type="CHORD",
+                           trim_bases=True)
+_f = ctx.active_object
+_d = _rails_apart(_f)
+_c = [_crt(_f, o_) or _crt(o_, _f) for o_ in (_hcy, _hj)]
+check("surface fillet by chord across a joined sheet's joint (the crossing in two pieces): one closed ring, "
+      "rails 0.1 apart all round, tangent to both",
+      _r == {'FINISHED'} and store.get_brep(_hj).face_count() == 2 and abs(min(_d) - 0.1) < 1e-4
+      and abs(max(_d) - 0.1) < 1e-4 and all(_c) and max(c["angle"] for c in _c) < 0.05
+      and np.linalg.norm(np.array(store.get_surfaces(_f)[0].evaluate(0.0, 0.5))
+                         - np.array(store.get_surfaces(_f)[0].evaluate(1.0, 0.5))) < 1e-9,
+      f"faces {store.get_brep(_hj).face_count()} chord {min(_d):.6f}..{max(_d):.6f} {[c and round(c['angle'], 4) for c in _c]}")
+
+# Edge fillet by chord along an edge whose angle changes (a twisted wall on a floor,
+# about 70 -> 110 deg): exact sections keep the rails the chord apart all along
+_fl = poly("ECf_ln", [(0, 1180, 0), (0, 1184, 0)])
+bpy.ops.nproto.extrude(inputs=ins((_fl, "S0")), distance=2.0, direction="X"); _ecf = ctx.active_object
+_w0 = poly("ECw0", [(2, 1180, 0), (2, 1184, 0)]); _w1 = poly("ECw1", [(2.6, 1180, 1.6), (1.4, 1184, 1.6)])
+bpy.ops.nproto.loft(inputs=ins((_w0, "S0"), (_w1, "S0"))); _ecw = ctx.active_object
+bpy.ops.object.select_all(action='DESELECT'); _ecf.select_set(True); _ecw.select_set(True)
+ctx.view_layer.objects.active = _ecf
+bpy.ops.nproto.join(); _ecj = ctx.active_object
+_n_shared = len(store.shared_edges(_ecj))
+_r = fillet_all(_ecj, shape="CIRCULAR", radius=0.3, rail_type="CHORD")
+_eb = store.get_brep(_ecj); _M = np.array(geom.world_matrix(_ecj))
+def _iso_chords(f):
+    s_ = f.surface(); (u0, v0), (u1, v1) = f.uv_domain()
+    du = [np.linalg.norm(np.array(s_.evaluate(u0, v)) - np.array(s_.evaluate(u1, v))) for v in np.linspace(v0, v1, 41)]
+    dv = [np.linalg.norm(np.array(s_.evaluate(u, v0)) - np.array(s_.evaluate(u, v1))) for u in np.linspace(u0, u1, 41)]
+    return min((du, dv), key=lambda d: abs(np.mean(d) - 0.3))
+_fd = min((_iso_chords(f) for f in _eb.faces()), key=lambda d: abs(np.mean(d) - 0.3))
+_sm = _kl()
+_angs = []
+for e_ in _eb.edges():
+    fs_ = e_.faces()
+    if len(fs_) != 2:
+        continue
+    t0_, t1_ = e_.parameter_range()
+    for t_ in np.linspace(t0_, t1_, 21)[1:-1]:
+        p_ = np.array(e_.point_at(t_)); nn_ = []
+        for f_ in fs_:
+            uv_ = _sm.surface_closest_point(f_.surface(), tuple(p_))[1][0]
+            nn_.append(np.array(f_.outward_normal_at_uv(uv_.x, uv_.y)))
+        _angs.append(math.degrees(math.acos(min(1.0, abs(nn_[0] @ nn_[1]) / np.linalg.norm(nn_[0]) / np.linalg.norm(nn_[1])))))
+check("edge fillet by chord on a twisted wall (angle 70 -> 110 deg along the edge): rails 0.3 apart all along, "
+      "tangent to both faces, one sheet",
+      _n_shared == 1 and _r == {'FINISHED'} and abs(min(_fd) - 0.3) < 1e-4 and abs(max(_fd) - 0.3) < 1e-4
+      and max(_angs) < 0.05 and _eb.face_count() == 3,
+      f"chord {min(_fd):.6f}..{max(_fd):.6f} angle {max(_angs):.4f} faces {_eb.face_count()}")
+
 print("ALL OK" if ok else "SOME FAILED")

@@ -155,8 +155,7 @@ class Base:
         fi = self.face_of(q) if fi is None else fi
         s = self.surfs[fi]
         _, uvs, _ = self.sm.surface_closest_point(s, tuple(float(x) for x in q))
-        uv = uvs[0]
-        u, v = (uv.x, uv.y) if hasattr(uv, "x") else (uv[0], uv[1])
+        u, v = _uv(s, uvs[0])
         pt, su, sv = s.derivatives(u, v)
         n = np.cross(su, sv)
         n = n / (np.linalg.norm(n) or 1.0) * self.orient[fi] * self.side
@@ -169,6 +168,14 @@ class Base:
         su, sv, suu, suv, svv = _second(s, u, v)
         a, c = np.linalg.lstsq(np.array([su, sv]).T, t, rcond=None)[0]
         return float(a * a * (suu @ n) + 2 * a * c * (suv @ n) + c * c * (svv @ n)) / max(float(t @ t), 1e-30)
+
+
+def _uv(surf, uv):
+    """A closest point's (u, v), inside the surface's domain (the kernel can
+    return one a rounding past its edge, which it then will not evaluate)."""
+    u, v = (uv.x, uv.y) if hasattr(uv, "x") else (uv[0], uv[1])
+    (u0, u1), (v0, v1) = surf.u_domain(), surf.v_domain()
+    return min(max(float(u), u0), u1), min(max(float(v), v0), v1)
 
 
 def _second(surf, u, v):
@@ -198,19 +205,25 @@ def _second(surf, u, v):
 # ---------------------------------------------------------------------------
 
 class Crossing:
-    """An intersection curve, by arc length s in 0..1."""
+    """An intersection chain -- the kernel's curves joined end to end (it
+    breaks a crossing where it passes an edge or seam of either surface) --
+    by arc length s in 0..1."""
 
-    def __init__(self, curve, m=801):
-        t0, t1 = curve.parameter_range()
-        self.c = curve
-        T = np.linspace(t0, t1, m)
-        P = np.array([curve.evaluate(t) for t in T], float)
-        d = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))])
-        self.length = float(d[-1])
-        self.s, self.t, self.h = d / (d[-1] or 1.0), T, 1e-4 * (t1 - t0)
-        self.t0, self.t1 = t0, t1
-        self.closed = float(np.linalg.norm(P[0] - P[-1])) <= 1e-6 * max(self.length, 1e-12)
-        self.P = P
+    def __init__(self, chain, m=401):
+        self.pieces = []                       # (curve, reversed, t samples, cumulative length from the chain's start)
+        pts, start = [], 0.0
+        for c, rev in chain:
+            t0, t1 = c.parameter_range()
+            T = np.linspace(t1, t0, m) if rev else np.linspace(t0, t1, m)
+            P = np.array([c.evaluate(t) for t in T], float)
+            d = start + np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))])
+            self.pieces.append((c, T, d))
+            pts.append(P)
+            start = float(d[-1])
+        self.length = start
+        P = np.vstack(pts)
+        self.closed = len(P) > 2 and float(np.linalg.norm(P[0] - P[-1])) <= 1e-5 * max(self.length, 1e-12)
+        self.ends = np.array([q[2][0] for q in self.pieces[1:]])
         self.off = 0.0          # closed: where s = 0 lies (see start_away)
 
     def start_away(self, polys):
@@ -221,25 +234,61 @@ class Crossing:
         if not self.closed or not polys:
             return
         ks = np.linspace(0.0, 1.0, 96, endpoint=False)
-        Q = np.array([self.at(k)[0] for k in ks])
+        Q = np.array([self._pos(k) for k in ks])
         E = np.vstack(polys)
         d = np.min(np.linalg.norm(Q[:, None, :] - E[None, :, :], axis=2), axis=1)
         self.off = float(ks[int(np.argmax(d))])
 
-    def _p(self, t):
-        if self.closed:
-            t = self.t0 + (t - self.t0) % (self.t1 - self.t0)
-        else:
-            t = min(max(t, self.t0), self.t1)
-        return np.array(self.c.evaluate(t), float)
+    def _pos(self, s):
+        s = s % 1.0 if self.closed else min(max(s, 0.0), 1.0)
+        L = s * self.length
+        k = int(np.searchsorted(self.ends, L, side="right"))
+        c, T, d = self.pieces[k]
+        return np.array(c.evaluate(float(np.interp(L, d, T))), float)
 
     def at(self, s):
         if self.closed:
             s = (s + self.off) % 1.0
-        t = float(np.interp(s, self.s, self.t))
-        p = np.array(self.c.evaluate(t), float)
-        T = self._p(t + self.h) - self._p(t - self.h)
-        return p, T / (np.linalg.norm(T) or 1.0)
+        h = 1e-5
+        if not self.closed:
+            lo, hi = max(s - h, 0.0), min(s + h, 1.0)
+        else:
+            lo, hi = s - h, s + h
+        T = self._pos(hi) - self._pos(lo)
+        return self._pos(s), T / (np.linalg.norm(T) or 1.0)
+
+
+def chains(curves, tol):
+    """The curves joined end to end where their ends meet: [[(curve, reversed)]]."""
+    ends = []
+    for c in curves:
+        t0, t1 = c.parameter_range()
+        ends.append((np.array(c.evaluate(t0), float), np.array(c.evaluate(t1), float)))
+    left = list(range(len(curves)))
+    out = []
+    while left:
+        i = left.pop(0)
+        ch = [(i, False)]
+        head, tail = ends[i][0], ends[i][1]
+        grown = True
+        while grown and left:
+            grown = False
+            for j in list(left):
+                a, b = ends[j]
+                if np.linalg.norm(a - tail) <= tol:
+                    ch.append((j, False)); tail = b
+                elif np.linalg.norm(b - tail) <= tol:
+                    ch.append((j, True)); tail = a
+                elif np.linalg.norm(b - head) <= tol:
+                    ch.insert(0, (j, False)); head = a
+                elif np.linalg.norm(a - head) <= tol:
+                    ch.insert(0, (j, True)); head = b
+                else:
+                    continue
+                left.remove(j)
+                grown = True
+        out.append([(curves[k], r) for k, r in ch])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -287,8 +336,10 @@ class Solver:
                 break
         pa, na, wa = self.A.foot(C, fa)
         pb, nb, wb = self.B.foot(C, fb)
-        if abs(na @ (C - pa) - ra) > 1e-6 * max(ra, 1e-9) + 1e-9 * self.scale or \
-                abs(nb @ (C - pb) - rb) > 1e-6 * max(rb, 1e-9) + 1e-9 * self.scale:
+        tol_a, tol_b = 1e-6 * max(ra, 1e-9) + 1e-9 * self.scale, 1e-6 * max(rb, 1e-9) + 1e-9 * self.scale
+        # the whole offset, not only its normal part: a foot clamped to a
+        # surface's edge (the ball past where the surface ends) is no contact
+        if np.linalg.norm(C - pa - ra * na) > 10 * tol_a or np.linalg.norm(C - pb - rb * nb) > 10 * tol_b:
             raise RuntimeError("no ball of this size fits between the surfaces here")
         return C, pa, na, wa, pb, nb, wb
 
@@ -414,8 +465,7 @@ def _check(sm, surf, x, rows, deg, gap_tol, tangent=True):
         if dist > gap_tol:
             return False
         if tangent and k in (0, len(w) - 1):
-            uv = uvs[0]
-            u, v = (uv.x, uv.y) if hasattr(uv, "x") else (uv[0], uv[1])
+            u, v = _uv(surf, uvs[0])
             _, su, sv = surf.derivatives(u, v)
             nn = np.cross(su, sv)
             nn /= np.linalg.norm(nn) or 1.0
@@ -433,25 +483,54 @@ def _bern(n, t):
 # The fillet
 # ---------------------------------------------------------------------------
 
-def build(sm, brep_a, brep_b, side_a, side_b, ra, rb, chord=None, shape="CIRCULAR", tolerance=1e-4):
+
+def _sides_on(sm, brep_a, brep_b, cr, ra, rb, chord, size, faces):
+    """(side_a, side_b) whose ball's rails lie on the given faces (sampled at
+    three places along the crossing)."""
+    best = None
+    for sa in (-1.0, 1.0):
+        for sb in (-1.0, 1.0):
+            solver = Solver(Base(sm, brep_a, sa), Base(sm, brep_b, sb), ra, rb, chord, size)
+            worst = 0.0
+            try:
+                for s in (0.25, 0.5, 0.75):
+                    x = solver.section(cr, s)
+                    worst = max(worst, faces[0].closest_point(tuple(x.pa))[1], faces[1].closest_point(tuple(x.pb))[1])
+            except Exception:
+                continue
+            if best is None or worst < best[0]:
+                best = (worst, sa, sb)
+    if best is None or best[0] > 1e-4 * size:
+        raise RuntimeError("no fillet of this size fits between the two faces")
+    return best[1], best[2]
+
+def build(sm, brep_a, brep_b, side_a, side_b, ra, rb, chord=None, shape="CIRCULAR", tolerance=1e-4,
+          curves=None, on_faces=None):
     """(fillet brep, info) between two world-space breps. side_a / side_b: +1
-    for the fillet on that surface's outward-normal side, -1 the other."""
+    for the fillet on that surface's outward-normal side, -1 the other.
+    curves: the crossing to follow (an edge fillet's edges) instead of the
+    breps' intersection. on_faces = (face on A, face on B) with side_a /
+    side_b None: the sides are the ones whose rails land on those faces
+    (an edge fillet: the one corner between the two faces that both have)."""
     ext = sm.blender_ext
     if shape not in SHAPES:
         raise ValueError(f"unknown section {shape}")
-    try:
-        curves, _ = sm.intersect_breps(brep_a, brep_b)
-    except RuntimeError:
-        raise RuntimeError("the surfaces do not cross")
-    crossings = [Crossing(c) for c in curves or []]
+    if curves is None:
+        try:
+            curves, _ = sm.intersect_breps(brep_a, brep_b)
+        except RuntimeError:
+            raise RuntimeError("the surfaces do not cross")
+    bb = [brep_a.bounding_box(), brep_b.bounding_box()]
+    size = max(float(np.linalg.norm(np.array(b[1], float) - np.array(b[0], float))) for b in bb) or 1.0
+    crossings = [Crossing(ch) for ch in chains(list(curves or []), 1e-5 * size)]
     crossings = [c for c in crossings if c.length > 1e-9]
     if not crossings:
         raise RuntimeError("the surfaces do not cross")
-    A, B = Base(sm, brep_a, side_a), Base(sm, brep_b, side_b)
-    bb = [brep_a.bounding_box(), brep_b.bounding_box()]
-    size = max(float(np.linalg.norm(np.array(b[1], float) - np.array(b[0], float))) for b in bb) or 1.0
-    solver = Solver(A, B, ra, rb, chord, size)
     cr = max(crossings, key=lambda c: c.length)
+    if side_a is None or side_b is None:
+        side_a, side_b = _sides_on(sm, brep_a, brep_b, cr, ra, rb, chord, size, on_faces)
+    A, B = Base(sm, brep_a, side_a), Base(sm, brep_b, side_b)
+    solver = Solver(A, B, ra, rb, chord, size)
     polys = []
     for br in (brep_a, brep_b):
         for e in br.edges():

@@ -2422,9 +2422,14 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
             msg = f"{name}: {info['edges']} edge(s) filleted" + (" (solid)" if info.get("solid") else "")
             if info.get("chord"):
                 lo, mean, hi = info["chord"]
+                rr = info.get("radius_range") or (info["radius"],) * 3
+                ball = (f"{rr[0]:.4g}..{rr[2]:.4g}" if rr[2] - rr[0] > 1e-3 * rr[1] else f"{rr[1]:.4g}")
                 msg += (f" · chord {lo:.4g}..{hi:.4g} m" if hi - lo > 1e-3 * mean else f" · chord {mean:.4g} m") \
-                    + f" (ball radius {info['radius']:.4g} m)"
+                    + f" (ball radius {ball} m)"
             level = 'INFO'
+            if info.get("chord_note"):
+                msg += " · " + info["chord_note"]
+                level = 'WARNING'
             if info.get("rings") and "class_a" not in info:
                 msg += " · " + ring_summary(info["rings"])
             if "class_a" in info:
