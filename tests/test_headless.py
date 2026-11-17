@@ -5438,6 +5438,8 @@ _log = []
 features.mark_built(_tj)
 _ctx_feat = _types.SimpleNamespace(view_layer=ctx.view_layer, scene=ctx.scene, window_manager=ctx.window_manager)
 from blender_nurbs import feature_ui as _fui
+from blender_nurbs import subsel as _ssf
+_ssf.clear_tree_pick()             # (still picked from above: clicking its row again would unpick it)
 bpy.ops.nproto.tree_step(name=_tj.name, root=_tj.name, index=0)
 _fui.draw_feature(_FL(_log), ctx)
 _lab1 = [e[1] for e in _log if e[0] == "label"]
@@ -5459,6 +5461,88 @@ check("step focus: a step picked in the tree reads like a feature (Feature: <ste
       f"{_lab1[:4]} | {_lab2[:4]} | mute {len(_mute_ops)}")
 check("step focus: the fillet step knows its face (highlighted while open; CVs / Hulls shows just its net)",
       _sf_ok and _ssf.step_faces(_tj) == [], f"{_sf} areas {[round(f.area(), 3) for f in _tjf]}")
+
+# --- an earlier fillet step still finds its face after a later step cut away the point stored for it
+# (a chamfer through the fillet's end): it is found by its surface; the open row is drawn pressed ---
+def _edge_near(o, p):
+    _pl = _ssf._edge_polys(o)
+    return int(np.argmin([_ssf._dist_poly(P, np.array(p, float)) if P is not None else 1e9 for P in _pl]))
+bpy.ops.nproto.add_primitive(kind="BOX", width=2, depth=2, height=2, degree="0")
+_eb = ctx.active_object; ctx.view_layer.update()
+bpy.ops.nproto.edge_fillet(inputs=json.dumps([[_eb.name, f"E{_edge_near(_eb, (1, 0, 1))}"]]), shape="CIRCULAR", radius=0.5)
+_eb = ctx.active_object
+_ech = [_edge_near(_eb, p) for p in ((0, -1, 1), (-1, -1, 0), (-1, 0, 1))]
+bpy.ops.nproto.edge_fillet(inputs=json.dumps([[_eb.name, f"E{i}"] for i in _ech]), shape="CHAMFER", radius=0.3)
+_eb = ctx.active_object
+bpy.ops.nproto.tree_step(name=_eb.name, root=_eb.name, index=0)
+_es0 = _ssf.step_faces(_eb)
+_ebf = store.get_brep(_eb).faces()
+_es0_ok = len(_es0) == 1 and abs(_ebf[_es0[0]].area() - 0.5 * math.pi * 0.5 * 2.0) < 0.25   # a quarter cylinder, end cut
+bpy.ops.nproto.tree_step(name=_eb.name, root=_eb.name, index=1)
+_es1 = _ssf.step_faces(_eb)
+class _FLD(_FL):
+    def split(self, **k): return _FLD(self.log)
+    def row(self, **k): return _FLD(self.log)
+    def column(self, **k): return _FLD(self.log)
+    def box(self): return _FLD(self.log)
+    def operator(self, idname, text="", **k):
+        o = _types.SimpleNamespace(); self.log.append(("op", idname, text, o, k.get("depress"), k.get("emboss"))); return o
+_log = []
+_hui.draw_tree(_FLD(_log), ctx, _eb)
+_pressed = [e[2] for e in _log if e[0] == "op" and e[4] and e[5]]
+check("step focus: an earlier fillet step finds its face after a later chamfer cut its stored point away "
+      "(by its surface); the open step's row is drawn pressed (and only it)",
+      _es0_ok and len(_es1) == 4 and not set(_es0) & set(_es1) and len(_pressed) == 1 and _pressed[0].startswith("2. "),
+      f"step0={_es0} area={[round(_ebf[i].area(), 3) for i in _es0]} step1={_es1} pressed={_pressed}")
+
+# --- a feature clicked in the History list is drawn blue (the body filled from its own mesh, a sketch
+# as its curve) while it stays active and selected; an open step shows only its faces ---
+bpy.ops.nproto.history_focus(name=_eb.name, root=_eb.name)
+_tp1 = _ssf.tree_pick(ctx) == _eb
+_tpt = _ssf._mesh_tris(_eb)
+_tp_mesh = len(_tpt[1]) == len(_eb.data.loop_triangles) > 0
+bpy.ops.nproto.tree_step(name=_eb.name, root=_eb.name, index=0)
+_tp2 = _ssf.tree_pick(ctx) is None
+bpy.ops.nproto.history_focus(name=_eb.name, root=_eb.name)
+_eb.select_set(False)
+_tp3 = _ssf.tree_pick(ctx) is None
+_tpc = bezier("TP_sketch", [(0, 1300), (1, 1300.5), (2, 1300)], 0.0)
+bpy.ops.nproto.history_focus(name=_tpc.name, root=_tpc.name)
+_tpp = _ssf._curve_polys(_tpc)
+_tp4 = _ssf.tree_pick(ctx) == _tpc and len(_tpp) == 1 and len(_tpp[0]) == 200 \
+    and np.allclose(_tpp[0][0], (0, 1300, 0), atol=1e-6) and np.allclose(_tpp[0][-1], (2, 1300, 0), atol=1e-6)
+check("history pick: the clicked feature is drawn blue while active and selected (not while one of its "
+      "steps is open, not once deselected); a clicked sketch is drawn as its curve",
+      _tp1 and _tp_mesh and _tp2 and _tp3 and _tp4, f"{_tp1} {_tp_mesh} {_tp2} {_tp3} {_tp4}")
+
+# --- nothing picked: a body selected in the viewport presses no History row; clicking the pressed row
+# again unpicks it; selecting something else ends the pick (an open step closes) ---
+def _pressed_rows(o):
+    _lg = []
+    _hui.draw_tree(_FLD(_lg), ctx, o)
+    return [e[2] for e in _lg if e[0] == "op" and e[4] and e[5]]
+def _viewport_select(o):
+    for _o in ctx.selected_objects:
+        _o.select_set(False)
+    o.select_set(True); ctx.view_layer.objects.active = o
+    ctx.view_layer.update(); _ssf._tree_pick_watch(ctx.scene)
+bpy.ops.nproto.history_focus(name=_eb.name, root=_eb.name)
+_np1 = _pressed_rows(_eb) == [_eb.name]
+bpy.ops.nproto.history_focus(name=_eb.name, root=_eb.name)          # again: unpicked, still selected
+_np2 = _pressed_rows(_eb) == [] and _ssf.tree_pick(ctx) is None and _eb.select_get()
+bpy.ops.nproto.tree_step(name=_eb.name, root=_eb.name, index=0)
+_np3 = _eb.nproto_step.focus and [t[:3] for t in _pressed_rows(_eb)] == ["1. "]
+_viewport_select(_tpc)                                               # something else: the pick ends
+_viewport_select(_eb)                                                # the body again, from the viewport
+_np4 = _ssf.TREE_PICK["name"] is None and not _eb.nproto_step.focus and _pressed_rows(_eb) == [] \
+    and _ssf.step_faces(_eb) == [] and _ssf.tree_pick(ctx) is None
+bpy.ops.nproto.tree_step(name=_eb.name, root=_eb.name, index=1)
+bpy.ops.nproto.tree_step(name=_eb.name, root=_eb.name, index=1)    # again: the step closes
+_np5 = not _eb.nproto_step.focus and _pressed_rows(_eb) == [] and _ssf.step_faces(_eb) == []
+check("history pick: a body selected in the viewport presses no row (nothing picked); clicking a pressed "
+      "row again unpicks it; selecting something else ends the pick and closes an open step",
+      _np1 and _np2 and _np3 and _np4 and _np5, f"{_np1} {_np2} {_np3} {_np4} {_np5}")
+bpy.data.objects.remove(_tpc)
 
 # --- two surfaces trimmed by each other follow their inputs (the rebuild order does not matter) ---
 from blender_nurbs import history as _hist

@@ -167,11 +167,12 @@ def _mids_key(mids_local):
     return json.dumps([[round(float(x), 6) for x in m] for m in mids_local])
 
 
-def store_rims(obj, mids_local, info, Mi=None):
+def store_rims(obj, mids_local, info, Mi=None, text=None):
     """Keep what an edge fillet step made, keyed by the step's edges, for its
-    panel: its faces (a point inside each, local: highlighted while the step
-    is open), what became of its rims (closed edges), and whether every face
-    of the fillet is a rim (then the Class-A settings have nothing to do)."""
+    panel: its faces (a point inside each, local, and the key of the surface
+    under it from the step's result `text`: highlighted while the step is
+    open), what became of its rims (closed edges), and whether every face of
+    the fillet is a rim (then the Class-A settings have nothing to do)."""
     try:
         d = json.loads(obj.get(PROP_RIMS, "{}"))
     except ValueError:
@@ -184,6 +185,14 @@ def store_rims(obj, mids_local, info, Mi=None):
         entry.update(rings=info["rings"], only=bool(info.get("rims_only")))
     if info.get("new_faces"):
         entry["faces"] = [[float(x) for x in (Mi @ Vector(p))] for p in info["new_faces"]]
+        if text:
+            # the surface under each face too: a later step that trims the face (a
+            # chamfer cutting its end off) keeps its surface, not that one point
+            try:
+                from . import subsel
+                entry["keys"] = subsel.face_keys(store.brep_from_text(text), entry["faces"])
+            except Exception as exc:
+                print("NURBS fillet face keys:", exc)
     if entry:
         d[key] = entry
     else:
@@ -216,7 +225,7 @@ def apply_edge_fillet(obj, text, inputs, p):
         obj["nproto_class_a"] = json.dumps(info["class_a"])
     elif "nproto_class_a" in obj:
         del obj["nproto_class_a"]
-    store_rims(obj, p["mids_local"], info, M.inverted())
+    store_rims(obj, p["mids_local"], info, M.inverted(), breps["result"])
     return breps["result"]
 
 

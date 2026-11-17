@@ -2410,7 +2410,7 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
             store.set_geometry_text(obj, breps["result"], context, keep_untrimmed=False)
             if keep_history:
                 Mi = geom.world_matrix(obj).inverted()
-                steps.store_rims(obj, [list(Mi @ Vector(m)) for m in mids], info, Mi)
+                steps.store_rims(obj, [list(Mi @ Vector(m)) for m in mids], info, Mi, breps["result"])
                 features.push_step(obj, "edge_fillet", [], {
                     "mids_local": [list(Mi @ Vector(m)) for m in mids], "shape": self.shape, "radius": self.radius,
                     "end_radius": self.end_radius if self.variable and not chord else None, "chord": chord,
