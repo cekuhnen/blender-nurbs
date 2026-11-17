@@ -4776,7 +4776,7 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cy
               "patch_auto_corners", "patch_corner", "patch_remove_guide", "rebuild", "rebuild_waiting", "remove_step",
               "restore_inputs", "sync_feature", "tab_edit", "continuity", "continuity_clear", "section_add", "section_orient",
               "section_targets", "section_curves", "section_remove", "subsel_picker", "bake_feature", "delete_feature",
-              "curve_degree", "fix_clip_start", "delete_faces",
+              "curve_degree", "fix_clip_start", "delete_faces", "move_pivot",
               "square"}     # Square: merged into Patch (Quad Sided); kept for older files, off the menus
 _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto)
               if n not in _not_tools and not n.startswith("workplane_")}   # the Work Planes panel's own
@@ -10264,5 +10264,74 @@ check("mirror + apply scale: same side shown and in the B-rep, rebuilds and the 
       _pm_ok and _shown(_pme2).dot(_pme2_n) > 0.999 and _brep_n(_pme2).dot(_pme2_n) > 0.999
       and _near(_wpts(_pme2), _pme2_w) < 1e-6 and _near(_wpts(_pml), _pml_w) < 1e-6 and _near(_pml_w, _wpts(_pml)) < 1e-6,
       (_pm_ok, tuple(_shown(_pme2)), tuple(_brep_n(_pme2)), _near(_wpts(_pml), _pml_w), features.history(_pml)["refs"]))
+
+# --- Move Pivot (pivottool.py): the origin goes to a point; the geometry, children and B-rep stay in the world.
+# (The modal itself, its undo in Edit Mode and on a CV cage were checked in a GUI Blender with simulated input.)
+from blender_nurbs import pivottool
+# a turned, scaled mesh with a child
+_mv_me = bpy.data.meshes.new("MvPivMesh")
+_mv_me.from_pydata([(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0.5)], [], [(0, 1, 2, 3)])
+_mv = bpy.data.objects.new("MvPiv", _mv_me); ctx.collection.objects.link(_mv)
+_mv.location = (2, 1, 0); _mv.rotation_euler = (0.2, 0.4, 0.9); _mv.scale = (1.5, 0.5, 2.0)
+_mv_ch = bpy.data.objects.new("MvPivChild", None); ctx.collection.objects.link(_mv_ch)
+_mv_ch.parent = _mv; _mv_ch.location = (0.3, 0.2, 0.1)
+ctx.view_layer.update()
+_mv_w, _mv_cw = _wpts(_mv), _mv_ch.matrix_world.copy()
+_P = np.array([3.0, -1.0, 2.0])
+_ok_m = pivottool.move_origin(_mv, _P)
+ctx.view_layer.update()
+check("move pivot, mesh: origin at the point, vertices and child stay in the world",
+      _ok_m and np.linalg.norm(np.array(_mv.matrix_world.translation) - _P) < 1e-6 and _near(_wpts(_mv), _mv_w) < 1e-6
+      and max(abs(a - b) for ra, rb in zip(_mv_ch.matrix_world, _mv_cw) for a, b in zip(ra, rb)) < 1e-6
+      and tuple(_mv.scale) == (1.5, 0.5, 2.0), (tuple(_mv.matrix_world.translation), _near(_wpts(_mv), _mv_w)))
+# a curve
+_mvc = nurbs("MvPivCurve", [(0, 0, 0), (1, 1, 0), (2, 0, 1), (3, 1, 1)])
+_mvc.rotation_euler = (0, 0, 0.7)
+ctx.view_layer.update()
+_cw = [tuple(_mvc.matrix_world @ p.co.xyz) for p in _mvc.data.splines[0].points]
+pivottool.move_origin(_mvc, (1, 2, 3)); ctx.view_layer.update()
+_cw2 = [tuple(_mvc.matrix_world @ p.co.xyz) for p in _mvc.data.splines[0].points]
+check("move pivot, curve: its points stay", max(abs(a - b) for p, q in zip(_cw, _cw2) for a, b in zip(p, q)) < 1e-6
+      and (Vector(_mvc.matrix_world.translation) - Vector((1, 2, 3))).length < 1e-6)
+# a NURBS feature with a G2 blend built from its edge: everything stays through rebuilds
+_mpl1 = nurbs("MvLine1", [(0, 5, 0), (0, 6, 0)], order=2)
+_mpl2 = nurbs("MvLine2", [(1, 5, 1), (1, 6, 1)], order=2)
+bpy.ops.nproto.extrude(inputs=ins((_mpl1, "S0")), distance=-0.5, direction="Z"); _mpe1 = ctx.active_object
+bpy.ops.nproto.extrude(inputs=ins((_mpl2, "S0")), distance=0.5, direction="Z"); _mpe2 = ctx.active_object
+bpy.ops.nproto.loft(inputs=ins((_mpe1, f"E{_edge_of(_mpe1, 0.0)}"), (_mpe2, f"E{_edge_of(_mpe2, 1.0)}")),
+                    cont_a="G2", cont_b="G2")
+_mplo = ctx.active_object
+_plo_w, _pe2_w, _pe2_b = _wpts(_mplo), _wpts(_mpe2), _bpts(_mpe2)
+_r = pivottool.move_origin(_mpe2, (1.0, 5.5, 1.25))
+ctx.view_layer.update()
+_k_ok = _mpe2.get(features.PROP_KEY) == features.build_key(_mpe2)
+features.rebuild(_mpe2, ctx, force=True); features.rebuild(_mplo, ctx, force=True)
+check("move pivot, NURBS feature: B-rep follows, its rebuild and the G2 blend built from it stay",
+      _r and _k_ok and (Vector(_mpe2.location) - Vector((1.0, 5.5, 1.25))).length < 1e-6
+      and _near(_bpts(_mpe2), _pe2_b) < 1e-9 and _near(_wpts(_mpe2), _pe2_w) < 1e-6 and _near(_wpts(_mplo), _plo_w) < 1e-6,
+      (_r, _k_ok, _near(_bpts(_mpe2), _pe2_b), _near(_wpts(_mplo), _plo_w)))
+# the operator's apply step on several objects, in mesh Edit Mode (it leaves and comes back)
+bpy.ops.object.select_all(action='DESELECT')
+_mv.select_set(True); ctx.view_layer.objects.active = _mv
+bpy.ops.object.mode_set(mode='EDIT')
+_mv_w = _wpts(_mv)
+_moved = pivottool.apply_targets(ctx, [(_mv, np.array([0.0, 0.0, 0.0]))])
+_back = _mv.mode == 'EDIT'
+bpy.ops.object.mode_set(mode='OBJECT')
+check("move pivot in Edit Mode: origin moved, still in Edit Mode, vertices stay",
+      _moved == [_mv.name] and _back and Vector(_mv.matrix_world.translation).length < 1e-6
+      and _near(_wpts(_mv), _mv_w) < 1e-6, (_moved, _back))
+# a NURBS surface with its CV cage open: the surface's origin moves, Cancel still restores it exactly in place
+bpy.ops.nproto.add_primitive(kind="PLANE"); _cs = ctx.active_object
+_cs.location = (0, -6, 0); ctx.view_layer.update()
+_cs_b = _bpts(_cs)
+bpy.ops.nproto.edit_cvs()
+_cage = ctx.active_object
+_moved = pivottool.apply_targets(ctx, [(pivottool.owner(_cage), np.array([0.5, -5.5, 0.0]))])
+_still = _cage.name in bpy.data.objects and _cage.mode == 'EDIT'
+bpy.ops.nproto.cvs_cancel()
+check("move pivot on a CV cage: the surface's origin moves, the cage stays open, Cancel keeps it in place",
+      _moved == [_cs.name] and _still and (Vector(_cs.location) - Vector((0.5, -5.5, 0))).length < 1e-6
+      and _near(_bpts(_cs), _cs_b) < 1e-9, (_moved, _still, tuple(_cs.location), _near(_bpts(_cs), _cs_b)))
 
 print("ALL OK" if ok else "SOME FAILED")
