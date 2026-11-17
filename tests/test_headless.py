@@ -5070,8 +5070,13 @@ _bm = bmesh.from_edit_mesh(_cg.data); _bm.verts.ensure_lookup_table()
 _bm.verts[_mid].co.z += 0.2; bmesh.update_edit_mesh(_cg.data)
 ctx.view_layer.update(); ncvs._process()
 r4 = bpy.ops.nproto.cvs_done()
-check("Edit CVs on a patch, move a CV then Done: the edit stays and the history is removed",
-      r4 == {'FINISHED'} and not features.has_history(_PP) and _PP[store.PROP_BREP] != _txt0)
+_pp_cvs = ext.surface_cvs(store.get_surfaces(_PP)[0])["points"]
+_pp_st = [e["op"] for e in features.stack(_PP)]
+features.rebuild(_PP, ctx, force=True)          # the patch again, then the tweak replayed on it (trimmed: worker)
+_pp_re = np.abs(np.array(ext.surface_cvs(store.get_surfaces(_PP)[0])["points"]) - np.array(_pp_cvs)).max()
+check("Edit CVs on a patch, move a CV then Done: the edit stays as a CV Tweak step that replays it (trimmed)",
+      r4 == {'FINISHED'} and features.history(_PP) is not None and _pp_st[-1:] == ["cv_tweak"]
+      and _PP[store.PROP_BREP] != _txt0 and _pp_re < 1e-9 and not store.is_natural(_PP), (_pp_st, _pp_re))
 
 # --- Edit CVs on a trimmed face whose edges have no UV trim curves (some STEP faces):
 #     they are dropped onto the surface first, then the edit works as usual
@@ -10770,6 +10775,107 @@ check("nudge CVs: a neighbour on another layout along the edge gives no guides a
       {e: (v["obj"].name, v["why"]) for e, v in _npart.items()})
 bpy.ops.nproto.cvs_cancel()
 nuL.hide_set(False)
+
+# --- CV Tweak (cvtweak.py): CV edits on a surface with history become a step that replays them
+from blender_nurbs import cvtweak as _tw
+def _cvs_of(o):
+    return np.array(ext.surface_cvs(store.get_surfaces(o)[0])["points"], float)
+def _cage_to(cage, Xw):
+    M_ = np.array(cage.matrix_world, float)
+    bm_ = bmesh.from_edit_mesh(cage.data); bm_.verts.ensure_lookup_table()
+    for v, p in zip(bm_.verts, (Xw - M_[:3, 3]) @ np.linalg.inv(M_[:3, :3]).T):
+        v.co = p
+    bmesh.update_edit_mesh(cage.data); ctx.view_layer.update(); ncvs._process()
+_tf = _tw.local_frames(np.stack(list(np.meshgrid(np.arange(4.0), np.arange(3.0), indexing="ij")) + [np.zeros((4, 3))], 2))
+_tX = np.random.default_rng(3).normal(size=(12, 3))
+_tY = _tX.copy(); _tY[[2, 7]] += [[0.1, -0.2, 0.3], [0.0, 0.05, 0.0]]
+check("CV tweak: frames are orthonormal (U, across, normal); offsets replay exactly on the same CVs",
+      np.allclose(_tf[0], [1, 0, 0]) and np.allclose(_tf[1], [0, 1, 0]) and np.allclose(_tf[2], [0, 0, 1])
+      and [m[0] for m in _tw.offsets(_tX, _tY, (4, 3, 3))] == [2, 7]
+      and np.abs(_tw.moved(_tX, _tw.offsets(_tX, _tY, (4, 3, 3)), (4, 3, 3)) - _tY).max() < 1e-12)
+# a tweak on an extrusion: the curve turns, the pushed CV's offset turns with the surface
+_twc = nurbs("TW_crv", [(600, 700, 0), (601, 700.5, 0), (602, 700, 0), (603, 700.4, 0)])
+bpy.ops.nproto.extrude(inputs=ins((_twc, "S0")), distance=2.0, direction="Z")
+_twE = ctx.active_object
+bpy.ops.object.select_all(action='DESELECT'); _twE.select_set(True); ctx.view_layer.objects.active = _twE
+bpy.ops.nproto.edit_cvs(); _tcg = ctx.active_object
+_tA = np.array(geom.world_matrix(_twE), float)[:3, :3]
+_tW0 = _cvs_of(_twE) @ _tA.T + np.array(geom.world_matrix(_twE), float)[:3, 3]
+_tk = len(_tW0) // 2
+_tN = _tw.local_frames(_tW0.reshape(*[ext.surface_cvs(store.get_surfaces(_twE)[0])[c] for c in ("count_u", "count_v")], 3))[2]
+_tW1 = _tW0.copy(); _tW1[_tk] += 0.3 * _tN[_tk]
+_cage_to(_tcg, _tW1)
+r1 = bpy.ops.nproto.cvs_done()
+_tst = features.stack(_twE)
+_tL0 = _cvs_of(_twE)
+_twc.rotation_euler.z = math.radians(30.0); ctx.view_layer.update()
+features.rebuild(_twE, ctx)
+_tL1 = _cvs_of(_twE)
+_tst_raw = json.loads(_twE[features.PROP_STACK]); _tst_raw[-1]["params"]["_off"] = True
+_twE[features.PROP_STACK] = json.dumps(_tst_raw); features.rebuild(_twE, ctx, force=True)
+_tL1off = _cvs_of(_twE)
+_tst_raw[-1]["params"].pop("_off"); _twE[features.PROP_STACK] = json.dumps(_tst_raw); features.rebuild(_twE, ctx, force=True)
+_tR = np.array(_Mx.Rotation(math.radians(30.0), 3, "Z"), float)
+_tdk = (_tL1[_tk] - _tL1off[_tk]) @ _tA.T
+_td0 = _tL0[_tk] @ _tA.T + np.array(geom.world_matrix(_twE), float)[:3, 3] - _tW0[_tk]     # the push as kept (32-bit cage)
+_trest = np.delete(np.abs(_tL1 - _tL1off).max(axis=1), _tk).max()
+check("CV tweak: Done on an extrusion adds a CV Tweak step (history kept); the curve turns 30 deg, the surface "
+      "follows and the pushed CV's offset turns with it",
+      r1 == {'FINISHED'} and features.history(_twE)["op"] == "extrude" and [e["op"] for e in _tst] == ["cv_tweak"]
+      and np.abs(_tL1 - _tL0).max() > 0.1 and abs(np.linalg.norm(_td0) - 0.3) < 1e-4
+      and np.linalg.norm(_tdk - _tR @ _td0) < 1e-4 and np.linalg.norm(_tdk - _td0) > 0.1 and _trest < 1e-12,
+      (np.linalg.norm(_td0), np.linalg.norm(_tdk - _tR @ _td0), _trest))
+# (1e-4: the curve's 32-bit world matrix at x ~ 600 rounds the rebuilt CVs by ~1e-5, so the frames lean that much)
+# a locked nudge at an edge on another surface: the CVs on their guides stay on them when that surface changes
+_tG = np.stack(list(np.meshgrid(np.linspace(600, 604, _nn), np.linspace(800, 804, _nn), indexing="ij"))
+               + [0.4 * np.sin(0.8 * np.linspace(0, 4, _nn))[:, None] * np.cos(0.6 * np.linspace(0, 4, _nn))[None, :]], 2)
+(_tLG, _tUL), (_tRG, _tUR) = _nsplit(_tG, _nU, 0.5)
+twL = _nk("TW_L", _tLG, _tUL, _nU)
+twS = _nk("TW_S", _tRG, _tUR, _nU)
+features.push_step(twS, "flip_normal", [], {"_off": True})         # some history (a muted step) to keep
+bpy.ops.object.select_all(action='DESELECT'); twS.select_set(True); ctx.view_layer.objects.active = twS
+bpy.ops.nproto.edit_cvs(); _tcg = ctx.active_object
+_tnet = _nu.net_of_cage(_tcg)
+_tgd = _nu.Guided(_tnet, _nu.find_partners(ctx, twS, _tnet, (_tcg,)))
+_tX0 = _tnet.G.reshape(-1, 3).copy()
+_tfd = _nu.frames(_tnet.G)
+_tix = _sa._grid_index("U0", *_tnet.G.shape[:2])
+_tk1 = _tix(1, 3)
+_theld = {k for k, g in _nu.first_guides(_tgd.guides(_tX0, 2)).items() if _nu.holds(g, _tol)}
+_tX1 = _nu.nudge(_tX0, {_tk1}, lambda k: 0.2 * _tfd["U"].reshape(-1, 3)[k] + 0.05 * _tfd["N"].reshape(-1, 3)[k],
+                 _tgd, 2, True, _theld)
+_cage_to(_tcg, _tX1)
+bpy.ops.nproto.cvs_done()
+_tlast = features.stack(twS)[-1]
+_tholds = _tlast["params"]["holds"]
+check("CV tweak: a locked nudge records the edge's neighbour as an input and the moved CVs on their guides",
+      _tlast["op"] == "cv_tweak" and [(o.name, r_) for o, r_ in _tlast["inputs"]] == [("TW_L", "U1")]
+      and len(_tholds) == 1 and _tholds[0]["edge"] == "U0" and _tk1 in _tholds[0]["ks"] and len(_tholds[0]["ks"]) > 1,
+      (_tholds, [(o.name, r_) for o, r_ in _tlast["inputs"]]))
+_tdL = ext.surface_cvs(store.get_surfaces(twL)[0])
+_tPL = np.array(_tdL["points"], float).reshape(_tdL["count_u"], _tdL["count_v"], 3)
+_tPL[-2, :, 2] -= 0.15; _tPL[-3, :, 2] += 0.1                     # the neighbour's tangent rows move: its G1 lines turn
+store.set_geometry(twL, ext.surface_from_cvs(3, 3, [tuple(q) for q in _tPL.reshape(-1, 3)], _tdL["knots_u"],
+                                             _tdL["knots_v"]), ctx)
+ctx.view_layer.update(); nhist._process()
+_tS = _cvs_of(twS) @ np.array(geom.world_matrix(twS), float)[:3, :3].T + np.array(geom.world_matrix(twS), float)[:3, 3]
+_tnS = _ma.Net(_tS.reshape(_tnet.G.shape), _tnet.knots, _tnet.deg)
+_tg = _nu.first_guides(_nu.guides(_tnS, {"U0": _nu.partner_of(_tnS, "U0", twL, "U1")}, 2))
+_tother1 = max(_tg[_tix(1, j)]["err"] for j in range(_nn) if _tix(1, j) != _tk1)
+check("CV tweak: the neighbour changes, the surface rebuilds and the tweaked CVs are back on its new guides "
+      "(the untweaked ones come from the snapshot and don't)",
+      _tg[_tk1]["err"] < 1e-9 and max(_tg[k]["err"] for k in _tholds[0]["ks"] if k != _tk1) < 1e-6 and _tother1 > 1.0,
+      (_tg[_tk1]["err"], max(_tg[k]["err"] for k in _tholds[0]["ks"] if k != _tk1), _tother1))
+# a step before it that changes the CV layout: the tweak says so
+features._write_stack(twS, [{"op": "rebuild_surface", "inputs": [],
+                             "params": {"degree_u": 3, "degree_v": 3, "spans_u": 6, "spans_v": 6}}]
+                      + [{"op": e["op"], "inputs": e["inputs"], "params": e["params"]} for e in features.stack(twS)])
+try:
+    features.rebuild(twS, ctx, force=True); _tmsg = ""
+except Exception as exc:
+    _tmsg = str(exc)
+check("CV tweak: a CV layout changed before it stops the rebuild with a clear message", "CV layout changed" in _tmsg,
+      _tmsg)
 
 # Surface fillet round a cylinder through a tilted plane (the angle between them
 # goes 59 -> 121 deg round the crossing): a chord keeps the rails that far apart

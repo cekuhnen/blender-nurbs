@@ -38,8 +38,8 @@ the edge says so and only the measurement is shown (Match Surface makes the
 layouts one).
 
 The cage rebuilds the surface as it moves (cvs.py), so history is as with
-any CV edit: Done on the cage after a real move removes the surface's
-construction history.
+any CV edit: Done on the cage after a real move adds a CV Tweak step
+(cvtweak.py), which keeps the CVs that end on their guide on it.
 """
 
 import math
@@ -164,22 +164,28 @@ def find_partners(context, surf, net, exclude=()):
             tgt = None
         if tgt is None or isinstance(tgt, list):
             continue
-        tobj, tref = tgt
-        e = {"obj": tobj, "ref": tref, "side": None, "max": 0, "why": None}
-        try:
-            sd = match.fit_side(match.target_side(tobj, tref), E[0], E[-1], "EDGE")
-        except Exception as exc:
-            e["why"] = str(exc)
-            out[edge] = e
-            continue
-        s = side_on_layout(net, edge, sd)
-        if s is None:
-            e["why"] = "the CV layouts along the edge differ (Match Surface makes them one)"
-        else:
-            e["side"] = s
-            e["max"] = 0 if s.get("D") is None else min(2, p, Gs.shape[0] - 1)
-        out[edge] = e
+        out[edge] = partner_of(net, edge, *tgt)
     return out
+
+
+def partner_of(net, edge, tobj, tref):
+    """{"obj", "ref", "side" (on the net's layout) or None, "max", "why"}:
+    the target (tobj, tref) as the partner of the net's `edge`."""
+    Gs, Ua, Ue, p, q = net.std(edge)
+    E = Gs[0]
+    e = {"obj": tobj, "ref": tref, "side": None, "max": 0, "why": None}
+    try:
+        sd = match.fit_side(match.target_side(tobj, tref), E[0], E[-1], "EDGE")
+    except Exception as exc:
+        e["why"] = str(exc)
+        return e
+    s = side_on_layout(net, edge, sd)
+    if s is None:
+        e["why"] = "the CV layouts along the edge differ (Match Surface makes them one)"
+    else:
+        e["side"] = s
+        e["max"] = 0 if s.get("D") is None else min(2, p, Gs.shape[0] - 1)
+    return e
 
 
 # --------------------------------------------------------------------------
@@ -1024,6 +1030,7 @@ classes = (NPROTO_OT_cv_nudge,)
 def register():
     _handles.append(bpy.types.SpaceView3D.draw_handler_add(_draw_view, (), 'WINDOW', 'POST_VIEW'))
     _handles.append(bpy.types.SpaceView3D.draw_handler_add(_draw_px, (), 'WINDOW', 'POST_PIXEL'))
+    cvtweak.register()
 
 
 def unregister():
@@ -1034,3 +1041,8 @@ def unregister():
             pass
     _handles.clear()
     overlay.update(on=False, guides=[], sel=set(), axis=None)
+
+
+# the CV Tweak history step (CV edits kept in the history) lives next to the
+# tool; importing it here registers its replay with the history stack
+from . import cvtweak  # noqa: E402
