@@ -337,6 +337,28 @@ class NprotoView(bpy.types.PropertyGroup):
                                  update=lambda s, c: _redraw_views(c),
                                  description="G2 holds while the curvature across the edge differs by no more than this, "
                                              "in percent of the largest along the edge (also used by the feature labels)")
+    # Nudge CVs (cvnudge.py)
+    cv_step: FloatProperty(name="Step", default=0.01, min=1e-7, soft_max=10.0, precision=5, unit='LENGTH',
+                           description="How far one arrow key moves the CVs (Shift: a tenth, Ctrl: ten); "
+                                       "Ctrl while dragging moves in whole Steps. [ and ] halve / double it")
+    cv_sensitivity: FloatProperty(name="Sensitivity", default=1.0, min=1.0, soft_max=100.0, precision=1,
+                                  description="Dragging moves the CVs 1 / this of the mouse's distance "
+                                              "(Alias Mouse Sensitivity: 2 = half as far). Shift: ten times finer")
+    cv_axis: EnumProperty(name="Direction", default="N", items=[
+        ("N", "N", "Each CV along its own normal (across its hull lines)"),
+        ("U", "U", "Each CV along its U hull line"),
+        ("V", "V", "Each CV along its V hull line"),
+        ("X", "X", "World X"), ("Y", "Y", "World Y"), ("Z", "Z", "World Z"),
+        ("FREE", "View", "In the view plane")])
+    cv_guides: EnumProperty(name="Guides", default="G2", update=lambda s, c: _redraw_views(c), items=[
+        ("OFF", "Off", "No continuity guides"),
+        ("G0", "G0", "Where the edge CVs must sit to touch the neighbour"),
+        ("G1", "G1", "... and the line the next row must lie on (the neighbour's hull run on straight)"),
+        ("G2", "G2", "... and the plane the third row must lie in for the same curvature across the edge")],
+        description="Continuity guides at the edges that meet another surface (C in Nudge CVs)")
+    cv_lock: BoolProperty(name="Lock to Guides", default=False,
+                          description="Guided CVs stay on their guide while they are nudged, and a row 2 CV "
+                                      "that was on its G2 plane follows when its row 1 CV moves (L in Nudge CVs)")
     show_zebra: BoolProperty(name="Zebra", default=False, update=lambda s, c: _one_map(s, "show_zebra"),
                              description="Reflection stripes on NURBS surfaces")
     show_draft: BoolProperty(name="Draft Angle", default=False, update=lambda s, c: _one_map(s, "show_draft"),
@@ -561,7 +583,11 @@ class VIEW3D_PT_nproto_active(_SidePanel, bpy.types.Panel):
         cage = _cage(context)
         if cage is not None:
             # A plain line like the object's own; Tab goes back to Object Mode
-            lay.box().label(text=f"{cage[_cvs.CAGE_OF]}: editing CVs", icon='EDITMODE_HLT')
+            box = lay.box()
+            box.label(text=f"{cage[_cvs.CAGE_OF]}: editing CVs", icon='EDITMODE_HLT')
+            if cage.mode == 'EDIT':
+                from . import cvnudge
+                cvnudge.draw_panel(box, context)
 
         from . import feature_ui as _fui
         _fui.draw_feature(lay, context)

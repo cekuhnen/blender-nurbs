@@ -4776,7 +4776,7 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cy
               "patch_auto_corners", "patch_corner", "patch_remove_guide", "rebuild", "rebuild_waiting", "remove_step",
               "restore_inputs", "sync_feature", "tab_edit", "continuity", "continuity_clear", "section_add", "section_orient",
               "section_targets", "section_curves", "section_remove", "subsel_picker", "bake_feature", "delete_feature",
-              "curve_degree", "fix_clip_start", "delete_faces", "move_pivot",
+              "curve_degree", "fix_clip_start", "delete_faces", "move_pivot", "cv_nudge",
               "square"}     # Square: merged into Patch (Quad Sided); kept for older files, off the menus
 _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto)
               if n not in _not_tools and not n.startswith("workplane_")}   # the Work Planes panel's own
@@ -10333,6 +10333,98 @@ bpy.ops.nproto.cvs_cancel()
 check("move pivot on a CV cage: the surface's origin moves, the cage stays open, Cancel keeps it in place",
       _moved == [_cs.name] and _still and (Vector(_cs.location) - Vector((0.5, -5.5, 0))).length < 1e-6
       and _near(_bpts(_cs), _cs_b) < 1e-9, (_moved, _still, tuple(_cs.location), _near(_bpts(_cs), _cs_b)))
+
+# --- Nudge CVs (cvnudge.py): continuity guides at an edge that meets another surface, lock, put on guide
+from blender_nurbs import cvnudge as _nu, match as _ma, salign as _sa, cvs as ncvs
+import bmesh
+def _nk(name, G, Uu, Uv, du=3, dv=3):
+    pts = [tuple(map(float, G[i, j])) for i in range(G.shape[0]) for j in range(G.shape[1])]
+    return store.new_object(ctx, name, ext.surface_from_cvs(du, dv, pts, list(Uu), list(Uv)))
+def _nsplit(G, U, t, p=3):
+    U = list(U)
+    while U.count(t) < p:
+        G, U = _sa.insert_knot(G, U, p, t)
+    k = max(i for i, x in enumerate(U) if x == t) - p
+    return (G[:k + 1], [x / t for x in U[:k + p + 1]] + [1.0]), (G[k:], [0.0] + [(x - t) / (1 - t) for x in U[k + 1:]])
+# one surface cut at u = 0.5: NU_L | NU_S, exactly G2 across S's U0
+_nn = 7
+_nX, _nY = np.meshgrid(np.linspace(500, 504, _nn), np.linspace(0, 4, _nn), indexing="ij")
+_nG = np.stack([_nX, _nY, 0.4 * np.sin(0.8 * (_nX - 500)) * np.cos(0.6 * _nY) + 0.15 * np.sin(_nY)], 2)
+_nU = geom.clamped_uniform_knots(_nn, 3)
+(_nL, _nUL), (_nR, _nUR) = _nsplit(_nG, _nU, 0.5)
+nuL = _nk("NU_L", _nL, _nUL, _nU)
+nuS = _nk("NU_S", _nR, _nUR, _nU)
+# frames of a flat grid: N across, U / V along the hull lines
+_fr = _nu.frames(np.stack(list(np.meshgrid(np.arange(4.0), np.arange(3.0), indexing="ij")) + [np.zeros((4, 3))], 2))
+check("nudge CVs: frames of a flat grid (N = Z, U = X, V = Y)",
+      np.allclose(_fr["N"], [0, 0, 1]) and np.allclose(_fr["U"], [1, 0, 0]) and np.allclose(_fr["V"], [0, 1, 0]))
+bpy.ops.object.select_all(action='DESELECT'); nuS.select_set(True); ctx.view_layer.objects.active = nuS
+bpy.ops.nproto.edit_cvs()
+_ncage = ctx.active_object
+_nnet = _nu.net_of_cage(_ncage)
+_npart = _nu.find_partners(ctx, nuS, _nnet, (_ncage,))
+_tol = _nu.tolerances(ctx)
+_ng = _nu.guides(_nnet, _npart, 2)
+check("nudge CVs: the edge on the other surface is found, on one layout, G2 allowed; the split is on every guide",
+      list(_npart) == ["U0"] and _npart["U0"]["obj"] == nuL and _npart["U0"]["side"] is not None
+      and _npart["U0"]["max"] == 2 and len(_ng) == 3 * _nn and all(_nu.holds(g, _tol) for g in _ng),
+      ({e: (v["obj"].name, v["ref"], v["max"], v["why"]) for e, v in _npart.items()},
+       max((g["err"] for g in _ng), default=None)))
+_nix = _sa._grid_index("U0", *_nnet.G.shape[:2])
+X0 = _nnet.G.reshape(-1, 3).copy()
+_gd = _nu.Guided(_nnet, _npart)
+_j = 3
+_k1, _k2 = _nix(1, _j), _nix(2, _j)
+_row2 = {_nix(2, j) for j in range(_nn)}
+_fd = _nu.frames(_nnet.G)
+_dir = lambda k: 0.05 * _fd["N"].reshape(-1, 3)[k]
+# free: a row 1 CV pushed along N leaves its G1 line (and the row 2 CV's G2 plane)
+X1 = _nu.nudge(X0, {_k1}, _dir)
+_g1 = _nu.first_guides(_gd.guides(X1, 2))
+check("nudge CVs: a free push of a row 1 CV breaks its G1 guide (and the G2 one of the CV after it)",
+      not _nu.holds(_g1[_k1], _tol) and not _nu.holds(_g1[_k2], _tol), (_g1[_k1]["err"], _g1[_k2]["err"]))
+# locked: a push that leans along the hull and lifts it: the CV slides along its line, row 2 is refitted
+_held = {k for k, g in _nu.first_guides(_gd.guides(X0, 2)).items() if _nu.holds(g, _tol)}
+_push = lambda k: 0.2 * _fd["U"].reshape(-1, 3)[k] + 0.05 * _fd["N"].reshape(-1, 3)[k]
+X2 = _nu.nudge(X0, {_k1}, _push, _gd, 2, True, _held)
+_g2 = _nu.first_guides(_gd.guides(X2, 2))
+_moved = np.linalg.norm(X2 - X0, axis=1)
+_others = [k for k in range(len(X0)) if k != _k1 and k not in _row2]
+check("nudge CVs: locked, the row 1 CV slides along its G1 line, row 2 follows onto its G2 planes, "
+      "nothing else moves",
+      _moved[_k1] > 1e-3 and _g2[_k1]["err"] < 1e-9 and max(_g2[k]["err"] for k in _row2) < 1e-6
+      and _moved[_k2] > 0 and _moved[_others].max() == 0.0,
+      (_moved[_k1], _g2[_k1]["err"], max(_g2[k]["err"] for k in _row2)))
+# P: a CV put back onto its guide holds it; a whole row put on its guides = its least-squares best
+X3 = _nu.put_on(_gd, X1, [_k1], 2)
+X4 = _nu.put_on(_gd, X1 + 0.0, sorted(_row2 | {_k1}), 2)
+_g4 = _nu.first_guides(_gd.guides(X4, 2))
+check("nudge CVs: put on guide (P) brings the row 1 CV back onto its line; with row 2 every CV ends on its plane",
+      _nu.first_guides(_gd.guides(X3, 2))[_k1]["err"] < 1e-9 and max(_g4[k]["err"] for k in _row2) < 1e-6)
+# the surface itself: a locked nudge written into the cage keeps the edge G2 as measured
+_M = np.array(_ncage.matrix_world, float)
+bm = bmesh.from_edit_mesh(_ncage.data); bm.verts.ensure_lookup_table()
+for v, p in zip(bm.verts, (X2 - _M[:3, 3]) @ np.linalg.inv(_M[:3, :3]).T):
+    v.co = p
+bmesh.update_edit_mesh(_ncage.data); ctx.view_layer.update(); ncvs._process()
+_nm = _ma.measure(nuS, "U0", nuL, "U1")
+check("nudge CVs: after the locked nudge the edge measures G0 / G1 / G2 (Continuity Check)",
+      _nm["gap"] < 1e-6 and _nm["angle"] < _tol["G1"] and _nm["curv"] < _tol["G2"], _nm)
+# a target on a different layout along the edge: no guides, said why
+bpy.ops.nproto.cvs_cancel()
+_nTv, _nTU = _sa.insert_knot(_nL.transpose(1, 0, 2), list(_nU), 3, 0.3)
+nuT = _nk("NU_T", _nTv.transpose(1, 0, 2), _nUL, _nTU)      # NU_L's shape with one more knot along the edge
+nuL.hide_set(True)
+bpy.ops.object.select_all(action='DESELECT'); nuS.select_set(True); ctx.view_layer.objects.active = nuS
+bpy.ops.nproto.edit_cvs()
+_ncage = ctx.active_object
+_npart = _nu.find_partners(ctx, nuS, _nu.net_of_cage(_ncage), (_ncage,))
+check("nudge CVs: a neighbour on another layout along the edge gives no guides and says so",
+      list(_npart) == ["U0"] and _npart["U0"]["obj"] == nuT and _npart["U0"]["side"] is None
+      and "layouts" in (_npart["U0"]["why"] or "") and _nu.guides(_nu.net_of_cage(_ncage), _npart, 2) == [],
+      {e: (v["obj"].name, v["why"]) for e, v in _npart.items()})
+bpy.ops.nproto.cvs_cancel()
+nuL.hide_set(False)
 
 # Surface fillet round a cylinder through a tilted plane (the angle between them
 # goes 59 -> 121 deg round the crossing): a chord keeps the rails that far apart
