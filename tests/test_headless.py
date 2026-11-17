@@ -4776,7 +4776,7 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cy
               "patch_auto_corners", "patch_corner", "patch_remove_guide", "rebuild", "rebuild_waiting", "remove_step",
               "restore_inputs", "sync_feature", "tab_edit", "continuity", "continuity_clear", "section_add", "section_orient",
               "section_targets", "section_curves", "section_remove", "subsel_picker", "bake_feature", "delete_feature",
-              "curve_degree", "fix_clip_start", "delete_faces", "move_pivot",
+              "curve_degree", "fix_clip_start", "delete_faces", "move_pivot", "cv_nudge",
               "square"}     # Square: merged into Patch (Quad Sided); kept for older files, off the menus
 _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto)
               if n not in _not_tools and not n.startswith("workplane_")}   # the Work Planes panel's own
@@ -10333,5 +10333,207 @@ bpy.ops.nproto.cvs_cancel()
 check("move pivot on a CV cage: the surface's origin moves, the cage stays open, Cancel keeps it in place",
       _moved == [_cs.name] and _still and (Vector(_cs.location) - Vector((0.5, -5.5, 0))).length < 1e-6
       and _near(_bpts(_cs), _cs_b) < 1e-9, (_moved, _still, tuple(_cs.location), _near(_bpts(_cs), _cs_b)))
+
+# --- Nudge CVs (cvnudge.py): continuity guides at an edge that meets another surface, lock, put on guide
+from blender_nurbs import cvnudge as _nu, match as _ma, salign as _sa, cvs as ncvs
+import bmesh
+def _nk(name, G, Uu, Uv, du=3, dv=3):
+    pts = [tuple(map(float, G[i, j])) for i in range(G.shape[0]) for j in range(G.shape[1])]
+    return store.new_object(ctx, name, ext.surface_from_cvs(du, dv, pts, list(Uu), list(Uv)))
+def _nsplit(G, U, t, p=3):
+    U = list(U)
+    while U.count(t) < p:
+        G, U = _sa.insert_knot(G, U, p, t)
+    k = max(i for i, x in enumerate(U) if x == t) - p
+    return (G[:k + 1], [x / t for x in U[:k + p + 1]] + [1.0]), (G[k:], [0.0] + [(x - t) / (1 - t) for x in U[k + 1:]])
+# one surface cut at u = 0.5: NU_L | NU_S, exactly G2 across S's U0
+_nn = 7
+_nX, _nY = np.meshgrid(np.linspace(500, 504, _nn), np.linspace(0, 4, _nn), indexing="ij")
+_nG = np.stack([_nX, _nY, 0.4 * np.sin(0.8 * (_nX - 500)) * np.cos(0.6 * _nY) + 0.15 * np.sin(_nY)], 2)
+_nU = geom.clamped_uniform_knots(_nn, 3)
+(_nL, _nUL), (_nR, _nUR) = _nsplit(_nG, _nU, 0.5)
+nuL = _nk("NU_L", _nL, _nUL, _nU)
+nuS = _nk("NU_S", _nR, _nUR, _nU)
+# frames of a flat grid: N across, U / V along the hull lines
+_fr = _nu.frames(np.stack(list(np.meshgrid(np.arange(4.0), np.arange(3.0), indexing="ij")) + [np.zeros((4, 3))], 2))
+check("nudge CVs: frames of a flat grid (N = Z, U = X, V = Y)",
+      np.allclose(_fr["N"], [0, 0, 1]) and np.allclose(_fr["U"], [1, 0, 0]) and np.allclose(_fr["V"], [0, 1, 0]))
+bpy.ops.object.select_all(action='DESELECT'); nuS.select_set(True); ctx.view_layer.objects.active = nuS
+bpy.ops.nproto.edit_cvs()
+_ncage = ctx.active_object
+_nnet = _nu.net_of_cage(_ncage)
+_npart = _nu.find_partners(ctx, nuS, _nnet, (_ncage,))
+_tol = _nu.tolerances(ctx)
+_ng = _nu.guides(_nnet, _npart, 2)
+check("nudge CVs: the edge on the other surface is found, on one layout, G2 allowed; the split is on every guide",
+      list(_npart) == ["U0"] and _npart["U0"]["obj"] == nuL and _npart["U0"]["side"] is not None
+      and _npart["U0"]["max"] == 2 and len(_ng) == 3 * _nn and all(_nu.holds(g, _tol) for g in _ng),
+      ({e: (v["obj"].name, v["ref"], v["max"], v["why"]) for e, v in _npart.items()},
+       max((g["err"] for g in _ng), default=None)))
+_nix = _sa._grid_index("U0", *_nnet.G.shape[:2])
+X0 = _nnet.G.reshape(-1, 3).copy()
+_gd = _nu.Guided(_nnet, _npart)
+_j = 3
+_k1, _k2 = _nix(1, _j), _nix(2, _j)
+_row2 = {_nix(2, j) for j in range(_nn)}
+_fd = _nu.frames(_nnet.G)
+_dir = lambda k: 0.05 * _fd["N"].reshape(-1, 3)[k]
+# free: a row 1 CV pushed along N leaves its G1 line (and the row 2 CV's G2 plane)
+X1 = _nu.nudge(X0, {_k1}, _dir)
+_g1 = _nu.first_guides(_gd.guides(X1, 2))
+check("nudge CVs: a free push of a row 1 CV breaks its G1 guide (and the G2 one of the CV after it)",
+      not _nu.holds(_g1[_k1], _tol) and not _nu.holds(_g1[_k2], _tol), (_g1[_k1]["err"], _g1[_k2]["err"]))
+# locked: a push that leans along the hull and lifts it: the CV slides along its line, row 2 is refitted
+_held = {k for k, g in _nu.first_guides(_gd.guides(X0, 2)).items() if _nu.holds(g, _tol)}
+_push = lambda k: 0.2 * _fd["U"].reshape(-1, 3)[k] + 0.05 * _fd["N"].reshape(-1, 3)[k]
+X2 = _nu.nudge(X0, {_k1}, _push, _gd, 2, True, _held)
+_g2 = _nu.first_guides(_gd.guides(X2, 2))
+_moved = np.linalg.norm(X2 - X0, axis=1)
+_others = [k for k in range(len(X0)) if k != _k1 and k not in _row2]
+check("nudge CVs: locked, the row 1 CV slides along its G1 line, row 2 follows onto its G2 planes, "
+      "nothing else moves",
+      _moved[_k1] > 1e-3 and _g2[_k1]["err"] < 1e-9 and max(_g2[k]["err"] for k in _row2) < 1e-6
+      and _moved[_k2] > 0 and _moved[_others].max() == 0.0,
+      (_moved[_k1], _g2[_k1]["err"], max(_g2[k]["err"] for k in _row2)))
+# P: a CV put back onto its guide holds it; a whole row put on its guides = its least-squares best
+X3 = _nu.put_on(_gd, X1, [_k1], 2)
+X4 = _nu.put_on(_gd, X1 + 0.0, sorted(_row2 | {_k1}), 2)
+_g4 = _nu.first_guides(_gd.guides(X4, 2))
+check("nudge CVs: put on guide (P) brings the row 1 CV back onto its line; with row 2 every CV ends on its plane",
+      _nu.first_guides(_gd.guides(X3, 2))[_k1]["err"] < 1e-9 and max(_g4[k]["err"] for k in _row2) < 1e-6)
+# the surface itself: a locked nudge written into the cage keeps the edge G2 as measured
+_M = np.array(_ncage.matrix_world, float)
+bm = bmesh.from_edit_mesh(_ncage.data); bm.verts.ensure_lookup_table()
+for v, p in zip(bm.verts, (X2 - _M[:3, 3]) @ np.linalg.inv(_M[:3, :3]).T):
+    v.co = p
+bmesh.update_edit_mesh(_ncage.data); ctx.view_layer.update(); ncvs._process()
+_nm = _ma.measure(nuS, "U0", nuL, "U1")
+check("nudge CVs: after the locked nudge the edge measures G0 / G1 / G2 (Continuity Check)",
+      _nm["gap"] < 1e-6 and _nm["angle"] < _tol["G1"] and _nm["curv"] < _tol["G2"], _nm)
+# a target on a different layout along the edge: no guides, said why
+bpy.ops.nproto.cvs_cancel()
+_nTv, _nTU = _sa.insert_knot(_nL.transpose(1, 0, 2), list(_nU), 3, 0.3)
+nuT = _nk("NU_T", _nTv.transpose(1, 0, 2), _nUL, _nTU)      # NU_L's shape with one more knot along the edge
+nuL.hide_set(True)
+bpy.ops.object.select_all(action='DESELECT'); nuS.select_set(True); ctx.view_layer.objects.active = nuS
+bpy.ops.nproto.edit_cvs()
+_ncage = ctx.active_object
+_npart = _nu.find_partners(ctx, nuS, _nu.net_of_cage(_ncage), (_ncage,))
+check("nudge CVs: a neighbour on another layout along the edge gives no guides and says so",
+      list(_npart) == ["U0"] and _npart["U0"]["obj"] == nuT and _npart["U0"]["side"] is None
+      and "layouts" in (_npart["U0"]["why"] or "") and _nu.guides(_nu.net_of_cage(_ncage), _npart, 2) == [],
+      {e: (v["obj"].name, v["why"]) for e, v in _npart.items()})
+bpy.ops.nproto.cvs_cancel()
+nuL.hide_set(False)
+
+# Surface fillet round a cylinder through a tilted plane (the angle between them
+# goes 59 -> 121 deg round the crossing): a chord keeps the rails that far apart
+# all round (the ball radius changes), and a G2 blend is a closed ring, G2 to both
+from blender_nurbs.ops_sweep import continuity_report as _crt
+def _tilt_pair(tag, y):
+    ln = poly(tag + "_pl", [(-1.2, y - 1.2, -0.72), (1.2, y - 1.2, 0.72)])
+    bpy.ops.nproto.extrude(inputs=ins((ln, "S0")), distance=2.4, direction="Y")
+    pl = ctx.active_object; pl.name = tag + "_plane"
+    bpy.ops.curve.primitive_nurbs_circle_add(radius=0.3, location=(0, y, 0))
+    ci = ctx.active_object
+    bpy.ops.nproto.extrude(inputs=ins((ci, "S0")), distance=1.0, direction="NORMAL", symmetric=True)
+    cy = ctx.active_object; cy.name = tag + "_cyl"
+    return cy, pl
+def _rails_apart(o):
+    s_ = store.get_surfaces(o)[0]; (u0, u1), (v0, v1) = s_.u_domain(), s_.v_domain()
+    du = [np.linalg.norm(np.array(s_.evaluate(u, v0)) - np.array(s_.evaluate(u, v1))) for u in np.linspace(u0, u1, 97)]
+    dv = [np.linalg.norm(np.array(s_.evaluate(u0, v)) - np.array(s_.evaluate(u1, v))) for v in np.linspace(v0, v1, 97)]
+    return du if np.mean(du) > np.mean(dv) else dv
+_tc = {}
+for _tag, _shape, _rail in (("TCc", "CIRCULAR", "CHORD"), ("TCb", "BLEND", "CHORD"), ("TCr", "BLEND", "RADIUS")):
+    _cy, _pl = _tilt_pair(_tag, 1100 + 10 * len(_tc))
+    _r = bpy.ops.nproto.fillet(surf_a=_cy.name, surf_b=_pl.name, radius=0.1, shape=_shape, rail_type=_rail,
+                               continuity="2", trim_bases=True)
+    _f = ctx.active_object
+    _d = _rails_apart(_f)
+    _c = [_crt(_f, o_) or _crt(o_, _f) for o_ in (_cy, _pl)]
+    _tc[_tag] = (_r, _f, min(_d), max(_d), _c, [e["op"] for e in features.stack(_cy)], [e["op"] for e in features.stack(_pl)])
+_r, _f, _lo, _hi, _c, _s1, _s2 = _tc["TCc"]
+check("surface fillet by chord round a cylinder through a tilted plane: rails 0.1 apart all round, tangent to both, "
+      "both trimmed", _r == {'FINISHED'} and abs(_lo - 0.1) < 1e-4 and abs(_hi - 0.1) < 1e-4 and all(_c)
+      and max(c["angle"] for c in _c) < 0.05 and "fillet_trim" in _s1 and "fillet_trim" in _s2,
+      f"chord {_lo:.6f}..{_hi:.6f} {[c and round(c['angle'], 4) for c in _c]} {_s1} {_s2}")
+for _tag, _what in (("TCb", "chord"), ("TCr", "rolling ball")):
+    _r, _f, _lo, _hi, _c, _s1, _s2 = _tc[_tag]
+    check(f"surface fillet G2 blend ({_what}) round a cylinder through a tilted plane: a closed ring, G2 to both",
+          _r == {'FINISHED'} and all(_c) and max(c["gap"] for c in _c) < 1e-4 and max(c["angle"] for c in _c) < 0.05
+          and max(c["curv_diff"] for c in _c) < 0.02 and (_what != "chord" or abs(_lo - 0.1) < 1e-4 and abs(_hi - 0.1) < 1e-4),
+          f"apart {_lo:.5f}..{_hi:.5f} {[c and (round(c['gap'], 6), round(c['angle'], 4), round(c['curv_diff'], 4)) for c in _c]}")
+_f = _tc["TCb"][1]
+features.rebuild(_f, ctx, force=True)
+_c = [_crt(_f, o_) or _crt(o_, _f) for o_ in (bpy.data.objects["TCb_cyl"], bpy.data.objects["TCb_plane"])]
+check("surface fillet G2 blend by chord: a history rebuild keeps it G2 and the chord",
+      all(_c) and max(c["curv_diff"] for c in _c) < 0.02 and abs(max(_rails_apart(_f)) - 0.1) < 1e-4
+      and features.history(_f)["params"].get("blend") == 2 and features.history(_f)["params"].get("chord"),
+      f"{[c and round(c['curv_diff'], 4) for c in _c]}")
+
+# the kernel returns a crossing in pieces where it passes an edge (here the joint of a
+# two-face sheet, in the user's scene a split region's edge): the pieces are one ring
+_y2 = 1140
+_h1 = poly("TJ1_ln", [(-1.2, _y2 - 1.2, -0.72), (0.0, _y2 - 1.2, 0.0)])
+bpy.ops.nproto.extrude(inputs=ins((_h1, "S0")), distance=2.4, direction="Y"); _hs1 = ctx.active_object
+_h2 = poly("TJ2_ln", [(0.0, _y2 - 1.2, 0.0), (1.2, _y2 - 1.2, 0.72)])
+bpy.ops.nproto.extrude(inputs=ins((_h2, "S0")), distance=2.4, direction="Y"); _hs2 = ctx.active_object
+bpy.ops.object.select_all(action='DESELECT'); _hs1.select_set(True); _hs2.select_set(True)
+ctx.view_layer.objects.active = _hs1
+bpy.ops.nproto.join(); _hj = ctx.active_object; _hj.name = "TJ_sheet"
+bpy.ops.curve.primitive_nurbs_circle_add(radius=0.3, location=(0, _y2, 0))
+_hc = ctx.active_object
+bpy.ops.nproto.extrude(inputs=ins((_hc, "S0")), distance=1.0, direction="NORMAL", symmetric=True)
+_hcy = ctx.active_object
+_r = bpy.ops.nproto.fillet(surf_a=_hcy.name, surf_b=_hj.name, radius=0.1, shape="CIRCULAR", rail_type="CHORD",
+                           trim_bases=True)
+_f = ctx.active_object
+_d = _rails_apart(_f)
+_c = [_crt(_f, o_) or _crt(o_, _f) for o_ in (_hcy, _hj)]
+check("surface fillet by chord across a joined sheet's joint (the crossing in two pieces): one closed ring, "
+      "rails 0.1 apart all round, tangent to both",
+      _r == {'FINISHED'} and store.get_brep(_hj).face_count() == 2 and abs(min(_d) - 0.1) < 1e-4
+      and abs(max(_d) - 0.1) < 1e-4 and all(_c) and max(c["angle"] for c in _c) < 0.05
+      and np.linalg.norm(np.array(store.get_surfaces(_f)[0].evaluate(0.0, 0.5))
+                         - np.array(store.get_surfaces(_f)[0].evaluate(1.0, 0.5))) < 1e-9,
+      f"faces {store.get_brep(_hj).face_count()} chord {min(_d):.6f}..{max(_d):.6f} {[c and round(c['angle'], 4) for c in _c]}")
+
+# Edge fillet by chord along an edge whose angle changes (a twisted wall on a floor,
+# about 70 -> 110 deg): exact sections keep the rails the chord apart all along
+_fl = poly("ECf_ln", [(0, 1180, 0), (0, 1184, 0)])
+bpy.ops.nproto.extrude(inputs=ins((_fl, "S0")), distance=2.0, direction="X"); _ecf = ctx.active_object
+_w0 = poly("ECw0", [(2, 1180, 0), (2, 1184, 0)]); _w1 = poly("ECw1", [(2.6, 1180, 1.6), (1.4, 1184, 1.6)])
+bpy.ops.nproto.loft(inputs=ins((_w0, "S0"), (_w1, "S0"))); _ecw = ctx.active_object
+bpy.ops.object.select_all(action='DESELECT'); _ecf.select_set(True); _ecw.select_set(True)
+ctx.view_layer.objects.active = _ecf
+bpy.ops.nproto.join(); _ecj = ctx.active_object
+_n_shared = len(store.shared_edges(_ecj))
+_r = fillet_all(_ecj, shape="CIRCULAR", radius=0.3, rail_type="CHORD")
+_eb = store.get_brep(_ecj); _M = np.array(geom.world_matrix(_ecj))
+def _iso_chords(f):
+    s_ = f.surface(); (u0, v0), (u1, v1) = f.uv_domain()
+    du = [np.linalg.norm(np.array(s_.evaluate(u0, v)) - np.array(s_.evaluate(u1, v))) for v in np.linspace(v0, v1, 41)]
+    dv = [np.linalg.norm(np.array(s_.evaluate(u, v0)) - np.array(s_.evaluate(u, v1))) for u in np.linspace(u0, u1, 41)]
+    return min((du, dv), key=lambda d: abs(np.mean(d) - 0.3))
+_fd = min((_iso_chords(f) for f in _eb.faces()), key=lambda d: abs(np.mean(d) - 0.3))
+_sm = _kl()
+_angs = []
+for e_ in _eb.edges():
+    fs_ = e_.faces()
+    if len(fs_) != 2:
+        continue
+    t0_, t1_ = e_.parameter_range()
+    for t_ in np.linspace(t0_, t1_, 21)[1:-1]:
+        p_ = np.array(e_.point_at(t_)); nn_ = []
+        for f_ in fs_:
+            uv_ = _sm.surface_closest_point(f_.surface(), tuple(p_))[1][0]
+            nn_.append(np.array(f_.outward_normal_at_uv(uv_.x, uv_.y)))
+        _angs.append(math.degrees(math.acos(min(1.0, abs(nn_[0] @ nn_[1]) / np.linalg.norm(nn_[0]) / np.linalg.norm(nn_[1])))))
+check("edge fillet by chord on a twisted wall (angle 70 -> 110 deg along the edge): rails 0.3 apart all along, "
+      "tangent to both faces, one sheet",
+      _n_shared == 1 and _r == {'FINISHED'} and abs(min(_fd) - 0.3) < 1e-4 and abs(max(_fd) - 0.3) < 1e-4
+      and max(_angs) < 0.05 and _eb.face_count() == 3,
+      f"chord {min(_fd):.6f}..{max(_fd):.6f} angle {max(_angs):.4f} faces {_eb.face_count()}")
 
 print("ALL OK" if ok else "SOME FAILED")
