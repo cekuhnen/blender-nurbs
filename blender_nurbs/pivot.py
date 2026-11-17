@@ -47,9 +47,15 @@ def remember(obj):
 
 
 def _transform_text(text, A):
+    """text moved by A; turned over as well when A mirrors: Blender's Apply
+    keeps the side it showed (it turns the mesh's faces), and so does the B-rep."""
     b = store.brep_from_text(text)
     store.transform(b, A)
-    return store.brep_to_text(b)
+    text = store.brep_to_text(b)
+    if np.linalg.det(A[:3, :3]) < 0.0:
+        from .steps import flip_text
+        text = flip_text(text)
+    return text
 
 
 def apply(obj, A):
@@ -63,6 +69,11 @@ def apply(obj, A):
         s = json.loads(obj[PROP_SIG])
         M0 = np.array(s["m"], float).reshape(4, 4)
         built = obj.get(features.PROP_KEY) == features.build_key(obj, matrix=M0.tolist(), place=C)
+    mirror = np.linalg.det(A[:3, :3]) < 0.0
+    if mirror:   # turning it over renames edges (U0 / U1 swap): what is built from them keeps them (in A's frame)
+        marks = [m @ A[:3, :3].T + A[:3, 3] for m in features._edge_marks(obj)]
+        natural = store.is_natural(obj)
+        base_natural = bool(obj.get(store.PROP_UNTRIM + "_natural", natural))
     texts = {}
     for k in (store.PROP_BREP, store.PROP_UNTRIM, features.PROP_BASE):
         if isinstance(obj.get(k), str):
@@ -75,6 +86,11 @@ def apply(obj, A):
     store._cache[obj.session_uid] = (obj[store.PROP_REV], brep)
     if features.history(obj) is not None:
         features.set_placement(obj, A if C is None else A @ C)
+    if mirror:
+        features._remap_dependents(obj, marks, turned=natural)
+        entries = features.stack(obj)
+        if entries and base_natural:
+            features._swap_own(obj, entries)        # its own steps naming its edges (Match, Extend)
     if hist and built:
         obj[features.PROP_KEY] = features.build_key(obj)    # what it holds is still what a rebuild gives
     remember(obj)                                              # (the mesh Blender moved shows it already)

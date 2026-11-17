@@ -1435,13 +1435,26 @@ def placed(obj, g):
     A = placement(obj)
     if A is None:
         return g
+    turn = np.linalg.det(A[:3, :3]) < 0.0   # a mirror: turned over too, facing the side Blender showed (pivot.py)
     if isinstance(g, tuple):
         if not g or g[0] != "brep_text":
             return g                    # curves: not moved (Blender moves a curve's own points)
         b = store.brep_from_text(g[1])
         store.transform(b, A)
-        return ("brep_text", store.brep_to_text(b))
-    return store.transform(g, A)        # a fresh Surface / Brep of the builder's
+        text = store.brep_to_text(b)
+    else:
+        store.transform(g, A)           # a fresh Surface / Brep of the builder's
+        sm = _k()[0]
+        if not turn:
+            return g
+        if not isinstance(g, sm.Brep):
+            from .square import reverse_u
+            return reverse_u(g)
+        text = store.brep_to_text(g)
+    if turn:
+        from .steps import flip_text
+        text = flip_text(text)
+    return ("brep_text", text)
 
 
 def record(obj, op, inputs, params):
