@@ -1601,6 +1601,24 @@ def history_collection(context, create=True):
     return coll
 
 
+def include_history(context):
+    """Put the History collection back in the view layers that exclude it (its
+    checkbox off in the Outliner): kept inputs must stay in the view layer so
+    the Construction Tree can make them active and show them. Its eye stays
+    off, so they stay hidden. Call it from operators only (not from draw)."""
+    coll = history_collection(context, create=False)
+    if coll is None:
+        return False
+    changed = False
+    for vl in context.scene.view_layers:
+        lc = _layer_coll(vl.layer_collection, coll)
+        if lc is not None and lc.exclude:
+            lc.exclude = False
+            lc.hide_viewport = True
+            changed = True
+    return changed
+
+
 def _layer_coll(lc, coll):
     if lc.collection is coll:
         return lc
@@ -1615,6 +1633,7 @@ def keep_inputs(context, objs):
     """Hide the inputs a result was built from in the NURBS History collection
     (their old collections are remembered for Restore Inputs)."""
     coll = history_collection(context)
+    include_history(context)
     for o in objs:
         homes = [c.name for c in o.users_collection if c is not coll]
         if homes:
@@ -1641,6 +1660,7 @@ def set_shown(context, obj, show):
     the hidden History collection, so showing it also links it to the scene
     collection for the moment; hiding it again takes that link away."""
     coll = history_collection(context, create=False)
+    include_history(context)
     kept = coll is not None and obj.name in coll.objects
     scol = context.scene.collection
     if show and kept and not keepers_of(obj):

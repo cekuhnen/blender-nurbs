@@ -252,14 +252,20 @@ class NPROTO_OT_history_focus(bpy.types.Operator):
             subsel.clear_tree_pick()           # clicked again: nothing picked in the list
             _redraw(context)
             return {'FINISHED'}
-        _focus(context, obj, self.root, self.reveal)
+        if not _focus(context, obj, self.root, self.reveal):
+            self.report({'WARNING'}, f"{obj.name} is not in this view layer (its collection is excluded)")
+            return {'CANCELLED'}
         obj.nproto_step.focus = False          # the object itself: its feature and all steps
         return {'FINISHED'}
 
 
 def _focus(context, obj, root, reveal=False):
     """Make obj active (a hidden input stays hidden: its edges are drawn as a
-    ghost) and keep root's tree shown."""
+    ghost) and keep root's tree shown. False when obj can't be made active:
+    it is in no collection of this view layer."""
+    features.include_history(context)          # kept inputs live there; its checkbox may be off
+    if obj.name not in context.view_layer.objects:
+        return False
     if reveal:
         features.set_shown(context, obj, True)
     for o in context.selected_objects:
@@ -274,6 +280,7 @@ def _focus(context, obj, root, reveal=False):
     subsel.TREE_PICK["name"] = obj.name        # drawn blue while it stays the active one
     context.scene["nproto_tree_root"] = root or obj.name
     _redraw(context)
+    return True
 
 
 def _redraw(context):
@@ -302,7 +309,9 @@ class NPROTO_OT_tree_step(bpy.types.Operator):
             subsel.clear_tree_pick()           # clicked again: the step closes, nothing picked
             _redraw(context)
             return {'FINISHED'}
-        _focus(context, obj, self.root)
+        if not _focus(context, obj, self.root):
+            self.report({'WARNING'}, f"{obj.name} is not in this view layer (its collection is excluded)")
+            return {'CANCELLED'}
         sync_step(obj, self.index)
         obj.nproto_step.focus = True           # the panel shows just this step
         return {'FINISHED'}
