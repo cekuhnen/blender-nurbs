@@ -6,6 +6,8 @@ result is rebuilt on a short timer so dragging stays responsive. Results that
 are themselves inputs propagate downstream in dependency order.
 """
 
+import time
+
 import bpy
 from bpy.app.handlers import persistent
 
@@ -16,6 +18,16 @@ _just_built = set()  # rebuilt by us: their own mesh update must not re-trigger
 _held = set()       # rebuilds Pause Rebuild holds back (inputs that changed meanwhile)
 _busy = False
 _DELAY = 0.08
+_last_change = [0.0]  # when an input last changed (time.monotonic): slow rebuilds wait for a pause after it
+
+
+def _wait(obj, scene):
+    """How long obj's rebuild waits for its inputs to be still (seconds): a live SubD to BREP body the scene's
+    SubD Wait (its solve takes a while: not on every step of a drag), every other feature 0."""
+    if '"subd_to_brep"' not in str(obj.get(features.PROP_HIST, "")):
+        return 0.0
+    s = getattr(scene, "nproto_settings", None)
+    return float(getattr(s, "subd_delay", 0.3)) if s is not None else 0.3
 
 
 def _dependents_map(scene):
@@ -57,6 +69,7 @@ def _on_depsgraph(scene, depsgraph):
         return
     if hit:
         _dirty.update(hit)
+        _last_change[0] = time.monotonic()
         if not bpy.app.timers.is_registered(_process):
             bpy.app.timers.register(_process, first_interval=_DELAY)
 
@@ -87,6 +100,22 @@ def _process():
         return None
     # pull in downstream dependents of everything we rebuild
     deps = _dependents_map(scene)
+    # the slow ones (live SubD bodies) wait until their inputs have been still a while, and so does what is
+    # built from them; the rest goes now
+    still = time.monotonic() - _last_change[0]
+    later, stack = set(), []
+    for n in _dirty:
+        o = scene.objects.get(n)
+        if o is not None and still < _wait(o, scene):
+            later.add(n)
+            stack.append(n)
+    while stack:
+        for d in deps.get(stack.pop(), ()):
+            if d not in later:
+                later.add(d)
+                stack.append(d)
+    if later:
+        _dirty.difference_update(later)
     todo = set(_dirty)
     stack = list(todo)
     while stack:
@@ -95,6 +124,7 @@ def _process():
             if d not in todo:
                 todo.add(d)
                 stack.append(d)
+    todo -= later
     _dirty.clear()
     _busy = True
     try:
@@ -106,6 +136,11 @@ def _process():
                 print(f"NURBS history: rebuild of {obj.name} failed: {exc}")
     finally:
         _busy = False
+    if later:
+        _dirty.update(later)
+        left = max(_wait(scene.objects[n], scene) for n in later if scene.objects.get(n) is not None) - \
+            (time.monotonic() - _last_change[0])
+        return max(left, 0.02)          # (the timer runs again then)
     return None
 
 

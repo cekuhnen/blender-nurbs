@@ -34,7 +34,7 @@ import numpy as np
 from bpy.props import BoolProperty, EnumProperty, FloatProperty
 from mathutils import Matrix
 
-from . import jobs, store
+from . import features, jobs, store
 
 SPANS = (4, 8)              # G1, G2: even spans per face and direction (CVs straight from the cage subdivided that far)
 SLIVER_KNOT = 1 / 512       # a knot this far from each end of an edge at a star point frees the face corners there
@@ -73,6 +73,56 @@ def cage(obj, depsgraph):
     if all(len(f) == 4 for f in F):                 # (triangles / n-gons: build() splits them, MacroConverter)
         sharp = with_borders(F, sharp)
     return V, F, sharp, obj.matrix_world.copy()
+
+
+def _plain_cage(obj):
+    """Nothing but the Subdivision modifier(s) and what comes after them: the cage is the mesh itself."""
+    if obj.data.shape_keys:
+        return False
+    for m in obj.modifiers:
+        if m.type == 'SUBSURF':
+            return True
+        if m.show_viewport:
+            return False
+    return True
+
+
+def live_cage(obj, depsgraph=None):
+    """(V, F, sharp) of obj's cage, as cage() gives it, read straight from the mesh (in Edit Mode from the mesh
+    being edited) when no modifier comes before Subdivision: nothing re-evaluated, quick enough for a drag."""
+    if not _plain_cage(obj):
+        return cage(obj, depsgraph or bpy.context.evaluated_depsgraph_get())[:3]
+    me = obj.data
+    if obj.mode == 'EDIT':
+        import bmesh
+        bm = bmesh.from_edit_mesh(me)
+        bm.verts.ensure_lookup_table()
+        V = np.array([v.co for v in bm.verts], float)
+        F = [tuple(v.index for v in f.verts) for f in bm.faces]
+        lay = bm.edges.layers.float.get("crease_edge")
+        sharp = {tuple(sorted(v.index for v in e.verts)) for e in bm.edges if e[lay] >= 0.999} if lay else set()
+    else:
+        V = np.empty(len(me.vertices) * 3)
+        me.vertices.foreach_get("co", V)
+        V = V.reshape(-1, 3)
+        F = [tuple(p.vertices) for p in me.polygons]
+        cr = me.attributes.get("crease_edge")
+        sharp = {tuple(sorted(e.vertices)) for e, d in zip(me.edges, cr.data) if d.value >= 0.999} if cr else set()
+    F = [tuple(int(x) for x in f) for f in F]
+    if all(len(f) == 4 for f in F):
+        sharp = with_borders(F, sharp)
+    return V, F, sharp
+
+
+def cage_key(obj):
+    """Fingerprint of a SubD object's cage and Boundary Smooth: what a live SubD to BREP body is built from."""
+    import hashlib
+    V, F, sharp = live_cage(obj)
+    h = hashlib.sha1(np.round(np.asarray(V, float), 12).tobytes())
+    h.update(str(F).encode())
+    h.update(str(sorted(sharp)).encode())
+    h.update(str(keeps_corners(obj)).encode())
+    return h.hexdigest()
 
 
 def keeps_corners(obj):
@@ -1470,28 +1520,35 @@ def _length(context, x):
     return bpy.utils.units.to_string(us.system, 'LENGTH', x * (us.scale_length or 1.0), precision=3)
 
 
-def build(V, F, sharp, g2=True, angle_tol=0.05, curv_tol=0.02, degree=None, keep_corners=False):
+def build(V, F, sharp, g2=True, angle_tol=0.05, curv_tol=0.02, degree=None, keep_corners=False, fast=False,
+          prev=None, checks=True):
     """(nets, knots, stats, conv) for a cage: faces without a star corner bicubic
     (the SubD exactly), the others 2 x 2 pieces joined exactly, of degree 6 in
     G2, 5 in G1 (subd_g2); the joins measured as Continuity Check would. A cage
     with triangles or n-gons: one face per quad, the n-gons split (MacroConverter,
     T-junctions where they meet quads); if that cannot be solved, every face
     split by one subdivision step. keep_corners: a border vertex of one face
-    stays put (Boundary Smooth: Keep Corners)."""
+    stays put (Boundary Smooth: Keep Corners). fast: G2 holds each star point's first ring (subd_g2's
+    hold_jet): one solve step fewer, a little further from the SubD on some cages. prev: the solver's
+    info["state"] from the last build of this cage (same faces, creases and settings): only the faces near the
+    vertices that moved are solved again. checks False: the joins and the distance to the SubD are not
+    measured (a live rebuild: nobody reads them)."""
     if any(len(f) != 4 for f in F):
         try:
-            return _build(MacroConverter(V, F, sharp, angle_tol, curv_tol, keep_corners), g2, macro=True, degree=degree)
+            return _build(MacroConverter(V, F, sharp, angle_tol, curv_tol, keep_corners), g2, macro=True, degree=degree,
+                          fast=fast, checks=checks)
         except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
             V2, F2, s2 = refine_any(np.asarray(V, float), F, sharp, keep_corners)
             F2 = [tuple(int(x) for x in f) for f in F2]
             nets, knots, st, conv = _build(Converter(V2, F2, with_borders(F2, s2), angle_tol, curv_tol, keep_corners),
-                                           g2, degree=degree)
+                                           g2, degree=degree, fast=fast, checks=checks)
             st["layout_fallback"] = str(exc)
             return nets, knots, st, conv
-    return _build(Converter(V, F, sharp, angle_tol, curv_tol, keep_corners), g2, degree=degree)
+    return _build(Converter(V, F, sharp, angle_tol, curv_tol, keep_corners), g2, degree=degree, fast=fast, prev=prev,
+                  checks=checks)
 
 
-def _build(conv, g2, macro=False, degree=None):
+def _build(conv, g2, macro=False, degree=None, fast=False, prev=None, checks=True):
     """degree: of the faces by star points (G2: 6, or 5 for a lighter net; G1: 5); None: the mode's own."""
     import sys
     from . import subd_g2
@@ -1499,7 +1556,9 @@ def _build(conv, g2, macro=False, degree=None):
     if conv.irr:
         try:
             nets, knots, info = subd_g2.build(sys.modules[__name__], conv, g2=g2, kernel=store._k()[1],
-                                              opts={"degree": degree} if degree else None)
+                                              opts=dict({"degree": degree} if degree else {},
+                                                        **({"hold_jet": True} if fast else {}),
+                                                        **({"prev": prev} if prev is not None else {})))
         except (RuntimeError, ValueError, np.linalg.LinAlgError, AttributeError) as exc:
             if macro:                                              # the earlier joints know quads only
                 raise RuntimeError(str(exc)) from exc
@@ -1511,13 +1570,14 @@ def _build(conv, g2, macro=False, degree=None):
         nets = conv.natural(0, sliver=False)
         knots = list(conv.fk)
     six = {f for f, (ku, _) in enumerate(knots) if np.count_nonzero(ku == ku[0]) > 4}
-    edges = {e for e, uses in conv.joins() if any(u[0] in six for u in uses)}   # the others join as the SubD does: C2
-    ends, every = conv.edge_jumps(nets, knots, CHECK_ENDS, edges=edges, also_ends=True)
+    edges = {e for e, uses in conv.joins() if any(u[0] in six for u in uses)} if checks else set()   # the others: C2
+    ends, every = conv.edge_jumps(nets, knots, CHECK_ENDS, edges=edges, also_ends=True) if checks else ({}, {})
     st = {"normal": max((j for j, _ in ends.values()), default=0.0),
           "normal_all": max((j for j, _ in every.values()), default=0.0),
           "curvature": max((j for j, _ in conv.curvature_jumps(nets, knots, edges=edges).values()), default=0.0)
-          if g2 else None,
-          "deviation": subd_g2.deviation(sys.modules[__name__], conv, nets, knots) if six and not fallback else conv.deviation,
+          if g2 and checks else None,
+          "deviation": (subd_g2.deviation(sys.modules[__name__], conv, nets, knots) if six and not fallback else conv.deviation)
+          if checks else None,
           "cvs": sum(n.shape[0] * n.shape[1] for n in nets), "star_points": len(conv.irr), "split": len(six),
           "faces": len(nets), "t_junctions": len(conv.tedges),
           "degree": max((int(np.count_nonzero(knots[f][0] == 0.0)) - 1 for f in six), default=3),
@@ -1525,22 +1585,59 @@ def _build(conv, g2, macro=False, degree=None):
     return nets, knots, st, conv
 
 
-def convert(context, obj, angle_tol=0.05, g2=True, curv_tol=0.02, degree=None, keep_corners=None):
-    """(new NURBS object, summary text, note) for a SubD (or any quad) mesh object. keep_corners: the border
-    corners stay put (None: as the object's Subdivision modifier's Boundary Smooth says)."""
-    V, F, sharp, M = cage(obj, context.evaluated_depsgraph_get())
+# the last solve per SubD object: converting it again after moving some cage vertices re-solves only the faces
+# near them (same faces, creases and settings; anything else solves it all)
+_LAST = {}
+
+
+def _solve(obj, V, F, sharp, angle_tol, g2, curv_tol, degree, keep_corners, fast, reuse, checks=True):
+    """(brep text, nets, knots, stats, conv, worker info) for obj's cage."""
     if not F:
         raise RuntimeError("the mesh has no faces")
     if keep_corners is None:
         keep_corners = keeps_corners(obj)
-    nets, knots, st, conv = build(V, F, sharp, g2, angle_tol, curv_tol, degree, keep_corners)
+    sig = (tuple(F), frozenset(sharp), g2, degree, keep_corners, fast)
+    last = _LAST.get(obj.name) if reuse else None
+    nets, knots, st, conv = build(V, F, sharp, g2, angle_tol, curv_tol, degree, keep_corners, fast,
+                                  prev=last[1] if last is not None and last[0] == sig else None, checks=checks)
+    state = (st.get("solver") or {}).pop("state", None)
+    if state is not None:
+        _LAST[obj.name] = (sig, state)
     patches = [{"net": [list(map(float, c)) for c in net.reshape(-1, 3)], "ku": list(map(float, ku)),
                 "kv": list(map(float, kv)), "degree": int(np.count_nonzero(ku == ku[0])) - 1}
                for net, (ku, kv) in zip(nets, knots)]
     tol = 1e-5 * conv.size
     info, breps = jobs.run("mesh_to_brep", {}, ["result"], xform=None, faces=[], cylinders=[], fillets=[],
-                           sweeps=[], patches=patches, tol=tol)
-    new = store.new_object_text(context, obj.name + " BREP", breps["result"], Matrix(M))
+                           sweeps=[], patches=patches, tol=tol, persistent=True)
+    return breps["result"], nets, knots, st, conv, info
+
+
+@features.builder("subd_to_brep")
+def build_subd_to_brep(inputs, p):
+    """Live SubD to BREP: the body again from its SubD object's cage as it is now (only the faces near the
+    vertices that moved solved again, see Local Re-solve)."""
+    src = inputs[0][0]
+    V, F, sharp = live_cage(src)
+    text = _solve(src, V, F, sharp, p.get("angle", 0.05), p.get("g2", True), p.get("curvature", 0.02),
+                  p.get("degree"), p.get("keep_corners"), p.get("fast", False), p.get("reuse", True), checks=False)[0]
+    return ("brep_text", text)
+
+
+def convert(context, obj, angle_tol=0.05, g2=True, curv_tol=0.02, degree=None, keep_corners=None, fast=False,
+            reuse=True, live=False):
+    """(new NURBS object, summary text, note) for a SubD (or any quad) mesh object. keep_corners: the border
+    corners stay put (None: as the object's Subdivision modifier's Boundary Smooth says). reuse: start from the
+    object's last conversion and solve again only near the vertices that moved since. live: the body keeps
+    its construction history: it follows the SubD's cage (edits, also in Edit Mode) and its creases."""
+    M = obj.matrix_world.copy()
+    V, F, sharp = live_cage(obj, context.evaluated_depsgraph_get())
+    text, nets, knots, st, conv, info = _solve(obj, V, F, sharp, angle_tol, g2, curv_tol, degree, keep_corners,
+                                               fast, reuse)
+    new = store.new_object_text(context, obj.name + " BREP", text, Matrix(M))
+    if live:
+        features.record(new, "subd_to_brep", [(obj, "")],
+                        {"angle": angle_tol, "g2": g2, "curvature": curv_tol, "degree": degree,
+                         "keep_corners": keep_corners, "fast": fast, "reuse": reuse})
     for coll in obj.users_collection:
         if new.name not in coll.objects:
             coll.objects.link(new)
@@ -1558,6 +1655,9 @@ def convert(context, obj, angle_tol=0.05, g2=True, curv_tol=0.02, degree=None, k
     else:
         layout, near, at_points = "one bicubic span each", "exactly the SubD surface", ""
     tj = f" ({st['t_junctions']} T-junctions by the n-gons)" if st["t_junctions"] else ""
+    loc = (st.get("solver") or {}).get("local")
+    if loc and not loc["fallback"]:
+        tj += f" · {loc['faces']} of {loc['of']} star faces solved again"
     summary = (f"{len(nets)} faces{tj} · {layout} · {st['cvs']:,} CVs · G1 within {st['normal']:.3f}°{at_points}"
                + (f" · G2 within {100 * st['curvature']:.2f}%" if g2 else "") + f" · {near}")
     notes = [] if info.get("solid") or conv.open else ["the faces did not close into a solid"]
@@ -1614,6 +1714,19 @@ class NPROTO_OT_subd_to_brep(bpy.types.Operator):
                                                                  "place, whatever its modifier says; a grid then "
                                                                  "converts to bicubic faces only, as a NURBS surface "
                                                                  "would be")])
+    live: BoolProperty(name="Live Link", default=True,
+                       description="The body keeps following its SubD: move cage vertices (also in Edit Mode) or "
+                                   "change creases and it is built again, only near what moved (Local Re-solve); "
+                                   "trims and fillets on it are applied again on top. Bake it to cut the link")
+    reuse: BoolProperty(name="Local Re-solve", default=True,
+                        description="Converting the same SubD again after moving some cage vertices: only the "
+                                    "faces near them are solved again, the rest kept from the last conversion "
+                                    "(still exact; same faces, creases and settings, else all of it)")
+    fast: BoolProperty(name="Fast", default=False,
+                       description="G2: shape each star point's first ring of CVs directly (one curvature shared by "
+                                   "its faces) and solve only the rest: about a third faster, still exactly G2; "
+                                   "on some cages closer to the SubD, on others up to twice as far. Not used on "
+                                   "cages with triangles or n-gons")
     hide_original: BoolProperty(name="Hide Meshes", default=True,
                                 description="Hide the SubD objects in the viewport and in renders (they stay)")
 
@@ -1629,8 +1742,11 @@ class NPROTO_OT_subd_to_brep(bpy.types.Operator):
         col.prop(self, "angle")
         if self.continuity == "G2":
             col.prop(self, "degree", expand=True)
+            col.prop(self, "fast")
             col.prop(self, "curvature")
         col.prop(self, "boundary")
+        col.prop(self, "reuse")
+        col.prop(self, "live")
         col.prop(self, "hide_original")
 
     @classmethod
@@ -1647,7 +1763,8 @@ class NPROTO_OT_subd_to_brep(bpy.types.Operator):
                 new, summary, note = convert(context, src, self.angle, g2=g2, curv_tol=self.curvature / 100.0,
                                              degree=int(self.degree) if g2 else None,
                                              keep_corners=None if self.boundary == "MODIFIER"
-                                             else self.boundary == "PRESERVE_CORNERS")
+                                             else self.boundary == "PRESERVE_CORNERS",
+                                             fast=g2 and self.fast, reuse=self.reuse, live=self.live)
             except (jobs.JobError, RuntimeError, np.linalg.LinAlgError) as exc:
                 warn.append(f"{src.name}: not converted ({exc})")
                 continue
@@ -1682,4 +1799,5 @@ def register():
 
 
 def unregister():
+    jobs.shutdown()                       # (the worker kept for SubD to BREP)
     bpy.types.VIEW3D_MT_object_convert.remove(menu_convert)
