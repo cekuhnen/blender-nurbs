@@ -812,8 +812,8 @@ def _orient_fillet(f, bases):
 def job_fillet(job):
     """Surface fillet. A rolling-ball circle or chamfer: the kernel's fillet.
     With job['chord'] (the rails that far apart, the ball radius changing
-    with the angle between the surfaces) or job['blend'] (1 / 2: a G1 / G2
-    blend between the rolling ball's rails): built from exact sections
+    with the angle between the surfaces) or job['blend'] (1 / 2 / 3: a G1 / G2 /
+    G3 blend between the rolling ball's rails): built from exact sections
     (secfillet.py). Either way the bases are trimmed back to its rails."""
     A = world_brep(job, "a_base" if "a_base" in job["breps"] else "a")
     B = world_brep(job, "b_base" if "b_base" in job["breps"] else "b")
@@ -826,7 +826,7 @@ def job_fillet(job):
         import secfillet
         sa = 1.0 if float(job["radius_a"]) >= 0 else -1.0
         sb = 1.0 if float(job["radius_b"]) >= 0 else -1.0
-        shape = {1: "G1", 2: "G2"}.get(blend) or ("LINEAR" if int(job["xsect"]) == 0 else "CIRCULAR")
+        shape = {1: "G1", 2: "G2", 3: "G3"}.get(blend) or ("LINEAR" if int(job["xsect"]) == 0 else "CIRCULAR")
         f, info = secfillet.build(sm, A, B, sa, sb, abs(float(job["radius_a"])), abs(float(job["radius_b"])),
                                   chord=float(chord) if chord else None, shape=shape,
                                   tolerance=float(job.get("tolerance", 1e-4)))
@@ -1393,10 +1393,11 @@ def job_untrim_region(job):
     if drop:
         ext.delete_faces(b, drop)
     b = heal_cut_seams(b, unt)
-    save(to_local(b, job.get("xforms", {}).get("untrimmed")), job["out"]["result"])
-    left = sum(1 for e in b.edges() if _edge_poly(e, 9)
+    left = sum(1 for e in b.edges() if _edge_poly(e, 9)       # (world, as on_own: before to_local moves b)
                and not all(on_own(p) for p in np.array(_edge_poly(e, 9))[1:-1]))
-    return {"faces": b.face_count(), "area": b.area(1e-6), "cuts_left": left,
+    n_faces, area = b.face_count(), b.area(1e-6)
+    save(to_local(b, job.get("xforms", {}).get("untrimmed")), job["out"]["result"])
+    return {"faces": n_faces, "area": area, "cuts_left": left,
             "restored": float(sum(faces[i].area(1e-6) for gi in back for i in groups[gi]))}
 
 
@@ -1898,7 +1899,7 @@ def job_edge_fillet(job):
     r1 = job.get("end_radius")
     chord_info = chord_note = None
     if job.get("chord") and not (r1 is not None and abs(float(r1) - r0) > 1e-12):
-        shape = {0: "LINEAR", 1: "CIRCULAR"}.get(xsect) or {1: "G1", 2: "G2"}.get(int(job.get("continuity", 1)))
+        shape = {0: "LINEAR", 1: "CIRCULAR"}.get(xsect) or {1: "G1", 2: "G2", 3: "G3"}.get(int(job.get("continuity", 1)))
         sec, chord_note = None, None
         if shape and abs(float(job.get("thumbweight", 1.0)) - 1.0) < 1e-9:
             try:
@@ -1983,12 +1984,12 @@ def job_edge_fillet(job):
             r = _shrink_planes(r, lambda f: on_in(f) and any(not on_in(g) for e in f.edges() for g in e.faces()))
     except Exception:
         pass
+    ch = _measured_chords(b_ring, r) if chord_info is not None else None    # (world: before to_local moves r)
     save(to_local(r, job.get("xforms", {}).get("target")), job["out"]["result"])
     out = {"edges": len(sel), "faces": r.face_count(), "solid": solid, "new_faces": new_faces,
            "rings": [{k: v for k, v in g.items() if k != "at"} for g in rings], "rims_only": rims_only}
     if chord_info is not None:
         out["radius"] = r0
-        ch = _measured_chords(b_ring, r)
         if ch is not None:
             out["chord"] = ch
             if chord_note and ch[2] - ch[0] > 1e-3 * ch[1]:     # one radius is exact where the angle holds

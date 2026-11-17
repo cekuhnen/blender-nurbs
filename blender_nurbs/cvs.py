@@ -9,10 +9,10 @@ the original B-rep; both remove the cage.
 
 Leaving Edit Mode on the cage (Tab) is the same as Done.
 
-Construction history stays until a CV actually moves: Done after a real edit
-removes it (the edit can't be replayed when the inputs change), while looking
-at the CVs, Cancel, or Done without a change keep it -- and keep the B-rep
-exactly as it was (no re-lift of the trim edges).
+Construction history stays: Done after a real edit adds a CV Tweak step
+(cvtweak.py) that replays the moves when the inputs change. Looking at the
+CVs, Cancel, or Done without a change add nothing and keep the B-rep exactly
+as it was (no re-lift of the trim edges).
 """
 
 import json
@@ -254,8 +254,8 @@ def finish_cage(cage, view_layer=None):
     surf_obj = bpy.data.objects.get(cage[CAGE_OF])
     if surf_obj is not None:
         if rebuild_from_cage(cage) and features.has_history(surf_obj):
-            features.clear_history(surf_obj)
-            print(f"NURBS: {surf_obj.name}: construction history removed (CVs moved)")
+            from . import cvtweak
+            cvtweak.keep_edit(surf_obj, cage)
     _modes.pop(cage.name, None)
     me = cage.data
     bpy.data.objects.remove(cage)
@@ -264,7 +264,8 @@ def finish_cage(cage, view_layer=None):
     if surf_obj is not None:
         vl = view_layer or bpy.context.view_layer
         for o in vl.objects:
-            if o.select_get():
+            # (the removed cage can still sit in the list as None until the layer updates)
+            if o is not None and o.select_get():
                 o.select_set(False)
         try:
             surf_obj.select_set(True)
@@ -321,16 +322,17 @@ def _process():
 
 def _end(context, cage, keep):
     """Remove the cage, keeping the edit (keep) or restoring the surface.
-    Returns (surface object, True when its history was removed)."""
+    Returns (surface object, "step" when the edit became a CV Tweak step,
+    "cleared" when it could not and the history was removed, else None)."""
     surf_obj = bpy.data.objects.get(cage[CAGE_OF])
     if context.object is not None and context.object.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
-    dropped = False
+    dropped = None
     if surf_obj is not None:
         if keep and rebuild_from_cage(cage, context):
             if features.has_history(surf_obj):
-                features.clear_history(surf_obj)
-                dropped = True
+                from . import cvtweak
+                dropped = cvtweak.keep_edit(surf_obj, cage, context)
         elif not keep:
             _restore(surf_obj, cage, context)
     _modes.pop(cage.name, None)
@@ -381,8 +383,8 @@ class NPROTO_OT_edit_cvs(bpy.types.Operator):
                     self.report({'WARNING'}, f"{obj.name}: {why}")
                     return {'CANCELLED'}
                 if features.has_history(obj):
-                    self.report({'INFO'}, f"{obj.name}: moving a CV bakes it -- its construction history goes "
-                                          "(Cancel, or leaving without a change, keeps it)")
+                    self.report({'INFO'}, f"{obj.name}: CV moves become a CV Tweak step in its history "
+                                          "(Cancel, or leaving without a change, adds none)")
                 if context.object is not None and context.object.mode != 'OBJECT':
                     bpy.ops.object.mode_set(mode='OBJECT')
                 cage = make_cage(context, obj)
@@ -409,9 +411,12 @@ class NPROTO_OT_cvs_done(bpy.types.Operator):
         cage = _active_cage(context)
         if cage is None:
             return {'CANCELLED'}
-        surf_obj, dropped = _end(context, cage, keep=True)
-        if dropped:
-            self.report({'INFO'}, f"{surf_obj.name}: construction history removed (CVs moved)")
+        surf_obj, kept = _end(context, cage, keep=True)
+        if kept == "step":
+            self.report({'INFO'}, f"{surf_obj.name}: CV Tweak added to its history")
+        elif kept == "cleared":
+            self.report({'WARNING'}, f"{surf_obj.name}: the CV edit could not be recorded -- "
+                                     "construction history removed")
         return {'FINISHED'}
 
 

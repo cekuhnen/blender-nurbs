@@ -8,8 +8,10 @@ the feet). The feet are the rails. Chord: one radius per section, found so
 that the rails are exactly the chord apart (the angle between the surfaces
 changes along the crossing, so the radius does). Between the rails the
 section is a circular arc (exact, rational), a straight chamfer, or a G1
-cubic / G2 quintic blend: tangent to each surface square across the rail
-and, G2, with its normal curvature in that direction.
+cubic / G2 quintic / G3 degree-7 blend: tangent to each surface square
+across the rail and, G2, with its normal curvature in that direction; G3
+also with the rate that curvature changes at (the surface's third-order
+form, from the exact third derivatives of its CV net).
 
 The sections are skinned through, in homogeneous coordinates (rational arcs
 stay exact), periodic round a closed crossing; a section is added halfway
@@ -22,7 +24,7 @@ import math
 
 import numpy as np
 
-SHAPES = ("CIRCULAR", "LINEAR", "G1", "G2")
+SHAPES = ("CIRCULAR", "LINEAR", "G1", "G2", "G3")
 MAX_SECTIONS = 400
 ANGLE_TOL = math.radians(0.02)       # surface normal vs a surface's along a rail (labels: 0.1 deg)
 
@@ -53,6 +55,70 @@ def _basis(U, p, t):
             M[i] = a + b
         N = M
     return N
+
+
+def _basis_ders(U, p, t, nd):
+    """[N, N', ..., N^(nd)]: the degree-p basis values and their derivatives
+    at t (each len(U) - p - 1), from the lower degrees' values."""
+    U = np.asarray(U, float)
+    m = len(U) - 1
+    N = np.zeros(m)
+    if t >= U[-1]:
+        k = max(i for i in range(m) if U[i] < U[i + 1])
+    else:
+        k = int(np.searchsorted(U, t, side="right") - 1)
+    N[k] = 1.0
+    levels = [N]
+    for d in range(1, p + 1):
+        i = np.arange(m - d)
+        a, b = U[i + d] - U[i], U[i + d + 1] - U[i + 1]
+        lo = np.divide((t - U[i]) * N[:-1], a, out=np.zeros(m - d), where=a > 0)
+        hi = np.divide((U[i + d + 1] - t) * N[1:], b, out=np.zeros(m - d), where=b > 0)
+        N = lo + hi
+        levels.append(N)
+    out = []
+    for r in range(nd + 1):
+        if r > p:
+            out.append(np.zeros(m - p))
+            continue
+        D = levels[p - r]
+        for d in range(p - r + 1, p + 1):
+            i = np.arange(len(D) - 1)
+            a, b = U[i + d] - U[i], U[i + d + 1] - U[i + 1]
+            D = d * (np.divide(D[:-1], a, out=np.zeros(len(i)), where=a > 0)
+                     - np.divide(D[1:], b, out=np.zeros(len(i)), where=b > 0))
+        out.append(D)
+    return out
+
+
+class _Exact:
+    """A kernel surface's partial derivatives up to the third, exact from
+    its CV net (rational: the quotient rule)."""
+
+    def __init__(self, ext, surf):
+        d = ext.surface_cvs(surf)
+        self.p, self.q = int(d["degree_u"]), int(d["degree_v"])
+        nu, nv = int(d["count_u"]), int(d["count_v"])
+        self.U, self.V = list(d["knots_u"]), list(d["knots_v"])
+        P = np.asarray(d["points"], float).reshape(nu, nv, 3)
+        w = d.get("weights")
+        W = np.asarray(w, float).reshape(nu, nv) if w else np.ones((nu, nv))
+        self.Pw = np.concatenate([P * W[..., None], W[..., None]], axis=2)
+
+    def ders(self, u, v):
+        """{(k, l): d^(k+l) S / du^k dv^l} for k + l <= 3."""
+        Bu, Bv = _basis_ders(self.U, self.p, u, 3), _basis_ders(self.V, self.q, v, 3)
+        A = {(k, l): np.einsum("i,j,ijc->c", Bu[k], Bv[l], self.Pw)
+             for k in range(4) for l in range(4 - k)}
+        S = {}
+        for k, l in sorted(A, key=sum):
+            x = A[k, l][:3].copy()
+            for i in range(k + 1):
+                for j in range(l + 1):
+                    if i or j:
+                        x -= math.comb(k, i) * math.comb(l, j) * A[i, j][3] * S[k - i, l - j]
+            S[k, l] = x / A[0, 0][3]
+        return S
 
 
 def _insert(P, U, p, t):
@@ -144,6 +210,24 @@ class Base:
             except Exception:
                 self.orient.append(1.0)
         self.side = float(side)
+        self._exact = {}
+
+    def curvature_rate(self, where, n, t):
+        """(normal curvature, its rate dk/ds) in the unit tangent direction t
+        (sign: along n), exact: k = II(t, t), dk/ds = C(t, t, t) -- along the
+        parameter line through the point with c' = t, n.c''' - 3 II(t, P c'')."""
+        fi, u, v = where
+        if fi not in self._exact:
+            self._exact[fi] = _Exact(self.sm.blender_ext, self.surfs[fi])
+        D = self._exact[fi].ders(u, v)
+        J = np.array([D[1, 0], D[0, 1]]).T
+        a, c = np.linalg.lstsq(J, t, rcond=None)[0]
+        H = np.array([[D[2, 0] @ n, D[1, 1] @ n], [D[1, 1] @ n, D[0, 2] @ n]])
+        c2 = a * a * D[2, 0] + 2 * a * c * D[1, 1] + c * c * D[0, 2]
+        c3 = a ** 3 * D[3, 0] + 3 * a * a * c * D[2, 1] + 3 * a * c * c * D[1, 2] + c ** 3 * D[0, 3]
+        b = np.linalg.lstsq(J, c2 - (c2 @ n) * n, rcond=None)[0]
+        ac = np.array([a, c])
+        return float(ac @ H @ ac), float(c3 @ n - 3.0 * (ac @ H @ b))
 
     def face_of(self, q):
         if len(self.faces) == 1:
@@ -417,6 +501,19 @@ def section_rows(x, shape, A, B):
     if shape == "G1":
         h = d / 3.0
         return 3, np.array([h1(pa), h1(pa + h * ta), h1(pb + h * tb), h1(pb)])
+    if shape == "G3":
+        # degree 7, h = d / 7: C'(0) = 7 h ta, C''(0) = 42 (P2 - 2 P1 + P0) = (7 h)^2 k n,
+        # C'''(0) = 210 (P3 - 3 P2 + 3 P1 - P0) = (7 h)^3 k' n (its part in the
+        # tangent plane is a reparameterisation: 0) -- each side the same way
+        h = d / 7.0
+        rows = []
+        for p, t, n, base, where in ((pa, ta, x.na, A, x.wa), (pb, tb, x.nb, B, x.wb)):
+            k, k3 = base.curvature_rate(where, n, t)
+            P1 = p + h * t
+            P2 = p + 2 * h * t + (7.0 / 6.0) * h * h * k * n
+            P3 = 3 * P2 - 3 * P1 + p + (343.0 / 210.0) * h ** 3 * k3 * n
+            rows.append([p, P1, P2, P3])
+        return 7, np.array([h1(q) for q in rows[0] + rows[1][::-1]])
     # G2 quintic: C'(0) = 5 h ta, C''(0) . n = 25 h^2 k  ->  P2 = P0 + 2 h ta + 1.25 h^2 k n
     h = d / 5.0
     ka = A.normal_curvature(x.wa, x.na, ta)

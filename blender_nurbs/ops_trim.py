@@ -443,6 +443,7 @@ class NPROTO_OT_trim(bpy.types.Operator):
         if self.action == "SPLIT":
             other = store.new_object_text(context, tgt.name + "_split", breps["DELETE"], geom.world_matrix(tgt))
             other[store.PROP_UNTRIM] = tgt[store.PROP_UNTRIM]
+            other[store.PROP_UNTRIM + "_natural"] = tgt.get(store.PROP_UNTRIM + "_natural", 0)
             if keep_history:  # same history, last step keeps the other side
                 features.copy_history(tgt, other)
                 entries = features.stack(other)
@@ -456,8 +457,21 @@ class NPROTO_OT_trim(bpy.types.Operator):
 TRIM_OPS = {"trim", "fillet_trim", "untrim_region"}
 
 
+def _split_piece(o):
+    """A piece of a Split with history: its feature gives the trimmed piece,
+    so untrims are history steps (set straight on it, a rebuild undoes them)."""
+    return store.is_nurbs(o) and features.untrimmed_base(o) is not None
+
+
 def untrim_all(o, context):
     """Back to the surface before its first trim. False: nothing to undo."""
+    if _split_piece(o):
+        if store.is_natural(o):
+            return False
+        entries = [e for e in features.stack(o) if e["op"] not in TRIM_OPS | {"untrim"}]
+        features._write_stack(o, [{"op": "untrim", "inputs": [], "params": {}}] + entries)
+        features.rebuild(o, context, force=True)
+        return True
     if store.is_nurbs(o) and features.PROP_STACK in o and any(
             e["op"] in ("trim", "fillet_trim") for e in features.stack(o)):
         features.remove_steps(o, TRIM_OPS)
@@ -499,7 +513,18 @@ def _trim_history(o):
 
 
 def _untrimmable(o):
+    if _split_piece(o):
+        return not store.is_natural(o)
     return store.is_nurbs(o) and (store.PROP_UNTRIM in o or _trim_history(o))
+
+
+def _untrim_reference(o):
+    """(untrimmed text, as a history step?) for Untrim Region on o."""
+    if _split_piece(o):
+        return steps.untrim_reference(o), True
+    if _trim_history(o):
+        return features.base_text(o), True
+    return o[store.PROP_UNTRIM], False
 
 
 class NPROTO_OT_untrim_region(bpy.types.Operator):
@@ -518,9 +543,8 @@ class NPROTO_OT_untrim_region(bpy.types.Operator):
     def untrim(self, context, obj, point=None, points=None):
         """Give back the area at the cut edge nearest `point`, or the areas
         nearest `points`. Returns an error text or None."""
-        hist = _trim_history(obj)
         try:
-            untrimmed = features.base_text(obj) if hist else obj[store.PROP_UNTRIM]
+            untrimmed, hist = _untrim_reference(obj)
             text, info = steps.untrim_region_text(obj[store.PROP_BREP], untrimmed, jobs.xform(obj), point, points)
         except (jobs.JobError, KeyError) as exc:
             return str(exc)
@@ -576,7 +600,7 @@ class NPROTO_OT_untrim_region(bpy.types.Operator):
         context.window.cursor_set('WAIT')
         for o in objs:
             try:
-                untrimmed = features.base_text(o) if _trim_history(o) else o[store.PROP_UNTRIM]
+                untrimmed, _ = _untrim_reference(o)
                 for text, pt in steps.untrim_preview(o[store.PROP_BREP], untrimmed, jobs.xform(o)):
                     tris, border = steps.region_mesh(text, o.matrix_world)
                     self._regions.append({"target": o.name, "point": pt, "tris": tris, "border": border})
@@ -716,10 +740,12 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
     shape: EnumProperty(name="Shape", items=[
         ("CIRCULAR", "Circular", "Exact circular cross-section"),
         ("CHAMFER", "Chamfer", "Straight (linear) cross-section"),
-        ("BLEND", "Blend", "Free-form blend, G1 or G2 to both surfaces"),
+        ("BLEND", "Blend", "Free-form blend, G1, G2 or G3 to both surfaces"),
     ], default="CIRCULAR")
     continuity: EnumProperty(name="Continuity", items=[("1", "G1", "Tangent to both surfaces"),
-                                                       ("2", "G2", "Curvature continuous to both surfaces")],
+                                                       ("2", "G2", "Curvature continuous to both surfaces"),
+                                                       ("3", "G3", "Curvature continuous, and changing at the "
+                                                               "surfaces' rate (degree 7 across)")],
                              default="2")
     rail_type: EnumProperty(name="Rail", items=[
         ("RADIUS", "Rolling Ball", "The size is the radius of a ball rolling between the faces"),
@@ -949,7 +975,7 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
                 self.radius_b = self.radius
             self._field = 0
         elif ch == "g" and self.shape == "BLEND":
-            self.continuity = "1" if self.continuity == "2" else "2"
+            self.continuity = {"1": "2", "2": "3"}.get(self.continuity, "1")
         elif ch == "t":
             self.trim_bases = not self.trim_bases
         else:
@@ -966,7 +992,7 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
                            hints.cycle("R", ["rolling ball", "chord"],
                                        "rolling ball" if self.rail_type == "RADIUS" else "chord", "size"),
                            hints.toggle("S", "same radius", self.same_radius)]
-                 + ([hints.cycle("G", ["G1", "G2"], "G" + self.continuity)] if self.shape == "BLEND" else [])),
+                 + ([hints.cycle("G", ["G1", "G2", "G3"], "G" + self.continuity)] if self.shape == "BLEND" else [])),
                 ("Side", [hints.key("A", "other side of A"), hints.key("B", "other side of B"),
                           hints.toggle("T", "trim the surfaces", self.trim_bases)])]
         return rows
@@ -1516,6 +1542,8 @@ class NPROTO_OT_split(bpy.types.Operator):
         for name, (inputs, info, pieces) in results.items():
             tgt = bpy.data.objects[name]
             original = tgt.get(store.PROP_UNTRIM, tgt[store.PROP_BREP])
+            original_nat = tgt.get(store.PROP_UNTRIM + "_natural", 0) if store.PROP_UNTRIM in tgt \
+                else (1 if store.is_natural(tgt) else 0)
             if not keep:                  # no history: the first piece stays in the surface itself
                 _frozen(tgt, self)
                 store.set_geometry_text(tgt, pieces[0][0], context)
@@ -1524,6 +1552,7 @@ class NPROTO_OT_split(bpy.types.Operator):
             for i, (text, idx) in enumerate(pieces if keep else pieces[1:], 1):
                 o = store.new_object_text(context, f"{name}_split{i}", text, geom.world_matrix(tgt))
                 o[store.PROP_UNTRIM] = original
+                o[store.PROP_UNTRIM + "_natural"] = original_nat
                 if tgt.data.materials:
                     for m in tgt.data.materials:
                         o.data.materials.append(m)
@@ -2094,8 +2123,8 @@ def surface_fillet_sections(P, NA, NB, ra, rb, sa, sb, shape="CIRCULAR", k=9, co
     """Cross-sections (n, k, 3) of a fillet between two crossing surfaces,
     rail on A first: the ball (radius ra from A, rb from B; an equal pair is
     the rolling ball's arc), a straight chamfer, or a blend tangent to both
-    (the worker's G1 cubic / G2 quintic, secfillet.py, with the surfaces'
-    curvature left out)."""
+    (the worker's G1 cubic / G2 quintic / G3 degree 7, secfillet.py, with the
+    surfaces' curvature left out)."""
     n = len(P)
     ra = np.broadcast_to(np.asarray(ra, float), (n,))
     rb = np.broadcast_to(np.asarray(rb, float), (n,))
@@ -2112,12 +2141,10 @@ def surface_fillet_sections(P, NA, NB, ra, rb, sa, sb, shape="CIRCULAR", k=9, co
         tb = -D - np.sum(-D * B, axis=1, keepdims=True) * B
         ta /= np.linalg.norm(ta, axis=1, keepdims=True) + 1e-300
         tb /= np.linalg.norm(tb, axis=1, keepdims=True) + 1e-300
-        deg = 3 if int(continuity) == 1 else 5
+        deg = {1: 3, 3: 7}.get(int(continuity), 5)
         h = d / deg
-        if deg == 3:
-            cv = [T1, T1 + h * ta, T2 + h * tb, T2]
-        else:
-            cv = [T1, T1 + h * ta, T1 + 2 * h * ta, T2 + 2 * h * tb, T2 + h * tb, T2]
+        k = (deg + 1) // 2                          # CVs from each side: on along its tangent
+        cv = [T1 + i * h * ta for i in range(k)] + [T2 + i * h * tb for i in range(k)][::-1]
         from math import comb
         return sum(comb(deg, i) * w ** i * (1 - w) ** (deg - i) * c[:, None] for i, c in enumerate(cv))
     a, b = -A, -B                                    # centre -> rails, unit

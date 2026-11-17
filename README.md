@@ -74,7 +74,7 @@ everything built from it rebuilds.
   continuity to the neighbours carries over; seams where the patches meet with a kink stay sharp (or Smooth).
   Gap, angle and curvature checks show in the panel; trimmed patches fall back to a projected grid (G0 edges)
 - **Trim and join:** Trim, Split, Untrim, Join, Unjoin
-- **Fillets:** Surface Fillet, Edge Fillet
+- **Fillets:** Surface Fillet, Edge Fillet (circular, chamfer, or blends G1 to G3)
 - **Solids:** Union, Difference, Intersection, Boundary Fill
 
 ### Analyze

@@ -1777,6 +1777,28 @@ def history(obj):
     return h
 
 
+SPLIT_OPS = {"split_region"}     # features whose result is a piece trimmed out of their first input
+
+
+def untrimmed_base(obj):
+    """(text, natural) of the surface a split piece was cut out of -- what
+    Untrim and Untrim Region give back -- in obj's local space; None when
+    obj's feature is not a split (or lost its input)."""
+    h = history(obj)
+    if h is None or h["op"] not in SPLIT_OPS or not h["inputs"]:
+        return None
+    src = h["inputs"][0][0]
+    text = src.get(store.PROP_UNTRIM)
+    if text:
+        nat = bool(src.get(store.PROP_UNTRIM + "_natural", 0))
+    else:
+        text, nat = src.get(store.PROP_BREP), store.is_natural(src)
+    if not text:
+        return None
+    g = placed(obj, ("brep_text", text))      # the split's pieces are in the split surface's local space
+    return g[1], nat
+
+
 NATURAL_STEPS = {"refit_trim", "merge_patches", "rebuild_surface", "extend_surface"}   # result is an untrimmed surface
 KEEP_STEPS = {"flip_normal"}     # result is plain / trimmed exactly when its input was
 PROP_STACK = "nproto_stack"   # JSON list of in-place steps: {"op", "refs", "params"}
@@ -2285,11 +2307,21 @@ def _rebuild_inner(obj, context, h, entries, steps, turned):
     # Flip Normal keeps a surface as it is (plain or trimmed): look past it
     core = [e for e in active if e["op"] not in KEEP_STEPS]
     flips = sum(1 for e in active if e["op"] == "flip_normal") % 2
-    if (core and core[-1]["op"] in NATURAL_STEPS) or (not core and natural):
+    if core and core[-1]["op"] == "untrim":   # a split piece back to the surface it was cut out of
+        whole = untrimmed_base(obj)
+        obj[store.PROP_NATURAL] = 1 if whole is None or whole[1] else 0
+        if store.PROP_UNTRIM in obj:
+            del obj[store.PROP_UNTRIM]
+    elif (core and core[-1]["op"] in NATURAL_STEPS) or (not core and natural):
         obj[store.PROP_NATURAL] = 1          # a plain surface (again)
         if store.PROP_UNTRIM in obj:
             del obj[store.PROP_UNTRIM]
-    elif entries:
+    elif entries or (h is not None and h["op"] in SPLIT_OPS):
+        # a split piece's untrimmed surface is the one it was cut out of (as it
+        # is now: it follows that surface), not the piece the split gives
+        whole = untrimmed_base(obj) if h is not None else None
+        if whole is not None:
+            base_text, natural = whole
         if flips and natural:                # Untrim gives the surface facing the same way
             try:
                 base_text = steps.flip_text(base_text)
