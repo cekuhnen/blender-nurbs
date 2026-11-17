@@ -1118,6 +1118,28 @@ sb = store.get_brep(tube2)
 vol = sb.volume(1e-6) if sb.is_manifold_solid() else 0.0
 check("join: tube + 2 caps = closed solid", r == {'FINISHED'} and sb.is_manifold_solid() and abs(abs(vol) - math.pi * 0.25 * 2) < 1e-3,
       f"solid={sb.is_manifold_solid()} volume={vol:.5f} (pi*r^2*h={math.pi*0.25*2:.5f})")
+# a trimmed upright cylinder and an elbow built G2 into it along the trim arch
+# (from a user's boot model): faces that touch tangentially along their edge.
+# Join copies the faces in and stitches; intersecting them first (a MERGE
+# boolean) failed outright or came back with the cylinder's face destroyed
+import gzip
+with gzip.open(os.path.join(ROOT, "tests", "data", "join_tangent_elbow.json.gz"), "rt") as _f:
+    _tg = json.load(_f)
+for _rev in (False, True):           # either one active (receives the result)
+    _perm = [store.new_object_text(ctx, "TG_" + k, t) for k, t in _tg.items()]
+    _perm = _perm[::-1] if _rev else _perm
+    _tga = sorted(round(store.get_brep(o).faces()[0].area(), 4) for o in _perm)
+    bpy.ops.object.select_all(action='DESELECT')
+    for o in _perm:
+        o.select_set(True)
+    ctx.view_layer.objects.active = _perm[-1]
+    r = bpy.ops.nproto.join()
+    _tb = store.get_brep(ctx.active_object)
+    _sh = sum(1 for e in _tb.edges() if len(e.faces()) == 2)
+    check("join: tangent elbow + trimmed cylinder keep both faces whole, arch stitched",
+          r == {'FINISHED'} and _tb.face_count() == 2 and sorted(round(f.area(), 4) for f in _tb.faces()) == _tga
+          and _sh >= 4, f"faces={_tb.face_count()} shared={_sh} areas={[round(f.area(), 4) for f in _tb.faces()]} vs {_tga}")
+    bpy.data.objects.remove(ctx.active_object)
 
 # --- Edge fillet -----------------------------------------------------------
 def make_L(tag, loc=(0, 0, 0)):
