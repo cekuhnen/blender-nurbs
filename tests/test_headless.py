@@ -1765,6 +1765,20 @@ check("continuity labels: click steps the side and the square rebuilds; step bac
       r == {'FINISHED'} and _after == _cl.next_value(_cl.ORDER, _before, 1) and r2 == {'FINISHED'}
       and features.history(sqo)["params"]["e1"] == _before and store.get_brep(sqo).face_count() == 1,
       f"{_before} -> {_after} -> {features.history(sqo)['params']['e1']}")
+# the label's click operator must not be an UNDO operator: Blender's redo of the last operator (the
+# feature's Adjust Last Operation panel) run inside one pushes no step for the redone feature, and the
+# next click's redo then restores the scene from before an OLDER step of the same name (all later
+# work gone: "Input object 'Extrude.001' not found"). The history edit is its own UNDO operator.
+_gz_ops = set(_cl.NPROTO_GGT_cont_labels._sync.__code__.co_consts)
+_before = features.history(sqo)["params"]["e1"]
+r = bpy.ops.nproto.click_continuity(obj_name=sqo.name, index=1)
+_after = features.history(sqo)["params"]["e1"]
+bpy.ops.nproto.cycle_continuity(obj_name=sqo.name, index=1, step=-1)
+check("continuity labels: the click operator has no UNDO flag, the history edit has; the gizmos run the click",
+      'UNDO' not in _cl.NPROTO_OT_click_continuity.bl_options and 'UNDO' in _cl.NPROTO_OT_cycle_continuity.bl_options
+      and "nproto.click_continuity" in _gz_ops and "nproto.cycle_continuity" not in _gz_ops
+      and r == {'FINISHED'} and _after == _cl.next_value(_cl.ORDER, _before, 1)
+      and features.history(sqo)["params"]["e1"] == _before, f"{r} {_before} -> {_after}")
 _c1 = nurbs("CL_A", [(0, 500, 0), (1, 500, 0.3), (2, 500, 0)]); _c2 = nurbs("CL_B", [(0, 502, 0), (1, 502, -0.3), (2, 502, 0)])
 bpy.ops.nproto.loft(inputs=ins((_c1, "S0"), (_c2, "S0"))); _lo = ctx.active_object
 _lf = _cl.labels(_lo)
@@ -4728,7 +4742,7 @@ for _op in set(_in_panels):
         getattr(bpy.ops.nproto, _op.split(".")[1]).get_rna_type()
     except Exception:
         _missing.append(_op)
-_not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "cycle_continuity", "delete_history", "collect_inputs", "export_step",
+_not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cycle_continuity", "delete_history", "collect_inputs", "export_step",
               "import_step", "open_step", "history_focus", "history_toggle_hide", "tree_step", "step_unfocus", "mute_step", "patch_add_guides",
               "patch_auto_corners", "patch_corner", "patch_remove_guide", "rebuild", "rebuild_waiting", "remove_step",
               "restore_inputs", "sync_feature", "tab_edit", "continuity", "continuity_clear", "section_add", "section_orient",
@@ -10187,5 +10201,39 @@ _pfree.location = (4, 4, 4)
 ctx.view_layer.update()
 check("moving a NURBS object leaves its B-rep alone", not pivot.check(_pfree)
       and _near(_bpts(_pfree), _pf_b + np.array([1, 2, 3])) < 1e-9)
+
+# Mirror (Ctrl+M, a negative scale) then Apply Scale: the surface keeps the side Blender showed (its B-rep is turned
+# over with the mesh), and a G2 blend built from its edge keeps that edge (its ref follows the renumbering)
+_pm1 = nurbs("PivMir1", [(5, 0, 0), (5, 1, 0)], order=2)
+_pm2 = nurbs("PivMir2", [(6, 0, 1), (6, 1, 1)], order=2)
+bpy.ops.nproto.extrude(inputs=ins((_pm1, "S0")), distance=-0.5, direction="Z"); _pme1 = ctx.active_object
+bpy.ops.nproto.extrude(inputs=ins((_pm2, "S0")), distance=0.5, direction="Z"); _pme2 = ctx.active_object
+bpy.ops.nproto.loft(inputs=ins((_pme1, f"E{_edge_of(_pme1, 0.0)}"), (_pme2, f"E{_edge_of(_pme2, 1.0)}")),
+                    cont_a="G2", cont_b="G2")
+_pml = ctx.active_object
+def _shown(o):
+    N = o.matrix_world.to_3x3().inverted().transposed()
+    return (N @ sum((q.normal for q in o.data.polygons), Vector())).normalized()
+def _brep_n(o):
+    f_ = store.get_brep(o).faces()[0]; (a_, b_), (c_, d_) = f_.uv_domain()
+    n_ = Vector(f_.outward_normal_at_uv((a_ + b_) / 2, (c_ + d_) / 2))
+    return (geom.world_matrix(o).to_3x3().inverted().transposed() @ n_).normalized()
+bpy.ops.object.select_all(action='DESELECT')
+_pme2.select_set(True); ctx.view_layer.objects.active = _pme2
+bpy.ops.transform.mirror(orient_type='LOCAL', constraint_axis=(True, False, False))
+ctx.view_layer.update()
+features.rebuild(_pml, ctx, force=True)
+_pml_w, _pme2_w, _pme2_n = _wpts(_pml), _wpts(_pme2), _shown(_pme2)
+bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+ctx.view_layer.update()
+_pm_ok = (_shown(_pme2).dot(_pme2_n) > 0.999 and _brep_n(_pme2).dot(_pme2_n) > 0.999
+          and _near(_wpts(_pme2), _pme2_w) < 1e-6)
+features.rebuild(_pme2, ctx, force=True)
+features.rebuild(_pml, ctx, force=True)
+ctx.view_layer.update()
+check("mirror + apply scale: same side shown and in the B-rep, rebuilds and the G2 blend stay in place",
+      _pm_ok and _shown(_pme2).dot(_pme2_n) > 0.999 and _brep_n(_pme2).dot(_pme2_n) > 0.999
+      and _near(_wpts(_pme2), _pme2_w) < 1e-6 and _near(_wpts(_pml), _pml_w) < 1e-6 and _near(_pml_w, _wpts(_pml)) < 1e-6,
+      (_pm_ok, tuple(_shown(_pme2)), tuple(_brep_n(_pme2)), _near(_wpts(_pml), _pml_w), features.history(_pml)["refs"]))
 
 print("ALL OK" if ok else "SOME FAILED")
