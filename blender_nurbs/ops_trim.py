@@ -702,9 +702,10 @@ def fit_radius(op, objs, names):
 
 
 class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
-    """Fillet or chamfer between two surfaces (select both). Where they cross,
-    the fillet is previewed with a radius arrow: drag it, type a value, A / B
-    put it on the other side of a surface, click away or Enter to make it"""
+    """Fillet or chamfer between two surfaces: select both, or click them.
+    Where they cross, the fillet is previewed with a radius arrow: drag it,
+    type a value, A / B put it on the other side of a surface (where there is
+    room), click away or Enter to make it"""
     bl_idname = "nproto.fillet"
     bl_label = "Fillet / Chamfer"
     bl_options = {'REGISTER', 'UNDO'}
@@ -736,16 +737,99 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
                              description="Trim both surfaces back to the fillet rails")
 
     def invoke(self, context, event):
-        sel = [o for o in context.selected_objects if store.is_nurbs(o)]
-        if len(sel) != 2:
-            self.report({'WARNING'}, "Select exactly two NURBS surfaces")
-            return {'CANCELLED'}
-        act = context.active_object
-        sel.sort(key=lambda o: o == act)  # active = B
-        self.surf_a, self.surf_b = sel[0].name, sel[1].name
+        given = [bpy.data.objects.get(n) for n in (self.surf_a, self.surf_b) if n]
+        if not (len(given) == 2 and all(o is not None and store.is_nurbs(o) for o in given)):
+            sel = [o for o in context.selected_objects if store.is_nurbs(o)]
+            if len(sel) != 2:
+                # one selected surface is A: click the other; none or many: click both
+                return self._start_surface_pick(context, sel if len(sel) == 1 else [])
+            act = context.active_object
+            sel.sort(key=lambda o: o == act)  # active = B
+            self.surf_a, self.surf_b = sel[0].name, sel[1].name
         self.fit_pending = True
         self._start_event = (event.mouse_x, event.mouse_y, event.type, event.value)
         return self.ask(context)
+
+    # -- clicking the two surfaces (nothing or one selected) -----------------
+    def _start_surface_pick(self, context, first):
+        if context.area is None or context.area.type != 'VIEW_3D' or bpy.app.background:
+            self.report({'WARNING'}, "Select two NURBS surfaces")
+            return {'CANCELLED'}
+        self._surf_picks = list(first)
+        self._sel0 = ([o.name for o in context.selected_objects],
+                      context.view_layer.objects.active.name if context.view_layer.objects.active else None)
+        self._show_picks(context)
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def _show_picks(self, context):
+        for o in context.selected_objects:
+            o.select_set(False)
+        for o in self._surf_picks:
+            o.select_set(True)
+        if self._surf_picks:
+            context.view_layer.objects.active = self._surf_picks[-1]
+        which = "A" if not self._surf_picks else "B"
+        state = [f"click surface {which}"] + ([f"A: {self._surf_picks[0].name}"] if self._surf_picks else [])
+        hints.show(context, self.bl_label, state,
+                   [("Pick", [hints.key("Backspace", "undo", on=True if self._surf_picks else False)])],
+                   [("MOUSE_LMB", "Pick"), ("EVENT_ESC", "Cancel")])
+        context.area.tag_redraw()
+
+    def _pick_modal(self, context, event):
+        from .ops import PickMixin
+        if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM',
+                          'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
+            return {'PASS_THROUGH'}
+        if event.type.startswith(("NUMPAD_", "NDOF_")) and event.type != 'NUMPAD_ENTER':
+            return {'PASS_THROUGH'}          # turning the view
+        if hints.handle(event):
+            context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+        if event.type in {'LEFTMOUSE', 'RIGHTMOUSE'} and not PickMixin._in_view(context, event):
+            return {'PASS_THROUGH'}
+        if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            obj = self._surface_under(context, event)
+            if obj is not None and obj not in self._surf_picks:
+                self._surf_picks.append(obj)
+                self._show_picks(context)
+                if len(self._surf_picks) == 2:
+                    hints.clear(context)
+                    # the value stage is a modal of its own: start the command again with both
+                    a, b = self._surf_picks
+                    bpy.ops.nproto.fillet('INVOKE_DEFAULT', surf_a=a.name, surf_b=b.name)
+                    return {'CANCELLED'}
+            return {'RUNNING_MODAL'}
+        if event.type == 'BACK_SPACE' and event.value == 'PRESS' and self._surf_picks:
+            self._surf_picks.pop()
+            self._show_picks(context)
+            return {'RUNNING_MODAL'}
+        if event.type in {'ESC', 'RIGHTMOUSE'} and event.value == 'PRESS':
+            names, act = self._sel0
+            for o in context.selected_objects:
+                o.select_set(False)
+            for n in names:
+                if n in bpy.data.objects:
+                    bpy.data.objects[n].select_set(True)
+            context.view_layer.objects.active = bpy.data.objects.get(act) if act else None
+            hints.clear(context)
+            context.area.tag_redraw()
+            return {'CANCELLED'}
+        return {'RUNNING_MODAL'}
+
+    def _surface_under(self, context, event):
+        # the 3D view's main region, whichever region the tool was started from (a sidebar button)
+        region, rv3d = self._win(context)
+        m = (event.mouse_x - region.x, event.mouse_y - region.y)
+        o = view3d_utils.region_2d_to_origin_3d(region, rv3d, m)
+        d = view3d_utils.region_2d_to_vector_3d(region, rv3d, m)
+        hit, _, _, _, obj, _ = context.scene.ray_cast(context.evaluated_depsgraph_get(), o, d)
+        return obj.original if hit and obj is not None and store.is_nurbs(obj.original) else None
+
+    def modal(self, context, event):
+        if getattr(self, "_surf_picks", None) is not None:
+            return self._pick_modal(context, event)
+        return ValueDrag.modal(self, context, event)
 
     # -- the live value stage (valuedrag.py) ----------------------------------
     fit_view = "shrink"         # the radius fit_radius found for the part: only ever made smaller
@@ -771,7 +855,29 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         if a is None or b is None:
             return False
         self._sf = surface_fillet_frames(a, b)
-        return bool(self._sf)          # surfaces that do not cross: the dialog
+        if not self._sf:
+            return False               # surfaces that do not cross: the dialog
+        try:
+            self._fits = surface_fillet_sides(a, b, self._sf, part_size([a, b]))
+        except Exception as exc:
+            print("NURBS fillet sides:", exc)
+            self._fits = {s: 1.0 for s in SIDES}
+        best = max(self._fits.values())
+        if best > 0 and self._fits[(self.flip_a, self.flip_b)] < best:
+            # the side asked for has no room (surfaces meeting at their edges):
+            # show the one the kernel's Auto Side would make
+            self.flip_a, self.flip_b = next(s for s in SIDES if self._fits[s] == best)
+        return True
+
+    def _toggle_side(self, which):
+        fa, fb = (not self.flip_a, self.flip_b) if which == "a" else (self.flip_a, not self.flip_b)
+        fits = getattr(self, "_fits", None)
+        if fits and fits[(fa, fb)] < max(fits.values()):
+            several = sum(v == max(fits.values()) for v in fits.values()) > 1
+            self._msg = (f"the other side of {which.upper()} has no room: a surface ends at the crossing"
+                         if several else "only this side has room: the surfaces end at the crossing")
+            return
+        self.flip_a, self.flip_b = fa, fb
 
     def _chord_k(self, P, NA, NB):
         """2 sin(th/2) per sample (chord = k * ball radius), th the turn between the faces."""
@@ -835,10 +941,8 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         elif ch == "r":
             self.rail_type = "CHORD" if self.rail_type == "RADIUS" else "RADIUS"
             self._field = 0
-        elif ch == "a":
-            self.flip_a = not self.flip_a
-        elif ch == "b":
-            self.flip_b = not self.flip_b
+        elif ch in ("a", "b"):
+            self._toggle_side(ch)
         elif ch == "s":
             self.same_radius = not self.same_radius
             if not self.same_radius:
@@ -1943,6 +2047,39 @@ def surface_fillet_frames(a, b, n=15):
                 acc.append(nn / (np.linalg.norm(nn) or 1.0))
         out.append((P, np.array(NA), np.array(NB)))
     return out or None
+
+
+SIDES = ((False, False), (False, True), (True, False), (True, True))    # (flip A, flip B), the kernel's order
+
+
+def surface_fillet_sides(a, b, frames, size):
+    """Which sides (flip A, flip B) have room for a fillet: {sides: share of
+    the samples where it fits}. The rails leave the crossing along the
+    surfaces (ca - A + cb on A, ca + cb - B on B); a short step that way must
+    land on the surface itself, not on its extension -- two surfaces meeting
+    at their edges (a tent) have one side, two crossing through each other
+    four."""
+    from .sweeps import _world_brep
+    wa, wb = _world_brep(a), _world_brep(b)
+    h = 0.02 * (size or 1.0)
+
+    def dist(br, p):
+        return min(f.closest_point(tuple(p))[1] for f in br.faces())
+
+    out = {}
+    for fa, fb in SIDES:
+        ok = n = 0
+        for P, NA, NB in frames:
+            idx = sorted({len(P) // 4, len(P) // 2, (3 * len(P)) // 4})
+            ca, cb, A, B = surface_fillet_rails(P[idx], NA[idx], NB[idx], -1.0 if fa else 1.0, -1.0 if fb else 1.0)
+            D1, D2 = ca - A + cb, ca + cb - B
+            for p, d1, d2 in zip(P[idx], D1, D2):
+                d1 = d1 / (np.linalg.norm(d1) or 1.0)
+                d2 = d2 / (np.linalg.norm(d2) or 1.0)
+                n += 1
+                ok += dist(wa, p + h * d1) < 0.25 * h and dist(wb, p + h * d2) < 0.25 * h
+        out[(fa, fb)] = ok / max(n, 1)
+    return out
 
 
 def surface_fillet_rails(P, NA, NB, sa, sb):
