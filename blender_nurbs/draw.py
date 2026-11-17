@@ -741,7 +741,7 @@ def _draw_px():
     font = 0
     blf.size(font, 11)
     cols = {"FREE": (0.62, 0.62, 0.62, 1), "G0": (0.9, 0.9, 0.9, 1), "G1": (0.35, 0.8, 1.0, 1),
-            "G2": (0.4, 1.0, 0.5, 1)}
+            "G2": (0.4, 1.0, 0.5, 1), "G3": (1.0, 0.82, 0.3, 1)}
     for obj in contlabels.visible_label_objects(ctx):
         for i, L in enumerate(contlabels.labels(obj)):
             q = location_3d_to_region_2d(region, rv3d, L["pos"])

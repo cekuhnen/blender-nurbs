@@ -317,7 +317,9 @@ class NprotoView(bpy.types.PropertyGroup):
                              items=[('G0', "G0", "Position: the gap between the two sides (comb = gap, magnified)"),
                                     ('G1', "G1", "Tangency: the angle between the two sides' normals (comb = angle)"),
                                     ('G2', "G2", "Curvature: the difference of the two sides' curvature across the edge "
-                                                 "(comb = difference, magnified; Curvature Combs: each side's own too)")])
+                                                 "(comb = difference, magnified; Curvature Combs: each side's own too)"),
+                                    ('G3', "G3", "Curvature rate: the difference of how fast the two sides' curvature "
+                                                 "changes across the edge (comb = difference, magnified)")])
     cont_scale: FloatProperty(name="Scale", default=1.0, min=0.02, soft_max=10.0, max=50.0,
                               update=lambda s, c: _redraw_views(c), description="Comb length: at 1 the longest hair is a fifth of the edge's length (+ / - in the tool)")
     cont_kcombs: BoolProperty(name="Curvature Combs", default=False, update=lambda s, c: _redraw_views(c),
@@ -337,6 +339,11 @@ class NprotoView(bpy.types.PropertyGroup):
                                  update=lambda s, c: _redraw_views(c),
                                  description="G2 holds while the curvature across the edge differs by no more than this, "
                                              "in percent of the largest along the edge (also used by the feature labels)")
+    cont_g3_tol: FloatProperty(name="Curvature Rate %", default=5.0, min=0.0, soft_max=50.0,
+                               update=lambda s, c: _redraw_views(c),
+                               description="G3 holds while the rate of change of the curvature across the edge differs "
+                                           "by no more than this, in percent of the largest rate on the two faces "
+                                           "(also used by the feature labels)")
     # Nudge CVs (cvnudge.py)
     cv_step: FloatProperty(name="Step", default=0.01, min=1e-7, soft_max=10.0, precision=5, unit='LENGTH',
                            description="How far one arrow key moves the CVs (Shift: a tenth, Ctrl: ten); "

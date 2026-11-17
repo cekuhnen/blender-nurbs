@@ -580,7 +580,21 @@ def compatible_curves(curves, tol=1e-7):
         raise ValueError("the sections could not be given one layout")
 
 
-_SIDE_ROWS = ("P", "D", "DD")
+_SIDE_ROWS = ("P", "D", "DD", "DDD")
+
+
+def start_coeffs(U, p, k):
+    """Weights w (k + 1,) of the k-th derivative at the start of a clamped
+    B-spline (degree p, knots U) in its first k + 1 CVs: C^(k)(U[0]) =
+    sum_i w_i P_i. The derivative CVs P^(r)_i = (p - r + 1) / (U[i+p+1] -
+    U[i+r]) (P^(r-1)_{i+1} - P^(r-1)_i), whose first one is the derivative
+    there. Zero (all weights) for k > p."""
+    W = np.eye(k + 1)
+    if k > p:
+        return np.zeros(k + 1)
+    for r in range(1, k + 1):
+        W = np.array([(p - r + 1) / (U[i + p + 1] - U[i + r]) * (W[i + 1] - W[i]) for i in range(len(W) - 1)])
+    return W[0]
 
 
 def _side_array(s):
@@ -589,7 +603,7 @@ def _side_array(s):
 
 
 def _side_from(keys, deg, knots, A):
-    out = {"deg": int(deg), "knots": [float(k) for k in knots], "P": None, "D": None, "DD": None}
+    out = {"deg": int(deg), "knots": [float(k) for k in knots], "P": None, "D": None, "DD": None, "DDD": None}
     for i, k in enumerate(keys):
         out[k] = A[:, 3 * i:3 * i + 3].copy()
     return out
@@ -1319,7 +1333,8 @@ def blend_loft_exact(sa, sb, a, b, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.
 def reverse_side(s):
     k = s["knots"]
     r = lambda A: None if A is None else A[::-1].copy()
-    return {"deg": s["deg"], "knots": [1.0 - x for x in reversed(k)], "P": r(s["P"]), "D": r(s["D"]), "DD": r(s["DD"])}
+    return {"deg": s["deg"], "knots": [1.0 - x for x in reversed(k)], "P": r(s["P"]), "D": r(s["D"]), "DD": r(s["DD"]),
+            "DDD": r(s.get("DDD"))}
 
 
 def should_flip(Pa, Pb):

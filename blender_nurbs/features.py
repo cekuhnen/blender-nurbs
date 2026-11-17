@@ -162,7 +162,7 @@ def _iso_side(ext, surf, ref, R, T):
         Ua = [lo + hi - u for u in reversed(Ua)]
     p = deg_a
     P0 = G[0]
-    D = DD = None
+    D = DD = DDD = None
     if p >= 1 and len(G) > 1:
         d1 = p / (Ua[p + 1] - Ua[1])
         Su = d1 * (G[1] - G[0])                  # dS/du at the edge (u increasing inward)
@@ -172,10 +172,13 @@ def _iso_side(ext, surf, ref, R, T):
             a1 = (G[1] - G[0]) / (Ua[p + 1] - Ua[1])
             a2 = (G[2] - G[1]) / (Ua[p + 2] - Ua[2])
             DD = p * (p - 1) / (Ua[p + 1] - Ua[2]) * (a2 - a1)
+        # third: odd, so outward is minus the inward one (zero below degree 3)
+        w3 = geom.start_coeffs(Ua, p, 3)
+        DDD = -sum(w * G[i] for i, w in enumerate(w3)) if p >= 3 and len(G) > 3 else np.zeros_like(P0)
     lo, hi = Ue[0], Ue[-1]
     knots = [(u - lo) / (hi - lo) for u in Ue]
     tw = lambda A: None if A is None else A @ R.T
-    return {"deg": int(deg_e), "knots": knots, "P": P0 @ R.T + T, "D": tw(D), "DD": tw(DD)}
+    return {"deg": int(deg_e), "knots": knots, "P": P0 @ R.T + T, "D": tw(D), "DD": tw(DD), "DDD": tw(DDD)}
 
 
 def exact_side(obj, ref):

@@ -1,6 +1,6 @@
 """Surface Align (Alias "Align" for surfaces): make one or more boundary edges
-of an untrimmed surface G0 / G1 / G2 to the neighbouring surface edge (or G0
-to a curve), by moving only the first 1 / 2 / 3 CV rows at each edge.
+of an untrimmed surface G0 / G1 / G2 / G3 to the neighbouring surface edge (or
+G0 to a curve), by moving only the first 1 / 2 / 3 / 4 CV rows at each edge.
 
 Per edge, with the edge at a = 0 of the cross direction (degree p, clamped
 knots Ua) and CV rows R0, R1, R2 along it (basis Ne along the edge):
@@ -15,6 +15,12 @@ so each condition is a linear least-squares fit of one row (end CVs exact).
       away from it; its length and its along-edge part are kept (x Tangent)
   G2  the normal part of the cross second derivative gives the neighbour's
       normal curvature in that direction; its tangential part is kept
+  G3  the normal part of the cross third derivative continues the
+      neighbour's height over its tangent plane to third order:
+          N . Saaa = 3 II(Sa, P Saa) + C(Sa, Sa, Sa)
+      (II, C: the neighbour's second / third-order forms, surfeval.forms;
+      P: the tangent part), on rows 0-2 as already set; its tangential part
+      is kept. Saaa = sum_i w_i R_i, w = geom.start_coeffs.
 When the surface has too few rows for the conditions at both ends of a
 direction, knots are inserted first (the shape does not change).
 
@@ -27,7 +33,7 @@ from mathutils import Vector
 from . import features, geom, store
 
 EDGES = ("U0", "U1", "V0", "V1")
-CONT = {"G0": 0, "G1": 1, "G2": 2}
+CONT = {"G0": 0, "G1": 1, "G2": 2, "G3": 3}
 
 
 def _k():
@@ -132,7 +138,7 @@ def target_name(t):
     return " + ".join(f"{o.name} {r}" for o, r in pieces(t))
 
 
-def _matched(side, E, mode="arc"):
+def _matched(side, E, mode="arc", want_c=False):
     """Target data at the edge points E (m, 3, uniform in the edge's parameter),
     oriented like E. mode: "arc" equal arc length, "project" closest points,
     "param" equal (normalised) parameter of edge and neighbour."""
@@ -159,6 +165,9 @@ def _matched(side, E, mode="arc"):
         out["N"] = _unit(lerp(np.asarray(side.N, float)))
         Q = np.asarray(side.Q, float).reshape(len(side.P), 9) if side.Q is not None else None
         out["Q"] = None if Q is None else lerp(Q).reshape(-1, 3, 3)
+        if want_c:
+            C = side.C
+            out["C"] = None if C is None else lerp(np.asarray(C, float).reshape(len(side.P), 27)).reshape(-1, 3, 3, 3)
     return out
 
 
@@ -171,7 +180,7 @@ def edge_conditions(G, Ua, p, Ue, q, side, cont, tangent=1.0, mode="project"):
     m = max(80, 8 * n_e)
     ts = np.linspace(Ue[q], Ue[-q - 1], m)
     Ne = basis_matrix(Ue, q, n_e, ts)
-    tg = _matched(side, Ne @ G[0], mode)
+    tg = _matched(side, Ne @ G[0], mode, want_c=cont >= 3)
     out = [[({0: Ne}, tg["P"], None)]]
     if cont >= 1:
         d1 = Ua[p + 1] - Ua[1]
@@ -196,6 +205,19 @@ def edge_conditions(G, Ua, p, Ue, q, side, cont, tangent=1.0, mode="project"):
             r = d2 / d1
             C = {2: Ne, 1: -(1 + r) * Ne, 0: r * Ne}
             out.append([(C, d2 * Saa_d / c2, None), (C, d2 * kn / c2, Nn)])
+            if cont >= 3:
+                # rows 0-2 as they are now (solved at the levels before): the
+                # curvature rate the neighbour asks of row 3
+                w3 = geom.start_coeffs(Ua, p, 3)
+                Sa0 = c1 * (Ne @ (G[1] - G[0]))
+                Saa0 = c2 * (Ne @ ((G[2] - G[1]) / d2 - (G[1] - G[0]) / d1))
+                Saaa = Ne @ sum(w3[i] * G[i] for i in range(4))
+                PSaa = Saa0 - np.sum(Saa0 * Nn, axis=1)[:, None] * Nn
+                k3 = 3.0 * np.einsum("ki,kij,kj->k", Sa0, tg["Q"], PSaa) + \
+                    np.einsum("kijl,ki,kj,kl->k", tg["C"], Sa0, Sa0, Sa0)
+                Saaa_d = Saaa - np.sum(Saaa * Nn, axis=1)[:, None] * Nn + k3[:, None] * Nn
+                C3 = {a: (w3[a] / w3[3]) * Ne for a in range(4)}
+                out.append([(C3, Saaa_d / w3[3], None), (C3, k3 / w3[3], Nn)])
     return out
 
 
@@ -291,9 +313,10 @@ def solve_joint(G, Uu, Uv, du, dv, work, sides, modes, tangent=1.0, iters=4, lam
     return G
 
 
-def check_edge(G, Ua, p, Ue, q, side, m=60):
+def check_edge(G, Ua, p, Ue, q, side, m=60, rate=False):
     """(max gap, max normal angle in degrees, max relative curvature error) of
-    the std grid's a = 0 edge against the neighbour."""
+    the std grid's a = 0 edge against the neighbour; rate: a fourth, the
+    relative curvature-rate (G3) error, None when it can't be told."""
     n_e = G.shape[1]
     ts = np.linspace(Ue[q], Ue[-q - 1], m)
     Ne = basis_matrix(Ue, q, n_e, ts)
@@ -301,10 +324,10 @@ def check_edge(G, Ua, p, Ue, q, side, m=60):
     lo, hi = np.maximum(ts - h, ts[0]), np.minimum(ts + h, ts[-1])
     dNe = (basis_matrix(Ue, q, n_e, hi) - basis_matrix(Ue, q, n_e, lo)) / (hi - lo)[:, None]
     E = Ne @ G[0]
-    tg = _matched(side, E, "project")
+    tg = _matched(side, E, "project", want_c=rate)
     gap = float(np.max(np.linalg.norm(E - tg["P"], axis=1)))
     if "N" not in tg:
-        return gap, None, None
+        return (gap, None, None, None) if rate else (gap, None, None)
     d1 = Ua[p + 1] - Ua[1]
     Sa = p / d1 * (Ne @ (G[1] - G[0]))
     Se = dNe @ G[0]
@@ -321,7 +344,28 @@ def check_edge(G, Ua, p, Ue, q, side, m=60):
         k_t = np.einsum("ki,kij,kj->k", Sa, tg["Q"], Sa) / ss
         ref = float(np.abs(k_t).max())
         kerr = float(np.abs(k_own - k_t).max() / ref) if ref > 1e-12 else float(np.abs(k_own).max())
-    return gap, ang, kerr
+    if not rate:
+        return gap, ang, kerr
+    rerr = None
+    if p >= 3 and G.shape[0] > 3 and tg.get("Q") is not None and tg.get("C") is not None:
+        # the third derivative of the neighbour's height along the edge's
+        # cross curves, per unit speed (/ |Sa|^3: invariant once G2 holds)
+        w3 = geom.start_coeffs(Ua, p, 3)
+        Saaa = Ne @ sum(w3[i] * G[i] for i in range(4))
+        sg = np.sign(np.sum(tg["N"] * n, axis=1))
+        Nn = tg["N"] * sg[:, None]
+        Q, C = tg["Q"] * sg[:, None, None], tg["C"] * sg[:, None, None, None]
+        PSaa = Saa - np.sum(Saa * Nn, axis=1)[:, None] * Nn
+        res = np.sum(Saaa * Nn, axis=1) - 3.0 * np.einsum("ki,kij,kj->k", Sa, Q, PSaa) - \
+            np.einsum("kijl,ki,kj,kl->k", C, Sa, Sa, Sa)
+        sp = np.linalg.norm(Sa, axis=1)
+        u = Sa / sp[:, None]
+        r_t = np.abs(np.einsum("kijl,ki,kj,kl->k", C, u, u, u))
+        L = float(np.sum(np.linalg.norm(np.diff(E, axis=0), axis=1))) or 1.0
+        kt = np.abs(np.einsum("ki,kij,kj->k", u, Q, u))
+        ref3 = max(float(r_t.max()), max(float(kt.max()), 0.05 / L) / L)
+        rerr = float(np.max(np.abs(res) / sp ** 3) / ref3)
+    return gap, ang, kerr, rerr
 
 
 # --------------------------------------------------------------------------
@@ -356,6 +400,10 @@ def align_text(obj, text, jobs_, tangent=1.0, report=None, measure_only=False):
             c = 0                        # a curve only gives position
             if report is not None:
                 report.append(f"{edge}: {target_name(tgt)} is a curve, aligned G0")
+        if c >= 3 and getattr(sd, "C", None) is None:
+            c = 2                        # no third-order form (a chain of edges, no CV net)
+            if report is not None:
+                report.append(f"{edge}: {target_name(tgt)} has no curvature rate to follow, aligned G2")
         sides[edge] = sd
         work.append((edge, c))
     cmap = dict(work)
@@ -390,12 +438,14 @@ def align_text(obj, text, jobs_, tangent=1.0, report=None, measure_only=False):
     if report is not None:
         for edge, c in work:
             Gs, Ua, Ue, p, q = _to_std(G, Uu, Uv, du, dv, edge)
-            gap, ang, kerr = check_edge(Gs, Ua, p, Ue, q, sides[edge])
+            gap, ang, kerr, rerr = check_edge(Gs, Ua, p, Ue, q, sides[edge], rate=True)
             msg = f"{edge} G{c}: gap {gap:.2g}"
             if ang is not None and c >= 1:
                 msg += f", angle {ang:.2g}°"
             if kerr is not None and c >= 2:
                 msg += f", curvature {100 * kerr:.2g}%"
+            if c >= 3:
+                msg += ", curvature rate " + ("n/a" if rerr is None else f"{100 * rerr:.2g}%")
             report.append(msg)
     if measure_only:
         return text
@@ -549,7 +599,8 @@ from . import draw as _draw  # noqa: E402
 
 _ITEMS = [("G0", "G0", "Position: the edge lies on the neighbour edge"),
           ("G1", "G1", "Tangent to the neighbouring surface"),
-          ("G2", "G2", "Curvature continuous with the neighbouring surface")]
+          ("G2", "G2", "Curvature continuous with the neighbouring surface"),
+          ("G3", "G3", "Curvature rate continuous with the neighbouring surface (degree 3 or more across)")]
 
 
 def _cont_prop(edge):
@@ -647,7 +698,7 @@ class EdgePicking(PickMixin):
 
 
 class NPROTO_OT_surface_align(EdgePicking, bpy.types.Operator):
-    """Align boundary edges of an untrimmed surface G0 / G1 / G2 to the surfaces they
+    """Align boundary edges of an untrimmed surface G0 / G1 / G2 / G3 to the surfaces they
     touch (moves only the CV rows at those edges). Pick one or more edges of the
     surface (Enter to finish); picking another surface's edge right after one sets
     its target, otherwise the touching edge is found"""

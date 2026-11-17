@@ -1791,7 +1791,7 @@ r = bpy.ops.nproto.cycle_continuity(obj_name=sqo.name, index=1)
 _after = features.history(sqo)["params"]["e1"]
 r2 = bpy.ops.nproto.cycle_continuity(obj_name=sqo.name, index=1, step=-1)
 check("continuity labels: click steps the side and the square rebuilds; step back restores",
-      r == {'FINISHED'} and _after == _cl.next_value(_cl.ORDER, _before, 1) and r2 == {'FINISHED'}
+      r == {'FINISHED'} and _after == _cl.next_value(_lb[1]["values"], _before, 1) and r2 == {'FINISHED'}
       and features.history(sqo)["params"]["e1"] == _before and store.get_brep(sqo).face_count() == 1,
       f"{_before} -> {_after} -> {features.history(sqo)['params']['e1']}")
 # the label's click operator must not be an UNDO operator: Blender's redo of the last operator (the
@@ -1806,7 +1806,7 @@ bpy.ops.nproto.cycle_continuity(obj_name=sqo.name, index=1, step=-1)
 check("continuity labels: the click operator has no UNDO flag, the history edit has; the gizmos run the click",
       'UNDO' not in _cl.NPROTO_OT_click_continuity.bl_options and 'UNDO' in _cl.NPROTO_OT_cycle_continuity.bl_options
       and "nproto.click_continuity" in _gz_ops and "nproto.cycle_continuity" not in _gz_ops
-      and r == {'FINISHED'} and _after == _cl.next_value(_cl.ORDER, _before, 1)
+      and r == {'FINISHED'} and _after == _cl.next_value(_lb[1]["values"], _before, 1)
       and features.history(sqo)["params"]["e1"] == _before, f"{r} {_before} -> {_after}")
 _c1 = nurbs("CL_A", [(0, 500, 0), (1, 500, 0.3), (2, 500, 0)]); _c2 = nurbs("CL_B", [(0, 502, 0), (1, 502, -0.3), (2, 502, 0)])
 bpy.ops.nproto.loft(inputs=ins((_c1, "S0"), (_c2, "S0"))); _lo = ctx.active_object
@@ -3946,12 +3946,12 @@ _mlab = _cl.labels(maS)
 _r1 = bpy.ops.nproto.cycle_continuity(obj_name=maS.name, index=0) if _mlab else None
 _cl._cache.clear()
 _mlab2 = _cl.labels(maS)
-_r2 = bpy.ops.nproto.cycle_continuity(obj_name=maS.name, index=0, step=-1) if _mlab2 else None   # back from G0 to G2
+_r2 = bpy.ops.nproto.cycle_continuity(obj_name=maS.name, index=0, step=-1) if _mlab2 else None   # back from G3 to G2
 _cl._cache.clear()
 _mlab3 = _cl.labels(maS)
-check("match surface: history -- moving the target matches again; its edge label holds and steps G2 -> G0 -> G2",
+check("match surface: history -- moving the target matches again; its edge label holds and steps G2 -> G3 -> G2",
       _exact(_m2) and len(_mlab) == 1 and _mlab[0]["value"] == "G2" and _mlab[0]["check"]["ok"]
-      and _r1 == {'FINISHED'} and _mlab2[0]["value"] == "G0" and _r2 == {'FINISHED'} and _mlab3[0]["value"] == "G2"
+      and _r1 == {'FINISHED'} and _mlab2[0]["value"] == "G3" and _r2 == {'FINISHED'} and _mlab3[0]["value"] == "G2"
       and _exact(_ma.measure(maS, "U0", maL, "U1")), f"{_m2} {[(L['value'], L['check']) for L in _mlab + _mlab2 + _mlab3]}")
 # two edges meeting at a corner: both exact, and the cut-out piece comes back CV for CV
 features.remove_step(maS, 0); features.rebuild(maS, ctx, force=True)
@@ -4069,6 +4069,98 @@ r2 = bpy.ops.nproto.match_surface(inputs=ins((maR, "U1"), (maS3, "U0")), cont_U1
 check("match surface: matching a target that is built from the surface is refused (history loop); the command is undoable",
       r == {'FINISHED'} and r2 == {'CANCELLED'} and 'UNDO' in bpy.types.NPROTO_OT_match_surface.bl_options
       and features.depends_on(maS3, maR), f"{r} {r2}")
+
+# --- G3: the curvature rate (Continuity Check, Match Surface, Surface Align) ---
+from blender_nurbs import contcheck as _cc, surfeval as _se
+# the third-order form against an analytic cubic graph z = f(x, y) at its flat point
+_g3f = lambda x, y: 0.3 * x * x + 0.1 * x * y - 0.2 * y * y + 0.15 * x ** 3 - 0.05 * x * x * y + 0.07 * y ** 3
+_X, _Y = np.meshgrid(np.linspace(-1, 1, 4), np.linspace(-1, 1, 4), indexing="ij")
+_g3G = np.stack([_Bi @ A_ @ _Bi.T for A_ in (_X + 500, _Y, _g3f(_X, _Y))], -1)
+_g3o = _mk("G3_Graph", _g3G, [0] * 4 + [1] * 4, [0] * 4 + [1] * 4)
+_, _, _g3C = _se.forms(_se.Surf(store.get_surfaces(_g3o)[0]).at([0.5], [0.5], 3))
+_dd = np.array([1.0, 1.0, 0.0]) / math.sqrt(2)
+_want = [0.9, 0.42, 0.9 * _dd[0] ** 3 - 0.3 * _dd[0] ** 2 * _dd[1] + 0.42 * _dd[1] ** 3]
+_got = [float(_se.cubic(_g3C, d_[None])[0]) for d_ in (np.array([1.0, 0, 0]), np.array([0, 1.0, 0]), _dd)]
+check("G3: third-order form = the third derivatives of a cubic graph (C(x,x,x), C(y,y,y), C(d,d,d))",
+      np.allclose(_got, _want, atol=1e-9), f"{_got} vs {_want}")
+# one smooth surface cut between knots (C-inf there: G3 holds) and at a simple cubic knot (C2 only: G3 fails)
+_g3n = 8
+_X, _Y = np.meshgrid(np.linspace(0, 4, _g3n), np.linspace(0, 4, _g3n), indexing="ij")
+_g3S = np.stack([_X + 510, _Y, 0.5 * np.sin(0.9 * _X) * np.cos(0.7 * _Y) + 0.05 * _mrng.standard_normal(_X.shape)], -1)
+_g3U = geom.clamped_uniform_knots(_g3n, 3)
+_g3k = sorted(set(_g3U[4:-4]))
+def _g3cut(t, name):
+    (a_, ua_), (b_, ub_) = _msplit(_g3S, _g3U, t, 0)
+    A_, B_ = _mk(name + "A", a_, ua_, _g3U), _mk(name + "B", b_, ub_, _g3U)
+    return _cc.analyze({"a": _cc.side_key(A_, "U1"), "b": _cc.side_key(B_, "U0")}, 80)
+_rs, _rk = _g3cut(0.5 * (_g3k[1] + _g3k[2]), "G3_Cut"), _g3cut(_g3k[2], "G3_Knot")
+check("G3 check: a cut between knots holds G3 (~1e-11); at a simple cubic knot G2 holds but G3 does not",
+      _rs["g3rel"].max() < 1e-8 and _rk["crel"].max() < 1e-7 and _rk["g3rel"].max() > 0.2,
+      f"{_rs['g3rel'].max():.2e} / {_rk['crel'].max():.2e} {_rk['g3rel'].max():.2e}")
+def _exact3(m):
+    return _exact(m) and m["rate"] is not None and m["rate"] < 1e-6
+# Match G3: one edge of the cut-out piece -- exact; only rows 0-3 move
+_g3P = _mR1.copy(); _g3P[0] += 0.02 * _mrng.standard_normal(_g3P[0].shape); _g3P[1:4] += 0.1 * _mrng.standard_normal(_g3P[1:4].shape)
+g3S = _mk("G3_S", _g3P, _mUR, _mVR1)
+_m0 = _mmeas(g3S, "U0", maL, "U1")
+r = bpy.ops.nproto.match_surface(inputs=ins((g3S, "U0"), (maL, "U1")), cont_U0="G3")
+_m1 = _ma.measure(g3S, "U0", maL, "U1")
+_mg, _ = _mgrid(g3S)
+check("match surface G3: one edge -- exact G0-G3 (Continuity Check), only rows 0-3 move",
+      r == {'FINISHED'} and not _exact3(_m0) and _exact3(_m1) and np.abs(_mg[4:] - _g3P[4:]).max() < 1e-12, f"{_m0} -> {_m1}")
+# two edges at a corner, both G3: the cut-out piece comes back CV for CV (cut at 0.45, not a knot:
+# at u = v = 0.5 -- a knot of this cubic -- the pieces are only C2 to each other)
+(_c45L, _c45UL), (_c45R, _c45UR) = _msplit(_mG + np.array([0.0, 20.0, 0.0]), _mU, 0.45, 0)
+(_, _), (_c45L1, _c45VL1) = _msplit(_c45L, _mU, 0.45, 1)
+(_c45R0, _c45VR0), (_c45R1, _c45VR1) = _msplit(_c45R, _mU, 0.45, 1)
+g3L, g3Bt = _mk("G3_L", _c45L1, _c45UL, _c45VL1), _mk("G3_Bt", _c45R0, _c45UR, _c45VR0)
+_g3P2 = _c45R1.copy(); _g3P2[:4] += 0.1 * _mrng.standard_normal(_g3P2[:4].shape); _g3P2[:, :4] += 0.1 * _mrng.standard_normal(_g3P2[:, :4].shape)
+g3S2 = _mk("G3_S2", _g3P2, _c45UR, _c45VR1)
+r = bpy.ops.nproto.match_surface(inputs=ins((g3S2, "U0"), (g3L, "U1"), (g3S2, "V0"), (g3Bt, "V1")), cont_U0="G3", cont_V0="G3")
+_mg, _ = _mgrid(g3S2)
+check("match surface G3: two edges at a corner -- both exact, the cut-out piece comes back CV for CV",
+      r == {'FINISHED'} and _exact3(_ma.measure(g3S2, "U0", g3L, "U1")) and _exact3(_ma.measure(g3S2, "V0", g3Bt, "V1"))
+      and _mg.shape == _c45R1.shape and np.abs(_mg - _c45R1).max() < 1e-9, f"{_mg.shape} {_c45R1.shape}")
+# G2 leaves row 3 (and G3) alone; a 4-row cubic gets rows for G3 + Keep G3; a degree-5 target; Average
+g3S3 = _mk("G3_S3", _g3P, _mUR, _mVR1)
+bpy.ops.nproto.match_surface(inputs=ins((g3S3, "U0"), (maL, "U1")), cont_U0="G2")
+_m2 = _ma.measure(g3S3, "U0", maL, "U1")
+_X, _Y = np.meshgrid(np.linspace(520, 522, 4), np.linspace(0, 2, 5), indexing="ij")
+g3T4 = _mk("G3_T4", np.stack([_X, _Y, 0.1 * np.sin(_X) + 0.05 * _Y ** 2], 2), geom.clamped_uniform_knots(4, 3), geom.clamped_uniform_knots(5, 3))
+_X, _Y = np.meshgrid(np.linspace(522, 524, 4), np.linspace(0, 2, 5), indexing="ij")
+g3S4 = _mk("G3_S4", np.stack([_X, _Y, 0.2 * np.cos(_X) - 0.1 * _Y], 2), geom.clamped_uniform_knots(4, 3), geom.clamped_uniform_knots(5, 3))
+_far0 = np.array(geom.boundary_points(store.get_surfaces(g3S4)[0], "U1", 9))
+r = bpy.ops.nproto.match_surface(inputs=ins((g3S4, "U0"), (g3T4, "U1")), cont_U0="G3", keep="G3")
+_far1 = np.array(geom.boundary_points(store.get_surfaces(g3S4)[0], "U1", 9))
+_X, _Y = np.meshgrid(np.linspace(530, 532, 6), np.linspace(0, 2, 5), indexing="ij")
+g3T5 = _mk("G3_T5", np.stack([_X, _Y, 0.3 * np.sin(1.3 * _X) * (1 + 0.2 * _Y)], 2), geom.clamped_uniform_knots(6, 5),
+           geom.clamped_uniform_knots(5, 3), du=5)
+_X, _Y = np.meshgrid(np.linspace(532, 534, 6), np.linspace(0, 2, 5), indexing="ij")
+g3S5 = _mk("G3_S5", np.stack([_X, _Y, 0.1 * _X - 53.0 + 0.05 * _Y], 2), geom.clamped_uniform_knots(6, 3), geom.clamped_uniform_knots(5, 3))
+r5 = bpy.ops.nproto.match_surface(inputs=ins((g3S5, "U0"), (g3T5, "U1")), cont_U0="G3")
+_X, _Y = np.meshgrid(np.linspace(540, 542, 6), np.linspace(0, 2, 5), indexing="ij")
+g3A = _mk("G3_A", np.stack([_X, _Y, 0.2 * np.sin(2 * _X) + 0.1 * _Y], 2), geom.clamped_uniform_knots(6, 3), geom.clamped_uniform_knots(5, 3))
+_X, _Y = np.meshgrid(np.linspace(542, 544, 6), np.linspace(0, 2, 5), indexing="ij")
+g3B = _mk("G3_B", np.stack([_X, _Y, 0.25 * np.cos(1.5 * _X) - 0.05 * _Y], 2), geom.clamped_uniform_knots(6, 3), geom.clamped_uniform_knots(5, 3))
+ra = bpy.ops.nproto.match_surface(inputs=ins((g3B, "U0"), (g3A, "U1")), cont_U0="G3", average=True)
+check("match surface G3: G2 leaves G3 open; rows added for G3 + Keep G3 (far edge stays); degree-5 target; Average Both",
+      _m2["curv"] < 1e-6 and _m2["rate"] > 1e-3
+      and r == {'FINISHED'} and _exact3(_ma.measure(g3S4, "U0", g3T4, "U1")) and _mgrid(g3S4)[1]["count_u"] == 8
+      and np.abs(_far1 - _far0).max() < 1e-9
+      and r5 == {'FINISHED'} and _exact3(_ma.measure(g3S5, "U0", g3T5, "U1"))
+      and ra == {'FINISHED'} and _exact3(_ma.measure(g3B, "U0", g3A, "U1")), f"{_m2}")
+# Surface Align G3: one edge on the neighbour's layout -- G3 to the check's tolerance; its label shows G3 and holds
+_pts1 = [(x + 20, y, _F(x, y) + 0.3 * (x - 2) * (4 - x) * (y + 0.3) + 0.02 * math.sin(3 * y))
+         for x in np.linspace(2, 4, 7) for y in np.linspace(0, 2, 4)]
+g3SA = store.new_object(ctx, "G3_SA", ext.surface_from_cvs(3, 3, _pts1, geom.clamped_uniform_knots(7, 3), [0] * 4 + [1] * 4))
+_b = _ma.measure(g3SA, "U0", saN, "U1")
+r = bpy.ops.nproto.surface_align(inputs=ins((g3SA, "U0"), (saN, "U1")), cont_U0="G3")
+_a = _ma.measure(g3SA, "U0", saN, "U1")
+_cl._cache.clear()
+_lab = _cl.labels(g3SA)
+check("surface align G3: one edge -- curvature rate within 1% (it was 40%); its label shows G3 and holds",
+      r == {'FINISHED'} and _b["rate"] > 0.1 and _a["gap"] < 1e-4 and _a["curv"] < 0.01 and _a["rate"] < 0.01
+      and len(_lab) == 1 and _lab[0]["value"] == "G3" and _lab[0]["check"]["ok"], f"{_b} -> {_a} {_lab and _lab[0]['check']}")
 
 # --- Boundary: exact Coons edges, degree / spans ------------------------------
 _bx = 40.0

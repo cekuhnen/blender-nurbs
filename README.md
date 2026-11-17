@@ -79,7 +79,7 @@ everything built from it rebuilds.
 
 ### Analyze
 
-- **Continuity Check:** G0, G1 and G2 between surfaces
+- **Continuity Check:** G0, G1, G2 and G3 between surfaces
 - **Feature Labels:** each feature's edges show the continuity it holds, live; click one to change it
 - **Overlays:** Zebra, Curvature Map, Draft Angle, Matcap
 - **Combs and sections:** Curvature Comb, Surface Combs, Dynamic Section
