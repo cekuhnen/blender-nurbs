@@ -60,6 +60,8 @@ COL_OK = (0.3, 1.0, 0.45, 1.0)
 COL_BAD = (1.0, 0.32, 0.25, 1.0)
 COL_GUIDE = (0.35, 0.85, 1.0, 0.9)
 COL_AXIS = (1.0, 0.85, 0.3, 0.9)
+COL_PLANE = (0.35, 0.85, 1.0, 0.15)
+PLANE_PX = 22.0   # half the G2 plane square's width, in pixels
 WORLD = {"X": (1.0, 0.0, 0.0), "Y": (0.0, 1.0, 0.0), "Z": (0.0, 0.0, 1.0)}
 
 overlay = {"on": False, "guides": [], "sel": set(), "axis": None, "labels": []}
@@ -905,6 +907,21 @@ class NPROTO_OT_cv_nudge(bpy.types.Operator):
 # Drawing
 # --------------------------------------------------------------------------
 
+def _world_per_px(p):
+    """World length of one pixel at the depth of point `p` in the region
+    being drawn (1.0 when it can't be told, e.g. behind the view)."""
+    ctx = bpy.context
+    region, rv3d = ctx.region, ctx.region_data
+    if region is None or rv3d is None:
+        return 1.0
+    p = Vector(tuple(p))
+    q = view3d_utils.location_3d_to_region_2d(region, rv3d, p)
+    if q is None:
+        return 1.0
+    w = view3d_utils.region_2d_to_location_3d(region, rv3d, q + Vector((1.0, 0.0)), p)
+    return float((w - p).length) or 1.0
+
+
 def _draw_view():
     if not overlay["on"]:
         return
@@ -935,11 +952,14 @@ def _draw_view():
                 a = np.cross(n, (1.0, 0.0, 0.0) if abs(n[0]) < 0.9 else (0.0, 1.0, 0.0))
                 a /= np.linalg.norm(a) or 1.0
                 b = np.cross(n, a)
-                r = 0.6 * (float(np.linalg.norm(np.asarray(g["x"]) - O)) or 1.0)
-                sq = [foot + r * (u * a + v * b) for u, v in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+                # the plane is a direction, not a size: draw it the same on screen
+                # wherever the CV is (the gap shows in the line and the %)
+                r = _world_per_px(foot) * PLANE_PX
+                sq = [Vector(tuple(foot + r * (u * a + v * b))) for u, v in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+                draw._draw_tris([sq[0], sq[1], sq[2], sq[0], sq[2], sq[3]], COL_PLANE)
                 ed = []
                 for i in range(4):
-                    ed += [Vector(tuple(sq[i])), Vector(tuple(sq[(i + 1) % 4]))]
+                    ed += [sq[i], sq[(i + 1) % 4]]
                 draw._draw_lines(ed, COL_GUIDE, 1.5)
                 draw._draw_lines([x, Vector(tuple(foot))], col, 1.5)
         draw._draw_points(rings_bad, COL_BAD, 12.0)
