@@ -103,7 +103,9 @@ everything built from it rebuilds.
   a set offset off it, or draped over it (bridging folds, never dipping in: housings, covers, sockets), then SubD to
   BREP makes the exact NURBS body. **Tube Cage from Scan** builds and fits a starting cage for limb-like scans,
   **Refine Cage to Scan** adds edge loops only where the surface misses the scan (all quads, no new star points),
-  **Trim Cage to Curve** holds the cage's open edge to a trim line drawn on the scan; the
+  **Trim Cage to Curve** holds the cage's open edge to a trim line drawn on the scan, **Drape Patch to Scan** lays
+  one single-span NURBS patch (degree 5 from a 6 × 6 grid) straight down onto a scan, its CVs moving only up and
+  down; the
   **Scan Deviation** overlay colours any surface by its distance from the scan
 
 ### STEP Import and Export

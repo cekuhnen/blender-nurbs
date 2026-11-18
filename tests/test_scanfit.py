@@ -14,7 +14,7 @@ sys.path.insert(0, ROOT)
 import blender_nurbs  # noqa: E402
 
 blender_nurbs.register()
-from blender_nurbs import scanfit as sf, store, subd_brep as sb  # noqa: E402
+from blender_nurbs import scanfit as sf, scanpatch as sp, store, subd_brep as sb  # noqa: E402
 
 ok = True
 
@@ -343,5 +343,101 @@ se = sf.scan_for(scan_obj).signed(Pe)
 check("Trim with Drape + 3 mm: the edge stands 3 mm off the scan, on the line pushed out",
       res == {'FINISHED'} and np.nanmax(np.abs(se - 0.003)) < 0.4e-3 and sf.LAST_INFO["edge_max"] < 0.3e-3,
       f"edge off the scan {np.nanmin(se) * MM:.2f}..{np.nanmax(se) * MM:.2f} mm")
+
+# -- 9. Drape Patch to Scan: one NURBS patch, CVs moving straight down only -----------------
+rng9 = np.random.default_rng(9)
+Gv = np.array([(x, y, 0.5) for x in np.linspace(-0.3, 0.3, 6) for y in np.linspace(-0.2, 0.2, 6)])
+Gf = [(i * 6 + j, (i + 1) * 6 + j, (i + 1) * 6 + j + 1, i * 6 + j + 1) for i in range(5) for j in range(5)]
+perm = rng9.permutation(36)                          # the grid's vertices in any order
+inv = np.argsort(perm)
+Gshuf = Gv[perm]
+Fshuf = [tuple(int(inv[a]) for a in f) for f in Gf]
+G = sp.grid_order(36, Fshuf)
+rows_ok = all(np.allclose(np.ptp(Gshuf[G[i], 0 if np.ptp(Gshuf[G[0], 1]) > np.ptp(Gshuf[G[0], 0]) else 1]), 0)
+              for i in range(6))
+check("grid_order: a shuffled 6 x 6 quad grid comes back as rows and columns", G.shape == (6, 6) and rows_ok)
+try:
+    sp.grid_order(5, [(0, 1, 2, 3), (1, 4, 2)])
+    refused = False
+except ValueError:
+    refused = True
+check("grid_order: anything but a quad grid is refused", refused)
+check("degree: 6 CVs -> one span of degree 5, 8 CVs -> 3 spans of degree 5, 4 CVs -> degree 3",
+      sp.degree_and_knots(6)[0] == 5 and len(sp.degree_and_knots(8)[1]) == 14 and sp.degree_and_knots(4)[0] == 3)
+
+
+def height_scan(name, fz, gap=None, n=240):
+    """A triangulated height field z = fz(x, y) over -0.4..0.4 x -0.3..0.3; gap: (x0, width, depth) groove."""
+    xs, ys = np.linspace(-0.4, 0.4, n), np.linspace(-0.3, 0.3, n)
+    X, Y = np.meshgrid(xs, ys, indexing='ij')
+    Z = fz(X, Y)
+    if gap is not None:
+        x0, w, dep = gap
+        Z = Z - dep * (np.abs(X - x0) < w / 2)
+    P = np.stack([X, Y, Z], -1).reshape(-1, 3)
+    T = []
+    for i in range(n - 1):
+        for j in range(n - 1):
+            a = i * n + j
+            T += [(a, a + n, a + n + 1), (a, a + n + 1, a + 1)]
+    m = bpy.data.meshes.new(name)
+    m.from_pydata([tuple(p) for p in P], [], T)
+    m.update()
+    o = bpy.data.objects.new(name, m)
+    ctx.collection.objects.link(o)
+    return o
+
+
+poly = lambda x, y: 0.2 + 0.1 * x * x - 0.05 * x * y + 0.03 * y ** 3          # degree <= 5: exactly a patch
+hs = height_scan("PolyScan", poly)
+C0 = Gv.reshape(6, 6, 3)
+du, Ku = sp.degree_and_knots(6)
+Cp, rp = sp.drape_patch(C0, du, du, Ku, Ku, sf.scan_for(hs), smoothness=0.0)
+dp = sp.deviation(Cp, du, du, Ku, Ku, sf.scan_for(hs))
+check("Drape Patch: a scan that is a degree-5 surface is met exactly (RMS < 2 µm), the CVs moved only in z",
+      dp["dev_rms"] < 2e-6 and np.abs(Cp[..., :2] - C0[..., :2]).max() == 0.0,
+      f"RMS {dp['dev_rms'] * 1e6:.2f} µm")
+gs = height_scan("GapScan", poly, gap=(0.05, 0.012, 0.006))                    # a 12 mm wide, 6 mm deep panel gap
+scg = sf.scan_for(gs)
+Cf_, _ = sp.drape_patch(C0, du, du, Ku, Ku, scg, smoothness=0.0)
+Cd_, _ = sp.drape_patch(C0, du, du, Ku, Ku, scg, smoothness=0.0, drape=True)
+ts9 = np.linspace(0, 1, 60)
+S9 = np.einsum('ai,bj->abij', sp.basis(6, du, Ku, ts9), sp.basis(6, du, Ku, ts9)).reshape(-1, 36)
+Pf, Pd = S9 @ Cf_.reshape(-1, 3), S9 @ Cd_.reshape(-1, 3)
+away = np.abs(Pf[:, 0] - 0.05) > 0.02
+ef = np.abs(Pf[away, 2] - poly(Pf[away, 0], Pf[away, 1])).max()
+ed = (Pd[:, 2] - poly(Pd[:, 0], Pd[:, 1]))
+check("a panel gap: the fit lets go of it (within 0.3 mm of the panel away from the gap), Drape bridges it "
+      "(never more than 0.3 mm below the panel's top)",
+      ef < 0.3e-3 and ed.min() > -0.3e-3, f"fit {ef * MM:.3f} mm, drape lowest {ed.min() * MM:.3f} mm")
+# the operator: a NURBS patch object, updated in place when run again
+me9 = bpy.data.meshes.new("Sheet9")
+me9.from_pydata([tuple(p) for p in Gshuf], [], Fshuf)
+me9.update()
+sheet9 = bpy.data.objects.new("Sheet9", me9)
+ctx.collection.objects.link(sheet9)
+for o in ctx.scene.objects:
+    o.select_set(False)
+hs.select_set(True)
+sheet9.select_set(True)
+ctx.view_layer.objects.active = sheet9
+res = bpy.ops.nproto.scan_drape_patch(smoothness=0.0)
+p9 = ctx.active_object
+
+from blender_nurbs.kernel import load as load_kernel  # noqa: E402
+d9 = load_kernel().blender_ext.surface_cvs(store.get_brep(p9).faces()[0].surface())
+check("Drape Patch to Scan: one NURBS face, degree 5 x 5, 6 x 6 CVs, on the scan",
+      res == {'FINISHED'} and store.is_nurbs(p9) and (d9["degree_u"], d9["degree_v"], d9["count_u"], d9["count_v"]) == (5, 5, 6, 6)
+      and sp.LAST_INFO["dev_rms"] < 5e-6, f"{sp.LAST_INFO['dev_rms'] * 1e6:.2f} µm")
+for o in ctx.scene.objects:
+    o.select_set(False)
+hs.select_set(True)
+sheet9.select_set(True)
+ctx.view_layer.objects.active = sheet9
+n_before = len([o for o in ctx.scene.objects if store.is_nurbs(o)])
+res = bpy.ops.nproto.scan_drape_patch(offset=0.002)
+check("run again (Offset 2 mm): the same patch object is updated, 2 mm above the scan",
+      res == {'FINISHED'} and ctx.active_object is p9 and len([o for o in ctx.scene.objects if store.is_nurbs(o)]) == n_before
+      and abs(sp.LAST_INFO["dev_mean"]) < 0.1e-3, f"mean {sp.LAST_INFO['dev_mean'] * MM + 2:.3f} mm off")
 
 print("ALL OK" if ok else "SOME FAILED")

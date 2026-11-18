@@ -436,6 +436,12 @@ class Scan:
         self.tree = BVHTree.FromPolygons(self.V.tolist(), self.T.tolist(), all_triangles=True)
         self.area = area
 
+    def flip_normals(self):
+        """Take the other side as the outside (an open scan, a single panel, whose middle says nothing)."""
+        self.fn = -self.fn
+        self.vn = -self.vn
+        self.flip = not self.flip
+
     def nearest(self, P, max_dist=None):
         """(Q nearest points, N their face normals, d distances, ok found)."""
         Q = np.zeros_like(P)

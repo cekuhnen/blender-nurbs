@@ -17,7 +17,7 @@ The sidebar tab **NURBS Proto** has one collapsible panel per group. Ctrl+click 
 | **Create Surfaces** | Draw Plane · Plane, Disk, Box, Cylinder, Cone, Sphere, Torus · from curves: Loft, Loft Rails, Sweep, Pipe, Extrude, Revolve, Planar · filling a gap: Boundary, Square, Patch, Dome · from surfaces: Offset, Thicken, Convert Blender Surface |
 | **Curve Edit** | Join / Unjoin Curves, Trim / Split Curves, Rebuild / Extend Curve, Align Curve |
 | **Surface Edit** | Edit CVs, Flip Normal, Rebuild Surface, Extend Surface, Surface Align, Match Surface, Refit to Trim, Merge Patches · Trim, Split, Untrim, Join, Unjoin · Surface Fillet, Edge Fillet · solids: Union, Difference, Intersection, Boundary Fill |
-| **Convert** (closed at first) | BREP to Mesh, Mesh to BREP, SubD to BREP (all also in Object › Convert) · fit to a scan: Tube Cage from Scan, Fit Cage to Scan, Refine Cage to Scan, Trim Cage to Curve |
+| **Convert** (closed at first) | BREP to Mesh, Mesh to BREP, SubD to BREP (all also in Object › Convert) · fit to a scan: Tube Cage from Scan, Fit Cage to Scan, Refine Cage to Scan, Trim Cage to Curve, Drape Patch to Scan |
 | **Analyze** (closed at first) | Continuity Check and the overlays (also in the viewport header's Analyze popover) |
 | **Display** | **Edges**, **CVs / Hulls**, **Spans**, **Feature Labels** and **Fine Grid** on / off (also as icons in the 3D view header, next to the Analyze button, so they are always at hand); **CVs / Hulls** also draws the CV hulls of selected curves (NURBS and Poly CVs, Bezier points with their handles) outside Edit mode, where Blender draws its own; **Spans** draws the knot lines (isoparms) of every face of the visible NURBS surfaces, clipped to their trims, so you see each surface's layout at a glance; **Fine Grid** draws the floor grid's finer levels (mm, cm, 10 cm; inches) in a perspective or turned orthographic view, where Blender's floor grid stops at 1 m (1 ft); right under them how finely surfaces are meshed for display: **Quality** *Fast / Medium / Fine* sets the four values below at once (Fast: angle 10°, chord 0.001, edges 3°, max edge 1/20; Medium, the defaults: 5°, 0.0005, 2°, 1/30; Fine: 2.5°, 0.0002, 1°, 1/50), one retessellation of every body; it reads *Custom* once a value is set by hand: Chord / Angle Tolerance, Edge Angle, Max Edge. The display mesh is rebuilt after every edit, so Fast makes editing quicker (a 38-face SubD body: 0.16 s Fast, 0.37 s Medium, 1.2 s Fine, 12k / 40k / 144k triangles). The analysis overlays (zebra, curvature map) don't use it: they have their own mesh and quality. **Clip Start warning:** a 3D view's depth buffer spreads its precision between Clip Start and Clip End, so a tiny Clip Start (say 1 µm) leaves depth steps of about 8 mm at 0.37 m. Surfaces, edges and Face / Edge highlights then flicker against each other (blotchy fills, dashed edges). When the steps exceed 0.05 % of the view distance, the Display panel says so and a red ⚠ appears in the header: one click sets Clip Start to about a thousandth of the view distance. |
 | **History** (closed at first) | Construction History, Live Update, Pause Rebuild, Delete History, Collect Inputs, Rebuild / Re-tessellate |
@@ -636,7 +636,7 @@ before its Subdivision Surface modifier), with **one face per cage face**.
 * Modifiers other than the Subdivision Surface count (a Mirror, for instance). Creases below 1.0 are treated as smooth.
 * Not yet: partial creases (below 1.0).
 
-### Fit to Scan (Tube Cage from Scan, Fit Cage to Scan, Refine Cage to Scan, Trim Cage to Curve)
+### Fit to Scan (Tube Cage from Scan, Fit Cage to Scan, Refine Cage to Scan, Trim Cage to Curve, Drape Patch to Scan)
 
 Turn a scan (a residual limb, a body part, a product or car part) into exact NURBS that match it: a SubD cage is
 fitted so its smooth surface lies on the scan, then **SubD to BREP** makes the NURBS body. Use it to drape a
@@ -703,6 +703,24 @@ On the residual-limb scan, with a line dipping 6.6 cm front to back: the 10 × 1
 scan at 0.66 mm RMS with its edge on the line within 0.93 mm along the skin; 6 loops of Refine (232 vertices) take
 that to 0.36 mm RMS and 0.73 mm. On a smooth synthetic scan the edge keeps within 0.05 mm.
 
+**Drape Patch to Scan** lays one NURBS patch straight down onto a scan, for Class-A style surfacing on a car or
+product scan where each patch is a single span of low degree. The active object is the patch's control net: a quad
+grid of vertices laid out above the scan (a 6 × 6 grid is one span of degree 5 each way: three CV rows from every
+edge, for G0, G1 and G2 to a neighbour later, and no more; more vertices than **Max Degree** + 1 make more spans);
+the scan is the other selected mesh or the **Scan** under Analyze. Each CV moves only up or down (**Direction**:
+World Z, or the sheet's own normal), so the patch keeps its plan view: footprint, CV columns and parametrisation stay
+as laid out. That makes the fit linear and exact: every surface point keeps its place across the direction, the scan's
+height under it is found once by a ray straight down, and one least-squares solve gives the CV heights (distances
+taken along the scan's normal, so sloping parts count right; walls seen almost edge-on are left out). Robust weights
+let go of panel gaps and trim strips; **Drape** makes it one-sided, like a sheet: pushed up wherever it dips into the
+scan, only lightly pulled down where it stands above, so it bridges gaps. **Offset** fits that far above the scan,
+**Smoothness** calms the CV net (rarely needed: one degree-5 span is already smooth). The result is a new NURBS
+object (*Sheet* Patch); run it again on the same sheet and that patch is updated in place. An open scan (a single
+panel) whose outside is ambiguous takes the side the patch is draped from as its outside.
+
+On the car scan's hood (a 6 × 6 sheet, 1.5 × 1.1 m): one degree-5 patch is 0.96 mm RMS from the scan, 95 % within
+1.95 mm, the rest being the scan's own surface noise; the fit takes 0.04 s.
+
 How it works: every point of the limit surface is a fixed linear mix of cage vertices. That mix is built once as a
 sparse matrix with SubD to BREP's own Catmull-Clark rules (creases, open borders, Keep Corners), so the fitted
 surface is exactly what SubD to BREP converts. Then, each round, the surface samples find their nearest scan points
@@ -716,7 +734,8 @@ Measured on a residual-limb scan (38 cm, 92k triangles), 10 rings × 12: the NUR
 (a muscle ridge, a round bump): Refine Cage to Scan adds loops there, or model the cage around them.
 
 * Not yet: open trim lines (an edge of a patch held to part of a curve), symmetry, and cages with modifiers above
-  the Subdivision (apply them first).
+  the Subdivision (apply them first); for Drape Patch, holding edge rows to a neighbouring patch (G0 / G1 / G2)
+  during the fit, and splitting a patch where one span can't follow the scan.
 
 ## STEP Import and Export
 

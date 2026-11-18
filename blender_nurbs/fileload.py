@@ -17,7 +17,7 @@ from bpy.app.handlers import persistent
 
 from . import (anamesh, brep_mesh, contlabels, cvnudge, cvs, curvejoin, curveoffset, diagnostics, draw,
                drawtools, feature_ui, features, hints, history, isocombs, loft_rails, merge, ops, patch, refit,
-               scanfit, sections, snapping, square, steps, store, subd_brep, subsel, sweeps, workplanes)
+               scanfit, scanpatch, sections, snapping, square, steps, store, subd_brep, subsel, sweeps, workplanes)
 
 # overlays and tool flags with a fixed shape: put back to how they start
 _SHAPED = (cvnudge.overlay, draw.pick_overlay, draw.sketch_overlay, draw.ghost, contlabels.hover, ops.GIZMO)
@@ -31,7 +31,7 @@ def _emptied():
         # last-operation reports (Adjust Last Operation panels, notes)
         curvejoin.LAST_INFO, curveoffset.LAST_INFO, loft_rails.LAST_INFO, merge.LAST_INFO, refit.LAST_INFO,
         square.LAST_INFO, square.LAST_NOTES, brep_mesh.LAST, features.LOFT_NOTES, features.LAST_EASES,
-        sweeps.boundary_info, patch.info, diagnostics.LAST_RANGE, merge.DEVMAP, scanfit.LAST_INFO,
+        sweeps.boundary_info, patch.info, diagnostics.LAST_RANGE, merge.DEVMAP, scanfit.LAST_INFO, scanpatch.LAST_INFO,
         # pending work on object names of the old file
         history._dirty, history._just_built, history._held, cvs._dirty, cvs._modes, cvs._finish,
         feature_ui._resyncing, workplanes._anims, subd_brep._LAST,

@@ -119,6 +119,7 @@ GROUPS = (
             (_t("nproto.scan_fit_cage", "Fit Cage to Scan", 'MOD_SHRINKWRAP'),),
             (_t("nproto.scan_refine_cage", "Refine Cage to Scan", 'MOD_MULTIRES'),),
             (_t("nproto.scan_trim_cage", "Trim Cage to Curve", 'CURVE_DATA'),),
+            (_t("nproto.scan_drape_patch", "Drape Patch to Scan", 'SURFACE_NSURFACE'),),
         )),
     )),
 )
