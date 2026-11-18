@@ -821,7 +821,7 @@ def fit_cage(X0, F, scan, sharp=(), keep_corners=False, iterations=8, offset=0.0
             break
     t_fit = time.perf_counter() - t0 - t_build
     out = FitResult(X=X, history=hist, samples=m, levels=levels, build_s=t_build, fit_s=t_fit,
-                    orient=orient or 1.0)
+                    orient=orient or 1.0, sampler=smp)
     out.update(deviation_stats(A @ X, scan, offset, Fs))
     return out
 
@@ -1011,6 +1011,167 @@ def tube_cage(scan, rings=10, segments=12, top=0.0, margin=0.03, cap=True):
     return Vc, F, info
 
 
+# ---------------------------------------------------------------------------
+# refining a cage where the fit misses: one edge loop at a time
+# ---------------------------------------------------------------------------
+#
+# A loop cut through an edge ring halves every face along it in one direction
+# and keeps the cage all quads (no new star points). Which ring: after a fit,
+# what is left of the deviation inside a face is what the cage cannot bend
+# to. Its part that varies along u (a per-row linear trend in u taken out)
+# needs the face halved in u; the same along v. A ring scores the sum over
+# its faces in the direction it halves each one.
+
+_CORNERS = np.array([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)])
+
+
+def face_grid(F, levels):
+    """Where each of Sampler(levels)'s quads Fs lies in its cage face: (parent
+    face per sub-quad, the sub-quad centre's (u, v) in the face's unit square
+    with corner 0 at (0, 0), 1 at (1, 0), 3 at (0, 1)); (u, v) is NaN under
+    faces that are not quads. Child i of a quad (a, b, c, d) is (corner i,
+    edge point i, face point, edge point i - 1), as step_any / step_quads
+    order them."""
+    n_f = np.array([len(f) for f in F])
+    off = np.r_[0, np.cumsum(n_f)]
+    per = 4 ** (max(levels, 1) - 1)
+    m = int(off[-1]) * per
+    s = np.arange(m)
+    c1 = s // per
+    parent = np.searchsorted(off, c1, side='right') - 1
+    corner = c1 - off[parent]
+    quad = n_f[parent] == 4
+    k = np.where(quad, corner, 0)
+    C = _CORNERS
+    o = C[k].copy()
+    ax = (C[(k + 1) % 4] - C[k]) / 2
+    ay = (C[(k - 1) % 4] - C[k]) / 2
+    rest = s % per
+    for lv in range(max(levels, 1) - 1):
+        d = (rest // 4 ** (levels - 2 - lv)) % 4
+        lo, lx, ly = C[d], (C[(d + 1) % 4] - C[d]) / 2, (C[(d - 1) % 4] - C[d]) / 2
+        o = o + ax * lo[:, :1] + ay * lo[:, 1:]
+        ax, ay = ax * lx[:, :1] + ay * lx[:, 1:], ax * ly[:, :1] + ay * ly[:, 1:]
+    uv = o + 0.5 * ax + 0.5 * ay
+    uv[~quad] = np.nan
+    return parent, uv
+
+
+def _detrended(r, w, x, groups):
+    """Sum of w (r - linear fit in x)^2, the linear fit taken per group (rows of a face)."""
+    sw, sx, sxx, sr, sxr, srr = (np.bincount(groups, q) for q in (w, w * x, w * x * x, w * r, w * x * r, w * r * r))
+    det = sw * sxx - sx * sx
+    ok = det > 1e-30 * np.maximum(sw * sxx, 1e-300)
+    b = np.where(ok, (sw * sxr - sx * sr) / np.where(ok, det, 1.0), 0.0)
+    a = np.where(sw > 0, (sr - b * sx) / np.maximum(sw, 1e-300), 0.0)
+    # sum w (r - a - b x)^2 expanded
+    return srr - 2 * a * sr - 2 * b * sxr + a * a * sw + 2 * a * b * sx + b * b * sxx
+
+
+def face_need(F, levels, P, Fs, resid, tol, faces_ok=None):
+    """(need_u, need_v, worst) per cage face: the deviation left in it that a
+    cut halving it in u (resp. v) could take up (area x length^2), and its
+    largest |deviation|. resid: the deviation at the sample points P (NaN: not
+    over the scan). Faces whose worst sample stays within tol (or that are not
+    quads, or not in faces_ok) need nothing."""
+    nF = len(F)
+    parent, uv = face_grid(F, levels)
+    r4 = resid[Fs]
+    good = np.isfinite(r4).all(1) & np.isfinite(uv).all(1)
+    r = np.where(good, np.nan_to_num(r4).mean(1), 0.0)
+    a = 0.5 * np.linalg.norm(np.cross(P[Fs[:, 2]] - P[Fs[:, 0]], P[Fs[:, 3]] - P[Fs[:, 1]]), axis=1)
+    w = np.where(good, a, 0.0)
+    worst = np.zeros(nF)
+    np.maximum.at(worst, parent, np.where(good, np.abs(r), 0.0))
+    G = 2 ** max(levels, 1)
+    u, v = np.nan_to_num(uv[:, 0]), np.nan_to_num(uv[:, 1])
+    iu = np.clip((u * G).astype(int), 0, G - 1)
+    iv = np.clip((v * G).astype(int), 0, G - 1)
+    rows_u = _detrended(r, w, u, parent * G + iv)            # rows: v fixed, varying along u
+    rows_v = _detrended(r, w, v, parent * G + iu)            # columns: u fixed, varying along v
+    need_u = np.bincount(np.arange(len(rows_u)) // G, rows_u, minlength=nF)[:nF]
+    need_v = np.bincount(np.arange(len(rows_v)) // G, rows_v, minlength=nF)[:nF]
+    hot = worst > tol
+    if faces_ok is not None:
+        hot &= faces_ok
+    quad = np.array([len(f) == 4 for f in F])
+    keep = hot & quad
+    return np.where(keep, np.maximum(need_u, 0.0), 0.0), np.where(keep, np.maximum(need_v, 0.0), 0.0), worst
+
+
+def edge_rings(F):
+    """Every edge ring through the quads: a list of (faces, halves) where
+    halves[i] is 0 when the ring halves faces[i] in u (it crosses the face's
+    edges 0 and 2), 1 in v (edges 1 and 3), and the ring's edges (sorted
+    vertex pairs). A ring stops at an open border and at a face that
+    is not a quad (that face just gets the new vertex on its edge)."""
+    ef = {}
+    for k, f in enumerate(F):
+        for j in range(len(f)):
+            ef.setdefault(tuple(sorted((f[j], f[(j + 1) % len(f)]))), []).append(k)
+
+    def edge(k, j):
+        f = F[k]
+        return tuple(sorted((f[j % 4], f[(j + 1) % 4])))
+
+    def walk(k, j):
+        """From face k leaving across its edge j: [(face, entry edge index)], the last edge, closed?"""
+        k0 = k
+        out = []
+        while True:
+            e = edge(k, j)
+            nb = [h for h in ef[e] if h != k]
+            if len(nb) != 1 or len(F[nb[0]]) != 4:
+                return out, e, False
+            h = nb[0]
+            fh = F[h]
+            jh = next(i for i in range(4) if tuple(sorted((fh[i], fh[(i + 1) % 4]))) == e)
+            out.append((h, jh))
+            k, j = h, jh + 2
+            if h == k0 or len(out) > len(F):
+                return out, e, False
+
+    seen = set()
+    rings = []
+    for k0, f in enumerate(F):
+        if len(f) != 4:
+            continue
+        for p in (0, 1):
+            if (k0, p) in seen:
+                continue
+            fwd, _, _ = walk(k0, p + 2)
+            closed = any(h == k0 for h, _ in fwd)
+            if closed:
+                fwd = fwd[:[h for h, _ in fwd].index(k0)]
+                back = []
+            else:
+                back, _, _ = walk(k0, p)
+            seq = [(h, jh % 2) for h, jh in reversed(back)] + [(k0, p)] + [(h, jh % 2) for h, jh in fwd]
+            faces = [h for h, _ in seq]
+            if len(set(faces)) != len(faces):          # crosses itself: leave it out
+                for h, q in seq:
+                    seen.add((h, q))
+                continue
+            for h, q in seq:
+                seen.add((h, q))
+            # the ring's edges: both cut edges of every face
+            edges = sorted({edge(h, q + d) for h, q in seq for d in (0, 2)})
+            rings.append((faces, [q for _, q in seq], edges))
+    return rings
+
+
+def best_ring(F, need_u, need_v, rings=None):
+    """The ring whose faces need cutting most (its score), or (None, 0)."""
+    rings = edge_rings(F) if rings is None else rings
+    best, top = None, 0.0
+    for ring in rings:
+        faces, halves, _ = ring
+        sc = float(sum(need_u[k] if q == 0 else need_v[k] for k, q in zip(faces, halves)))
+        if sc > top:
+            best, top = ring, sc
+    return best, top
+
+
 # ===========================================================================
 # Blender: the scan cache, the operators and the Scan Deviation overlay
 # ===========================================================================
@@ -1153,6 +1314,8 @@ def _report_lines(context, info):
     L = lambda x: _length(context, x)
     out = [f"RMS {L(info['dev_rms'])}  ·  95 % within {L(info['dev_p95'])}",
            f"most inside {L(info['dev_min'])}  ·  most outside {L(info['dev_hi'])}"]
+    if info.get("loops") is not None:
+        out.append(f"{info['loops']} loops added  ·  {info['verts_before']} -> {info['verts']} cage vertices")
     if info.get("time") is not None:
         out.append(f"{info['verts']} cage vertices  ·  {info['iterations']} rounds  ·  {info['time']:.1f} s")
     return out
@@ -1338,6 +1501,163 @@ class NPROTO_OT_scan_tube_cage(_FitProps, bpy.types.Operator):
         return {'FINISHED'}
 
 
+def insert_loop(me, F, ring):
+    """Cut `ring` (from edge_rings over the faces F) into the mesh me, in
+    Object Mode: a vertex at the middle of every ring edge, every ring face
+    split between its two. The old vertices keep their indices (the new ones
+    come after them); a split crease stays creased on both halves, the new
+    loop is smooth. Returns how many vertices were added."""
+    import bmesh
+    faces, halves, edges = ring
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    vs = list(bm.verts)                   # (splitting edges outdates bm.verts' index table)
+    n0 = len(vs)
+    lay = bm.edges.layers.float.get("crease_edge")
+    mid = {}
+    for a, b in edges:
+        e = bm.edges.get((vs[a], vs[b]))
+        if e is None:
+            continue
+        cr = e[lay] if lay else 0.0
+        ne, nv = bmesh.utils.edge_split(e, e.verts[0], 0.5)
+        if lay:
+            e[lay] = cr
+            ne[lay] = cr
+        nv.select = True
+        mid[(a, b)] = nv
+    for k, q in zip(faces, halves):
+        f = F[k]
+        v1 = mid.get(tuple(sorted((f[q], f[q + 1]))))
+        v2 = mid.get(tuple(sorted((f[q + 2], f[(q + 3) % 4]))))
+        if v1 is None or v2 is None:
+            continue
+        common = set(v1.link_faces) & set(v2.link_faces)
+        if len(common) != 1:
+            continue
+        _, loop = bmesh.utils.face_split(common.pop(), v1, v2)
+        if lay:
+            loop.edge[lay] = 0.0
+    added = len(bm.verts) - n0
+    bm.to_mesh(me)
+    bm.free()
+    me.update()
+    return added
+
+
+class NPROTO_OT_scan_refine_cage(_FitProps, bpy.types.Operator):
+    """Add edge loops to the active SubD cage where its surface misses the scan, one at a time with a fit after
+    each: every loop runs through the faces whose leftover deviation it can take up best, cutting them across
+    the way the deviation varies. The cage stays all quads, with no new star points. In Edit Mode only the
+    selected faces are looked at and the unselected vertices stay where they are"""
+    bl_idname = "nproto.scan_refine_cage"
+    bl_label = "Refine Cage to Scan"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    loops: IntProperty(name="Loops", default=4, min=1, max=40,
+                       description="Edge loops to add at most (fewer when the surface gets within the "
+                                   "tolerance everywhere first)")
+    tolerance: FloatProperty(name="Tolerance", default=0.0005, min=0.0, subtype='DISTANCE', unit='LENGTH',
+                             precision=4,
+                             description="A face whose surface stays this close to the scan gets no loop")
+    show_deviation: BoolProperty(name="Show Deviation", default=True,
+                                 description="Turn on the Scan Deviation overlay (Analyze) afterwards")
+
+    @classmethod
+    def poll(cls, context):
+        o = context.active_object
+        return o is not None and o.type == 'MESH' and 'nproto_brep' not in o and _subsurf(o) is not None
+
+    def draw(self, context):
+        lay = self.layout
+        lay.use_property_split = True
+        lay.prop(self, "loops")
+        lay.prop(self, "tolerance")
+        col = lay.column()
+        col.prop(self, "offset")
+        col.prop(self, "drape")
+        col.prop(self, "smoothness")
+        col.prop(self, "stiffness")
+        col.prop(self, "iterations")
+        lay.prop(self, "show_deviation")
+        _draw_report(lay, context)
+
+    def execute(self, context):
+        from . import subd_brep
+        cage = context.active_object
+        scan_obj = pick_scan(context, cage)
+        if scan_obj is None or scan_obj is cage or scan_obj.type != 'MESH':
+            self.report({'WARNING'}, "Select the scan too (or set it under Analyze > Scan Deviation)")
+            return {'CANCELLED'}
+        if not subd_brep._plain_cage(cage):
+            self.report({'WARNING'}, f"{cage.name}: apply the modifiers above Subdivision (and shape keys) first: "
+                                     "loops are cut into the mesh itself")
+            return {'CANCELLED'}
+        was_edit = cage.mode == 'EDIT'
+        if was_edit:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        me = cage.data
+        sel = None
+        if was_edit:
+            sel = np.zeros(len(me.vertices), bool)
+            me.vertices.foreach_get("select", sel)
+            if not sel.any():
+                sel = None
+        scan = scan_for(scan_obj)
+        kw = _fit_kwargs(self)
+        M = np.array(cage.matrix_world)
+        Mi = np.linalg.inv(M)
+        n_start = len(me.vertices)
+        t0 = time.perf_counter()
+        added = 0
+        try:
+            for rnd in range(self.loops + 1):
+                V, F, sharp, kc = cage_of(cage)
+                Xw = V @ M[:3, :3].T + M[:3, 3]
+                fixed = None if sel is None else ~np.r_[sel, np.ones(len(V) - len(sel), bool)]
+                last = rnd == self.loops
+                # (a full fit every round: shorter in-between fits pick worse loops, about 35 % faster)
+                r = fit_cage(Xw, F, scan, sharp=sharp, keep_corners=kc, fixed=fixed, **kw)
+                Xl = r["X"] @ Mi[:3, :3].T + Mi[:3, 3]
+                me.vertices.foreach_set("co", Xl.ravel())
+                me.update()
+                if last:
+                    break
+                smp = r["sampler"]
+                P = smp.A @ r["X"]
+                resid = r["dev_signed"] - kw["offset"]
+                if kw["drape"]:
+                    resid = np.minimum(resid, 0.0)          # standing off (bridging) is what a drape is for
+                faces_ok = None
+                if sel is not None:
+                    s_all = np.r_[sel, np.ones(len(V) - len(sel), bool)]
+                    faces_ok = np.array([s_all[list(f)].all() for f in F])
+                nu, nv_, _ = face_need(F, r["levels"], P, smp.Fs, resid, self.tolerance, faces_ok)
+                ring, _ = best_ring(F, nu, nv_)
+                if ring is None:
+                    break
+                insert_loop(me, F, ring)
+                added += 1
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            if was_edit:
+                bpy.ops.object.mode_set(mode='EDIT')
+            self.report({'WARNING'}, f"Refine Cage to Scan: {exc}")
+            return {'CANCELLED'}
+        if was_edit:
+            bpy.ops.object.mode_set(mode='EDIT')
+        cage["nproto_scan"] = scan_obj.name
+        info = {k: r[k] for k in ("dev_rms", "dev_p95", "dev_min", "dev_hi", "dev_max", "dev_mean")}
+        info.update(time=time.perf_counter() - t0, verts=len(me.vertices), iterations=len(r["history"]),
+                    offset=kw["offset"], loops=added, verts_before=n_start)
+        LAST_INFO.clear()
+        LAST_INFO.update(info)
+        if self.show_deviation:
+            _show_deviation(context, scan_obj)
+        self.report({'INFO'}, f"Refine Cage to Scan: {added} loop{'s' if added != 1 else ''} added "
+                    f"({n_start} -> {len(me.vertices)} vertices)  ·  " + _report_lines(context, info)[0])
+        return {'FINISHED'}
+
+
 # -- the Scan Deviation overlay -------------------------------------------------
 
 DEV_ANGLE, DEV_CHORD = 3.0, 0.001        # the NURBS analysis mesh the deviation is measured on
@@ -1443,4 +1763,4 @@ def draw_panel(col, context):
         col.label(text=f"inside {L(st['dev_min'])}  ·  outside {L(st['dev_hi'])}")
 
 
-classes = (NPROTO_OT_scan_fit_cage, NPROTO_OT_scan_tube_cage)
+classes = (NPROTO_OT_scan_fit_cage, NPROTO_OT_scan_tube_cage, NPROTO_OT_scan_refine_cage)

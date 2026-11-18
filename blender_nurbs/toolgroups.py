@@ -117,6 +117,7 @@ GROUPS = (
         ("Fit to Scan", (
             (_t("nproto.scan_tube_cage", "Tube Cage from Scan", 'MESH_CYLINDER'),),
             (_t("nproto.scan_fit_cage", "Fit Cage to Scan", 'MOD_SHRINKWRAP'),),
+            (_t("nproto.scan_refine_cage", "Refine Cage to Scan", 'MOD_MULTIRES'),),
         )),
     )),
 )
