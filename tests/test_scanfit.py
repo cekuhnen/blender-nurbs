@@ -119,6 +119,8 @@ Pd, Nd, Td, Vd = sf.deviation_mesh(cage, scan_obj)
 st = sf.STATS[cage.name]
 check("Scan Deviation on the SubD model: values per vertex, stats as the fit's",
       len(Vd) == len(Pd) and abs(st["dev_rms"] - info["dev_rms"]) < 0.05e-3, f"{st['dev_rms'] * MM:.3f} mm")
+check("the overlay arrays are C-contiguous (GPU buffers refuse anything else)",
+      all(a.flags.c_contiguous for a in (Pd, Nd, Td, Vd)))
 check("the overlay was turned on, with the scan as the scene's Scan",
       ctx.window_manager.nproto_view.show_scan_dev and ctx.scene.nproto_settings.scan_object == scan_obj)
 

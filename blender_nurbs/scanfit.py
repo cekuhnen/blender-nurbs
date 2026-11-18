@@ -1390,7 +1390,8 @@ def deviation_mesh(obj, scan_obj):
     s = scan_for(scan_obj).signed(Pw)
     ok = np.isfinite(s)
     V = np.where(ok, s, NO_VALUE).astype(np.float32)
-    data = (P.astype(np.float32), np.asarray(N, np.float32), np.asarray(T, np.int32), V)
+    C = np.ascontiguousarray                  # the GPU buffers take C-ordered arrays only
+    data = (C(P, np.float32), C(N, np.float32), C(T, np.int32), C(V))
     DEV_CACHE[obj.session_uid] = (key, data)
     STATS[obj.name] = summarize(s[ok], vertex_areas(Pw, np.asarray(T))[ok]) if ok.any() else {}
     return data
