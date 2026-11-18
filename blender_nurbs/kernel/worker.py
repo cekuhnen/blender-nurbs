@@ -1442,7 +1442,12 @@ def job_join(job):
     keys = job["order"]
     breps = [world_brep(job, k) for k in keys]
     before = sum(_shared_edges(b) for b in breps)
-    merged = breps[0] if len(breps) == 1 else sm.merge_breps(breps, operation=sm.BooleanOp.MERGE)
+    # the faces are copied in as they are: a MERGE boolean would intersect
+    # them first, and surfaces that touch tangentially along an edge (a blend
+    # built G1/G2 into a trimmed face) break it or come out with damaged trims
+    merged = breps[0]
+    for b in breps[1:]:
+        ext.append_brep(merged, b)
     res = sm.stitch_advanced(merged, float(job.get("tolerance", 1e-3)), squeeze_small_edges=False,
                              making_manifold_solid=False)
     b = res[0]

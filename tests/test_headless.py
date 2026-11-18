@@ -1118,6 +1118,28 @@ sb = store.get_brep(tube2)
 vol = sb.volume(1e-6) if sb.is_manifold_solid() else 0.0
 check("join: tube + 2 caps = closed solid", r == {'FINISHED'} and sb.is_manifold_solid() and abs(abs(vol) - math.pi * 0.25 * 2) < 1e-3,
       f"solid={sb.is_manifold_solid()} volume={vol:.5f} (pi*r^2*h={math.pi*0.25*2:.5f})")
+# a trimmed upright cylinder and an elbow built G2 into it along the trim arch
+# (from a user's boot model): faces that touch tangentially along their edge.
+# Join copies the faces in and stitches; intersecting them first (a MERGE
+# boolean) failed outright or came back with the cylinder's face destroyed
+import gzip
+with gzip.open(os.path.join(ROOT, "tests", "data", "join_tangent_elbow.json.gz"), "rt") as _f:
+    _tg = json.load(_f)
+for _rev in (False, True):           # either one active (receives the result)
+    _perm = [store.new_object_text(ctx, "TG_" + k, t) for k, t in _tg.items()]
+    _perm = _perm[::-1] if _rev else _perm
+    _tga = sorted(round(store.get_brep(o).faces()[0].area(), 4) for o in _perm)
+    bpy.ops.object.select_all(action='DESELECT')
+    for o in _perm:
+        o.select_set(True)
+    ctx.view_layer.objects.active = _perm[-1]
+    r = bpy.ops.nproto.join()
+    _tb = store.get_brep(ctx.active_object)
+    _sh = sum(1 for e in _tb.edges() if len(e.faces()) == 2)
+    check("join: tangent elbow + trimmed cylinder keep both faces whole, arch stitched",
+          r == {'FINISHED'} and _tb.face_count() == 2 and sorted(round(f.area(), 4) for f in _tb.faces()) == _tga
+          and _sh >= 4, f"faces={_tb.face_count()} shared={_sh} areas={[round(f.area(), 4) for f in _tb.faces()]} vs {_tga}")
+    bpy.data.objects.remove(ctx.active_object)
 
 # --- Edge fillet -----------------------------------------------------------
 def make_L(tag, loc=(0, 0, 0)):
@@ -7541,14 +7563,58 @@ _gn = _dtg.grid_steps("NONE", 1.0, 1.0, 10)
 _snap_in = lambda ppi: round(_dtg.visible_grid_step(_gi, ppi / 0.0254) / 0.0254, 6)
 _snap_cm = lambda ppcm: round(_dtg.visible_grid_step(_gm, ppcm / 0.01) * 100, 6)
 check("grid snap: Imperial levels are its units (thou, inch, foot, yard...), no inch fractions; the step is the finest "
-      "level drawn at least half visible",
+      "level drawn at least a quarter strong",
       _snap_in(74) == 1.0 and _snap_in(2000) == 1.0 and _snap_in(10) == 12.0 and _snap_in(25) == 1.0
       and len(_gi) == 8 and abs(_gi[1] - 0.0254) < 1e-12, f"{_snap_in(74)} {_snap_in(2000)} {_snap_in(10)}")
 check("grid snap: Metric steps by tens with the zoom (mm, cm, 10 cm, m); no units: Grid Scale x Subdivisions",
-      _snap_cm(200) == 0.1 and _snap_cm(40) == 1.0 and _snap_cm(5) == 10.0 and _snap_cm(1) == 100.0
-      and _gn[:3] == [1.0, 10.0, 100.0], f"{_snap_cm(200)} {_snap_cm(40)} {_snap_cm(5)} {_snap_cm(1)}")
+      _snap_cm(200) == 0.1 and _snap_cm(40) == 1.0 and _snap_cm(5) == 10.0 and _snap_cm(1) == 10.0 and _snap_cm(0.6) == 100.0
+      and _gn[:3] == [1.0, 10.0, 100.0], f"{_snap_cm(200)} {_snap_cm(40)} {_snap_cm(5)} {_snap_cm(1)} {_snap_cm(0.6)}")
 check("grid snap: the scene's Unit Scale and the overlay's Grid Scale move the levels",
       abs(_dtg.grid_steps("METRIC", 0.001)[4] - 1000.0) < 1e-9 and abs(_dtg.grid_steps("METRIC", 1.0, 2.0)[4] - 2.0) < 1e-12)
+check("grid snap: lines a third strong (mm 12 px apart) are snapped to, not skipped for the next level",
+      _snap_cm(120) == 0.1 and _snap_cm(9) == 10.0, f"{_snap_cm(120)} {_snap_cm(9)}")
+
+# Blender 5.1+'s own grid (overlay_grid.hh): strengths as measured in 5.3's drawing (Top view, a 1147 px wide
+# region: mm lines 13 px apart ~0.6 of a full line, 7 px ~0.15, 5 px none; perspective at 50 deg from straight
+# down: 1 m lines ~0.65 at 30 m eye height, ~0.3 at 50 m, gone at 80 m)
+from types import SimpleNamespace as _NS
+from mathutils import Matrix as _Mx, Euler as _Eu
+def _top_rv3d(ppu, w=1147, h=800):
+    W = _Mx.Diagonal((2.0 * ppu / w, 2.0 * ppu / h, -0.01, 1.0))
+    return _NS(is_perspective=False, is_orthographic_side_view=True, window_matrix=W, perspective_matrix=W,
+               view_distance=1.0), _NS(width=w, height=h)
+def _persp_rv3d(height, tilt=50.0):
+    R = _Eu((math.radians(tilt), 0, 0)).to_matrix().to_4x4()
+    eye = R @ Vector((0, 0, height / math.cos(math.radians(tilt))))
+    return _NS(is_perspective=True, is_orthographic_side_view=False,
+               view_matrix=(_Mx.Translation(eye) @ R).inverted()), _NS(width=1147, height=800)
+_bm = _dtg.blender_grid_steps("METRIC", 1.0, 1.0, 10, True)
+_bu = _dtg.blender_grid_steps("METRIC", 1.0, 1.0, 10, False)
+_ta = lambda p: _dtg.blender_level_alphas(_bm, *reversed(_top_rv3d(p * 1000.0)))[1]
+_pa = lambda hh: _dtg.blender_level_alphas(_bu, *reversed(_persp_rv3d(hh)))[0]
+check("grid snap: Blender's grid levels -- every unit in Top / Front / Side, from 1 m up elsewhere; no units: "
+      "three Subdivisions finer in Top",
+      _bm == _dtg.grid_steps("METRIC", 1.0) and _bu[:4] == [1.0, 10.0, 100.0, 1000.0]
+      and abs(_dtg.blender_grid_steps("NONE", 1.0, 1.0, 10, True)[0] - 0.001) < 1e-12
+      and _dtg.blender_grid_steps("NONE", 1.0, 1.0, 10, False)[0] == 1.0)
+check("grid snap: Blender 5.1+ grid strengths follow 5.3's drawing (Top: mm 13 / 7 / 5 px; floor: 1 m at 30 / 50 / 80 m)",
+      0.4 < _ta(13.2) < 0.7 and 0.03 < _ta(7.2) < 0.25 and _ta(5.0) < 0.05
+      and 0.5 < _pa(30) < 0.8 and 0.2 < _pa(50) < 0.45 and _pa(80) == 0.0,
+      f"{_ta(13.2):.2f} {_ta(7.2):.2f} {_ta(5.0):.2f} | {_pa(30):.2f} {_pa(50):.2f} {_pa(80):.2f}")
+_gov = _NS(show_overlays=True, show_floor=True, show_ortho_grid=True, grid_scale=1.0, grid_subdivisions=10)
+_gctx = _NS(scene=ctx.scene, space_data=_NS(type='VIEW_3D', overlay=_gov), area=None,
+            preferences=ctx.preferences, window_manager=ctx.window_manager)
+def _dstep(rv, rg, ppu, n=(0, 0, 1)):
+    return _dtg.drawn_grid_step(_gctx, rg, rv, ppu, np.array(n, float))
+_t13 = _dstep(*_top_rv3d(13200.0), 13200.0)
+_t5 = _dstep(*_top_rv3d(5000.0), 5000.0)
+_p30 = _dstep(*_persp_rv3d(30), 6.0)         # 1 m lines 6 px apart (squeezed), 0.65 strong: the old rule took 10 m
+_p80 = _dstep(*_persp_rv3d(80), 4.1)         # 1 m not drawn: 10 m
+_pup = _dstep(*_persp_rv3d(30), 6.0, (0, 1, 0))   # an upright plane: nothing drawn on it, the add-on's rule
+check("grid snap: Ctrl snaps to the finest level drawn plainly where you draw -- Top: mm lines 13 px apart "
+      "(they show), not 5 px; perspective floor: Blender's 1 m lines while they show",
+      (_t13, _t5, _p30, _p80, _pup) == (0.001, 0.01, 1.0, 10.0, 10.0) if _dtg.NEW_BLENDER_GRID else True,
+      f"{_t13} {_t5} {_p30} {_p80} {_pup}")
 
 # --- Draw Line: the lines drawn so far snap (their ends, middles, any point on them); Alt places a free point;
 #     O switches snapping onto mesh faces
