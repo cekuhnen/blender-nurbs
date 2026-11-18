@@ -17,7 +17,7 @@ The sidebar tab **NURBS Proto** has one collapsible panel per group. Ctrl+click 
 | **Create Surfaces** | Draw Plane · Plane, Disk, Box, Cylinder, Cone, Sphere, Torus · from curves: Loft, Loft Rails, Sweep, Pipe, Extrude, Revolve, Planar · filling a gap: Boundary, Square, Patch, Dome · from surfaces: Offset, Thicken, Convert Blender Surface |
 | **Curve Edit** | Join / Unjoin Curves, Trim / Split Curves, Rebuild / Extend Curve, Align Curve |
 | **Surface Edit** | Edit CVs, Flip Normal, Rebuild Surface, Extend Surface, Surface Align, Match Surface, Refit to Trim, Merge Patches · Trim, Split, Untrim, Join, Unjoin · Surface Fillet, Edge Fillet · solids: Union, Difference, Intersection, Boundary Fill |
-| **Convert** (closed at first) | BREP to Mesh, Mesh to BREP, SubD to BREP (all also in Object › Convert) |
+| **Convert** (closed at first) | BREP to Mesh, Mesh to BREP, SubD to BREP (all also in Object › Convert) · fit to a scan: Tube Cage from Scan, Fit Cage to Scan |
 | **Analyze** (closed at first) | Continuity Check and the overlays (also in the viewport header's Analyze popover) |
 | **Display** | **Edges**, **CVs / Hulls**, **Spans**, **Feature Labels** and **Fine Grid** on / off (also as icons in the 3D view header, next to the Analyze button, so they are always at hand); **CVs / Hulls** also draws the CV hulls of selected curves (NURBS and Poly CVs, Bezier points with their handles) outside Edit mode, where Blender draws its own; **Spans** draws the knot lines (isoparms) of every face of the visible NURBS surfaces, clipped to their trims, so you see each surface's layout at a glance; **Fine Grid** draws the floor grid's finer levels (mm, cm, 10 cm; inches) in a perspective or turned orthographic view, where Blender's floor grid stops at 1 m (1 ft); right under them how finely surfaces are meshed for display: **Quality** *Fast / Medium / Fine* sets the four values below at once (Fast: angle 10°, chord 0.001, edges 3°, max edge 1/20; Medium, the defaults: 5°, 0.0005, 2°, 1/30; Fine: 2.5°, 0.0002, 1°, 1/50), one retessellation of every body; it reads *Custom* once a value is set by hand: Chord / Angle Tolerance, Edge Angle, Max Edge. The display mesh is rebuilt after every edit, so Fast makes editing quicker (a 38-face SubD body: 0.16 s Fast, 0.37 s Medium, 1.2 s Fine, 12k / 40k / 144k triangles). The analysis overlays (zebra, curvature map) don't use it: they have their own mesh and quality. **Clip Start warning:** a 3D view's depth buffer spreads its precision between Clip Start and Clip End, so a tiny Clip Start (say 1 µm) leaves depth steps of about 8 mm at 0.37 m. Surfaces, edges and Face / Edge highlights then flicker against each other (blotchy fills, dashed edges). When the steps exceed 0.05 % of the view distance, the Display panel says so and a red ⚠ appears in the header: one click sets Clip Start to about a thousandth of the view distance. |
 | **History** (closed at first) | Construction History, Live Update, Pause Rebuild, Delete History, Collect Inputs, Rebuild / Re-tessellate |
@@ -432,6 +432,7 @@ history. Trimmed and multi-face objects can be picked by their real B-rep edges
 | **Curvature Map** | NURBS surfaces | **Gaussian / Mean / Max / Min** curvature, exact at every vertex of its own fine mesh (fundamental forms from the surface's exact first and second derivatives, singular points such as poles taken as the limit). Sign from the face's outward normal on the body (convex positive), also on a face whose orientation is reversed against its surface (a closed cylinder's side used to read concave). Blue → red ramp with **Contours**, **Auto Range** (2–98 percentile, symmetric for Gaussian/Mean) or a fixed range. Checked: sphere r=2 gives K 0.25, H 0.5 everywhere. Zebra, Draft and Curvature are exclusive overlays. |
 | **Draft Angle** | NURBS surfaces | Per-pixel colour from the exact surface normals against a **Pull** direction (±X/±Y/±Z or View). Green = more draft than **Min Draft °**, yellow = within ±Min Draft (won't release cleanly), red = undercut, with a dark line at the threshold. |
 | **Matcap** | NURBS surfaces | Shading from the exact normals (the zebra's fine mesh), drawn over any shading mode. **Highlight**: dark material with one bright highlight band, to judge how a highlight flows over blends (Plasticity style). **Gray Lines**: soft grey with a few thin, pixel-crisp lines (**Lines** count, **Line Px** width). Both are fixed to the view: horizontal / vertical, band **Position** and **Width**. **Environment**: paint under a clear coat (Schlick Fresnel, 4% face-on) that reflects an environment **fixed to the world**, so orbiting or turning the part sweeps the reflections across it (Alias style). Environments: **Light Tunnel** (strip lights around a horizontal axis, **Lights** count, **Rotation** turns the axis; drawn by the shader, so the strips stay pixel-sharp at any zoom), **Horizon** (bright sky over a dark ground, one crisp horizon line, **Height** moves it), and the eight HDRIs that ship with Blender (city, courtyard, forest, interior, night, studio, sunrise, sunset: 1K, CC0, from Poly Haven; read from Blender's install with OpenImageIO, nothing downloaded or added to the file; **Rotation** turns them). **Paint** colour (near-black by default; dark red gives car paint), **Gloss** (reflection strength, 0 = no reflection), **Roughness** (blurs the reflection: 0 mirror, 0.3 satin, 1 matte; the HDRIs step through their smaller maps and then the irradiance, the tunnel's strips are box-filtered exactly over the blur angle, the horizon line softens) and **Metallic** (0 = paint under a clear coat; 1 = bare metal, which reflects in the paint colour and has no matte part: light grey gives chrome, a colour gives anodised aluminium). **Clear Coat** (the toggle under Draft Angle, Curvature Map and the Highlight / Gray Lines matcaps) puts the same glossy, world-fixed reflection over those overlays (Fresnel-weighted; the overlay is the base colour, so it has the environment's controls and Roughness but no paint), so curvature colours or draft zones show with real reflections running over them; the header's Analyze button then reads e.g. *Curvature · Coat*. Each environment's irradiance is precomputed (cosine-weighted, 32 x 16) for the paint's matte part and scaled so its brightest is 1, so every environment looks about as bright; a filmic curve rolls the highlights off. An HDRI is kept at 1024 / 256 / 64 wide and the shader blends toward the smaller maps where one pixel covers many texels (tight fillets would sparkle). The old **Red** style is gone (it was Highlight tinted red; Environment with a red paint replaces it). |
+| **Scan Deviation** | NURBS surfaces and SubD models (selected, or all visible); the **Scan** mesh set in the panel | Colours each surface by its signed distance from the scan: green at **At** (0 on the scan, or a housing's clearance), red **±** outside, blue inside, **Contours** across the range, grey where no scan lies under the surface (past a cut or a hole). A SubD model is measured on its exact limit surface (as SubD to BREP builds it), a NURBS body on its analysis mesh. The panel gives the active object's area-weighted RMS, the distance 95 % of its surface stays within, and how far it goes in and out. Fit Cage to Scan turns it on. Exclusive with Zebra, Draft, Curvature and Matcap. |
 | **Curvature Comb** | Curve objects: NURBS, Bezier, poly (selected, or all visible) | Exact comb from the kernel's 1st/2nd derivatives: hairs of length curvature × **Scale**, pointing away from the centre of curvature, plus the envelope through the tips. An inflection shows as the comb changing side, a curvature jump as a step in the envelope (each knot is sampled just before and after it, so a jump draws as a clean step). **Knots** get a short tick across the curve: grey where the curve is smooth there, **orange where the curvature jumps** (G1 only: a degree-2 curve does this at almost every knot), red at a corner. **Samples** sets the density. **Degree, not Order:** with a curve active, the Active Object panel shows each spline's degree, CVs, spans and kind. **Degree 1-5** buttons set the degree on the same CVs: this is Blender's *Order U* in the spline panel, which is degree + 1, so Order U 3 is degree 2. A degree-2 curve gets a note that its comb steps at the knots. **Rebuild as Degree 3** refits it with the fewest CVs that keep its shape within 0.01 %, so its comb flows (G2). |
 | **Surface Combs** | NURBS surfaces | Curvature combs on iso-curves of the surfaces (Alias Curvature U / V): along U and / or V, with a count for each, and a scale and samples. |
 | **Dynamic Section** | The selected NURBS objects, or all visible ones | Parallel planes through the surfaces with their section curves and curvature combs, live while you move or turn the section: count, step, combs on / off, plane on / off; orient it to X, Y, Z or the view. Click again to switch it off; once more brings it back as it was. One section per scene. |
@@ -634,6 +635,54 @@ before its Subdivision Surface modifier), with **one face per cage face**.
   of the SubD surface (exactly on it on the one-span faces)*.
 * Modifiers other than the Subdivision Surface count (a Mirror, for instance). Creases below 1.0 are treated as smooth.
 * Not yet: partial creases (below 1.0).
+
+### Fit to Scan (Tube Cage from Scan, Fit Cage to Scan)
+
+Turn a scan (a residual limb, a body part, a product or car part) into exact NURBS that match it: a SubD cage is
+fitted so its smooth surface lies on the scan, then **SubD to BREP** makes the NURBS body. Use it to drape a
+housing, cover or socket over a scan for 3D printing, or to rebuild a scanned form as editable surfaces.
+
+**Why not Shrinkwrap?** A Shrinkwrap puts the cage's vertices on the scan, but a Catmull-Clark surface pulls away
+from its cage: inside it on bulges, outside it in hollows. On a residual-limb scan with a 124-vertex cage, the
+surface of a cage whose vertices sit on the scan is about 4 mm inside it on average. Fit Cage to Scan solves for the
+cage whose *surface* lies on the scan instead.
+
+**Tube Cage from Scan** (active object: the scan) builds a starting cage for limb-like shapes: **Rings** along the
+scan's main axis, **Around** vertices per ring (a multiple of 4), from the closed end up to just below the scan's
+open rim (**Length** sets it), the closed end capped with a quad grid (4 star points of valence 3). The rim is the
+scan's longest open border: small holes (at a tip, say) don't count, and a large n-gon closing the cut (a lid)
+is left out, as it is not scanned surface. With **Fit** on, it is fitted right away. The cage gets a Subdivision
+modifier and remembers its scan.
+
+**Fit Cage to Scan** (active object: the SubD cage; the scan is another selected mesh, the scan the cage was made
+from, or the **Scan** under Analyze › Scan Deviation) works on any cage you modeled yourself too.
+
+* **Offset**: fit to the scan moved this far out along its normal: a housing's clearance, a liner's thickness.
+* **Drape**: one-sided, like a sheet laid over the scan. Where the surface dips into the scan (+ offset) it is pushed
+  out at full weight; where it stands outside, it pulls in only lightly, so it bridges folds and hollows instead of
+  following them in. On the leg scan with a 3 mm offset, 99 % of the surface keeps at least 2.8 mm off the scan.
+* **Smoothness**: evens out the curvature (scan noise, small bumps) at the cost of a looser fit.
+* **Hold Spacing**: how firmly the cage keeps its spacing along the surface while it moves.
+* **Both Ways**: also pulls the surface towards every part of the scan, so bumps between the surface's samples are
+  reached. **Max Distance**: scan points farther away are ignored (0: automatic).
+* In Edit Mode only the selected vertices move.
+* The report gives the area-weighted RMS distance, the distance 95 % of the surface stays within, and the most inside /
+  outside (less the offset).
+
+How it works: every point of the limit surface is a fixed linear mix of cage vertices. That mix is built once as a
+sparse matrix with SubD to BREP's own Catmull-Clark rules (creases, open borders, Keep Corners), so the fitted
+surface is exactly what SubD to BREP converts. Then, each round, the surface samples find their nearest scan points
+and the scan's points their nearest surface points (pairs whose normals disagree, such as the far wall of a thin
+part, or that lie too far are dropped), and one linear least-squares solve moves the cage: point-to-plane distances
+both ways, the cage's tangential spacing held, a light fairness on its curvature variation (so round sections stay
+round instead of shrinking). On a 124-vertex cage and a 92k-triangle scan a fit takes about 2 s.
+
+Measured on a residual-limb scan (38 cm, 92k triangles), 10 rings × 12: the NURBS body is 1.2 mm RMS from the scan,
+95 % within 2 mm; the lower half within 0.2–0.7 mm RMS. Larger misses are features a 12-around cage can't follow
+(a muscle ridge, a round bump): more rings and vertices around, or a cage modeled around them, follow them closer.
+
+* Not yet: holding a cage edge to a curve on the scan (a trim line), symmetry, and cages with modifiers above the
+  Subdivision (apply them first).
 
 ## STEP Import and Export
 

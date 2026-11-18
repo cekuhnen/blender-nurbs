@@ -114,6 +114,10 @@ GROUPS = (
             (_t("nproto.mesh_to_brep", "Mesh to BREP", 'MESH_CUBE'),),
             (_t("nproto.subd_to_brep", "SubD to BREP", 'MOD_SUBSURF'),),
         )),
+        ("Fit to Scan", (
+            (_t("nproto.scan_tube_cage", "Tube Cage from Scan", 'MESH_CYLINDER'),),
+            (_t("nproto.scan_fit_cage", "Fit Cage to Scan", 'MOD_SHRINKWRAP'),),
+        )),
     )),
 )
 

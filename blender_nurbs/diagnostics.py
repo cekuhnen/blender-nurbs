@@ -370,6 +370,10 @@ void main()
         return;
     }
     if (mode == 2) {                                 /* curvature map */
+        if (vV > 1e29) {                             /* no value (off a scan): grey */
+            FragColor = finish(vec3(0.42) * shade, n, v);
+            return;
+        }
         float t = (vV - vmin) / max(vmax - vmin, 1e-12);
         vec3 col = ramp(t);
         if (fract(t * bands) < 0.04 && bands > 0.5) col *= 0.55;   /* contour lines */
@@ -652,10 +656,12 @@ def _curv_batch(obj, shader, kind, angle_deg, chord_rel):
 _value_batches = {}
 
 
-def draw_value_mesh(ctx, obj, key, P, N, T, V, vmin, vmax, bands=10.0, opacity=1.0):
+def draw_value_mesh(ctx, obj, key, P, N, T, V, vmin, vmax, bands=10.0, opacity=1.0, cache=None):
     """The curvature-map ramp (blue - green - red over vmin..vmax, contour
-    lines every 1/bands) on a mesh given in obj's local space. key: changes
-    when the mesh does (the batch is kept until then)."""
+    lines every 1/bands) on a mesh given in obj's local space; values of 1e30
+    and more are drawn grey (no value). key: changes when the mesh does (the
+    batch is kept until then). cache: the caller's own dict of batches, one per
+    object (by default one batch is kept, for one object)."""
     rv3d = ctx.region_data
     if rv3d is None or obj is None or len(T) == 0:
         return
@@ -664,11 +670,13 @@ def draw_value_mesh(ctx, obj, key, P, N, T, V, vmin, vmax, bands=10.0, opacity=1
     except Exception as exc:
         print("NURBS diagnostics shader:", exc)
         return
-    hit = _value_batches.get(obj.session_uid)
+    store_ = _value_batches if cache is None else cache
+    hit = store_.get(obj.session_uid)
     if hit is None or hit[0] != key:
         hit = (key, batch_for_shader(shader, 'TRIS', {"pos": P, "nor": N, "val": V}, indices=T))
-        _value_batches.clear()
-        _value_batches[obj.session_uid] = hit
+        if cache is None:
+            store_.clear()
+        store_[obj.session_uid] = hit
     vinv = rv3d.view_matrix.inverted()
     eye = vinv.translation if rv3d.is_perspective else (vinv.translation + vinv.to_3x3() @ Vector((0, 0, 1e6)))
     gpu.state.depth_test_set('LESS_EQUAL')

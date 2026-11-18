@@ -81,7 +81,7 @@ everything built from it rebuilds.
 
 - **Continuity Check:** G0, G1, G2 and G3 between surfaces
 - **Feature Labels:** each feature's edges show the continuity it holds, live; click one to change it
-- **Overlays:** Zebra, Curvature Map, Draft Angle, Matcap
+- **Overlays:** Zebra, Curvature Map, Draft Angle, Matcap, Scan Deviation (distance from a scan mesh)
 - **Combs and sections:** Curvature Comb, Surface Combs, Dynamic Section
 - **Display:** Edges, CVs / Hulls (surfaces, and selected curves outside Edit mode), Spans (every face's knot
   lines, clipped to its trims), Feature Labels, Fine Grid
@@ -99,6 +99,10 @@ everything built from it rebuilds.
   (G2: degree 6, 12 x 12; G1: degree 5, 10 x 10), solved so every face joins exactly (Continuity Check: G1 0.000°,
   G2 0.00 %, star points included), creases as sharp edges, open borders with or without kept corners; triangles and n-gons split into quads that meet the
   cage quads beside them at exact T-junctions
+- **Fit to Scan:** fit a SubD cage so its smooth surface (not its vertices, as a Shrinkwrap would) lies on a scan,
+  a set offset off it, or draped over it (bridging folds, never dipping in: housings, covers, sockets), then SubD to
+  BREP makes the exact NURBS body. **Tube Cage from Scan** builds and fits a starting cage for limb-like scans; the
+  **Scan Deviation** overlay colours any surface by its distance from the scan
 
 ### STEP Import and Export
 

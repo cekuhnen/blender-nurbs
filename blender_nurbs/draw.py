@@ -420,6 +420,11 @@ def _draw():
     from . import diagnostics
     if v is not None:
         diagnostics.draw_zebra(ctx)          # under the edges
+        from . import scanfit
+        try:
+            scanfit.draw_scan_dev(ctx)
+        except Exception as exc:
+            print("NURBS scan deviation:", exc)
     _draw_merge_devmap(ctx)
     chord = store.tess_settings(ctx)[0]
     curves = []
