@@ -258,4 +258,90 @@ moved = np.linalg.norm(Va[:len(Vb)] - Vb, axis=1)
 check("Refine in Edit Mode: the unselected vertices stay, loops are added",
       res == {'FINISHED'} and moved[~sel].max() < 1e-9 and len(Va) > len(Vb), f"{moved[~sel].max():.1e}, +{len(Va) - len(Vb)}")
 
+# -- 8. Trim Cage to Curve: the open edge held to a closed curve drawn on the scan -------------
+def on_capsule(t, z, out=0.0, rx=0.065, ry=0.05, h=0.26, z0=0.2):
+    sc = 1.0 + 0.12 * np.sin(np.pi * (z - z0) / h)
+    p = np.stack([rx * sc * np.cos(t), ry * sc * np.sin(t), z], 1)
+    nrm = np.stack([np.cos(t) / rx, np.sin(t) / ry, np.zeros_like(t)], 1)
+    return p + out * nrm / np.linalg.norm(nrm, axis=1)[:, None]
+
+
+def curve_obj(name, P, cyclic=True):
+    cu = bpy.data.curves.new(name, 'CURVE')
+    cu.dimensions = '3D'
+    sp = cu.splines.new('POLY')
+    sp.points.add(len(P) - 1)
+    for q, p in zip(sp.points, P):
+        q.co = (p[0], p[1], p[2], 1.0)
+    sp.use_cyclic_u = cyclic
+    o = bpy.data.objects.new(name, cu)
+    ctx.collection.objects.link(o)
+    return o
+
+
+tt = np.linspace(0, 2 * np.pi, 48, endpoint=False)
+trim_z = 0.2 + 0.17 + 0.05 * np.cos(tt)                      # dips 10 cm from front to back
+trim = curve_obj("Trim", on_capsule(tt, trim_z, out=0.001))  # drawn 1 mm off the scan: projected onto it
+for o in ctx.scene.objects:
+    o.select_set(False)
+scan_obj.select_set(True)
+ctx.view_layer.objects.active = scan_obj
+bpy.ops.nproto.scan_tube_cage(rings=8, segments=12)
+tc = ctx.active_object
+trim.select_set(True)
+res = bpy.ops.nproto.scan_trim_cage()
+ti = dict(sf.LAST_INFO)
+Vt, Ft, sht, kct = sf.cage_of(tc)
+smt = sf.Sampler(len(Vt), Ft, sht, kct, 3)
+Pt = smt.points(Vt)
+edge = sf.poly_border_loops(smt.Fs)[0]
+check("Trim Cage to Curve: the open edge lies on the trim line (both ways within 0.3 mm), the surface on the scan",
+      res == {'FINISHED'} and ti["edge_max"] < 0.3e-3 and ti["edge_along"] < 0.2e-3 and ti["dev_rms"] < 0.4e-3,
+      f"edge {ti['edge_max'] * MM:.3f} mm ({ti['edge_along'] * MM:.3f} along the scan), RMS {ti['dev_rms'] * MM:.3f} mm")
+check("the edge follows the line's 10 cm dip, the cage remembers its trim line",
+      np.ptp(Pt[edge, 2]) > 0.095 and tc.get("nproto_trim") == "Trim", f"{np.ptp(Pt[edge, 2]) * MM:.1f} mm")
+for o in ctx.scene.objects:
+    o.select_set(False)
+tc.select_set(True)
+ctx.view_layer.objects.active = tc
+res = bpy.ops.nproto.scan_fit_cage(smoothness=0.2)
+check("Fit Cage to Scan afterwards keeps the edge on the trim line", res == {'FINISHED'}
+      and sf.LAST_INFO.get("edge_max") is not None and sf.LAST_INFO["edge_max"] < 0.3e-3,
+      f"{sf.LAST_INFO.get('edge_max', 1) * MM:.3f} mm")
+res = bpy.ops.nproto.scan_refine_cage(loops=2, tolerance=0.0)
+check("Refine Cage to Scan keeps it too (loops across the edge add edge vertices)", res == {'FINISHED'}
+      and sf.LAST_INFO["edge_max"] < 0.3e-3 and sf.LAST_INFO["loops"] == 2, f"{sf.LAST_INFO['edge_max'] * MM:.3f} mm")
+# edge_need: a face whose open edge runs off the line asks to be halved along that edge
+Fe = [(0, 1, 2, 3), (1, 4, 5, 2), (3, 2, 6, 7), (2, 5, 8, 6)]
+Ve = np.array([(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (2, 0, 0), (2, 1, 0), (1, 2, 0), (0, 2, 0), (2, 2, 0)], float)
+se = sf.Sampler(len(Ve), Fe, (), False, 2)
+Pe_ = se.points(Ve)
+lp = sf.poly_border_loops(se.Fs)[0]
+miss = ((Pe_[lp, 1] < 0.02) & (Pe_[lp, 0] > 0.4) & (Pe_[lp, 0] < 0.95)).astype(float)   # face 0's bottom edge
+eu, ev = sf.edge_need(Fe, 2, Pe_, se.Fs, lp, miss, 0.5)
+check("edge_need: the face whose edge misses is asked to be halved along that edge, no other",
+      eu[0] > 0 and ev[0] == 0 and not eu[1:].any() and not ev[1:].any(), (eu, ev))
+res = bpy.ops.nproto.scan_fit_cage(hold_trim=False)
+check("Hold Trim Line off: the fit is free of it", res == {'FINISHED'} and sf.LAST_INFO.get("edge_max") is None)
+open_c = curve_obj("OpenTrim", on_capsule(tt[:30], trim_z[:30]), cyclic=False)
+open_c.select_set(True)
+Vb = np.array([v.co[:] for v in tc.data.vertices])
+res = bpy.ops.nproto.scan_trim_cage()
+check("an open curve is refused, the cage left as it was",
+      res == {'CANCELLED'} and np.allclose(Vb, np.array([v.co[:] for v in tc.data.vertices])))
+# a trim line with a drape offset: the edge sits the offset off the scan, over the line
+for o in ctx.scene.objects:
+    o.select_set(False)
+tc.select_set(True)
+trim.select_set(True)
+ctx.view_layer.objects.active = tc
+res = bpy.ops.nproto.scan_trim_cage(drape=True, offset=0.003)
+Vt, Ft, sht, kct = sf.cage_of(tc)
+smt = sf.Sampler(len(Vt), Ft, sht, kct, 3)
+Pe = smt.points(Vt)[sf.poly_border_loops(smt.Fs)[0]]
+se = sf.scan_for(scan_obj).signed(Pe)
+check("Trim with Drape + 3 mm: the edge stands 3 mm off the scan, on the line pushed out",
+      res == {'FINISHED'} and np.nanmax(np.abs(se - 0.003)) < 0.4e-3 and sf.LAST_INFO["edge_max"] < 0.3e-3,
+      f"edge off the scan {np.nanmin(se) * MM:.2f}..{np.nanmax(se) * MM:.2f} mm")
+
 print("ALL OK" if ok else "SOME FAILED")

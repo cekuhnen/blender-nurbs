@@ -121,8 +121,8 @@ to the old trim.
 ```
 
 `test_scanfit.py` covers Fit to Scan on a synthetic scan (an elliptic capsule with a cut, a lid n-gon and a
-hole at its tip, and one with a ridge along its side for Refine Cage to Scan), so no real scan has to be in the
-repository.
+hole at its tip, and one with a ridge along its side for Refine Cage to Scan; trim lines are curves built on it),
+so no real scan has to be in the repository.
 
 ## How G1/G2 lofts work
 

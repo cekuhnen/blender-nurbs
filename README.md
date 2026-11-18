@@ -102,7 +102,8 @@ everything built from it rebuilds.
 - **Fit to Scan:** fit a SubD cage so its smooth surface (not its vertices, as a Shrinkwrap would) lies on a scan,
   a set offset off it, or draped over it (bridging folds, never dipping in: housings, covers, sockets), then SubD to
   BREP makes the exact NURBS body. **Tube Cage from Scan** builds and fits a starting cage for limb-like scans,
-  **Refine Cage to Scan** adds edge loops only where the surface misses the scan (all quads, no new star points); the
+  **Refine Cage to Scan** adds edge loops only where the surface misses the scan (all quads, no new star points),
+  **Trim Cage to Curve** holds the cage's open edge to a trim line drawn on the scan; the
   **Scan Deviation** overlay colours any surface by its distance from the scan
 
 ### STEP Import and Export

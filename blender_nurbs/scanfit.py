@@ -512,6 +512,202 @@ def border_loops(V, T):
 
 
 # ---------------------------------------------------------------------------
+# trim lines: a cage's open edge held to a curve
+# ---------------------------------------------------------------------------
+
+
+def poly_border_loops(F):
+    """The open borders of polygons F (edges of one face) as ordered closed
+    vertex loops, longest (most vertices) first. Open chains (a non-manifold
+    border) are left out."""
+    cnt = {}
+    for f in F:
+        for i in range(len(f)):
+            e = (int(f[i]), int(f[(i + 1) % len(f)]))
+            k = (min(e), max(e))
+            cnt[k] = cnt.get(k, 0) + 1
+    adj = {}
+    for (a, b), c in cnt.items():
+        if c == 1:
+            adj.setdefault(a, []).append(b)
+            adj.setdefault(b, []).append(a)
+    seen, loops = set(), []
+    for s in adj:
+        if s in seen or len(adj[s]) != 2:
+            continue
+        loop, prev, x = [s], None, s
+        seen.add(s)
+        ok = True
+        while True:
+            nb = [y for y in adj[x] if y != prev]
+            if len(adj[x]) != 2 or not nb:
+                ok = False
+                break
+            y = nb[0]
+            if y == s:
+                break
+            if y in seen:
+                ok = False
+                break
+            loop.append(y)
+            seen.add(y)
+            prev, x = x, y
+        if ok and len(loop) >= 3:
+            loops.append(np.array(loop, np.int64))
+    loops.sort(key=lambda l: -len(l))
+    return loops
+
+
+def polyline_nearest(P, C, closed=True):
+    """For each point of P its nearest point on the polyline C: (foot, unit
+    tangent there, segment index, parameter along the segment, distance)."""
+    P = np.asarray(P, float)
+    C = np.asarray(C, float)
+    A = C if closed else C[:-1]
+    B = np.roll(C, -1, axis=0) if closed else C[1:]
+    D = B - A
+    L2 = np.maximum((D * D).sum(1), 1e-300)
+    foot = np.empty_like(P)
+    seg = np.empty(len(P), np.int64)
+    lam = np.empty(len(P))
+    dist = np.empty(len(P))
+    for i0 in range(0, len(P), 256):                       # (blocks: P x segments distances)
+        Q = P[i0:i0 + 256]
+        t = np.clip(((Q[:, None, :] - A[None]) * D[None]).sum(2) / L2[None], 0.0, 1.0)
+        F = A[None] + t[..., None] * D[None]
+        d2 = ((Q[:, None, :] - F) ** 2).sum(2)
+        k = d2.argmin(1)
+        r = np.arange(len(Q))
+        foot[i0:i0 + 256] = F[r, k]
+        seg[i0:i0 + 256] = k
+        lam[i0:i0 + 256] = t[r, k]
+        dist[i0:i0 + 256] = np.sqrt(d2[r, k])
+    tan = D[seg] / np.sqrt(L2[seg])[:, None]
+    return foot, tan, seg, lam, dist
+
+
+def resample_polyline(C, n, closed=True):
+    """n points evenly spaced by arc length along the polyline C."""
+    C = np.asarray(C, float)
+    Cc = np.vstack([C, C[:1]]) if closed else C
+    s = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(Cc, axis=0), axis=1))]
+    t = np.linspace(0.0, s[-1], n, endpoint=not closed)
+    return np.stack([np.interp(t, s, Cc[:, k]) for k in range(3)], 1)
+
+
+def _ring_angles(P, c, e1, e2):
+    d = P - c
+    return np.arctan2(d @ e2, d @ e1)
+
+
+def trim_targets(X, loop, C):
+    """Where each vertex of the cage's border `loop` goes on the closed trim
+    curve C: by the angle around the loop's centre in the loop's plane (the
+    columns of a tube cage stay upright, however far the line dips), or by
+    arc length when C does not wind once around that centre."""
+    Pl = X[loop]
+    c = Pl.mean(0)
+    _, _, Vt = np.linalg.svd(Pl - c)
+    e1, e2 = Vt[0], Vt[1]
+    th_v = _ring_angles(Pl, c, e1, e2)
+    th_c = np.unwrap(_ring_angles(C, c, e1, e2))
+    Cc = C
+    if th_c[-1] < th_c[0]:
+        Cc, th_c = C[::-1], th_c[::-1]
+    span = th_c[-1] - th_c[0]
+    steps = np.diff(th_c)
+    if abs(span) > 1.5 * math.pi and (steps >= -1e-9).all():
+        th = th_c - th_c[0]
+        tv = np.mod(th_v - th_c[0], 2 * math.pi)
+        thp = np.r_[th, 2 * math.pi]
+        Cp = np.vstack([Cc, Cc[:1]])
+        return np.stack([np.interp(tv, thp, Cp[:, k]) for k in range(3)], 1)
+    # arc length, starting where the loop's first vertex is nearest, in the loop's direction
+    sl = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(np.vstack([Pl, Pl[:1]]), axis=0), axis=1))]
+    fl = sl[:-1] / sl[-1]
+    _, _, k0, l0, _ = polyline_nearest(Pl[:1], C, True)
+    _, _, k1, _, _ = polyline_nearest(Pl[1:2], C, True)
+    step = (int(k1[0]) - int(k0[0])) % len(C)
+    Cr = C if step <= len(C) // 2 else C[::-1]
+    _, _, k0, l0, _ = polyline_nearest(Pl[:1], Cr, True)
+    Cr = np.roll(Cr, -int(k0[0]), axis=0)
+    Cc = np.vstack([Cr, Cr[:1]])
+    sc = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(Cc, axis=0), axis=1))]
+    return np.stack([np.interp(fl * sc[-1], sc, Cc[:, k]) for k in range(3)], 1)
+
+
+def nearest_loop(X, F, C):
+    """The open border loop of the cage (X, F) lying nearest the curve C (by mean distance), or None."""
+    loops = poly_border_loops(F)
+    if not loops:
+        return None
+    return min(loops, key=lambda l: float(polyline_nearest(X[l], C, True)[4].mean()))
+
+
+def place_on_trim(X, F, C, smooth=4, scan=None):
+    """Move the cage's open border nearest the closed trim curve C onto it,
+    and the rest of the cage along: each vertex by its nearest border
+    vertex's move, scaled down linearly with its distance in edges from the
+    border (to nothing at the farthest vertex), then smoothed. With the scan
+    given, every vertex then keeps the distance from the scan it had (a ring
+    moved down a tapering limb comes in with it). A starting place for the
+    fit, which then holds the edge to C."""
+    X = np.asarray(X, float)
+    n = len(X)
+    loop = nearest_loop(X, F, C)
+    if loop is None:
+        raise ValueError("the cage has no open edge to put on the trim line")
+    T = trim_targets(X, loop, C)
+    nb = [set() for _ in range(n)]
+    for f in F:
+        for i in range(len(f)):
+            a, b = int(f[i]), int(f[(i + 1) % len(f)])
+            nb[a].add(b)
+            nb[b].add(a)
+    dist = np.full(n, -1)
+    src = np.full(n, -1)
+    dist[loop] = 0
+    src[loop] = np.arange(len(loop))
+    front = list(loop)
+    while front:
+        nxt = []
+        for x in front:
+            for y in nb[x]:
+                if dist[y] < 0:
+                    dist[y] = dist[x] + 1
+                    src[y] = src[x]
+                    nxt.append(y)
+        front = nxt
+    K = max(int(dist.max()), 1)
+    reach = dist >= 0
+    D = np.zeros((n, 3))
+    Db = T - X[loop]
+    D[reach] = Db[src[reach]] * (1.0 - dist[reach] / K)[:, None]
+    free = reach & (dist > 0)
+    idx = np.nonzero(free)[0]
+    for _ in range(int(smooth)):
+        D2 = D.copy()
+        for x in idx:
+            D2[x] = 0.5 * D[x] + 0.5 * D[list(nb[x])].mean(0)
+        D = D2
+    Xn = X + D
+    if scan is not None:
+        moved = np.linalg.norm(D, axis=1) > 1e-9
+        Q0, N0, _, ok0, _ = scan.nearest(X[moved])
+        Q1, N1, _, ok1, _ = scan.nearest(Xn[moved])
+        off = ((X[moved] - Q0) * N0).sum(1)
+        good = ok0 & ok1
+        Xm = Xn[moved]
+        Xm[good] = Q1[good] + off[good, None] * N1[good]
+        Xn[moved] = Xm
+    return Xn, loop
+
+
+EDGE_WEIGHT = 20.0        # the trim line's pull, against the scan data's total of 1 (each way)
+TRIM_SMOOTH = 0.005       # the trim line is smoothed over this share of the scan's size (2.3 mm on a limb scan)
+
+
+# ---------------------------------------------------------------------------
 # the fit
 # ---------------------------------------------------------------------------
 
@@ -685,7 +881,7 @@ def _gram1(R, w, N):
 
 def fit_cage(X0, F, scan, sharp=(), keep_corners=False, iterations=8, offset=0.0, smoothness=0.1,
              stiffness=1.0, both_ways=True, max_dist=0.0, levels=None, normal_angle=60.0, report=None,
-             fixed=None, drape=False, drape_slack=0.01):
+             fixed=None, drape=False, drape_slack=0.01, edge_curve=None):
     """Solve cage vertex positions (world space, n x 3) so the cage's limit
     surface lies on the scan, `offset` off it along its outward normal.
     drape: one-sided, like a sheet laid over the scan: where the surface lies
@@ -695,6 +891,9 @@ def fit_cage(X0, F, scan, sharp=(), keep_corners=False, iterations=8, offset=0.0
     smoothness: fairness of the surface (0 = follow the scan as closely as the
     cage can). stiffness: how firmly the cage keeps its tangential spacing.
     fixed: boolean mask of cage vertices that stay where they are.
+    edge_curve: a closed polyline (world) the surface's open edge nearest it
+    is held to (a trim line), both ways: the edge onto the curve and the
+    whole curve reached by the edge, sliding along it freely.
     Returns the new cage and a report (deviation stats, timings)."""
     t0 = time.perf_counter()
     X0 = np.asarray(X0, float)
@@ -716,6 +915,17 @@ def fit_cage(X0, F, scan, sharp=(), keep_corners=False, iterations=8, offset=0.0
     hist = []
     orient = None
     size = scan.diag or 1.0
+    eloop = None
+    if edge_curve is not None:
+        Ce = np.asarray(edge_curve, float)
+        P0 = A @ X
+        sl = poly_border_loops(Fs)
+        if sl:
+            eloop = min(sl, key=lambda l: float(polyline_nearest(P0[l], Ce, True)[4].mean()))
+            ne_ = len(eloop)
+            E1 = spmm(Sp(np.arange(ne_), eloop, np.ones(ne_), (ne_, m)), A)
+            Cs = resample_polyline(Ce, max(4 * ne_, 200), True)
+            _, Ts, _, _, _ = polyline_nearest(Cs, Ce, True)
     for it in range(int(iterations)):
         P = A @ X
         NP = quad_normals(P, Fs)
@@ -762,6 +972,17 @@ def fit_cage(X0, F, scan, sharp=(), keep_corners=False, iterations=8, offset=0.0
                 w2 = w2 * np.where(e2 > 0, drape_slack, 1.0)
             w2 = w2 / max(w2.sum(), 1e-30)
             B = spmm(W, A)
+        # -- the trim line: the edge's samples onto the curve, the curve's samples onto the edge
+        if eloop is not None:
+            I3e = np.eye(3)[None]
+            Pe = P[eloop]
+            ft1, tg1, _, _, _ = polyline_nearest(Pe, Ce, True)
+            We1 = (EDGE_WEIGHT / len(eloop)) * (I3e - tg1[:, :, None] * tg1[:, None, :])
+            _, _, sg2, lm2, _ = polyline_nearest(Cs, Pe, True)
+            j = np.arange(len(Cs))
+            E2 = spmm(Sp(np.r_[j, j], np.r_[eloop[sg2], eloop[(sg2 + 1) % len(eloop)]], np.r_[1.0 - lm2, lm2],
+                         (len(Cs), m)), A)
+            We2 = (EDGE_WEIGHT / len(Cs)) * (I3e - Ts[:, :, None] * Ts[:, None, :])
         # -- regularisers, as scalar rows on the 3n coordinates
         Nv = NPo[:n]
         alpha, beta = 1.0, 0.05
@@ -777,6 +998,9 @@ def fit_cage(X0, F, scan, sharp=(), keep_corners=False, iterations=8, offset=0.0
             out = data(A, NQ, w1, Y) + mu * Y + R3.rmatvec(w3 * (R3 @ x)).reshape(n, 3)
             if both_ways:
                 out = out + data(B, Ns, w2, Y)
+            if eloop is not None:
+                out = out + E1.rmatvec(np.einsum('kij,kj->ki', We1, E1 @ Y))
+                out = out + E2.rmatvec(np.einsum('kij,kj->ki', We2, E2 @ Y))
             out[fixed] = Y[fixed]
             return out.ravel()
 
@@ -784,12 +1008,16 @@ def fit_cage(X0, F, scan, sharp=(), keep_corners=False, iterations=8, offset=0.0
         rhs += R3.rmatvec(w3 * t3).reshape(n, 3) + mu * X
         if both_ways:
             rhs += B.rmatvec(w2[:, None] * (alpha * Ns * (Ns * T2).sum(1, keepdims=True) + beta * T2))
+        if eloop is not None:
+            rhs += E1.rmatvec(np.einsum('kij,kj->ki', We1, ft1)) + E2.rmatvec(np.einsum('kij,kj->ki', We2, Cs))
         if n <= DENSE_MAX:
             # the normal equations assembled: sum over rows of r^T W r (W: 3 x 3 per row)
             I3 = np.eye(3)[None]
             M = _gram(A, w1[:, None, None] * (alpha * NQ[:, :, None] * NQ[:, None, :] + beta * I3), n)
             if both_ways:
                 M += _gram(B, w2[:, None, None] * (alpha * Ns[:, :, None] * Ns[:, None, :] + beta * I3), n)
+            if eloop is not None:
+                M += _gram(E1, We1, n) + _gram(E2, We2, n)
             M += _gram1(R3, w3, 3 * n)
             M[np.diag_indices(3 * n)] += mu
             b = rhs.ravel()
@@ -806,6 +1034,10 @@ def fit_cage(X0, F, scan, sharp=(), keep_corners=False, iterations=8, offset=0.0
             dg = np.bincount(A.c, weights=A.v ** 2 * w1[A.r], minlength=n)[:, None] * (alpha * NQ ** 2 + beta).mean(0)
             if both_ways:
                 dg += np.bincount(B.c, weights=B.v ** 2 * w2[B.r], minlength=n)[:, None] * (alpha * Ns ** 2 + beta).mean(0)
+            if eloop is not None:
+                for Ex, Wx in ((E1, We1), (E2, We2)):
+                    dg += np.bincount(Ex.c, weights=Ex.v ** 2 * np.trace(Wx, axis1=1, axis2=2)[Ex.r] / 3,
+                                      minlength=n)[:, None]
             dg = dg.ravel() + np.bincount(R3.c, weights=R3.v ** 2 * w3[R3.r], minlength=3 * n) + mu
             dg[np.repeat(fixed, 3)] = 1.0
             x, cg_it = _pcg(apply, rhs.ravel(), X.ravel(), np.maximum(dg, 1e-30))
@@ -823,6 +1055,21 @@ def fit_cage(X0, F, scan, sharp=(), keep_corners=False, iterations=8, offset=0.0
     out = FitResult(X=X, history=hist, samples=m, levels=levels, build_s=t_build, fit_s=t_fit,
                     orient=orient or 1.0, sampler=smp)
     out.update(deviation_stats(A @ X, scan, offset, Fs))
+    if eloop is not None:                        # how closely the edge keeps to the trim line, both ways
+        Pe = (A @ X)[eloop]
+        f1, _, _, _, d1 = polyline_nearest(Pe, Ce, True)
+        f2, _, _, _, d2 = polyline_nearest(Cs, Pe, True)
+        out["edge_max"] = max(float(d1.max()), float(d2.max()))
+        # along the scan (where on the skin the edge runs), leaving out the part along the scan's normal
+        # (the surface's own distance from the scan there)
+        _, n1, _, ok1, _ = scan.nearest(f1)
+        _, n2, _, ok2, _ = scan.nearest(Cs)
+        D1, D2 = Pe - f1, f2 - Cs
+        t1 = np.linalg.norm(D1 - (D1 * n1).sum(1, keepdims=True) * n1, axis=1)[ok1]
+        t2 = np.linalg.norm(D2 - (D2 * n2).sum(1, keepdims=True) * n2, axis=1)[ok2]
+        out["edge_along"] = max(float(t1.max()) if len(t1) else 0.0, float(t2.max()) if len(t2) else 0.0)
+        out["edge_loop"] = eloop
+        out["edge_miss"] = np.where(ok1, np.linalg.norm(D1 - (D1 * n1).sum(1, keepdims=True) * n1, axis=1), 0.0)
     return out
 
 
@@ -1068,6 +1315,47 @@ def _detrended(r, w, x, groups):
     return srr - 2 * a * sr - 2 * b * sxr + a * a * sw + 2 * a * b * sx + b * b * sxx
 
 
+def edge_need(F, levels, P, Fs, eloop, miss, tol):
+    """(need_u, need_v) per cage face from a trim line: along the open edge,
+    how far it runs off the line along the scan (miss, per sample of eloop),
+    where more than tol. A cut that puts a vertex on that face's edge takes
+    it up: the face is halved along its edge."""
+    nF = len(F)
+    nu, nv = np.zeros(nF), np.zeros(nF)
+    pos = np.full(len(P), -1)
+    pos[eloop] = np.arange(len(eloop))
+    on = (pos[Fs] >= 0)
+    two = on.sum(1) >= 2
+    if not two.any():
+        return nu, nv
+    parent, _ = face_grid(F, levels)
+    cnt = {}
+    for f in F:
+        for i in range(len(f)):
+            k = tuple(sorted((int(f[i]), int(f[(i + 1) % len(f)]))))
+            cnt[k] = cnt.get(k, 0) + 1
+    for q in np.nonzero(two)[0]:
+        k = parent[q]
+        f = F[k]
+        if len(f) != 4:
+            continue
+        js = [j for j in range(4) if cnt[tuple(sorted((int(f[j]), int(f[(j + 1) % 4]))))] == 1]
+        if not js:
+            continue
+        idx = Fs[q][on[q]][:2]
+        d = miss[pos[idx]]
+        if d.max() <= tol:
+            continue
+        seg = float(np.linalg.norm(P[idx[0]] - P[idx[1]]))
+        width = float(np.linalg.norm(P[int(f[js[0]])] - P[int(f[(js[0] + 1) % 4])]))
+        e = float((d ** 2).mean()) * seg * width
+        if js[0] % 2 == 0:
+            nu[k] += e
+        else:
+            nv[k] += e
+    return nu, nv
+
+
 def face_need(F, levels, P, Fs, resid, tol, faces_ok=None):
     """(need_u, need_v, worst) per cage face: the deviation left in it that a
     cut halving it in u (resp. v) could take up (area x length^2), and its
@@ -1260,7 +1548,7 @@ def cage_of(obj):
 def pick_scan(context, cage):
     """The scan to fit to: another selected mesh, else the one the cage was made from,
     else the scene's Scan."""
-    others = [o for o in context.selected_objects if o is not cage and o.type == 'MESH']
+    others = [o for o in context.selected_objects if o is not cage and o.type == 'MESH' and len(o.data.polygons)]
     if len(others) == 1:
         return others[0]
     name = cage.get("nproto_scan")
@@ -1278,7 +1566,106 @@ def _show_deviation(context, scan_obj):
 
 def _fit_kwargs(op):
     return dict(iterations=op.iterations, offset=op.offset, smoothness=op.smoothness, stiffness=op.stiffness,
-                both_ways=op.both_ways, max_dist=op.max_distance, drape=op.drape)
+                both_ways=op.both_ways, max_dist=op.max_distance, drape=op.drape, hold_trim=op.hold_trim)
+
+
+def chain_edges(E):
+    """Edges (vertex pairs) chained into polylines: [(ordered vertices, closed)], most vertices first."""
+    adj = {}
+    for a, b in E:
+        adj.setdefault(int(a), []).append(int(b))
+        adj.setdefault(int(b), []).append(int(a))
+    seen, out = set(), []
+    starts = [v for v in adj if len(adj[v]) == 1] + list(adj)          # open chains from an end first
+    for s in starts:
+        if s in seen:
+            continue
+        path, prev, x = [s], None, s
+        seen.add(s)
+        closed = False
+        while True:
+            nxt = [y for y in adj[x] if y != prev and (y not in seen or (y == s and len(path) > 2))]
+            if not nxt:
+                break
+            y = nxt[0]
+            if y == s:
+                closed = True
+                break
+            path.append(y)
+            seen.add(y)
+            prev, x = x, y
+        out.append((path, closed))
+    out.sort(key=lambda p: -len(p[0]))
+    return out
+
+
+def curve_polyline(obj, depsgraph=None):
+    """The trim curve object's longest polyline in world space and whether it is closed: a curve (as
+    evaluated, no bevel) or a mesh of edges. A chain whose ends nearly meet counts as closed."""
+    dg = depsgraph or bpy.context.evaluated_depsgraph_get()
+    ev = obj.evaluated_get(dg)
+    me = ev.to_mesh()
+    try:
+        if me is None or not len(me.edges):
+            raise ValueError(f"{obj.name} has no edges to use as a trim line (a curve with a bevel has faces)")
+        if len(me.polygons):
+            raise ValueError(f"{obj.name} has faces: draw the trim line as a curve, or a mesh of edges only")
+        V = np.empty(len(me.vertices) * 3)
+        me.vertices.foreach_get("co", V)
+        V = V.reshape(-1, 3)
+        E = np.empty(len(me.edges) * 2, np.int64)
+        me.edges.foreach_get("vertices", E)
+        E = E.reshape(-1, 2)
+    finally:
+        ev.to_mesh_clear()
+    M = np.array(obj.matrix_world)
+    Vw = V @ M[:3, :3].T + M[:3, 3]
+    path, closed = chain_edges(E)[0]
+    C = Vw[path]
+    if not closed and len(C) > 2:
+        length = float(np.linalg.norm(np.diff(C, axis=0), axis=1).sum())
+        closed = float(np.linalg.norm(C[0] - C[-1])) < 0.03 * length
+    return C, closed
+
+
+def trim_target(curve_obj, scan, offset=0.0):
+    """The trim line the cage's edge is held to (world): the curve evenly resampled, each point moved onto the
+    scan's nearest point and `offset` out along its normal (the surface's own target)."""
+    C, closed = curve_polyline(curve_obj)
+    if not closed:
+        raise ValueError(f"{curve_obj.name}: the trim line must be a closed curve (Cyclic) around the scan")
+    length = float(np.linalg.norm(np.diff(np.vstack([C, C[:1]]), axis=0), axis=1).sum())
+    n = int(min(1200, max(300, length / max(scan.diag / 1500.0, 1e-9))))
+    Cd = resample_polyline(C, n, True)
+    Q, NQ, _, ok, _ = scan.nearest(Cd)
+    Ct = np.where(ok[:, None], Q + offset * NQ, Cd)
+    # a line on skin picks up its wrinkles (a mm over a cm on a limb scan): a housing's edge should not follow
+    # them, so the line is smoothed over TRIM_SMOOTH of the scan's size (Gaussian along its length)
+    sig = TRIM_SMOOTH * scan.diag / (length / n)
+    if sig > 0.5:
+        k = np.arange(-int(3 * sig), int(3 * sig) + 1)
+        g = np.exp(-0.5 * (k / sig) ** 2)
+        g /= g.sum()
+        Ct = np.stack([np.convolve(np.r_[Ct[-len(k):, d], Ct[:, d], Ct[:len(k), d]], g, 'same')[len(k):-len(k)]
+                       for d in range(3)], 1)
+    return Ct
+
+
+def trim_object(cage):
+    """The trim curve the cage's edge is held to (Trim Cage to Curve), if it is still there."""
+    name = cage.get("nproto_trim")
+    o = bpy.data.objects.get(name) if name else None
+    return o if o is not None and o.type in {'CURVE', 'MESH'} else None
+
+
+def _with_edge(cage, scan, kw):
+    """kw for fit_cage: Hold Trim Line taken out, and the cage's trim line put in when it holds one."""
+    kw = dict(kw)
+    hold = kw.pop("hold_trim", True)
+    tr = trim_object(cage) if hold else None
+    if tr is not None:
+        kw["edge_curve"] = trim_target(tr, scan, kw.get("offset", 0.0))
+    return kw
 
 
 class _FitProps:
@@ -1304,6 +1691,9 @@ class _FitProps:
                             description="Also pull the surface to every part of the scan (not only the "
                                         "surface to its nearest scan point): bumps the surface would miss "
                                         "are reached")
+    hold_trim: BoolProperty(name="Hold Trim Line", default=True,
+                            description="Keep the cage's open edge on its trim line (the curve set by Trim Cage "
+                                        "to Curve)")
     max_distance: FloatProperty(name="Max Distance", default=0.0, min=0.0, subtype='DISTANCE', unit='LENGTH',
                                 precision=4,
                                 description="Scan points farther than this from the surface are ignored "
@@ -1314,6 +1704,9 @@ def _report_lines(context, info):
     L = lambda x: _length(context, x)
     out = [f"RMS {L(info['dev_rms'])}  ·  95 % within {L(info['dev_p95'])}",
            f"most inside {L(info['dev_min'])}  ·  most outside {L(info['dev_hi'])}"]
+    if info.get("edge_max") is not None:
+        out.append(f"edge on the trim line within {L(info['edge_along'])} along the scan "
+                   f"({L(info['edge_max'])} in all)")
     if info.get("loops") is not None:
         out.append(f"{info['loops']} loops added  ·  {info['verts_before']} -> {info['verts']} cage vertices")
     if info.get("time") is not None:
@@ -1345,13 +1738,14 @@ def _fit_object(context, cage, scan_obj, kw, only_selected=False):
         if sel.any():
             fixed = ~sel
     t0 = time.perf_counter()
-    r = fit_cage(Xw, F, scan, sharp=sharp, keep_corners=kc, fixed=fixed, **kw)
+    r = fit_cage(Xw, F, scan, sharp=sharp, keep_corners=kc, fixed=fixed, **_with_edge(cage, scan, kw))
     Mi = np.linalg.inv(M)
     Xl = r["X"] @ Mi[:3, :3].T + Mi[:3, 3]
     cage.data.vertices.foreach_set("co", Xl.ravel())
     cage.data.update()
     info = {k: r[k] for k in ("dev_rms", "dev_p95", "dev_min", "dev_hi", "dev_max", "dev_mean")}
-    info.update(time=time.perf_counter() - t0, verts=len(V), iterations=len(r["history"]), offset=kw.get("offset", 0.0))
+    info.update(time=time.perf_counter() - t0, verts=len(V), iterations=len(r["history"]), offset=kw.get("offset", 0.0),
+                edge_max=r.get("edge_max"), edge_along=r.get("edge_along"))
     return info
 
 
@@ -1381,6 +1775,8 @@ class NPROTO_OT_scan_fit_cage(_FitProps, bpy.types.Operator):
         lay.prop(self, "iterations")
         lay.prop(self, "both_ways")
         lay.prop(self, "max_distance")
+        if context.active_object is not None and trim_object(context.active_object) is not None:
+            lay.prop(self, "hold_trim")
         lay.prop(self, "show_deviation")
         _draw_report(lay, context)
 
@@ -1579,6 +1975,8 @@ class NPROTO_OT_scan_refine_cage(_FitProps, bpy.types.Operator):
         col.prop(self, "smoothness")
         col.prop(self, "stiffness")
         col.prop(self, "iterations")
+        if context.active_object is not None and trim_object(context.active_object) is not None:
+            col.prop(self, "hold_trim")
         lay.prop(self, "show_deviation")
         _draw_report(lay, context)
 
@@ -1604,7 +2002,13 @@ class NPROTO_OT_scan_refine_cage(_FitProps, bpy.types.Operator):
             if not sel.any():
                 sel = None
         scan = scan_for(scan_obj)
-        kw = _fit_kwargs(self)
+        try:
+            kw = _with_edge(cage, scan, _fit_kwargs(self))
+        except ValueError as exc:
+            if was_edit:
+                bpy.ops.object.mode_set(mode='EDIT')
+            self.report({'WARNING'}, f"Refine Cage to Scan: {exc}")
+            return {'CANCELLED'}
         M = np.array(cage.matrix_world)
         Mi = np.linalg.inv(M)
         n_start = len(me.vertices)
@@ -1633,6 +2037,11 @@ class NPROTO_OT_scan_refine_cage(_FitProps, bpy.types.Operator):
                     s_all = np.r_[sel, np.ones(len(V) - len(sel), bool)]
                     faces_ok = np.array([s_all[list(f)].all() for f in F])
                 nu, nv_, _ = face_need(F, r["levels"], P, smp.Fs, resid, self.tolerance, faces_ok)
+                if r.get("edge_loop") is not None:           # where the edge runs off its trim line
+                    eu, ev = edge_need(F, r["levels"], P, smp.Fs, r["edge_loop"], r["edge_miss"], self.tolerance)
+                    if faces_ok is not None:
+                        eu, ev = eu * faces_ok, ev * faces_ok
+                    nu, nv_ = nu + eu, nv_ + ev
                 ring, _ = best_ring(F, nu, nv_)
                 if ring is None:
                     break
@@ -1648,13 +2057,98 @@ class NPROTO_OT_scan_refine_cage(_FitProps, bpy.types.Operator):
         cage["nproto_scan"] = scan_obj.name
         info = {k: r[k] for k in ("dev_rms", "dev_p95", "dev_min", "dev_hi", "dev_max", "dev_mean")}
         info.update(time=time.perf_counter() - t0, verts=len(me.vertices), iterations=len(r["history"]),
-                    offset=kw["offset"], loops=added, verts_before=n_start)
+                    offset=kw["offset"], loops=added, verts_before=n_start, edge_max=r.get("edge_max"), edge_along=r.get("edge_along"))
         LAST_INFO.clear()
         LAST_INFO.update(info)
         if self.show_deviation:
             _show_deviation(context, scan_obj)
         self.report({'INFO'}, f"Refine Cage to Scan: {added} loop{'s' if added != 1 else ''} added "
                     f"({n_start} -> {len(me.vertices)} vertices)  ·  " + _report_lines(context, info)[0])
+        return {'FINISHED'}
+
+
+class NPROTO_OT_scan_trim_cage(_FitProps, bpy.types.Operator):
+    """Put the active SubD cage's open edge on a trim line: a closed curve drawn on or near the scan (the other
+    selected object: a curve, or a mesh of edges). The edge is moved onto the curve, the rest of the cage
+    following less and less farther from it, then the cage is fitted to the scan with its edge held to the
+    curve. The cage remembers its trim line: Fit and Refine Cage to Scan keep the edge on it"""
+    bl_idname = "nproto.scan_trim_cage"
+    bl_label = "Trim Cage to Curve"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    show_deviation: BoolProperty(name="Show Deviation", default=True,
+                                 description="Turn on the Scan Deviation overlay (Analyze) afterwards")
+
+    @classmethod
+    def poll(cls, context):
+        return is_subd(context.active_object)
+
+    def draw(self, context):
+        lay = self.layout
+        lay.use_property_split = True
+        lay.prop(self, "offset")
+        lay.prop(self, "drape")
+        lay.prop(self, "smoothness")
+        lay.prop(self, "stiffness")
+        lay.prop(self, "iterations")
+        lay.prop(self, "show_deviation")
+        _draw_report(lay, context)
+
+    def execute(self, context):
+        from . import subd_brep
+        cage = context.active_object
+        sel = [o for o in context.selected_objects if o is not cage]
+        curve = next((o for o in sel if o.type == 'CURVE'), None) or next(
+            (o for o in sel if o.type == 'MESH' and not len(o.data.polygons) and len(o.data.edges)), None)
+        curve = curve or trim_object(cage)
+        if curve is None:
+            self.report({'WARNING'}, "Select the trim line too: a closed curve drawn on the scan (cage active)")
+            return {'CANCELLED'}
+        scans = [o for o in sel if o is not curve and o.type == 'MESH' and len(o.data.polygons)]
+        scan_obj = scans[0] if len(scans) == 1 else pick_scan(context, cage)
+        if scan_obj is None or scan_obj in (cage, curve) or scan_obj.type != 'MESH':
+            self.report({'WARNING'}, "No scan: fit the cage to a scan first (or set it under Analyze > Scan Deviation)")
+            return {'CANCELLED'}
+        if not subd_brep._plain_cage(cage):
+            self.report({'WARNING'}, f"{cage.name}: apply the modifiers above Subdivision (and shape keys) first")
+            return {'CANCELLED'}
+        was_edit = cage.mode == 'EDIT'
+        if was_edit:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        t0 = time.perf_counter()
+        try:
+            scan = scan_for(scan_obj)
+            kw = _fit_kwargs(self)
+            kw.pop("hold_trim")
+            C = trim_target(curve, scan, kw["offset"])
+            V, F, sharp, kc = cage_of(cage)
+            M = np.array(cage.matrix_world)
+            Xw = V @ M[:3, :3].T + M[:3, 3]
+            Xp, _ = place_on_trim(Xw, F, C, scan=scan)
+            r = fit_cage(Xp, F, scan, sharp=sharp, keep_corners=kc, edge_curve=C, **kw)
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            if was_edit:
+                bpy.ops.object.mode_set(mode='EDIT')
+            self.report({'WARNING'}, f"Trim Cage to Curve: {exc}")
+            return {'CANCELLED'}
+        Mi = np.linalg.inv(M)
+        cage.data.vertices.foreach_set("co", (r["X"] @ Mi[:3, :3].T + Mi[:3, 3]).ravel())
+        cage.data.update()
+        if was_edit:
+            bpy.ops.object.mode_set(mode='EDIT')
+        cage["nproto_trim"] = curve.name
+        cage["nproto_scan"] = scan_obj.name
+        info = {k: r[k] for k in ("dev_rms", "dev_p95", "dev_min", "dev_hi", "dev_max", "dev_mean")}
+        info.update(time=time.perf_counter() - t0, verts=len(V), iterations=len(r["history"]),
+                    offset=kw["offset"], edge_max=r.get("edge_max"), edge_along=r.get("edge_along"))
+        LAST_INFO.clear()
+        LAST_INFO.update(info)
+        for o in context.selected_objects:
+            o.select_set(o is cage)
+        context.view_layer.objects.active = cage
+        if self.show_deviation:
+            _show_deviation(context, scan_obj)
+        self.report({'INFO'}, "Trim Cage to Curve: " + "  ·  ".join(_report_lines(context, info)[:3]))
         return {'FINISHED'}
 
 
@@ -1763,4 +2257,5 @@ def draw_panel(col, context):
         col.label(text=f"inside {L(st['dev_min'])}  ·  outside {L(st['dev_hi'])}")
 
 
-classes = (NPROTO_OT_scan_fit_cage, NPROTO_OT_scan_tube_cage, NPROTO_OT_scan_refine_cage)
+classes = (NPROTO_OT_scan_fit_cage, NPROTO_OT_scan_tube_cage, NPROTO_OT_scan_refine_cage,
+           NPROTO_OT_scan_trim_cage)
