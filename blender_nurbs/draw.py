@@ -886,7 +886,7 @@ def _disc(c, r, color):
 # orthographic turned) Blender's floor grid stops at 1 m (1 ft): it skips the
 # finer levels its Top / Front / Side grids draw (ED_view3d_grid_steps).
 # This draws those levels on the floor, faded in by the rule Ctrl snaps by
-# (drawtools.visible_grid_step, pixels_per_unit), so the grid points a sketch
+# (drawtools.own_level_alphas, drawn_grid_step), so the grid points a sketch
 # snaps to are lines you see. Display > Fine Grid (a header icon too) shows or
 # hides it; so does Blender's Floor overlay.
 # --------------------------------------------------------------------------

@@ -629,19 +629,167 @@ def fine_grid_levels(system, scale_length=1.0, grid_scale=1.0, subdivisions=10):
     return lv, base
 
 
-def visible_grid_step(steps, ppu):
-    """The finest grid level drawn at least half visible at ppu pixels per unit.
-    The viewport fades a level in from GRID_FADE_PX apart (invisible) to the
-    level below it reaching GRID_FADE_PX (fully drawn), alpha cubed; below half
-    its lines are hard to see, so the next level up is the one to snap to."""
+# a grid level counts as drawn -- Ctrl snaps to it -- from this strength (of a
+# fully drawn line): at a quarter its lines plainly show. Half (as before) left
+# a band at every zoom step where the finer lines were in view, a third to half
+# strength, and points still jumped the coarser level's width.
+SNAP_ALPHA = 0.25
+
+
+def own_level_alphas(steps, ppu):
+    """Each level's strength (0..1) as the add-on's grids draw it (the fine
+    floor grid, draw.py; the work plane's, workplanes.py) at ppu pixels per
+    unit: a level fades in from GRID_FADE_PX apart (nothing) to fully drawn
+    once the level below it reaches GRID_FADE_PX, alpha cubed; the levels
+    above it are drawn fully, the ones below not at all."""
     px = [s * ppu for s in steps]
     i = next((k for k, p in enumerate(px) if p >= GRID_FADE_PX), len(px) - 1)
     s0 = px[i - 1] if i > 0 else 0.0
     t = (GRID_FADE_PX - s0) / max(px[i] - s0, 1e-12)
-    blend = 1.0 - min(max(t, 0.0), 1.0)
-    if blend ** 3 >= 0.5 or i + 1 >= len(steps):
-        return steps[i]
-    return steps[i + 1]
+    blend = (1.0 - min(max(t, 0.0), 1.0)) ** 3
+    return [0.0] * i + [blend] + [1.0] * (len(steps) - i - 1)
+
+
+def finest_drawn_step(steps, alphas, ppu, min_alpha=SNAP_ALPHA):
+    """The finest level drawn at least min_alpha strong whose lines are at
+    least GRID_FADE_PX apart here (Blender's perspective floor keeps a level
+    across the whole view, packed tight far off); else the coarsest."""
+    for s, a in zip(steps, alphas):
+        if a >= min_alpha and s * ppu >= GRID_FADE_PX:
+            return s
+    return steps[-1]
+
+
+def visible_grid_step(steps, ppu, min_alpha=SNAP_ALPHA):
+    """The finest grid level the add-on's grids draw at least min_alpha
+    strong at ppu pixels per unit (own_level_alphas)."""
+    return finest_drawn_step(steps, own_level_alphas(steps, ppu), ppu, min_alpha)
+
+
+def blender_grid_steps(system, scale_length=1.0, grid_scale=1.0, subdivisions=10, axis_view=True):
+    """The levels Blender's own viewport grid draws (view3d_grid_steps_ex, and
+    the overlay's x10 for repeated slots): an axis view (Top / Front / Side)
+    has every unit; any other view starts at the base unit (1 m, 1 ft) -- the
+    fine floor grid (draw.py) draws the ones below. Without units an axis view
+    starts three Subdivisions below the Grid Scale."""
+    units = GRID_UNITS.get(system)
+    if units is None:
+        g = grid_scale / (subdivisions ** 3 if axis_view else 1)
+        return [g * subdivisions ** i for i in range(GRID_STEPS_LEN)]
+    if not axis_view:
+        units = [u for u in units if u >= GRID_BASE[system] * (1 - 1e-9)]
+    steps = [u * grid_scale / (scale_length or 1.0) for u in units]
+    while len(steps) < GRID_STEPS_LEN:
+        steps.append(10.0 * steps[-1])
+    return steps
+
+
+# Blender 5.1 replaced the viewport grid (overlay_grid.hh, overlay_grid_vert.glsl):
+# one level for the whole view from a distance, three levels drawn
+NEW_BLENDER_GRID = bpy.app.version >= (5, 1, 0)
+
+
+def _smoothstep(e0, e1, x):
+    t = min(max((x - e0) / (e1 - e0), 0.0), 1.0) if e1 != e0 else float(x >= e0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def blender_level_alphas(steps, region, rv3d, ui_scale=1.0):
+    """Each level's strength (0..1) as Blender 5.1+ draws its own grid in this
+    view (overlay_grid.hh, overlay_grid_vert.glsl; measured against 5.3's
+    drawing): a distance -- perspective: the eye's height over the floor,
+    |z| (2 - |view z|); Top / Front / Side: 60 UI pixels' worth
+    (ED_view3d_grid_view_scale's zoom); other orthographic views: the view
+    distance -- falls between two levels at a fraction f. Three levels are
+    drawn from the lower one (one below it outside Top / Front / Side), the
+    finest at 1 - f; orthographic views also fade a level from 64 pixels
+    apart (full) to 4 (nothing). Coarser levels show through the drawn ones."""
+    n = len(steps)
+    aligned = not rv3d.is_perspective and rv3d.is_orthographic_side_view
+    if rv3d.is_perspective:
+        vi = rv3d.view_matrix.inverted()
+        dist = abs(vi[2][3]) * (2.0 - abs(vi[2][2]))
+    elif aligned:
+        sizex = max(int((region.width + 0.5) / max(ui_scale, 1e-6)), 1)
+        dist = max(120.0 / (sizex * max(abs(rv3d.window_matrix[0][0]), 1e-12)), steps[0])
+    else:
+        dist = rv3d.view_distance
+    L = float(n - 1)
+    for i in range(n):
+        nxt = steps[i + 1] if i < n - 1 else steps[i] * 10.0
+        if nxt >= dist or i == n - 1:
+            L = i + (dist - steps[i]) / max(nxt - steps[i], 1e-30)
+            break
+    lo, fr = int(L), L - math.floor(L)          # the shader's int() and fract()
+    off = 0 if aligned else 1
+    wpp = None
+    if not rv3d.is_perspective:                 # rv3d->pixsize, the shader's pixel_fac
+        P = np.array(rv3d.perspective_matrix, float)
+        r = min(float(np.linalg.norm(P[0, :3])), float(np.linalg.norm(P[1, :3])))
+        wpp = 2.0 / max(r, 1e-30) / max(region.width, region.height, 1)
+    al = [0.0] * n
+    top = 0
+    for k in range(3):
+        j = min(max(lo + k - off, 0), n - 1)
+        a = min(max(k + 1.0 - fr, 0.0), 1.0)
+        if wpp is not None:
+            a *= _smoothstep(steps[j] * 0.25, steps[j] * 0.25 ** 3, wpp)
+        al[j] = max(al[j], a)
+        top = max(top, j)
+    for j in range(top + 1, n):
+        al[j] = al[top]
+    return al
+
+
+def drawn_grid_step(context, region, rv3d, ppu, n=None):
+    """The grid step Ctrl snaps to: the finest level the grid drawn on the
+    drawing plane shows at least SNAP_ALPHA strong, at ppu pixels per unit
+    there -- worked out by the rule of the grid that draws it: the active
+    work plane's (own_level_alphas over its levels); in Top / Front / Side
+    Blender's (blender_level_alphas, 5.1+); elsewhere on the floor Blender's
+    from the base unit up and the fine floor grid's below it. n: the drawing
+    plane's normal (no floor rules on an upright plane). A plane nothing is
+    drawn on gets the add-on's rule over all the levels."""
+    us = context.scene.unit_settings
+    sp = getattr(context, "space_data", None)
+    if getattr(sp, "type", None) != 'VIEW_3D' and context.area is not None:
+        sp = context.area.spaces.active
+    ov = getattr(sp, "overlay", None)
+    system, sl = us.system, us.scale_length or 1.0
+    gs, sub = getattr(ov, "grid_scale", 1.0) or 1.0, getattr(ov, "grid_subdivisions", 10) or 10
+    from . import workplanes
+    wp = workplanes.active_plane(context.scene)
+    if wp is not None:
+        return visible_grid_step(workplanes.plane_levels(context, wp, ov), ppu)
+    shown = ov is not None and getattr(ov, "show_overlays", True)
+    axis = bool(getattr(rv3d, "is_orthographic_side_view", False))
+    ui = getattr(context.preferences.system, "ui_scale", 1.0) or 1.0
+
+    def blender(axis_view):
+        st = blender_grid_steps(system, sl, gs, sub, axis_view)
+        al = blender_level_alphas(st, region, rv3d, ui) if NEW_BLENDER_GRID else own_level_alphas(st, ppu)
+        return st, al
+
+    if axis and not rv3d.is_perspective:                      # Top / Front / Side: Blender's grid only
+        if shown and ov.show_ortho_grid:
+            return finest_drawn_step(*blender(True), ppu)
+    elif n is None or abs(float(n[2])) > 1.0 - 1e-6:           # the floor
+        lv = {}
+        if shown and ov.show_floor:
+            for s, a in zip(*blender(axis)):
+                lv[s] = max(lv.get(s, 0.0), a)
+            vw = getattr(context.window_manager, "nproto_view", None)
+            fine = None if axis or not (vw is None or vw.show_fine_grid) else \
+                fine_grid_levels(system, sl, gs, sub)
+            if fine is not None:                                # draw.py: only its levels below Blender's
+                fl, base = fine
+                for s, a in zip(fl, own_level_alphas(fl, ppu)):
+                    if s < base * 0.999:
+                        lv[s] = max(lv.get(s, 0.0), a)
+        if lv:
+            st = sorted(lv)
+            return finest_drawn_step(st, [lv[s] for s in st], ppu)
+    return visible_grid_step(grid_steps(system, sl, gs, sub), ppu)
 
 
 def pixels_per_unit(region, rv3d, at, axes):
@@ -835,30 +983,23 @@ class SketchMixin:
         return snapping.View(rv3d.perspective_matrix, rv3d.view_matrix, region.width, region.height)
 
     def _grid_step(self, context, at, u=None, v=None):
-        """The grid step Ctrl snaps to here: the finest grid level the view
-        draws at least half visible (visible_grid_step), so points land on
+        """The grid step Ctrl snaps to here: the finest level the grid drawn on
+        the drawing plane shows plainly (drawn_grid_step), so points land on
         lines you can see, never between them. The pixels per unit are taken
         along the drawing plane's axes u and v at the point (the plane's, or
         before the first point the one the point lands on), the shorter of
-        the two -- as the fine floor grid (draw.py) fades its levels -- from
-        the projection's derivative, so a close perspective view measures
-        right too."""
+        the two -- as the add-on's grids fade their levels -- from the
+        projection's derivative, so a close perspective view measures right
+        too."""
         if u is None:
             pl = self._plane or self._view_plane(context, at)
             u, v = pl[2], pl[3]
-        ppu = pixels_per_unit(*self._win(context), at, [a for a in (u, v) if a is not None])
+        region, rv3d = self._win(context)
+        ppu = pixels_per_unit(region, rv3d, at, [a for a in (u, v) if a is not None])
         if ppu is None:
             return 1.0
-        us = context.scene.unit_settings
-        ov = getattr(getattr(context.area, "spaces", None) and context.area.spaces.active, "overlay", None)
-        from . import workplanes
-        wp = workplanes.active_plane(context.scene)
-        if wp is not None:                  # the levels the work plane's grid draws
-            steps = workplanes.plane_levels(context, wp, ov)
-        else:
-            steps = grid_steps(us.system, us.scale_length or 1.0, getattr(ov, "grid_scale", 1.0) or 1.0,
-                               getattr(ov, "grid_subdivisions", 10) or 10)
-        return visible_grid_step(steps, ppu)
+        n = np.cross(u, v) if u is not None and v is not None else None
+        return drawn_grid_step(context, region, rv3d, ppu, n)
 
     def pick_point(self, context, event, extra=(), prev=None):
         """(world point, snap) under the mouse. snap = (kind, outward tangent,
