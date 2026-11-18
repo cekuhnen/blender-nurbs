@@ -440,4 +440,87 @@ check("run again (Offset 2 mm): the same patch object is updated, 2 mm above the
       res == {'FINISHED'} and ctx.active_object is p9 and len([o for o in ctx.scene.objects if store.is_nurbs(o)]) == n_before
       and abs(sp.LAST_INFO["dev_mean"]) < 0.1e-3, f"mean {sp.LAST_INFO['dev_mean'] * MM + 2:.3f} mm off")
 
+# -- 10. Drape Patch: G0 / G1 / G2 to neighbouring patches -----------------------------------
+from blender_nurbs import surfeval  # noqa: E402
+
+wavy = lambda x, y: 0.2 + 0.08 * np.cos(3 * x) * np.cos(2 * y) + 0.02 * np.sin(5 * x + 1)
+ws = height_scan("WavyScan", wavy)
+
+
+def grid_sheet(name, xs, ys, z=0.6):
+    V = [(x, y, z) for x in xs for y in ys]
+    nu_, nv_ = len(xs), len(ys)
+    F = [(i * nv_ + j, (i + 1) * nv_ + j, (i + 1) * nv_ + j + 1, i * nv_ + j + 1)
+         for i in range(nu_ - 1) for j in range(nv_ - 1)]
+    m = bpy.data.meshes.new(name)
+    m.from_pydata(V, [], F)
+    m.update()
+    o = bpy.data.objects.new(name, m)
+    ctx.collection.objects.link(o)
+    return o
+
+
+def drape(sheet_obj, nbs=(), **kw):
+    for o in ctx.scene.objects:
+        o.select_set(False)
+    ws.select_set(True)
+    sheet_obj.select_set(True)
+    for o in nbs:
+        o.select_set(True)
+    ctx.view_layer.objects.active = sheet_obj
+    r = bpy.ops.nproto.scan_drape_patch(**kw)
+    return r, ctx.active_object, dict(sp.LAST_INFO)
+
+
+def measured(pb, edge, pa):
+    """Gap, normal angle (degrees) and normal-curvature difference across the edge (%), on the kernel surfaces."""
+    SB = surfeval.Surf(store.get_brep(pb).faces()[0].surface())
+    SA = surfeval.Surf(store.get_brep(pa).faces()[0].surface())
+    t = np.linspace(0.02, 0.98, 30)
+    z0, z1 = np.zeros(30), np.ones(30)
+    uv = {"u0": (z0, t), "u1": (z1, t), "v0": (t, z0), "v1": (t, z1)}[edge]
+    DB = SB.at(*uv, nd=2)
+    fa = SA.feet(DB[0, 0])
+    DA = SA.at(fa[:, 0], fa[:, 1], nd=2)
+    nA, QA = sp.second_form(DA)
+    nB, QB = sp.second_form(DB)
+    c = DB[1, 0] if edge[0] == "u" else DB[0, 1]
+    c = c - (c * nB).sum(1)[:, None] * nB
+    kA = np.einsum('mi,mij,mj->m', c, QA, c) * np.sign((nA * nB).sum(1))
+    kB = np.einsum('mi,mij,mj->m', c, QB, c)
+    return (float(np.linalg.norm(DA[0, 0] - DB[0, 0], axis=1).max()),
+            float(np.degrees(np.arccos(np.clip(np.abs((nA * nB).sum(1)), 0, 1))).max()),
+            float(np.abs(kA - kB).max() / np.abs(kA).max() * 100))
+
+
+sa_ = grid_sheet("SheetA", np.linspace(-0.35, 0.0, 6), np.linspace(-0.26, 0.26, 4))    # degree 3 along the edge
+_, pa_, _ = drape(sa_, match='NONE')
+ys_ = np.array([-0.2, -0.13, -0.05, 0.04, 0.12, 0.2])                                    # uneven, and 4 mm off in plan
+sb_ = grid_sheet("SheetB", np.linspace(0.004, 0.33, 6), ys_)
+res = {}
+for lv in ('G0', 'G1', 'G2'):
+    r_, pb_, ib_ = drape(sb_, (pa_,), match=lv)
+    res[lv] = (r_, ib_["edges"], measured(pb_, ib_["edges"][0]["edge"], pa_) if ib_["edges"] else None)
+g0, g1, g2 = res["G0"][2], res["G1"][2], res["G2"][2]
+check("Match Neighbours: the edge along the neighbour's (4 mm off in plan, uneven CVs, part of a degree-3 edge) "
+      "is found and held",
+      all(r[0] == {'FINISHED'} and len(r[1]) == 1 and r[1][0]["edge"] == "u0" for r in res.values()), res["G2"][1])
+check("G0: the edges meet (measured on the two NURBS surfaces: gap < 1 µm)", g0[0] < 1e-6, g0)
+check("G1: ... tangent too (normals within 0.001°), G2: ... and the curvature across the same (within 0.01 %)",
+      g1[0] < 1e-6 and g1[1] < 1e-3 and g2[0] < 1e-6 and g2[1] < 1e-3 and g2[2] < 0.01 and g1[2] > 10 * g2[2],
+      f"G1 {g1}, G2 {g2}")
+check("the report gives the same as measured", abs(res["G2"][1][0]["result"]["angle"] - g2[1]) < 1e-5
+      and abs(res["G1"][1][0]["result"]["angle"] - g1[1]) < 1e-5, (res["G2"][1][0]["result"], g2))
+# a corner: a neighbour along two edges (the lower one itself G2 to the left one)
+sl_ = grid_sheet("SheetL", np.linspace(-0.35, 0.0, 6), np.linspace(-0.42, 0.2, 6))
+_, pl_, _ = drape(sl_, match='NONE')
+sc_ = grid_sheet("SheetC", np.linspace(0.004, 0.33, 6), np.linspace(-0.42, -0.2, 6))
+_, pc_, ic_ = drape(sc_, (pl_,), match='G2')
+sk_ = grid_sheet("SheetK", np.linspace(0.0, 0.33, 6), np.array([-0.196, -0.13, -0.05, 0.04, 0.12, 0.2]))
+r_, pk_, ik_ = drape(sk_, (pl_, pc_), match='G2')
+mk = [measured(pk_, e["edge"], bpy.data.objects[e["neighbour"]]) for e in ik_["edges"]]
+check("a corner between two neighbours: both edges G2 to within 20 µm, 0.1° and 1 % (exact needs the neighbours' "
+      "twists to agree)",
+      r_ == {'FINISHED'} and len(ik_["edges"]) == 2 and all(m[0] < 2e-5 and m[1] < 0.1 and m[2] < 1.0 for m in mk), mk)
+
 print("ALL OK" if ok else "SOME FAILED")

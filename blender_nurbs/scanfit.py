@@ -1481,6 +1481,13 @@ DEV_BATCHES = {}          # object uid -> (key, batch)
 STATS = {}                # object name -> deviation stats shown in the Analyze panel
 
 
+def _world(obj):
+    """obj's world matrix from its stored transform (matrix_world can read as identity right after an undo,
+    which the Adjust Last Operation panel does on every change)."""
+    from . import geom
+    return geom.world_matrix(obj)
+
+
 def _length(context, x):
     us = context.scene.unit_settings
     return bpy.utils.units.to_string(us.system, 'LENGTH', x * (us.scale_length or 1.0), precision=3)
@@ -1488,7 +1495,7 @@ def _length(context, x):
 
 def _scan_key(obj):
     me = obj.data
-    M = tuple(round(x, 9) for row in obj.matrix_world for x in row)
+    M = tuple(round(x, 9) for row in _world(obj) for x in row)
     v = me.vertices
     probe = (tuple(v[0].co), tuple(v[len(v) // 2].co), tuple(v[-1].co)) if len(v) else ()
     return (me.name, len(v), len(me.polygons), M, probe)
@@ -1510,7 +1517,7 @@ def scan_for(obj):
     me.loop_triangles.foreach_get("vertices", T)
     T = T.reshape(-1, 3)
     T = T[~_lid_triangles(me)]
-    M = np.array(obj.matrix_world)
+    M = np.array(_world(obj))
     Vw = V @ M[:3, :3].T + M[:3, 3]
     s = Scan(Vw, T)
     _SCANS.clear()                                     # one scan at a time: they can be large
@@ -1624,7 +1631,7 @@ def curve_polyline(obj, depsgraph=None):
         E = E.reshape(-1, 2)
     finally:
         ev.to_mesh_clear()
-    M = np.array(obj.matrix_world)
+    M = np.array(_world(obj))
     Vw = V @ M[:3, :3].T + M[:3, 3]
     path, closed = chain_edges(E)[0]
     C = Vw[path]
@@ -1735,7 +1742,7 @@ def _fit_object(context, cage, scan_obj, kw, only_selected=False):
     """Fit cage (a SubD mesh object) to scan_obj in place; returns the fit report."""
     scan = scan_for(scan_obj)
     V, F, sharp, kc = cage_of(cage)
-    M = np.array(cage.matrix_world)
+    M = np.array(_world(cage))
     Xw = V @ M[:3, :3].T + M[:3, 3]
     fixed = None
     if only_selected:
@@ -2015,7 +2022,7 @@ class NPROTO_OT_scan_refine_cage(_FitProps, bpy.types.Operator):
                 bpy.ops.object.mode_set(mode='EDIT')
             self.report({'WARNING'}, f"Refine Cage to Scan: {exc}")
             return {'CANCELLED'}
-        M = np.array(cage.matrix_world)
+        M = np.array(_world(cage))
         Mi = np.linalg.inv(M)
         n_start = len(me.vertices)
         t0 = time.perf_counter()
@@ -2128,7 +2135,7 @@ class NPROTO_OT_scan_trim_cage(_FitProps, bpy.types.Operator):
             kw.pop("hold_trim")
             C = trim_target(curve, scan, kw["offset"])
             V, F, sharp, kc = cage_of(cage)
-            M = np.array(cage.matrix_world)
+            M = np.array(_world(cage))
             Xw = V @ M[:3, :3].T + M[:3, 3]
             Xp, _ = place_on_trim(Xw, F, C, scan=scan)
             r = fit_cage(Xp, F, scan, sharp=sharp, keep_corners=kc, edge_curve=C, **kw)
@@ -2184,7 +2191,7 @@ def _subd_surface(obj):
 
 def _dev_key(obj, scan_obj):
     from . import store, subd_brep
-    M = tuple(round(x, 9) for row in obj.matrix_world for x in row)
+    M = tuple(round(x, 9) for row in _world(obj) for x in row)
     if store.is_nurbs(obj):
         own = ("nurbs", obj.get(store.PROP_REV, 0))
     else:
@@ -2205,7 +2212,7 @@ def deviation_mesh(obj, scan_obj):
     else:
         P, N, T = _subd_surface(obj)
     P = np.asarray(P, float)
-    M = np.array(obj.matrix_world)
+    M = np.array(_world(obj))
     Pw = P @ M[:3, :3].T + M[:3, 3]
     s = scan_for(scan_obj).signed(Pw)
     ok = np.isfinite(s)

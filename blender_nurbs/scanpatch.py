@@ -120,12 +120,103 @@ def _fair_rows(nu, nv):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# edges matched to a neighbouring patch: G0 / G1 / G2 as rows on the CV heights
+# ---------------------------------------------------------------------------
+#
+# The patch meets a neighbour along an edge that lies on the neighbour's edge
+# in plan view (the edge's CVs are snapped there first). With the CVs moving
+# only along `up`, every condition is linear in the heights t:
+#   G0   up . B(s)            = up . A          (the same point)
+#   G1   n_A . B_c(s)         = 0               (the cross tangent in A's tangent plane)
+#   G2   n_A . B_cc(s)        = II_A(B_c, B_c)  (the same normal curvature across)
+# B_c, B_cc: the patch's first and second derivative across the edge; II_A the
+# neighbour's second fundamental form. G0 and G1 along a shared curve already
+# make the normal curvature along the edge and the twist term agree, so the
+# one scalar G2 row per point is all G2 asks. II_A(B_c, B_c) depends on B_c,
+# i.e. on the heights: it is taken from the last solve (a few rounds).
+
+EDGES = ("u0", "u1", "v0", "v1")
+
+
+def edge_tangent_rows(nu, nv, du, dv, Ku, Kv, edge, s):
+    """The patch's derivative along `edge` at the parameters s, as rows over the nu * nv CVs."""
+    from .surfeval import _basis_matrix
+    s = np.asarray(s, float)
+    if edge in ("u0", "u1"):
+        Bc = _basis_matrix(Ku, du, nu, np.array([0.0 if edge == "u0" else 1.0]), 0)[0, 0]
+        Ba = _basis_matrix(Kv, dv, nv, s, 1)[1]
+        return np.einsum('i,mj->mij', Bc, Ba).reshape(len(s), -1)
+    Bc = _basis_matrix(Kv, dv, nv, np.array([0.0 if edge == "v0" else 1.0]), 0)[0, 0]
+    Ba = _basis_matrix(Ku, du, nu, s, 1)[1]
+    return np.einsum('mi,j->mij', Ba, Bc).reshape(len(s), -1)
+
+
+def edge_rows(nu, nv, du, dv, Ku, Kv, edge, s):
+    """(R0, R1, R2, rows of the edge CVs): the patch's position and its first
+    and second derivatives across `edge` (into the patch) at the parameters s
+    along it, as rows over the nu * nv CVs."""
+    from .surfeval import _basis_matrix
+    s = np.asarray(s, float)
+    if edge in ("u0", "u1"):
+        c = np.array([0.0 if edge == "u0" else 1.0])
+        Bc = _basis_matrix(Ku, du, nu, c, 2)[:, 0, :]             # (3, nu)
+        Ba = _basis_matrix(Kv, dv, nv, s, 0)[0]                   # (m, nv)
+        sign = 1.0 if edge == "u0" else -1.0
+        R = [np.einsum('i,mj->mij', Bc[k] * sign ** k, Ba).reshape(len(s), -1) for k in range(3)]
+        rows = [[(i if edge == "u0" else nu - 1 - i) * nv + j for j in range(nv)] for i in range(3)]
+    else:
+        c = np.array([0.0 if edge == "v0" else 1.0])
+        Bc = _basis_matrix(Kv, dv, nv, c, 2)[:, 0, :]
+        Ba = _basis_matrix(Ku, du, nu, s, 0)[0]
+        sign = 1.0 if edge == "v0" else -1.0
+        R = [np.einsum('mi,j->mij', Ba, Bc[k] * sign ** k).reshape(len(s), -1) for k in range(3)]
+        rows = [[i * nv + (j if edge == "v0" else nv - 1 - j) for i in range(nu)] for j in range(3)]
+    return R[0], R[1], R[2], rows
+
+
+def edge_plan(C, du, dv, Ku, Kv, edge, m=48):
+    """Points along an edge of the patch with CVs C (world), and their parameters."""
+    nu, nv = C.shape[:2]
+    s = np.linspace(0.0, 1.0, m)
+    R0 = edge_rows(nu, nv, du, dv, Ku, Kv, edge, s)[0]
+    return R0 @ C.reshape(-1, 3), s
+
+
+def _flat(P, up):
+    return P - np.outer(P @ up, up)
+
+
+def continuity(C, du, dv, Ku, Kv, edge, match):
+    """How the patch meets its neighbour along `edge` (match: the data from
+    the neighbour): the largest gap, normal angle (degrees) and difference of
+    the normal curvature across the edge (relative to the neighbour's largest
+    there, in %)."""
+    nu, nv = C.shape[:2]
+    R0, R1, R2, _ = edge_rows(nu, nv, du, dv, Ku, Kv, edge, match["s"])
+    Cf = C.reshape(-1, 3)
+    P, Bc, Bcc = R0 @ Cf, R1 @ Cf, R2 @ Cf
+    Ta = edge_tangent_rows(nu, nv, du, dv, Ku, Kv, edge, match["s"]) @ Cf
+    nB = np.cross(Ta, Bc)
+    nB /= np.maximum(np.linalg.norm(nB, axis=1), 1e-300)[:, None]
+    nA = match["n"]
+    gap = float(np.linalg.norm(P - match["A"], axis=1).max())
+    ang = float(np.degrees(np.arccos(np.clip(np.abs((nA * nB).sum(1)), 0.0, 1.0))).max())
+    w2 = (Bc * Bc).sum(1)
+    kB = (nA * Bcc).sum(1) / np.maximum(w2, 1e-300)
+    kA = np.einsum('mi,mij,mj->m', Bc, match["Q"], Bc) / np.maximum(w2, 1e-300)
+    scale = max(float(np.abs(kA).max()), 1.0 / max(match["L"], 1e-9))
+    curv = float(100.0 * np.abs(kB - kA).max() / scale)
+    return {"gap": gap, "angle": ang, "curv": curv}
+
+
 def drape_patch(C0, du, dv, Ku, Kv, scan, up=(0.0, 0.0, 1.0), smoothness=0.01, drape=False, offset=0.0,
-                samples=64, iterations=6, fixed=None, drape_slack=0.01, steep=0.3):
+                samples=64, iterations=6, fixed=None, drape_slack=0.01, steep=0.3, edges=()):
     """Move the CVs C0 (nu x nv x 3, world) of a NURBS patch (degrees du, dv;
     knots Ku, Kv) along `up` only, so the patch lies on the scan seen from
     above (offset: a clearance along the scan's normal). fixed: (nu, nv)
-    mask of CVs that stay. Returns (CVs, report)."""
+    mask of CVs that stay. edges: matches to neighbours (match_edge), each
+    held at its level (0, 1, 2 for G0, G1, G2). Returns (CVs, report)."""
     t0 = time.perf_counter()
     C0 = np.asarray(C0, float)
     nu, nv = C0.shape[:2]
@@ -174,6 +265,16 @@ def drape_patch(C0, du, dv, Ku, Kv, scan, up=(0.0, 0.0, 1.0), smoothness=0.01, d
     t = np.zeros(n)
     hist = []
     w_rob = np.ones(len(hk))
+    ups = []
+    for e in edges:                                              # the rows of every matched edge, once
+        R0, R1, R2, _ = edge_rows(nu, nv, du, dv, Ku, Kv, e["edge"], e["s"])
+        nA = e["n"]
+        cu = nA @ up                                             # (n_A . up): how a height moves the condition
+        L = e["L"]
+        m = len(e["s"])
+        ups.append((e, R0, R1, R2, nA, cu, L, m))
+    if edges:
+        iterations = max(int(iterations), 6)
     for it in range(int(iterations)):
         r = (Sk @ t - hk) * ck                                   # along the scan's normal; + above the scan
         if it > 0:
@@ -185,17 +286,48 @@ def drape_patch(C0, du, dv, Ku, Kv, scan, up=(0.0, 0.0, 1.0), smoothness=0.01, d
         w = w / max(float(w.sum()), 1e-300)
         M = (Sk * w[:, None]).T @ Sk + float(smoothness) * (D.T @ D) / max(len(D), 1) + 1e-12 * np.eye(n)
         b = (Sk * w[:, None]).T @ hk
-        tn = t.copy()
-        if free.all():
-            tn = np.linalg.solve(M, b)
+        # the edge conditions first, as exactly as they can hold (least squares among themselves), then the
+        # scan with what freedom is left: t = t_c + N z, N spanning the heights that leave every condition be
+        C_now = Cf + t[:, None] * up
+        Crows, crhs = [], []
+        for e, R0, R1, R2, nA, cu, L, m in ups:
+            Crows.append(R0)
+            crhs.append(e["A"] @ up - (R0 @ Cf) @ up)
+            if e["level"] >= 1:
+                Bc = R1 @ C_now
+                wl = np.maximum(np.linalg.norm(Bc, axis=1), 1e-300)
+                Crows.append(R1 * (L * cu / wl)[:, None])
+                crhs.append(-L * ((R1 @ Cf) * nA).sum(1) / wl)
+            if e["level"] >= 2:
+                Bc = R1 @ C_now
+                w2 = np.maximum((Bc * Bc).sum(1), 1e-300)
+                qa = np.einsum('mi,mij,mj->m', Bc, e["Q"], Bc)
+                Crows.append(R2 * (L * L * cu / w2)[:, None])
+                crhs.append(L * L * (qa - ((R2 @ Cf) * nA).sum(1)) / w2)
+        if fixed.any():
+            Crows.append(np.eye(n)[fixed])
+            crhs.append(np.zeros(int(fixed.sum())))
+        if Crows:
+            Cm, cr = np.vstack(Crows), np.concatenate(crhs)
+            U_, sv, Vt = np.linalg.svd(Cm, full_matrices=True)
+            rank = int((sv > 1e-9 * max(float(sv[0]), 1e-300)).sum())
+            tc = Vt[:rank].T @ ((U_[:, :rank].T @ cr) / sv[:rank])  # the conditions' least-squares heights
+            N = Vt[rank:].T                                          # heights that leave them as they are
+            if N.shape[1]:
+                z = np.linalg.solve(N.T @ M @ N, N.T @ (b - M @ tc))
+                tn = tc + N @ z
+            else:
+                tn = tc
         else:
-            tn[free] = np.linalg.solve(M[np.ix_(free, free)], b[free] - M[np.ix_(free, fixed)] @ t[fixed])
+            tn = np.linalg.solve(M, b)
         moved = float(np.abs(tn - t).max())
         t = tn
         hist.append({"it": it, "moved": moved})
-        if it > 1 and moved < 1e-7 * reach:
+        if it > 1 and moved < 1e-7 * reach and not (edges and it < 4):
             break
     C = (Cf + t[:, None] * up).reshape(nu, nv, 3)
+    for e in edges:
+        e["result"] = continuity(C, du, dv, Ku, Kv, e["edge"], e)
     rep = {"samples": int(ok.sum()), "of": len(h), "iterations": len(hist), "time": time.perf_counter() - t0,
            "down": n_down / max(int(np.isfinite(h).sum()), 1),
            "degree": (du, dv), "cvs": (nu, nv), "spans": (nu - du, nv - dv)}
@@ -233,9 +365,116 @@ def sheet_grid(obj):
     me.vertices.foreach_get("co", V)
     V = V.reshape(-1, 3)
     G = grid_order(len(V), [tuple(p.vertices) for p in me.polygons])
-    M = np.array(obj.matrix_world)
+    M = np.array(geom.world_matrix(obj))
     Vw = V @ M[:3, :3].T + M[:3, 3]
     return Vw[G], G
+
+
+class Neighbour:
+    """A neighbouring NURBS patch (one face) in world space: its four parameter edges and its geometry on them."""
+
+    def __init__(self, obj):
+        from . import store, surfeval
+        faces = store.get_brep(obj).faces()
+        if len(faces) != 1:
+            raise ValueError(f"{obj.name}: a neighbour must be one NURBS face")
+        self.S = surfeval.Surf(faces[0].surface())
+        self.M = np.array(geom.world_matrix(obj))
+        self.Lm = self.M[:3, :3]
+        self.name = obj.name
+
+    def iso(self, k, n=400):
+        """(u, v) along the surface's parameter edge k (0: u min, 1: u max, 2: v min, 3: v max)."""
+        (u0, u1), (v0, v1) = self.S.u_domain, self.S.v_domain
+        t = np.linspace(0.0, 1.0, n)
+        if k < 2:
+            return np.full(n, u0 if k == 0 else u1), v0 + t * (v1 - v0)
+        return u0 + t * (u1 - u0), np.full(n, v0 if k == 2 else v1)
+
+    def eval(self, u, v, nd=2):
+        D = self.S.at(u, v, nd)
+        return {kl: (a @ self.Lm.T + (self.M[:3, 3] if kl == (0, 0) else 0.0)) for kl, a in D.items()}
+
+
+def second_form(D):
+    """(unit normal, second fundamental form as a world tensor on tangent vectors) of an evaluation dict (nd >= 2)."""
+    from .surfeval import normals
+    su, sv = D[1, 0], D[0, 1]
+    n, _ = normals(D)
+    J = np.stack([su, sv], axis=-1)
+    JtJ = np.einsum("mia,mib->mab", J, J)
+    Jp = np.linalg.solve(JtJ, np.transpose(J, (0, 2, 1)))         # (m, 2, 3): world tangent -> (du, dv)
+    H = np.stack([np.stack([(D[2, 0] * n).sum(1), (D[1, 1] * n).sum(1)], -1),
+                  np.stack([(D[1, 1] * n).sum(1), (D[0, 2] * n).sum(1)], -1)], -2)
+    return n, np.einsum("mab,mai,mbj->mij", H, Jp, Jp)
+
+
+def find_matches(C, du, dv, Ku, Kv, neighbours, up, tol=0.05):
+    """For each edge of the patch, the neighbour edge lying along it in plan view, if one lies within tol (of the
+    edge's length) on average: {edge: (neighbour, its edge k, mean plan distance)}."""
+    from .scanfit import polyline_nearest
+    out = {}
+    for e in EDGES:
+        P, _ = edge_plan(C, du, dv, Ku, Kv, e)
+        Pf = _flat(P, up)
+        Lb = float(np.linalg.norm(np.diff(Pf, axis=0), axis=1).sum())
+        best = None
+        for nb in neighbours:
+            for k in range(4):
+                A = nb.eval(*nb.iso(k, 200), nd=0)[0, 0]
+                d = float(polyline_nearest(Pf, _flat(A, up), closed=False)[4].mean())
+                if best is None or d < best[2]:
+                    best = (nb, k, d)
+        if best is not None and best[2] < tol * Lb:
+            out[e] = best
+    return out
+
+
+def snap_edge(C, du, dv, Ku, Kv, edge, nb, k, up):
+    """Move the patch's edge CVs (across `up` only) so its edge lies on the
+    neighbour's edge k in plan view with the neighbour's parametrisation: the
+    edge is the neighbour's edge between the points nearest its two ends, at
+    the same parameters (the same CV spacing along it: a neighbour edge of
+    one span and the same or lower degree is then met exactly). The edge's
+    second and third CV rows shift along with it, so the CV columns stay
+    straight."""
+    from .scanfit import polyline_nearest
+    C = C.copy()
+    nu, nv = C.shape[:2]
+    u, v = nb.iso(k, 801)
+    Af = _flat(nb.eval(u, v, nd=0)[0, 0], up)
+    s = np.linspace(0.0, 1.0, 81)
+    R0, _, _, rows = edge_rows(nu, nv, du, dv, Ku, Kv, edge, s)
+    Cf = C.reshape(-1, 3)
+    ends = _flat(R0[[0, -1]] @ Cf, up)
+    _, _, seg, lam, _ = polyline_nearest(ends, Af, closed=False)
+    tau = (seg + lam) / (len(u) - 1)                                # the ends' places along the neighbour edge
+    tt = tau[0] + s * (tau[1] - tau[0])
+    T = _flat(nb.eval(np.interp(tt, np.linspace(0, 1, len(u)), u), np.interp(tt, np.linspace(0, 1, len(v)), v),
+                      nd=0)[0, 0], up)
+    r0 = rows[0]
+    X = np.linalg.lstsq(R0[:, r0], T, rcond=None)[0]
+    delta = _flat(X, up) - _flat(Cf[r0], up)
+    for r in rows[:3]:
+        Cf[r] += delta
+    return Cf.reshape(nu, nv, 3)
+
+
+def edge_match(C, du, dv, Ku, Kv, edge, nb, k, up, level, m=40):
+    """The neighbour's geometry at the patch's edge points (by plan position): the data drape_patch holds the
+    edge to."""
+    from .scanfit import polyline_nearest
+    P, s = edge_plan(C, du, dv, Ku, Kv, edge, m)
+    u, v = nb.iso(k, 800)
+    A = nb.eval(u, v, nd=0)[0, 0]
+    _, _, seg, lam, _ = polyline_nearest(_flat(P, up), _flat(A, up), closed=False)
+    uu = u[seg] + lam * (u[np.minimum(seg + 1, len(u) - 1)] - u[seg])
+    vv = v[seg] + lam * (v[np.minimum(seg + 1, len(v) - 1)] - v[seg])
+    D = nb.eval(uu, vv, nd=2)
+    n, Q = second_form(D)
+    L = float(np.linalg.norm(np.diff(P, axis=0), axis=1).sum())
+    return {"edge": edge, "level": int(level), "s": s, "A": D[0, 0], "n": n, "Q": Q, "L": L,
+            "neighbour": nb.name, "k": k}
 
 
 class NPROTO_OT_scan_drape_patch(bpy.types.Operator):
@@ -263,6 +502,16 @@ class NPROTO_OT_scan_drape_patch(bpy.types.Operator):
     smoothness: FloatProperty(name="Smoothness", default=0.0001, min=0.0, soft_max=1.0, max=100.0, precision=4,
                               description="How evenly the CV net bends: higher keeps the patch calmer where the "
                                           "scan is noisy or has gaps, at the cost of a looser fit")
+    match: EnumProperty(name="Match Neighbours", default='G2',
+                        items=[('NONE', "Off", "Fit the scan only"),
+                               ('G0', "G0", "Edges meet the neighbouring patches' edges (position)"),
+                               ('G1', "G1", "... and are tangent to them"),
+                               ('G2', "G2", "... and have the same curvature across the edge")],
+                        description="Continuity to the selected NURBS patches whose edge lies along an edge of the "
+                                    "sheet (in plan view): the edge's first one, two or three CV rows are set by it")
+    snap_edges: BoolProperty(name="Snap Edges", default=True,
+                             description="Move a matched edge's CVs (across the drape direction only) so the edge "
+                                         "lies on the neighbour's edge in plan view")
     show_deviation: BoolProperty(name="Show Deviation", default=True,
                                  description="Turn on the Scan Deviation overlay (Analyze) afterwards")
 
@@ -279,6 +528,9 @@ class NPROTO_OT_scan_drape_patch(bpy.types.Operator):
         lay.prop(self, "drape")
         lay.prop(self, "offset")
         lay.prop(self, "smoothness")
+        lay.prop(self, "match")
+        if self.match != 'NONE':
+            lay.prop(self, "snap_edges")
         lay.prop(self, "show_deviation")
         if LAST_INFO:
             from . import scanfit
@@ -291,6 +543,14 @@ class NPROTO_OT_scan_drape_patch(bpy.types.Operator):
                       icon='SURFACE_NSURFACE')
             col.label(text=f"RMS {L(i['dev_rms'])}  ·  95 % within {L(i['dev_p95'])}")
             col.label(text=f"most inside {L(i['dev_min'])}  ·  most outside {L(i['dev_hi'])}")
+            for e in i.get("edges", ()):
+                r = e["result"]
+                txt = f"{e['edge']} -> {e['neighbour']}: G{e['level']}  gap {L(r['gap'])}"
+                if e["level"] >= 1:
+                    txt += f"  ·  {r['angle']:.3f}°"
+                if e["level"] >= 2:
+                    txt += f"  ·  curvature {r['curv']:.2f} %"
+                col.label(text=txt, icon='LINKED')
 
     def execute(self, context):
         from . import scanfit, store
@@ -316,8 +576,23 @@ class NPROTO_OT_scan_drape_patch(bpy.types.Operator):
                 if up[2] < 0:
                     up = -up
             scan = scanfit.scan_for(scan_obj)
+            own = sheet.get("nproto_patch")
+            nbs = [o for o in context.selected_objects if o is not sheet and store.is_nurbs(o) and o.name != own]
+            if not nbs and self.match != 'NONE':          # (run again later: the neighbours it was matched to)
+                nbs = [bpy.data.objects[n] for n in sheet.get("nproto_neighbours", "").split("\t")
+                       if n and n in bpy.data.objects and n != own]
+            matches = []
+            if self.match != 'NONE' and nbs:
+                level = int(self.match[1])
+                found = find_matches(C0, du, dv, Ku, Kv, [Neighbour(o) for o in nbs], up)
+                for e, (nb, k, _) in found.items():
+                    if self.snap_edges:
+                        C0 = snap_edge(C0, du, dv, Ku, Kv, e, nb, k, up)
+                for e, (nb, k, _) in found.items():
+                    deg = du if e in ("u0", "u1") else dv
+                    matches.append(edge_match(C0, du, dv, Ku, Kv, e, nb, k, up, min(level, deg)))
             C, rep = drape_patch(C0, du, dv, Ku, Kv, scan, up=up, smoothness=self.smoothness, drape=self.drape,
-                                 offset=self.offset)
+                                 offset=self.offset, edges=matches)
         except (ValueError, np.linalg.LinAlgError) as exc:
             self.report({'WARNING'}, f"Drape Patch to Scan: {exc}")
             return {'CANCELLED'}
@@ -337,9 +612,13 @@ class NPROTO_OT_scan_drape_patch(bpy.types.Operator):
         else:
             patch = store.new_object(context, sheet.name + " Patch", surf)
         sheet["nproto_patch"] = patch.name
+        if matches:
+            sheet["nproto_neighbours"] = "\t".join(sorted({m["neighbour"] for m in matches}))
         patch["nproto_scan"] = scan_obj.name
         dev = deviation(C, du, dv, Ku, Kv, scan, self.offset)
         info = dict(rep)
+        info["edges"] = [{"edge": m["edge"], "neighbour": m["neighbour"], "level": m["level"], "result": m["result"]}
+                         for m in matches]
         info.update({k: dev[k] for k in ("dev_rms", "dev_p95", "dev_min", "dev_hi", "dev_max", "dev_mean")})
         LAST_INFO.clear()
         LAST_INFO.update(info)
@@ -350,8 +629,13 @@ class NPROTO_OT_scan_drape_patch(bpy.types.Operator):
         if self.show_deviation:
             scanfit._show_deviation(context, scan_obj)
         L = lambda x: scanfit._length(context, x)
-        self.report({'INFO'}, f"Drape Patch to Scan: degree {du} x {dv}, {nu} x {nv} CVs  ·  RMS {L(info['dev_rms'])}"
-                              f"  ·  95 % within {L(info['dev_p95'])}")
+        msg = (f"Drape Patch to Scan: degree {du} x {dv}, {nu} x {nv} CVs  ·  RMS {L(info['dev_rms'])}"
+               f"  ·  95 % within {L(info['dev_p95'])}")
+        if matches:
+            msg += "  ·  " + ", ".join(f"G{m['level']} to {m['neighbour']}" for m in matches)
+        elif self.match != 'NONE' and nbs:
+            msg += "  ·  no neighbour edge lies along the sheet's edges (in plan view)"
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 

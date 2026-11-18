@@ -721,6 +721,26 @@ panel) whose outside is ambiguous takes the side the patch is draped from as its
 On the car scan's hood (a 6 × 6 sheet, 1.5 × 1.1 m): one degree-5 patch is 0.96 mm RMS from the scan, 95 % within
 1.95 mm, the rest being the scan's own surface noise; the fit takes 0.04 s.
 
+**Match Neighbours** (G0, G1, G2; default G2) joins the patch to NURBS patches selected with it: every edge of the
+sheet that lies along an edge of one of them in plan view (within 5 % of its length on average) is held to it. With
+**Snap Edges** the edge's CVs first move across the drape direction onto the neighbour's edge, taking the
+neighbour's spacing along it (its edge between the points nearest the sheet edge's two ends, at the same
+parameters), and the edge's second and third CV rows shift along, so the CV columns stay straight. Then, with the CVs
+still moving only up and down, every continuity condition is linear in their heights: G0 the same point, G1 the
+cross tangent in the neighbour's tangent plane, G2 the same normal curvature across the edge (G0 and G1 along a
+shared edge already make the rest of the curvature agree). The conditions are solved first, as exactly as they can
+hold, and the scan is fitted with the freedom that is left; so on a 6 × 6 sheet a G2 edge sets its three CV rows
+and the scan the other three, and two opposite G2 edges leave nothing to the scan. The report lists each matched
+edge with its gap, normal angle and curvature difference. Exact where the neighbour's edge (or the part the sheet
+covers) is one span of degree 5 or less: measured on the two NURBS surfaces, gaps of 1e-15, angles of 1e-6° and
+curvature differences of 1e-12 %, also against a degree-3 neighbour whose edge the sheet covers only part of. At a
+corner where two matched neighbours meet, exact G2 also needs the neighbours' twists to agree there; in the tests it
+stays within 10 µm, 0.04° and 0.2 %. The patch's sheet remembers its neighbours for the next run.
+
+On the hood, a second 6 × 6 sheet in front of the first, G2 to its patch: gap 1e-13, 0.0001°, 0.0015 %, and Zebra
+runs straight through the seam; the front patch keeps 1.5 mm RMS to the scan (0.9 mm on its own, with all six rows
+free).
+
 How it works: every point of the limit surface is a fixed linear mix of cage vertices. That mix is built once as a
 sparse matrix with SubD to BREP's own Catmull-Clark rules (creases, open borders, Keep Corners), so the fitted
 surface is exactly what SubD to BREP converts. Then, each round, the surface samples find their nearest scan points
@@ -734,8 +754,8 @@ Measured on a residual-limb scan (38 cm, 92k triangles), 10 rings × 12: the NUR
 (a muscle ridge, a round bump): Refine Cage to Scan adds loops there, or model the cage around them.
 
 * Not yet: open trim lines (an edge of a patch held to part of a curve), symmetry, and cages with modifiers above
-  the Subdivision (apply them first); for Drape Patch, holding edge rows to a neighbouring patch (G0 / G1 / G2)
-  during the fit, and splitting a patch where one span can't follow the scan.
+  the Subdivision (apply them first); for Drape Patch, splitting a patch where one span can't follow the scan, and
+  neighbours with more than one face or trimmed edges.
 
 ## STEP Import and Export
 

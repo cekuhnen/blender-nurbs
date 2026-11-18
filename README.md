@@ -105,7 +105,7 @@ everything built from it rebuilds.
   **Refine Cage to Scan** adds edge loops only where the surface misses the scan (all quads, no new star points),
   **Trim Cage to Curve** holds the cage's open edge to a trim line drawn on the scan, **Drape Patch to Scan** lays
   one single-span NURBS patch (degree 5 from a 6 × 6 grid) straight down onto a scan, its CVs moving only up and
-  down; the
+  down, its edges G0 / G1 / G2 to the neighbouring patches (exact where their edges are one span); the
   **Scan Deviation** overlay colours any surface by its distance from the scan
 
 ### STEP Import and Export
