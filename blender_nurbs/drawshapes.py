@@ -509,7 +509,8 @@ class _ShapeTool(SketchMixin):
             self.report({'WARNING'}, f"{self.TITLE} is interactive: start it from the panel or menu")
             return {'CANCELLED'}
         if kind == "arc":
-            params = primitive_params("prim_arc", radius=float(self.radius), angle=float(self.angle), degree=0)
+            params = primitive_params("prim_arc", radius=float(self.radius), angle=float(self.angle),
+                                      **circle_degree(getattr(self, "ctype", "EXACT"), getattr(self, "spans_u", 4)))
             obj = place_primitive(context, "NURBS Arc", "prim_arc", params, Matrix(d["matrix"]))
         else:
             params = primitive_params("prim_circle", radius=float(self.radius), elliptic=False,
@@ -542,11 +543,24 @@ def type_key(op, event):
     return False
 
 
-def type_rows(op):
+def type_rows(op, what="circle"):
     ct, sp = getattr(op, "ctype", "EXACT"), getattr(op, "spans_u", 8)
-    return [("Type", [hints.cycle("D", ["exact", "smooth"], ct.lower()),
+    return [("Kind", [hints.cycle("D", ["exact", "smooth"], ct.lower()),
                       hints.note(f"smooth: degree 3, {sp} spans (redo panel)" if ct == "SMOOTH"
-                                 else "rational: a true circle")])]
+                                 else f"rational: a true {what}")])]
+
+
+def type_name(op):
+    """'exact' or 'smooth, degree 3, N spans' for the tool's report."""
+    ct = getattr(op, "ctype", "EXACT")
+    return "exact" if ct == "EXACT" else f"smooth, degree 3, {getattr(op, 'spans_u', 8)} spans"
+
+
+def type_draw(op, layout):
+    """The redo panel's Exact / Smooth row (and Smooth's spans)."""
+    layout.row().prop(op, "ctype", expand=True)
+    if op.ctype == "SMOOTH":
+        layout.prop(op, "spans_u")
 
 
 CIRCLE_MODES = [("CENTER", "Centre", "Click the centre, then the radius"),
@@ -575,9 +589,7 @@ class NPROTO_OT_draw_circle(_ShapeTool, bpy.types.Operator):
     def draw(self, context):
         self.layout.use_property_split = True
         self.layout.prop(self, "radius")
-        self.layout.row().prop(self, "ctype", expand=True)
-        if self.ctype == "SMOOTH":
-            self.layout.prop(self, "spans_u")
+        type_draw(self, self.layout)
 
     def _extra_key(self, context, event):
         return type_key(self, event)
@@ -671,9 +683,7 @@ class NPROTO_OT_draw_circle(_ShapeTool, bpy.types.Operator):
     def execute(self, context):
         out = self._make(context, "circle")
         if out == {'FINISHED'}:
-            ct = getattr(self, "ctype", "EXACT")
-            kind = "exact" if ct == "EXACT" else f"smooth, degree 3, {getattr(self, 'spans_u', 8)} spans"
-            self.report({'INFO'}, f"Circle ({kind}), radius {self.radius:.4g}")
+            self.report({'INFO'}, f"Circle ({type_name(self)}), radius {self.radius:.4g}")
         return out
 
 
@@ -688,10 +698,11 @@ ARC_MODES = [("THREE", "3 Points", "Start, end, then a point the arc passes thro
 
 
 class NPROTO_OT_draw_arc(_ShapeTool, bpy.types.Operator):
-    """Draw an exact NURBS arc: through 3 points, by its centre, tangent from a
-    curve or line, or tangent to two lines (a fillet; M switches). Snaps like the
-    other drawing tools; type the radius and the angle. It stays editable in the
-    Feature panel"""
+    """Draw a NURBS arc: through 3 points, by its centre, tangent from a curve
+    or line, or tangent to two lines (a fillet; M switches). Exact (rational,
+    a true arc) or Smooth (degree 3: D switches). Snaps like the other drawing
+    tools; type the radius and the angle. It stays editable in the Feature
+    panel"""
     bl_idname = "nproto.draw_arc"
     bl_label = "Arc"
     bl_options = {'REGISTER', 'UNDO'}
@@ -701,6 +712,9 @@ class NPROTO_OT_draw_arc(_ShapeTool, bpy.types.Operator):
     mode: EnumProperty(name="Mode", items=ARC_MODES, default="THREE")
     radius: FloatProperty(name="Radius", default=0.5, min=1e-6, unit='LENGTH')
     angle: FloatProperty(name="Angle", default=90.0, min=0.01, max=360.0)
+    ctype: EnumProperty(name="Type", items=CIRCLE_TYPES, default="EXACT")
+    spans_u: IntProperty(name="Spans", default=4, min=1, max=64,
+                         description="Smooth: spans along the arc (degree 3)")
     data: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
 
     def draw(self, context):
@@ -708,6 +722,13 @@ class NPROTO_OT_draw_arc(_ShapeTool, bpy.types.Operator):
         col = self.layout.column(align=True)
         col.prop(self, "radius")
         col.prop(self, "angle")
+        type_draw(self, self.layout)
+
+    def _extra_key(self, context, event):
+        return type_key(self, event)
+
+    def _extra_rows(self):
+        return type_rows(self, "arc")
 
     def _needs_line(self):
         return self.mode == "FILLET" and len(self._lines_picked) < 2
@@ -884,7 +905,7 @@ class NPROTO_OT_draw_arc(_ShapeTool, bpy.types.Operator):
     def execute(self, context):
         out = self._make(context, "arc")
         if out == {'FINISHED'}:
-            self.report({'INFO'}, f"Arc, radius {self.radius:.4g}, {self.angle:.4g}°")
+            self.report({'INFO'}, f"Arc ({type_name(self)}), radius {self.radius:.4g}, {self.angle:.4g}°")
         return out
 
 
@@ -935,9 +956,10 @@ ELLIPSE_MODES = [("CENTER", "Centre", "The centre, the end of the major axis, th
 
 
 class NPROTO_OT_draw_ellipse(_TwoStep, bpy.types.Operator):
-    """Draw an exact NURBS ellipse: its centre (or one end of its major axis),
-    the major axis' end, then the minor size (M switches). Type the sizes. It
-    stays editable in the Feature panel"""
+    """Draw a NURBS ellipse: its centre (or one end of its major axis), the
+    major axis' end, then the minor size (M switches). Exact (rational, a true
+    ellipse) or Smooth (degree 3: D switches). Type the sizes. It stays
+    editable in the Feature panel"""
     bl_idname = "nproto.draw_ellipse"
     bl_label = "Ellipse"
     bl_options = {'REGISTER', 'UNDO'}
@@ -946,6 +968,9 @@ class NPROTO_OT_draw_ellipse(_TwoStep, bpy.types.Operator):
     mode: EnumProperty(name="Mode", items=ELLIPSE_MODES, default="CENTER")
     radius: FloatProperty(name="Major Radius", default=0.5, min=1e-6, unit='LENGTH')
     radius2: FloatProperty(name="Minor Radius", default=0.25, min=1e-6, unit='LENGTH')
+    ctype: EnumProperty(name="Type", items=CIRCLE_TYPES, default="EXACT")
+    spans_u: IntProperty(name="Spans", default=8, min=4, max=64,
+                         description="Smooth: spans round the ellipse (degree 3, periodic)")
     data: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
 
     def draw(self, context):
@@ -953,6 +978,27 @@ class NPROTO_OT_draw_ellipse(_TwoStep, bpy.types.Operator):
         col = self.layout.column(align=True)
         col.prop(self, "radius")
         col.prop(self, "radius2")
+        type_draw(self, self.layout)
+
+    def _extra_key(self, context, event):
+        return type_key(self, event)
+
+    def _extra_rows(self):
+        return type_rows(self, "ellipse")
+
+    def execute(self, context):
+        # the redo panel's type and spans go into the shape's parameters
+        try:
+            d = json.loads(self.data or "{}")
+        except ValueError:
+            d = {}
+        if d.get("params") is not None:
+            d["params"].update(circle_degree(getattr(self, "ctype", "EXACT"), getattr(self, "spans_u", 8)))
+            self.data = json.dumps(d)
+        out = self._make_generic(context)
+        if out == {'FINISHED'}:
+            self.report({'INFO'}, f"Ellipse ({type_name(self)}): radius {self.radius:.4g}, {self.radius2:.4g}")
+        return out
 
     def _needs_line(self):
         return False
@@ -998,7 +1044,8 @@ class NPROTO_OT_draw_ellipse(_TwoStep, bpy.types.Operator):
         b = typed["R2"] if "R2" in typed else (abs(float((P - C) @ T[:3, 1])) if P is not None else 0.0)
         if a < 1e-12 or b < 1e-12:
             return None
-        params = {"radius": a, "radius2": b, "elliptic": True, "degree": 0}
+        params = {"radius": a, "radius2": b, "elliptic": True,
+                  **circle_degree(getattr(self, "ctype", "EXACT"), getattr(self, "spans_u", 8))}
         from .feature_ui import primitive_params
         return {"kind": "ellipse", "op": "prim_circle", "name": "NURBS Ellipse", "T": T,
                 "params": primitive_params("prim_circle", **params), "poly": to_world(T, ellipse_outline(a, b)),
@@ -1526,9 +1573,7 @@ class NPROTO_OT_draw_cylinder(NPROTO_OT_draw_helix):
         col = lay.column(align=True)
         col.prop(self, "radius")
         col.prop(self, "height")
-        lay.row().prop(self, "ctype", expand=True)
-        if self.ctype == "SMOOTH":
-            lay.prop(self, "spans_u")
+        type_draw(self, lay)
         lay.prop(self, "caps")
 
     def _fields(self):
@@ -1604,8 +1649,7 @@ class NPROTO_OT_draw_cylinder(NPROTO_OT_draw_helix):
             self.data = json.dumps(d)
         out = self._make_generic(context)
         if out == {'FINISHED'}:
-            kind = "exact" if self.ctype == "EXACT" else f"smooth, degree 3, {self.spans_u} spans"
-            self.report({'INFO'}, f"Cylinder ({kind}{', solid' if self.caps else ''}): radius {self.radius:.4g}, "
+            self.report({'INFO'}, f"Cylinder ({type_name(self)}{', solid' if self.caps else ''}): radius {self.radius:.4g}, "
                                   f"height {self.height:.4g}")
         return out
 

@@ -48,6 +48,61 @@ check("smooth circle: close to the radius", abs(rad - 0.7).max() < 0.01 * 0.7, f
 r = bpy.ops.nproto.draw_circle(data=json.dumps({"matrix": T.tolist()}), radius=0.7, ctype="SMOOTH", spans_u=12)
 check("smooth circle: spans", len(ctx.active_object.data.splines[0].points) == 12)
 
+# --- Arc: Exact and Smooth ---------------------------------------------------------
+def arc_check(ctype, spans=4):
+    r = bpy.ops.nproto.draw_arc(data=json.dumps({"matrix": T.tolist()}), radius=0.6, angle=120.0, ctype=ctype,
+                                spans_u=spans)
+    a = ctx.active_object
+    sp = a.data.splines[0]
+    S = geom.sample_curve(features.input_curve(a, "S0"), 360)
+    rad = np.linalg.norm(S[:, :2] - [1, 2], axis=1)
+    ang = np.degrees(np.arctan2(S[:, 1] - 2, S[:, 0] - 1))
+    return r, a, sp, rad, ang
+
+r, a, sp, rad, ang = arc_check("EXACT")
+check("exact arc: rational, order 3, radius exact", r == {'FINISHED'} and sp.order_u == 3
+      and min(p.co[3] for p in sp.points) < 0.9 and abs(rad - 0.6).max() < 1e-6, f"{abs(rad - 0.6).max():.1e}")
+check("exact arc: history degree 0, 120°", features.history(a)["params"]["degree"] == 0
+      and abs(np.ptp(ang) - 120) < 1e-3, f"{np.ptp(ang):.4f}°")
+r, a, sp, rad, ang = arc_check("SMOOTH", 5)
+h = features.history(a)["params"]
+check("smooth arc: degree 3, not rational, spans + 3 CVs", r == {'FINISHED'} and sp.order_u == 4
+      and all(p.co[3] == 1.0 for p in sp.points) and len(sp.points) == 5 + 3 and h["degree"] == 3 and h["spans_u"] == 5,
+      f"order {sp.order_u}, {len(sp.points)} CVs")
+check("smooth arc: close to the radius, ends on the arc's ends", abs(rad - 0.6).max() < 0.002 * 0.6
+      and abs(np.ptp(ang) - 120) < 0.05, f"{abs(rad - 0.6).max() / 0.6:.3%}, {np.ptp(ang):.4f}°")
+
+# --- Ellipse: Exact and Smooth (a generic shape: matrix + parameters) --------------
+def ellipse(ctype, spans=8):
+    params = primitive_params("prim_circle", radius=0.8, radius2=0.3, elliptic=True, degree=0)
+    data = {"matrix": T.tolist(), "op": "prim_circle", "params": params, "name": "NURBS Ellipse"}
+    r = bpy.ops.nproto.draw_ellipse(data=json.dumps(data), radius=0.8, radius2=0.3, ctype=ctype, spans_u=spans)
+    e = ctx.active_object
+    S = geom.sample_curve(features.input_curve(e, "S0"), 720)
+    q = (S[:, 0] - 1) ** 2 / 0.8 ** 2 + (S[:, 1] - 2) ** 2 / 0.3 ** 2     # 1 on the ellipse
+    return r, e, e.data.splines[0], q
+
+r, e, sp, q = ellipse("EXACT")
+check("exact ellipse: rational, on the ellipse", r == {'FINISHED'} and sp.order_u == 3
+      and min(p.co[3] for p in sp.points) < 0.9 and abs(q - 1).max() < 1e-5, f"{abs(q - 1).max():.1e}")
+check("exact ellipse: history degree 0", features.history(e)["params"]["degree"] == 0)
+r, e, sp, q = ellipse("SMOOTH", 10)
+h = features.history(e)["params"]
+check("smooth ellipse: degree 3, periodic, not rational, 10 CVs", r == {'FINISHED'} and sp.order_u == 4
+      and sp.use_cyclic_u and all(p.co[3] == 1.0 for p in sp.points) and len(sp.points) == 10
+      and h["degree"] == 3 and h["spans_u"] == 10 and h["elliptic"], f"order {sp.order_u}, {len(sp.points)} CVs")
+check("smooth ellipse: close to the ellipse", abs(np.sqrt(q) - 1).max() < 0.02, f"{abs(np.sqrt(q) - 1).max():.2%}")
+
+# the interactive key: D flips the type on all three tools
+class _Ev:
+    value, type, ctrl, alt, oskey = 'PRESS', 'D', False, False, False
+class _Op:
+    _buf, ctype = "", "EXACT"
+o_ = _Op()
+check("D key: exact -> smooth -> exact", ds.type_key(o_, _Ev()) and o_.ctype == "SMOOTH"
+      and ds.type_key(o_, _Ev()) and o_.ctype == "EXACT")
+check("hints name the shape", "a true arc" in str(ds.type_rows(o_, "arc")) and "a true ellipse" in str(ds.type_rows(o_, "ellipse")))
+
 # --- Cylinder: what the tool places (its execute: matrix + parameters) -------------
 def cyl(ctype, caps, spans=8, r_=0.5, h_=1.2):
     Tc = ds.frame(np.array([0.0, 0.0, 0.0]) + np.array([0, 0, 1.0]) * (0.5 * h_), np.array([1.0, 0, 0]), np.array([0, 0, 1.0]))
