@@ -495,6 +495,7 @@ class NPROTO_OT_extend(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
     pick_min = 1
     pick_max = 1
     finish_on_min = True
+    start_value = 0.0      # the arrow stands on the edge: nothing is extended until it is dragged
     inputs: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     distance: FloatProperty(name="Distance", default=0.5, soft_min=-10.0, soft_max=10.0, unit='LENGTH',
                             description="How far the edge moves along the surface (negative: shrink)")

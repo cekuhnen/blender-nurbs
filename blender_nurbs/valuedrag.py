@@ -23,7 +23,8 @@ asking for the values in a dialog before anything can be seen.
 
 The value starts at the last one used, unless that would be tiny or run off
 the screen at this zoom: then a round length a quarter of the view is used.
-So pick + Enter is as quick as before.
+So pick + Enter is as quick as before. A tool with start_value (Extend: 0)
+starts there instead: nothing changes until the arrow is dragged or a value typed.
 The add-on preference Value Input = Dialog turns the stage off: every tool
 then asks in its dialog, as before.
 A tool mixes ValueDrag in before AskValue (whose dialog stays the fallback for
@@ -139,6 +140,8 @@ class ValueDrag:
     ask_dialog = True       # False: without the stage (Value Input = Dialog) run at once, as the tool always did
     fit_view = "both"       # a start length that is off-screen at this zoom: "both" sized to the view,
                             # "shrink" only made smaller (a radius the part allows), "none" kept
+    start_value = None      # a value the first field always starts at (Extend: 0, the arrow on the
+                            # edge until it is dragged); None: the last value used, fitted to the view
 
     def invoke(self, context, event):
         self._start_event = (event.mouse_x, event.mouse_y, event.type, event.value)
@@ -174,10 +177,14 @@ class ValueDrag:
         self._pull = (se is not None and se[2] == 'LEFTMOUSE' and se[3] == 'PRESS'
                       and mouse is not None and getattr(self, "_base_at_mouse", False))
         self._pull_from = Vector((se[0], se[1])) if self._pull else None
-        try:
-            self._fit_start(context)
-        except Exception as exc:
-            print("NURBS value preview:", exc)
+        name = self.drag_fields[0]
+        if self.start_value is not None:      # (the last value used comes along with the picks: not that)
+            setattr(self, name, self.start_value)
+        else:
+            try:
+                self._fit_start(context)
+            except Exception as exc:
+                print("NURBS value preview:", exc)
         context.window_manager.modal_handler_add(self)
         self._drag_refresh(context)
         return {'RUNNING_MODAL'}
