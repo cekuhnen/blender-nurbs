@@ -45,7 +45,9 @@ everything built from it rebuilds.
 
 - **Draw:** CV Curve, Draw Line (lines and tangent arcs), Arc, Circle, Ellipse, Rectangle (rounded corners), Polygon, Slot, Helix (3D: pitch, taper, left-handed), Profile
 - **Between curves:** Blend Curve, Fillet (trims and joins)
-- **From curves:** Offset Curve (individual or joined; sharp, round or chamfered corners)
+- **From curves:** Offset Curve (individual or joined; sharp, round or chamfered corners), Offset on Surface
+  (curves or surface edges offset along the surface by a distance measured on it, across joined faces, cut at
+  trims and free edges)
 - **Shapes:** in Shift+A every shape at the 3D cursor (sized to the view)
 - **From surfaces:** Iso Curve, Duplicate Edge, Project Curve, Intersect (Iso Curve and Duplicate Edge keep the
   surface's own CVs, degree, knots and weights: a cylinder rim is its exact 8-CV rational circle)

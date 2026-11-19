@@ -13,7 +13,7 @@ The sidebar tab **NURBS Proto** has one collapsible panel per group. Ctrl+click 
 | Panel | Contents |
 |---|---|
 | **Active Object** | Shown only when the active object has something to show: CV editing (Done / Cancel), its feature settings and history, its face and edge count |
-| **Create Curves** | CV Curve, Draw Line, Arc, Circle, Ellipse, Rectangle, Polygon, Slot, Profile · between curves: Blend Curve, Fillet · from curves: Offset Curve · Helix (the other shapes, placed at the 3D cursor: Shift+A) · from surfaces: Iso Curve, Duplicate Edge, Project Curve, Intersect |
+| **Create Curves** | CV Curve, Draw Line, Arc, Circle, Ellipse, Rectangle, Polygon, Slot, Profile · between curves: Blend Curve, Fillet · from curves: Offset Curve, Offset on Surface · Helix (the other shapes, placed at the 3D cursor: Shift+A) · from surfaces: Iso Curve, Duplicate Edge, Project Curve, Intersect |
 | **Create Surfaces** | Draw Plane · Plane, Disk, Box, Cylinder, Cone, Sphere, Torus · from curves: Loft, Loft Rails, Sweep, Pipe, Extrude, Revolve, Planar · filling a gap: Boundary, Square, Patch, Dome · from surfaces: Offset, Thicken, Convert Blender Surface |
 | **Curve Edit** | Join / Unjoin Curves, Trim / Split Curves, Rebuild / Extend Curve, Align Curve |
 | **Surface Edit** | Edit CVs, Flip Normal, Rebuild Surface, Extend Surface, Surface Align, Match Surface, Refit to Trim, Merge Patches · Trim, Split, Untrim, Join, Unjoin, Detach at Isoparm · Surface Fillet, Edge Fillet · solids: Union, Difference, Intersection, Boundary Fill |
@@ -266,6 +266,37 @@ instead of the fitted spline (within about 0.001 of the size); the fit runs when
   meeting); that crossing is not trimmed.
 * With construction history the offset follows its source curves, and Distance, Curves, Corners, Flip, Both Sides and
   Tolerance stay editable in the Feature panel. The sources stay visible.
+
+### Offset on Surface (From Curves)
+
+Offsets curves that lie on a surface by a **Distance** measured **along the surface**: every point walks square to the
+curve on the surface (the straightest path there) for the distance, so a border strip, a panel gap or a split line
+next to a trim keeps its width across the curvature. The result lies on the surface (within Tolerance): use it to
+Trim, Split or Project.
+
+* **Inputs**: select curves on the surface (drawn on it, projected, intersections) and start the tool; the surface is
+  the selected NURBS object, else the one the curves lie on is found. With no curves selected (or **Alt**), click
+  curves or **surface edges** (a trim edge, a hole's edge, a boundary) and press Enter. Curves a little off the surface
+  are pulled onto it first (the report says how far). Touching inputs are chained and offset as one. A dense
+  polyline (Project Curve, Intersect) is made a smooth spline through its points first, within a quarter of Tolerance.
+* **Side**: a positive distance goes **outward** on a closed curve, to the **left** (seen from the surface's outside)
+  on an open one. **Flip** goes to the other side, **Both Sides** makes both.
+* **Across faces**: on a joined body the walk goes on into the neighbouring face; where it crosses a crease (a box
+  edge) the offset gets an exact corner on the edge. Where it runs off the surface (a free boundary or a trim edge) the
+  offset ends there: pieces whose points would land off the surface are cut out, ending exactly on the trim. A walk may
+  cross a hole on its way and land beyond it.
+* **Corners** of the input: on the inside of a turn both pieces are trimmed where they cross; on the outside **Sharp**
+  (both offsets continued along the surface until they meet), **Round** (a circle on the surface about the corner) or
+  **Chamfer** (a line on the surface between them). Where the distance is larger than the curve's radius of curvature
+  on the surface, the fold is cut out (a corner there).
+* **Handle**: as in Offset Curve, the arrow stands on the curve (where the mouse was, else halfway) and walks along
+  the surface as you drag; type a value, click away or Enter. **F** flips, **B** both sides, **C** cycles the corners.
+  The preview walks with fewer samples and steps and draws the points joined by lines; the cubic fit (within
+  Tolerance, corners kept) runs when you make it.
+* Accuracy: on a sphere a latitude circle offsets onto the latitude d / R further within 2e-5 of the radius at
+  Tolerance 0.0001; on a plane and a cylinder the offsets are exact up to the fit.
+* With construction history the offset follows its curves and the surface; Distance, Corners, Flip, Both Sides and
+  Tolerance stay editable in the Feature panel.
 
 ### Profile (circle, ellipse, square, rectangle perpendicular to a curve)
 

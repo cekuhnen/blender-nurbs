@@ -38,7 +38,7 @@ GROUPS = (
             (_t("nproto.blend_curve", icon='IPO_EASE_IN_OUT'), _t("nproto.fillet_curves", "Fillet", 'SPHERECURVE')),
         )),
         ("From Curves", (
-            (_t("nproto.offset_curve", icon='MOD_OFFSET'),),
+            (_t("nproto.offset_curve", icon='MOD_OFFSET'), _t("nproto.offset_on_surface", icon='MOD_SHRINKWRAP')),
         )),
         ("Shapes", (                                         # at the 3D cursor: the menus only (the panel
             MenuOnly((_p("LINE"), _p("ARC"), _p("CIRCLE"), _p("ELLIPSE"), _p("RECTANGLE"), _p("POLYGON"),
