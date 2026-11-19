@@ -669,8 +669,12 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
         p = {"v": 2, "mode": self.mode, "space": self.space, "turn": self.turn,
              "center_point": list(self.center_point), "frame_x": list(self.frame_x), "frame_z": list(self.frame_z)}
         if self.mode == "LINEAR":
-            p.update(count_x=self.count_x, count_y=self.count_y, count_z=self.count_z,
-                     distance_x=self.distance_x, distance_y=self.distance_y, distance_z=self.distance_z)
+            for a in AXES:
+                # an arrow with no spacing makes no copies: off (a count left from an
+                # earlier pattern must not stack copies on the original or hold up Enter)
+                d = getattr(self, "distance_" + a)
+                p["count_" + a] = getattr(self, "count_" + a) if abs(d) > 0.0 else 1
+                p["distance_" + a] = d
         elif self.mode == "CIRCULAR":
             p.update(count=self.count, angle=self.angle, rotate=self.rotate)
         else:
@@ -1068,12 +1072,9 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
 
     def drag_check(self):
         if self.mode == "LINEAR":
-            on = [a for a in AXES if getattr(self, "count_" + a) > 1]
-            if not on:
-                return "Count 1: type a count, or drag an arrow out"
-            for a in on:
-                if abs(getattr(self, "distance_" + a)) <= 0.0:
-                    return f"{a.upper()} spacing 0: drag the {a.upper()} arrow out, or Tab and type it"
+            p = self.params()
+            if all(p["count_" + a] < 2 for a in AXES):
+                return "No copies yet: drag an arrow out (number keys: its count, Tab: its spacing)"
         elif self.mode == "CIRCULAR":
             if abs(self.angle) < 0.05:
                 return "Angle 0: drag the handle around the axis, or Tab and type an angle"
@@ -1337,7 +1338,7 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
         if self.mode == "LINEAR":
             for a in AXES:
                 n = getattr(self, "count_" + a)
-                if n > 1 or f == "distance_" + a:
+                if (n > 1 and abs(getattr(self, "distance_" + a)) > 0.0) or f == "distance_" + a:
                     txt = f"{a.upper()} {n}{'|' if f == 'distance_' + a and self._cbuf else ''} × " + \
                         self._fmt(context, "distance_" + a)
                     out.append(f"[{txt}]" if f == "distance_" + a else txt)

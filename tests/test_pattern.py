@@ -178,6 +178,14 @@ err = max(np.abs(surf_pts(c) - (G0 + idx(c) * np.array([0.0, 0.0, -1.0]))).max()
 check("face frame: Z along world Y: the widget's Y runs along -Z (Z x X)", len(g4) == 2 and err < 1e-6, f"{err:.2e}")
 
 
+select(GP)
+r, _ = run(mode="LINEAR", count_x=3, distance_x=1.0, count_y=4, distance_y=0.0)
+g5 = [c for c in copies_of(GP) if c not in g1 + g2 + g3 + g4]
+check("an arrow with spacing 0 is off: a count left on it makes no copies (and does not hold up Enter)",
+      r == {'FINISHED'} and len(g5) == 2 and max(np.abs(surf_pts(c) - (G0 + [idx(c), 0, 0])).max() for c in g5) < 1e-6,
+      f"{len(g5)}")
+
+
 # --- circular: a box (a solid, several faces) about a Z axis through the centre ----
 bpy.ops.nproto.add_primitive(kind="BOX", width=1.0, depth=0.5, height=0.4)
 BX = ctx.active_object
