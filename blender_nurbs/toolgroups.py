@@ -69,6 +69,7 @@ GROUPS = (
         )),
         ("From Surfaces", (
             (_t("nproto.offset", icon='MOD_OFFSET'), _t("nproto.thicken", icon='MOD_SOLIDIFY')),
+            (_t("nproto.flange", icon='MOD_SOLIDIFY'),),
             (_t("nproto.from_blender_surface", icon='SURFACE_NSURFACE'),),
         )),
     )),

@@ -67,7 +67,8 @@ everything built from it rebuilds.
 - **Primitives:** Plane, Disk, Box, Cylinder, Cone, Sphere, Torus
 - **From curves:** Loft (G0 to G3 to surface edges), Loft Rails, Sweep, Pipe, Extrude, Revolve, Planar
 - **Fill a gap:** Boundary, Square, Patch, Dome
-- **From surfaces:** Offset, Thicken, Convert Blender Surface
+- **From surfaces:** Offset, Thicken, Flange (from free edges or curves on a surface: at an angle to the surface,
+  or a constant-draft surface to a pull direction; the base is the edge exactly), Convert Blender Surface
 
 ### Surface Edit
 

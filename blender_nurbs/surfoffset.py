@@ -1151,9 +1151,22 @@ def _samples(pieces, per=8):
     return np.vstack([curvetrim.sample_spans(sp, per)[0] for sp in pieces])
 
 
-def find_targets(pieces, candidates, rel=2e-3):
+def built_from(obj, sources):
+    """Whether obj's feature takes one of the source objects as an input (a
+    flange grown from a curve lies against it, but is no surface under it)."""
+    try:
+        h = features.history(obj)
+    except Exception:
+        return False
+    names = {s.name for s in sources}
+    return bool(h) and any(getattr(o, "name", o) in names for o, _ in h.get("inputs", []))
+
+
+def find_targets(pieces, candidates, rel=2e-3, sources=()):
     """The candidate NURBS objects the curves lie on: each within rel of its
-    size of some of the curves' points (the nearest one if none is)."""
+    size of some of the curves' points (the nearest one if none is). Objects
+    built from the sources (the curves' objects) are not candidates."""
+    candidates = [o for o in candidates if not built_from(o, sources)]
     P = _samples(pieces)
     lo, hi = P.min(axis=0), P.max(axis=0)
     hits, nearest = [], None
@@ -1253,7 +1266,7 @@ class NPROTO_OT_offset_on_surface(ValueDrag, AskValue, PickMixin, bpy.types.Oper
             if pieces:
                 cands = [o for o in context.visible_objects if o.type != 'CURVE' and store.is_nurbs(o)
                          and o not in objs]
-                objs += find_targets(pieces, cands)
+                objs += find_targets(pieces, cands, sources=[o for o, r in curves if o.type == 'CURVE'])
         self.surfaces = json.dumps([o.name for o in objs])
         return objs
 
