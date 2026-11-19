@@ -59,6 +59,7 @@ GROUPS = (
         )),
         ("From Curves", (
             (_t("nproto.loft", icon='MOD_SIMPLEDEFORM'), _t("nproto.loft_rails", icon='MOD_SIMPLEDEFORM')),
+            (_t("nproto.network", icon='MESH_GRID'), _t("nproto.rail_revolve", icon='MOD_SCREW')),
             (_t("nproto.sweep", icon='MOD_CURVE'), _t("nproto.pipe", icon='META_CAPSULE')),
             (_t("nproto.extrude", icon='MOD_SOLIDIFY'), _t("nproto.revolve", icon='MOD_SCREW'),
              _t("nproto.planar", icon='MESH_PLANE')),

@@ -39,6 +39,8 @@ FIELDS = {
     "join_curves": ["jc_mode", "tolerance", "jc_degree", "jc_cvs"],
     "offset_curve": ["distance", "oc_mode", "oc_corner", "flip", "both_sides", "tolerance"],
     "offset_on_surface": ["distance", "os_corner", "flip", "both_sides", "tolerance"],
+    "rail_revolve": ["rr_axis", "pivot", "rr_height"],
+    "network": ["nw_cont", "nw_degree", "nw_spans_u", "nw_spans_v"],
     "flange": ["fl_mode", "fl_length", "angle", "draft_angle", "pull_flip", "measure", "flip", "both_sides",
                "tolerance"],
     "sweep": ["samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height", "flip_normal"],
@@ -73,7 +75,7 @@ LABELS = {"tan_a": "Tangent A", "tan_b": "Tangent B", "cur_a": "Curvature A", "c
           "w2": "Weight 3", "w3": "Weight 4", "sq_spans_u": "Spans U (0 auto)", "sq_spans_v": "Spans V (0 auto)"}
 PRETTY = {"patch": "Patch", "dome": "Dome", "square": "Square", "sweep": "Sweep", "pipe": "Pipe", "boundary": "Boundary", "iso_curve": "Iso Curve",
           "dup_edge": "Duplicate Edge", "project_curve": "Projected Curve", "intersect": "Intersection",
-          "join": "Join", "split_region": "Split", "iso_detach": "Detach at Isoparm", "boolean": "Boolean", "boundary_fill": "Boundary Fill", "join_curves": "Join Curves", "offset_curve": "Offset Curve", "offset_on_surface": "Offset on Surface", "flange": "Flange", "loft_rails": "Loft Rails", "surface_fillet": "Surface Fillet", "loft": "Loft", "blend_curve": "Blend Curve", "extrude": "Extrude", "revolve": "Revolve",
+          "join": "Join", "split_region": "Split", "iso_detach": "Detach at Isoparm", "boolean": "Boolean", "boundary_fill": "Boundary Fill", "join_curves": "Join Curves", "offset_curve": "Offset Curve", "offset_on_surface": "Offset on Surface", "flange": "Flange", "network": "Curve Network", "rail_revolve": "Rail Revolve", "loft_rails": "Loft Rails", "surface_fillet": "Surface Fillet", "loft": "Loft", "blend_curve": "Blend Curve", "extrude": "Extrude", "revolve": "Revolve",
           "offset": "Offset", "thicken": "Thicken", "planar": "Planar", "perp_profile": "Profile",
           "subd_to_brep": "SubD to BREP", "pattern": "Pattern"}
 
@@ -410,6 +412,13 @@ class NprotoFeature(bpy.types.PropertyGroup):
     lr_mode: EnumProperty(name="Mode", items=[("RAILS", "Rails", ""), ("CENTRELINE", "Centreline", "")], **_F())
     lr_spans_u: IntProperty(name="Spans U (0 auto)", min=0, max=32, **_F())
     lr_spans_v: IntProperty(name="Spans V (0 auto)", min=0, max=32, **_F())
+    rr_axis: EnumProperty(name="Axis", items=[("RAIL", "Rail Centre", "")] + REVOLVE_AXIS_ITEMS, **_F())
+    rr_height: EnumProperty(name="Height", items=[("KEEP", "Keep", ""), ("SHIFT", "Shift", ""), ("SCALE", "Scale", "")],
+                            **_F())
+    nw_cont: EnumProperty(name="Edges", items=[("G0", "G0", ""), ("G1", "G1", ""), ("G2", "G2", "")], **_F())
+    nw_degree: IntProperty(name="Degree (0 auto)", min=0, max=5, **_F())
+    nw_spans_u: IntProperty(name="Spans U (0 auto)", min=0, max=48, **_F())
+    nw_spans_v: IntProperty(name="Spans V (0 auto)", min=0, max=48, **_F())
     bool_op: EnumProperty(name="Operation", items=[("UNION", "Union", ""), ("DIFFERENCE", "Difference", ""),
                                                    ("INTERSECTION", "Intersection", "")], **_F())
     jc_mode: EnumProperty(name="Mode", items=[("EXACT", "Exact", "Keep every piece's shape exactly"),
@@ -660,7 +669,8 @@ def draw_feature(layout, context):
                     if op == "dome" and name == "dome_cvs" and pg.dome_layout != "DRAPED":
                         continue
                     if name in ("degree", "square_degree", "jc_mode", "bool_op", "lr_degree", "lr_mode", "pp_shape",
-                                "dome_cont", "dome_layout", "oc_mode", "oc_corner", "os_corner", "fl_mode", "measure"):
+                                "dome_cont", "dome_layout", "oc_mode", "oc_corner", "os_corner", "fl_mode", "measure",
+                                "nw_cont", "rr_height"):
                         col.row().prop(pg, name, expand=True)
                     elif name in ("jc_degree", "jc_cvs") and pg.jc_mode != "REBUILD":
                         continue

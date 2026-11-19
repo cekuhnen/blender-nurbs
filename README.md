@@ -65,7 +65,8 @@ everything built from it rebuilds.
 
 - **Draw:** Draw Plane
 - **Primitives:** Plane, Disk, Box, Cylinder, Cone, Sphere, Torus
-- **From curves:** Loft (G0 to G3 to surface edges), Loft Rails, Sweep, Pipe, Extrude, Revolve, Planar
+- **From curves:** Loft (G0 to G3 to surface edges), Loft Rails, Curve Network (a grid of crossing curves, G0 / G1 /
+  G2 to surface edges around it), Sweep, Pipe, Extrude, Revolve, Rail Revolve (exact), Planar
 - **Fill a gap:** Boundary, Square, Patch, Dome
 - **From surfaces:** Offset, Thicken, Flange (from free edges or curves on a surface: at an angle to the surface,
   or a constant-draft surface to a pull direction; the base is the edge exactly), Convert Blender Surface
