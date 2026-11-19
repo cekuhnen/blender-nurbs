@@ -11267,6 +11267,61 @@ check("detach at isoparm (trimmed): a plane with a hole cut through the hole and
 _iso_hs, _iso_hf = store.get_surfaces(_iso_hp)[0], store.get_brep(_iso_hp).faces()[0]
 check("detach at isoparm (trimmed): the picked isoparm is drawn where it runs on the face (broken by the hole)",
       len(_iso.iso_runs(_iso_hs, _iso_hf, "U", 0.6)) == 2 and len(_iso.iso_runs(_iso_hs, _iso_hf, "U", 0.2)) == 1)
+
+
+def _iso_snap_on(s_, pts, d):
+    """Largest distance from a snap point to the surface along its isoparm (the
+    isoparm passes through the edge middle; for a CV, 0 by construction)."""
+    (u0, u1), (v0, v1) = s_.u_domain(), s_.v_domain()
+    foot = store._make_foot(s_)
+    off = 0.0
+    for f, p, k in pts:
+        if k != "mid":
+            continue
+        u, v = foot(p)
+        q = s_.evaluate(u0 + (u1 - u0) * f, v) if d == "U" else s_.evaluate(u, v0 + (v1 - v0) * f)
+        off = max(off, float(np.linalg.norm(np.array(q) - p)))
+    return off
+
+
+bpy.ops.nproto.add_primitive(kind="PLANE"); _iso_sp = ctx.active_object
+_iso_ss = store.get_surfaces(_iso_sp)[0]
+_iso_su = _iso.snap_points(_iso_ss, None, None, "U")
+_iso_sc = _iso._k()[1].surface_cvs(_iso_ss)
+_iso_gre = _iso._greville_fracs(_iso_ss, "U")
+check("detach at isoparm snaps: an untrimmed plane's U cuts snap to the middles of its two u sides (0.5) and to "
+      "every CV at its row's Greville fraction, the end rows left out (the surface's edge)",
+      sorted(round(f, 9) for f, _, k in _iso_su if k == "mid") == [0.5, 0.5]
+      and sum(k == "cv" for _, _, k in _iso_su) == (int(_iso_sc["count_u"]) - 2) * int(_iso_sc["count_v"])
+      and {round(f, 9) for f, _, k in _iso_su if k == "cv"} == {round(g, 9) for g in _iso_gre[1:-1]}
+      and not any(k == "cv" for _, _, k in _iso.snap_points(_iso_ss, None, None, "U", cvs=False)),
+      str(sorted({round(f, 4) for f, _, _ in _iso_su})))
+_iso_hb = store.get_brep(_iso_hp)
+_iso_hm = {d: _iso.snap_points(_iso_hs, _iso_hb, _iso_hf, d) for d in "UV"}
+check("detach at isoparm snaps: on a plane with a hole every edge middle (the hole's too) lies on the isoparm "
+      "it snaps to", all(_iso_snap_on(_iso_hs, _iso_hm[d], d) < 1e-9 for d in "UV")
+      and all(sum(k == "mid" for _, _, k in _iso_hm[d]) == 3 for d in "UV"),
+      str({d: [round(f, 4) for f, _, k in _iso_hm[d] if k == "mid"] for d in "UV"}))
+bpy.ops.nproto.add_primitive(kind="PLANE"); _iso_kp = ctx.active_object
+bpy.ops.curve.primitive_bezier_circle_add(radius=0.3, location=(0.2, 0.1, 1)); _c_ = ctx.active_object
+bpy.ops.nproto.trim(target=_iso_kp.name, cutters=ins((_c_, "S0")), ref_point=(0.2, 0.1, 0), normal=(0, 0, 1),
+                    view_dir=(0, 0, -1), action="KEEP")
+bpy.data.objects.remove(_c_)
+_iso_kb = store.get_brep(_iso_kp)
+_iso_kf = {round(f, 4) for f, _, k in _iso.snap_points(store.get_surfaces(_iso_kp)[0], _iso_kb, _iso_kb.faces()[0], "U")
+           if k == "cv"}
+check("detach at isoparm snaps: CV rows whose isoparm the trim cuts away (a small disc kept from a plane) do not "
+      "snap", bool(_iso_kf) and all(0.44 < f < 0.76 for f in _iso_kf), str(sorted(_iso_kf)))
+bpy.ops.nproto.add_primitive(kind="CYLINDER"); _iso_cy = ctx.active_object
+_iso_cs = store.get_surfaces(_iso_cy)[0]
+_iso_cu = _iso.snap_points(_iso_cs, None if store.is_natural(_iso_cy) else store.get_brep(_iso_cy),
+                           None if store.is_natural(_iso_cy) else store.get_brep(_iso_cy).faces()[0], "U")
+check("detach at isoparm snaps: on a closed direction (a cylinder's u) the seam's CV row snaps (a cut there "
+      "opens the seam) and every fraction is in [0, 1)",
+      any(f == 0.0 and k == "cv" for f, _, k in _iso_cu) and all(0.0 <= f < 1.0 for f, _, _ in _iso_cu),
+      str(sorted({round(f, 4) for f, _, _ in _iso_cu})))
+for _o in (_iso_sp, _iso_kp, _iso_cy):
+    bpy.data.objects.remove(_o)
 bpy.ops.nproto.add_primitive(kind="DISK"); _iso_disk = ctx.active_object
 _out = _iso.detach_trimmed(store.get_brep(_iso_disk), [0.5], [0.5])
 _ae, _off = _iso_trim_err(store.get_brep(_iso_disk), _out, [0.5], [0.5])
