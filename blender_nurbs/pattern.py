@@ -16,8 +16,13 @@ it lines up with the face); a ring turns it about its Z (a row at an angle).
              a grid or a block; each has its own count and spacing.
   Circular   copies turned about the widget's Z through its centre.
   Path       copies along a curve or surface edge (input 1), from the point
-             of the path nearest the source on; turned with the path (a
-             rotation-minimising frame) or only moved.
+             of the path nearest the source on; turned with the surface the
+             path lies on (Z the surface normal, X along the path: the
+             copies stay on the surface, as stitches along a seam), with
+             the path alone (a rotation-minimising frame), or only moved.
+             The surface: a surface edge's own object; a curve's surface
+             inputs (Offset on Surface, Project, Iso Curve); else the NURBS
+             objects the curve runs on. It is the copies' third input.
 
 With construction history each copy keeps a "pattern" feature (inputs: the
 source, and for Path the path; params: the pattern and the copy's index). Its
@@ -281,6 +286,155 @@ def path_data(path, cache=None):
     return pd
 
 
+# -- on a surface ----------------------------------------------------------
+
+def _is_edge(path):
+    return path is not None and features.is_surface_edge(path[1])
+
+
+class SurfaceFrames:
+    """Frames on the surface under a path (world): Z the surface's outward
+    normal, X the path's direction laid into the tangent plane, Y = Z x X.
+    One face is followed along the path while the path stays on it (on an
+    edge between two faces: the face the source sits on), so the frames do
+    not jump from one side of a seam to the other."""
+
+    SUB = 4                     # every 4th path sample decides the face
+
+    def __init__(self, pd, target, anchor_pt):
+        self.pd, self.tg = pd, target
+        P = pd.P[::self.SUB]
+        self.S = pd.S[::self.SUB]
+        m, nf = len(P), len(target.faces)
+        D = np.full((nf, m), np.inf)            # distance to each face (inf: not over it)
+        Dany = np.full((nf, m), np.inf)         # ... over it or not (the nearest border point)
+        self.UV = np.zeros((nf, m, 2))
+        eps = max(target.eps, 1e-5 * target.size)
+        for fi, fc in enumerate(target.faces):
+            uv = fc.E.feet(P, g=17, iters=16)
+            S, n, _ = fc.frame(uv)
+            d = np.linalg.norm(P - S, axis=1)
+            ok = fc.inside(uv, P, S, n, eps, on_trim=True)
+            D[fi] = np.where(ok, d, np.inf)
+            Dany[fi] = d
+            self.UV[fi] = uv
+        none = ~np.isfinite(D).any(axis=0)
+        D[:, none] = Dany[:, none]              # off every face: the nearest one
+        tol = max(1e-3 * max(pd.length, 1e-12), 10.0 * eps)
+        j0 = int(np.argmin(np.abs(self.S - pd.nearest(anchor_pt))))
+        cand = np.nonzero(D[:, j0] <= D[:, j0].min() + tol)[0]
+        if len(cand) > 1:                       # a seam: the face nearest the source
+            A = np.asarray(anchor_pt, float)[None]
+            da = []
+            for fi in cand:
+                fc = target.faces[fi]
+                uv = fc.E.feet(A, g=17, iters=16)
+                S, n, _ = fc.frame(uv)
+                da.append(float(np.linalg.norm(A - S)) if fc.inside(uv, A, S, n, eps, on_trim=True)[0] else np.inf)
+            start = int(cand[int(np.argmin(da))]) if np.isfinite(min(da)) else int(cand[0])
+        else:
+            start = int(cand[0])
+        face = np.zeros(m, int)
+
+        def walk(order, cur):
+            for j in order:
+                if D[cur, j] > D[:, j].min() + tol:
+                    cur = int(np.argmin(D[:, j]))
+                face[j] = cur
+            return cur
+
+        last = walk(range(j0, m), start)
+        if pd.closed:
+            walk(range(0, j0), last)
+        else:
+            walk(range(j0 - 1, -1, -1), start)
+        self.face = face
+
+    def at(self, s):
+        """(point on the surface, frame 3x3: X along the path, Z the normal) at arc length s."""
+        pd = self.pd
+        s = float(s) % pd.length if pd.closed and pd.length > 0 else min(max(float(s), 0.0), pd.length)
+        C, F = pd.at(s)
+        j = int(np.argmin(np.abs(self.S - s)))
+        fi = int(self.face[j])
+        fc = self.tg.faces[fi]
+        uv = fc.E.feet(C[None], seed=self.UV[fi, j][None], iters=12)
+        S, n, _ = fc.frame(uv)
+        Z = _unit(n[0])
+        T = F[:, 0]
+        X = _unit(T - (T @ Z) * Z, _unit(F[:, 1] - (F[:, 1] @ Z) * Z, _perp(Z)))
+        return np.asarray(S[0], float), np.column_stack([X, np.cross(Z, X), Z])
+
+
+def _target(objs, cache):
+    key = ("target",) + tuple(sorted(o.name for o in objs))
+    tg = cache.get(key)
+    if tg is None:
+        from .surfoffset import target_of
+        tg = cache[key] = target_of(objs)
+    return tg
+
+
+def surface_frames(path, surfaces, src, pd, cache):
+    """SurfaceFrames of a path on its surfaces (None: no surface)."""
+    if not surfaces and _is_edge(path):
+        surfaces = [path[0]]
+    surfaces = [o for o in (surfaces or []) if store.is_nurbs(o)]
+    if not surfaces:
+        return None
+    key = ("sframes", src.name, path[0].name, path[1]) + tuple(sorted(o.name for o in surfaces))
+    sf = cache.get(key)
+    if sf is None:
+        sf = cache[key] = SurfaceFrames(pd, _target(surfaces, cache), anchor(src))
+    return sf
+
+
+ON_SURFACE = 1e-3       # a curve this close to a surface (times its length) lies on it
+
+
+def path_surfaces(path, objects, exclude=()):
+    """The NURBS objects a path lies on: a surface edge's own object; a curve
+    made on surfaces (its history's surface inputs: Offset on Surface, Project,
+    Iso Curve, Intersect); else the objects the curve runs on (within
+    ON_SURFACE of its length). [] when it lies on none."""
+    if path is None:
+        return []
+    obj, ref = path
+    if features.is_surface_edge(ref):
+        return [obj]
+    h = features.history(obj)
+    if h:
+        got = [o for o, r in h["inputs"] if r == "SURF" and store.is_nurbs(o) and o.name not in exclude]
+        if got:
+            return list(dict.fromkeys(got))
+    try:
+        pd = path_data(path)
+    except Exception:
+        return []
+    if pd is None or pd.length <= 0:
+        return []
+    X = pd.P[np.linspace(0, len(pd.P) - 1, 17).astype(int)]
+    tol = ON_SURFACE * pd.length
+    lo, hi = X.min(axis=0) - tol, X.max(axis=0) + tol
+    out = []
+    for o in objects:
+        if o is obj or o.name in exclude or not store.is_nurbs(o):
+            continue
+        M = world_matrix(o)
+        B = np.array([M[:3, :3] @ np.array(c) + M[:3, 3] for c in o.bound_box], float)
+        if (B.min(axis=0) > hi).any() or (B.max(axis=0) < lo).any():
+            continue
+        try:
+            from .surfoffset import target_of
+            d = target_of([o]).feet_all(X)[4]
+        except Exception as exc:
+            print("NURBS pattern: surface test skipped", o.name, exc)
+            continue
+        if float(d.max()) <= tol:
+            out.append(o)
+    return out
+
+
 def path_steps(p, pd, s0):
     """Arc lengths of the copies (the source's s0 first) along the path."""
     n = max(int(p.get("count", 2)), 1)
@@ -295,8 +449,10 @@ def path_steps(p, pd, s0):
     return [s0 + k * h for k in range(n)]
 
 
-def copy_transform(p, src, index, path=None, cache=None):
-    """World 4x4 that moves the source to copy `index` (None: no such copy)."""
+def copy_transform(p, src, index, path=None, cache=None, surfaces=None):
+    """World 4x4 that moves the source to copy `index` (None: no such copy).
+    surfaces: the NURBS objects a path lies on (orient SURFACE: the copies
+    turn with the surface normal; a surface edge's own object by default)."""
     cache = {} if cache is None else cache
     p = normalize(p, src)
     mode = p.get("mode", "LINEAR")
@@ -336,10 +492,15 @@ def copy_transform(p, src, index, path=None, cache=None):
     ss = cache.get(skey)                      # (keyed on the count and spacing: a live stage changes them)
     if ss is None:
         ss = cache[skey] = path_steps(p, pd, s0)
-    C0, F0 = pd.at(ss[0])
-    Ck, Fk = pd.at(ss[index])
     if not p.get("rotate", True):
-        return _translation(Ck - C0)
+        return _translation(pd.at(ss[index])[0] - pd.at(ss[0])[0])
+    sf = surface_frames(path, surfaces, src, pd, cache) if p.get("orient", "PATH") == "SURFACE" else None
+    if sf is not None:                        # turned with the surface, kept on it
+        C0, F0 = sf.at(ss[0])
+        Ck, Fk = sf.at(ss[index])
+    else:
+        C0, F0 = pd.at(ss[0])
+        Ck, Fk = pd.at(ss[index])
     R = Fk @ F0.T
     T = np.eye(4)
     T[:3, :3] = R
@@ -347,13 +508,13 @@ def copy_transform(p, src, index, path=None, cache=None):
     return T
 
 
-def copy_transforms(p, src, path=None, cache=None):
+def copy_transforms(p, src, path=None, cache=None, surfaces=None):
     """[(index, world 4x4)] of every copy (the source, index 0, left out)."""
     cache = {} if cache is None else cache
     p = normalize(p, src)
     out = []
     for k in range(1, total_count(p)):
-        T = copy_transform(p, src, k, path, cache)
+        T = copy_transform(p, src, k, path, cache, surfaces)
         if T is not None:
             out.append((k, T))
     return out
@@ -396,7 +557,8 @@ def build_pattern(inputs, p):
     placement takes it into its own local space). Curves: rewritten in place."""
     src, _ = inputs[0]
     path = inputs[1] if len(inputs) > 1 else None
-    T = copy_transform(p, src, int(p.get("index", 1)), path)
+    surfs = [o for o, r in inputs[2:] if r == "SURF"] or None
+    T = copy_transform(p, src, int(p.get("index", 1)), path, None, surfs)
     if T is None:
         raise RuntimeError("the pattern has no copy %s" % p.get("index"))
     W = T @ world_matrix(src)
@@ -520,8 +682,9 @@ def _ensure_matrix(obj, F):
     obj.matrix_basis = Matrix(F.tolist())
 
 
-def make_pattern(context, sources, p, group=None, path=None):
-    """Copies of each source by the pattern p (path: (object, ref) for Path).
+def make_pattern(context, sources, p, group=None, path=None, surfaces=None):
+    """Copies of each source by the pattern p (path: (object, ref) for Path;
+    surfaces: the objects the path lies on, inputs of the copies too).
     group: an existing pattern's group id -- its copies are moved and rebuilt
     where an index still exists, made where it is new, deleted where it is
     gone. -> (copies, errors)."""
@@ -538,8 +701,10 @@ def make_pattern(context, sources, p, group=None, path=None):
     for src in sources:
         M = world_matrix(src)
         inputs = [(src, "OBJ")] + ([path] if path is not None else [])
+        if path is not None and surfaces:
+            inputs += [(o, "SURF") for o in surfaces if not (_is_edge(path) and o is path[0])]
         try:
-            moves = copy_transforms(p, src, path, cache)
+            moves = copy_transforms(p, src, path, cache, surfaces)
         except Exception as exc:
             errors.append(f"{src.name}: {exc}")
             continue
@@ -659,6 +824,12 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
                                         "(0: to the path's end; a closed path: all the way round)")
     rotate: BoolProperty(name="Rotate Copies", default=True,
                          description="Turn each copy with the pattern (off: only moved, kept upright)")
+    orient: EnumProperty(name="Follow", default="SURFACE", items=[
+        ("SURFACE", "Surface", "On a path that lies on a surface (its edge, or a curve on it): each copy turns "
+                               "with the surface normal and stays on the surface, as stitches along a seam"),
+        ("PATH", "Path", "Each copy turns with the path alone (a rotation-minimising frame)")])
+    surfaces: StringProperty(options={'HIDDEN', 'SKIP_SAVE'},
+                             description="JSON list of the NURBS objects the path lies on (empty: look for them)")
     # the widget (world)
     center_point: FloatVectorProperty(name="Center", size=3, subtype='XYZ', unit='LENGTH',
                                       options={'SKIP_SAVE'}, description="The widget's centre: the axis of a "
@@ -702,7 +873,8 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
         elif self.mode == "CIRCULAR":
             p.update(count=self.count, angle=self.angle, rotate=self.rotate)
         else:
-            p.update(count=self.count, distance=self.distance, rotate=self.rotate, path_ref=self.path_ref)
+            p.update(count=self.count, distance=self.distance, rotate=self.rotate, path_ref=self.path_ref,
+                     orient=self.orient)
         return p
 
     def _load(self, p, src=None):
@@ -712,6 +884,7 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
                   "turn", "count", "angle", "distance", "rotate", "path_ref"):
             if k in p:
                 setattr(self, k, p[k])
+        self.orient = p.get("orient", "PATH")       # (patterns made before it: turned with the path)
         for k in ("center_point", "frame_x", "frame_z"):
             if k in p:
                 setattr(self, k, tuple(float(x) for x in p[k]))
@@ -733,6 +906,32 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
             return None
         obj = bpy.data.objects.get(self.path_obj)
         return None if obj is None else (obj, self.path_ref or "S0")
+
+    def _find_surfaces(self, context):
+        """Look for the surfaces the path lies on (kept in self.surfaces)."""
+        path = self._path()
+        if path is None:
+            self.surfaces = ""
+            return
+        srcs = {o.name for o in self._sources(context)}
+        objs = [o for o in context.view_layer.objects if o.visible_get()]
+        self.surfaces = json.dumps([o.name for o in path_surfaces(path, objs, srcs)])
+
+    def _surface(self):
+        """The objects the path lies on, when the copies follow the surface (else None)."""
+        if self.mode != "PATH" or not self.rotate or self.orient != "SURFACE":
+            return None
+        path = self._path()
+        if path is None:
+            return None
+        if _is_edge(path):
+            return [path[0]]
+        try:
+            names = json.loads(self.surfaces) if self.surfaces else []
+        except ValueError:
+            names = []
+        got = [o for o in (bpy.data.objects.get(n) for n in names) if o is not None and store.is_nurbs(o)]
+        return got or None
 
     def _default_widget(self, context, srcs):
         """The widget where a new pattern starts: on the sources' middle
@@ -761,6 +960,9 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
             path_in = ref[0].get("nproto_in_1")
             if path_in is not None:
                 self.path_obj = path_in.name
+            h = features.history(ref[0])
+            if h and self.mode == "PATH":
+                self.surfaces = json.dumps([o.name for o, r in h["inputs"][2:] if r == "SURF"])
         else:
             path = selected_path(context)
             if self.auto:
@@ -779,7 +981,9 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
             self.objects = json.dumps([o.name for o in srcs])
         if not self.group:
             self._default_widget(context, srcs)
-        self._keep = {f: getattr(self, f) for f in ("distance_x", "distance_y", "distance_z", "distance")} \
+            if self.mode == "PATH" and not self.surfaces:
+                self._find_surfaces(context)
+        self._keep ={f: getattr(self, f) for f in ("distance_x", "distance_y", "distance_z", "distance")} \
             if self.group else None         # an edit starts from the pattern as it is
         return self.ask(context)
 
@@ -818,8 +1022,14 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
         if n * len(srcs) > MAX_COPIES:
             self.report({'ERROR'}, f"{n * len(srcs)} copies: at most {MAX_COPIES} in one pattern")
             return {'CANCELLED'}
+        if self.mode == "PATH" and self.rotate and self.orient == "SURFACE" and not self.surfaces \
+                and not _is_edge(path):
+            self._find_surfaces(context)            # (a script: not looked for yet)
+        surfs = self._surface()
+        if self.mode == "PATH" and self.rotate and self.orient == "SURFACE" and surfs is None:
+            self.report({'INFO'}, "Pattern: the path lies on no surface: copies turned with the path")
         act = context.view_layer.objects.active
-        made, errors = make_pattern(context, srcs, p, self.group or None, path)
+        made, errors = make_pattern(context, srcs, p, self.group or None, path, surfs)
         for e in errors:
             self.report({'ERROR'}, "Pattern: " + e)
         if not made and errors:
@@ -863,9 +1073,16 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
             lay.prop(self, "count")
             lay.row().prop(self, "space", expand=True)
             lay.prop(self, "distance", text=("Spacing" if self.space == "SPACING" else "Length") + " (0: to the end)")
-            lay.prop(self, "rotate", text="Follow the Path")
+            lay.prop(self, "rotate", text="Turn Copies")
+            row = lay.row()
+            row.active = self.rotate
+            row.prop(self, "orient", expand=True)
             lay.label(text=f"Path: {self.path_obj or '-'}" + (f" ({self.path_ref})" if self.path_ref else ""),
                       icon='CURVE_PATH')
+            if self.rotate and self.orient == "SURFACE":
+                surfs = self._surface()
+                lay.label(text="On: " + ", ".join(o.name for o in surfs) if surfs
+                          else "On no surface: turned with the path", icon='SURFACE_NSURFACE')
 
     # -- the value stage --------------------------------------------------------
     def _fmt(self, context, name):
@@ -1020,9 +1237,10 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
         k_all = max(total_count(p) - 1, 0)
         n_lines = sum(len(L) for _, L, _, _ in self._pv) * k_all
         n_tris = sum(len(T) // 3 for _, _, T, _ in self._pv) * k_all     # (T: 3 points a triangle)
+        surfs = self._surface() if hasattr(self, "_surface") else None
         for src, L, Tw, box in self._pv:
             try:
-                moves = copy_transforms(p, src, path, self._ptmp)
+                moves = copy_transforms(p, src, path, self._ptmp, surfs)
             except Exception as exc:
                 print("NURBS pattern preview:", exc)
                 moves = []
@@ -1145,7 +1363,17 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
                 self._default_widget(context, [s for s, _, _, _ in self._pv])
             if self.mode == "PATH" and self._path() is None:
                 self._start_axis_pick(context)
-        elif ch == "r" and self.mode != "LINEAR":
+            elif self.mode == "PATH" and not self.surfaces:
+                self._find_surfaces(context)
+        elif ch == "r" and self.mode == "PATH":
+            # surface -> path -> not turned -> surface
+            if self.rotate and self.orient == "SURFACE":
+                self.orient = "PATH"
+            elif self.rotate:
+                self.rotate = False
+            else:
+                self.rotate, self.orient = True, "SURFACE"
+        elif ch == "r" and self.mode == "CIRCULAR":
             self.rotate = not self.rotate
         elif ch == "e" and self.mode != "CIRCULAR":
             self._toggle_space()
@@ -1339,6 +1567,7 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
             if self.mode == "PATH":
                 self.path_obj, self.path_ref = obj.name, ref
                 self._ptmp = {}
+                self._find_surfaces(context)
                 if self.distance > 0 and self.space == "EXTENT":
                     self.distance = 0.0
             else:
@@ -1388,6 +1617,10 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
                        (self._fmt(context, "distance") if self.distance > 0 else "to the end"))
             if not self.rotate:
                 out.append("not turned")
+            elif self.orient == "SURFACE":
+                surfs = self._surface()
+                out.append("on " + ", ".join(o.name for o in surfs) if surfs
+                           else "on no surface: turned with the path")
         if self._value_mode or self._typed:
             out.append("typing " + (self._label(f) if f != "turn" else "turn") +
                        (f": {self._typed}|" if self._typed else ""))
@@ -1414,7 +1647,9 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
                                    hints.toggle("R", "rotate copies", self.rotate)]))
         else:
             rows.append(("Path", [hints.key("LMB drag", "the arrow along the path"), hints.key("A", "pick the path"),
-                                  hints.toggle("R", "follow the path", self.rotate)]))
+                                  hints.cycle("R", ["surface", "path", "not turned"],
+                                              ("surface" if self.orient == "SURFACE" else "path")
+                                              if self.rotate else "not turned", "turn with")]))
         if self.mode != "PATH":
             wid = [hints.key("LMB drag", "the centre: move it (snaps; on a face it lines up)"),
                    hints.key("C W B", "cursor / world / middle")]
@@ -1559,7 +1794,8 @@ def summary(p):
         d = float(p.get("distance", 0.0))
         word = "spacing" if p.get("space") == "SPACING" else "length"
         return f"Path · {int(p.get('count', 2))} · " + (f"{word} {fmt_length(ctx, d)}" if d > 0 else "to the end") \
-            + ("" if p.get("rotate", True) else " · not turned")
+            + ("" if p.get("rotate", True) else " · not turned") \
+            + (" · on the surface" if p.get("rotate", True) and p.get("orient") == "SURFACE" else "")
     parts = []
     for a in AXES:
         n = int(p.get("count_" + a, 1))
