@@ -46,7 +46,7 @@ from .valuedrag import ValueDrag, angle_pick, rotate_points
 OP = "pattern"
 MAX_COPIES = 2000           # one run makes at most this many objects
 PREVIEW_LINES = 40000       # more preview polylines than this: each copy drawn as its box
-PREVIEW_TRIS = 60000        # more preview triangles than this: lines only
+PREVIEW_TRIS = 250000       # more preview triangles than this: each copy shaded as its box
 PATH_SAMPLES = 512          # samples of a path for its length and frames
 CENTER_PX = 11.0            # a press this close to the widget's centre drags it
 ARROW_PX = 90.0             # an unused arrow / the ring: this long on screen
@@ -328,8 +328,14 @@ def copy_transform(p, src, index, path=None, cache=None):
     pd = path_data(path, cache)
     if pd is None or pd.length <= 0:
         return None
-    s0 = cache.setdefault(("s0", src.name), pd.nearest(anchor(src)))
-    ss = cache.setdefault(("steps", src.name), path_steps(p, pd, s0))
+    pkey = (path[0].name, path[1])
+    s0 = cache.get(("s0", src.name, pkey))
+    if s0 is None:
+        s0 = cache[("s0", src.name, pkey)] = pd.nearest(anchor(src))
+    skey = ("steps", src.name, pkey, n, float(p.get("distance", 0.0)), p.get("space", "EXTENT"))
+    ss = cache.get(skey)                      # (keyed on the count and spacing: a live stage changes them)
+    if ss is None:
+        ss = cache[skey] = path_steps(p, pd, s0)
     C0, F0 = pd.at(ss[0])
     Ck, Fk = pd.at(ss[index])
     if not p.get("rotate", True):
@@ -591,6 +597,21 @@ _DIGITS = {f"NUMPAD_{i}": str(i) for i in range(10)} | {
     k: str(i) for i, k in enumerate(("ZERO", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN", "EIGHT", "NINE"))}
 
 
+def selected_path(context):
+    """The active curve when something else is selected with it (it is a path pattern's path), or None."""
+    act = context.view_layer.objects.active
+    if act is not None and act.type == 'CURVE' and act.select_get() and \
+            any(usable(o) and o != act for o in context.selected_objects):
+        return act
+    return None
+
+
+def start_mode(context, last):
+    """The mode the one Pattern button starts in: path for a curve active with
+    something else selected, else the one used last."""
+    return "PATH" if selected_path(context) is not None else last
+
+
 def _snapper_class():
     from .drawtools import SketchMixin
 
@@ -652,6 +673,9 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
                             description="JSON list of the object names to copy (empty: the selection)")
     group: StringProperty(options={'HIDDEN', 'SKIP_SAVE'},
                           description="An existing pattern to change (its group id)")
+    auto: BoolProperty(options={'HIDDEN', 'SKIP_SAVE'},
+                       description="The toolbar's one Pattern button: path when the active object is a curve "
+                                   "with something else selected, else the mode used last")
 
     # -- the live value stage (valuedrag.py) ----------------------------------
     angle_fields = ("angle", "turn")
@@ -737,17 +761,22 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
             path_in = ref[0].get("nproto_in_1")
             if path_in is not None:
                 self.path_obj = path_in.name
-        elif self.mode == "PATH" and not self.path_obj:
-            act = context.view_layer.objects.active
-            if act is not None and act.type == 'CURVE' and act.select_get() and \
-                    any(usable(o) and o != act for o in context.selected_objects):
-                self.path_obj, self.path_ref = act.name, "S0"     # the active curve is the path
+        else:
+            path = selected_path(context)
+            if self.auto:
+                self.mode = start_mode(context, self.mode)
+            if self.mode == "PATH" and not self.path_obj and path is not None:
+                self.path_obj, self.path_ref = path.name, "S0"    # the active curve is the path
         srcs = self._sources(context)
         if not srcs:
             self.report({'WARNING'}, "Select NURBS objects or curves to copy "
                                      "(for plain meshes Blender's Array modifier does it)")
             return {'CANCELLED'}
-        self.objects = json.dumps([o.name for o in srcs])
+        if not self.objects and not self.group:      # the whole selection: in a path pattern the
+            pool = [o for o in context.selected_objects if usable(o)]   # path drops out (_sources), but
+            self.objects = json.dumps([o.name for o in pool])          # M to linear copies it too
+        else:
+            self.objects = json.dumps([o.name for o in srcs])
         if not self.group:
             self._default_widget(context, srcs)
         self._keep = {f: getattr(self, f) for f in ("distance_x", "distance_y", "distance_z", "distance")} \
@@ -863,10 +892,7 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
         srcs = self._sources(context)
         if not srcs:
             return False
-        self._pv = []
-        for src in srcs:
-            M = world_matrix(src)
-            self._pv.append((src, _preview_lines(src, M), _preview_tris(src, M), _box(src, M)))
+        self._pv = _preview_sources(srcs)
         self._ctx = context
         self._ptmp = {}             # path data of this stage
         self._cbuf = ""             # number keys typed for the count
@@ -993,7 +1019,7 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
         lines, tris, guides = [], [], []
         k_all = max(total_count(p) - 1, 0)
         n_lines = sum(len(L) for _, L, _, _ in self._pv) * k_all
-        n_tris = sum(len(T) for _, _, T, _ in self._pv) * k_all
+        n_tris = sum(len(T) // 3 for _, _, T, _ in self._pv) * k_all     # (T: 3 points a triangle)
         for src, L, Tw, box in self._pv:
             try:
                 moves = copy_transforms(p, src, path, self._ptmp)
@@ -1008,6 +1034,8 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
                     lines += _box_lines(box @ R.T + t)
                 if n_tris <= PREVIEW_TRIS and len(Tw):
                     tris.append(Tw @ R.T + t)
+                else:
+                    tris.append(_box_tris(box @ R.T + t))
         if self.mode == "PATH" and path is not None:
             pd = path_data(path, self._ptmp)
             if pd is not None:
@@ -1110,6 +1138,9 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
             order = ["LINEAR", "CIRCULAR", "PATH"]
             self.mode = order[(order.index(self.mode) + 1) % 3]
             self._field, self._cbuf, self._value_mode = 0, "", False
+            srcs = self._sources(context)           # (the path is copied too when it stops being the path)
+            if srcs and [s.name for s in srcs] != [s.name for s, _, _, _ in self._pv]:
+                self._pv = _preview_sources(srcs)
             if not getattr(self, "_moved_center", False):
                 self._default_widget(context, [s for s, _, _, _ in self._pv])
             if self.mode == "PATH" and self._path() is None:
@@ -1424,6 +1455,14 @@ def _middle(objs):
 
 
 # preview geometry (world) of a source
+def _preview_sources(srcs):
+    out = []
+    for src in srcs:
+        M = world_matrix(src)
+        out.append((src, _preview_lines(src, M), _preview_tris(src, M), _box(src, M)))
+    return out
+
+
 def _preview_lines(src, M):
     R, t = M[:3, :3], M[:3, 3]
     if src.type == 'CURVE':
@@ -1461,6 +1500,15 @@ def _box(src, M):
     lo, hi = P.min(axis=0), P.max(axis=0)
     C = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
     return C @ M[:3, :3].T + M[:3, 3]
+
+
+_BOX_TRIS = np.array([(a, b, e, a, e, c) for a, b, c, e in
+                      ((0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 4, 5), (2, 3, 6, 7), (0, 2, 4, 6), (1, 3, 5, 7))]).ravel()
+
+
+def _box_tris(C):
+    """The 12 triangles of a box from its 8 corners (_box's order)."""
+    return C[_BOX_TRIS]
 
 
 def _box_lines(C):

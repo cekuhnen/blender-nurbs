@@ -485,14 +485,14 @@ history. Trimmed and multi-face objects can be picked by their real B-rep edges
 
 ## Pattern (Linear / Circular / Path)
 
-**Linear Pattern**, **Circular Pattern** and **Path Pattern** (Surface Edit panel; they work on curves too) copy the selected NURBS objects and curves. Each copy is a NURBS object (or curve) of its own carrying the exact geometry, so it exports to STEP, shows its CV net and can be picked, trimmed and joined like any other. Blender's **Array** modifier copies only the display mesh, which has no B-rep behind it, so use it only for plain meshes. A copy is the source's B-rep under another matrix: it takes the source's mesh as is, so making 24 copies costs no extra tessellation (only when the source changes is each copy rebuilt).
+**Pattern** (Create Surfaces panel, next to Flange; it works on curves too) copies the selected NURBS objects and curves in a row, grid or block (linear), around an axis (circular) or along a path. It starts as a path pattern when a curve is active with other objects selected (the curve is the path), otherwise in the mode used last; **M** switches. Each copy is a NURBS object (or curve) of its own carrying the exact geometry, so it exports to STEP, shows its CV net and can be picked, trimmed and joined like any other. Blender's **Array** modifier copies only the display mesh, which has no B-rep behind it, so use it only for plain meshes. A copy is the source's B-rep under another matrix: it takes the source's mesh as is, so making 24 copies costs no extra tessellation (only when the source changes is each copy rebuilt).
 
 The pattern is laid out on a **widget**: a centre with X (red), Y (green) and Z (blue). Linear and circular show it; the copies show as a preview.
 
 - **Drag the centre** to move the widget. It snaps like the sketch tools (ends, middles, face centres, CVs, edges; **Ctrl** the grid, **Alt** no snapping). Dropped on a flat face, the widget lines up with that face: its Z is the face's normal. **C / W / B** put it on the 3D cursor, the world origin or the middle of the sources.
 - **Number keys set the count**: of the active arrow (linear) or of the pattern (circular, path). **+ / -** (or Up / Down) one more or fewer.
 - **Tab** switches the number keys to the value instead (the active arrow's spacing, the angle, the path distance; unit letters work: `25mm`), Tab again back to the count.
-- **M** switches linear / circular / path. **Enter**, or a click away from the widget, makes the copies; **Esc** cancels.
+- **M** switches linear / circular / path (a curve that was the path is copied with the rest in linear and circular). **Enter**, or a click away from the widget, makes the copies; **Esc** cancels.
 
 | | Linear | Circular | Path |
 |---|---|---|---|
