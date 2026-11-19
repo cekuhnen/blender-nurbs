@@ -17,11 +17,12 @@ from bpy.app.handlers import persistent
 
 from . import (anamesh, brep_mesh, contlabels, cvnudge, cvs, curvejoin, curveoffset, diagnostics, draw,
                drawtools, extend, feature_ui, features, hints, history, isocombs, loft_rails, merge, ops, patch, refit,
-               scanfit, scanpatch, sections, snapping, square, steps, store, subd_brep, subsel, surfoffset, flange, network, railrevolve, sweeps,
+               scanfit, scanpatch, sections, snapping, square, steps, store, subd_brep, subsel, surfoffset, flange, network, railrevolve, measure, sweeps,
                workplanes)
 
 # overlays and tool flags with a fixed shape: put back to how they start
-_SHAPED = (cvnudge.overlay, draw.pick_overlay, draw.sketch_overlay, draw.ghost, contlabels.hover, ops.GIZMO)
+_SHAPED = (cvnudge.overlay, draw.pick_overlay, draw.sketch_overlay, draw.ghost, contlabels.hover, ops.GIZMO,
+           measure.OVERLAY)
 _DEFAULTS = [copy.deepcopy(d) for d in _SHAPED]
 
 

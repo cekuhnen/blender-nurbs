@@ -440,6 +440,8 @@ def draw_analyze(col, context):
     """Zebra / Draft / Curvature / Comb / Matcap toggles and their settings
     (sidebar and the viewport header's Analyze popover)."""
     v = context.window_manager.nproto_view
+    col.operator("nproto.measure", icon='DRIVER_DISTANCE')
+    col.separator(factor=0.5)
     row = col.row(align=True)
     row.prop(v, "show_zebra", toggle=True, icon='MOD_WAVE')
     row.prop(v, "show_draft", toggle=True, icon='MOD_SIMPLEDEFORM')
