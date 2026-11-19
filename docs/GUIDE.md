@@ -14,7 +14,7 @@ The sidebar tab **NURBS Proto** has one collapsible panel per group. Ctrl+click 
 |---|---|
 | **Active Object** | Shown only when the active object has something to show: CV editing (Done / Cancel), its feature settings and history, its face and edge count |
 | **Create Curves** | CV Curve, Draw Line, Arc, Circle, Ellipse, Rectangle, Polygon, Slot, Profile · between curves: Blend Curve, Fillet · from curves: Offset Curve, Offset on Surface · Helix (the other shapes, placed at the 3D cursor: Shift+A) · from surfaces: Iso Curve, Duplicate Edge, Project Curve, Intersect |
-| **Create Surfaces** | Draw Plane · Plane, Disk, Box, Cylinder, Cone, Sphere, Torus · from curves: Loft, Loft Rails, Curve Network, Sweep, Pipe, Extrude, Revolve, Rail Revolve, Planar · filling a gap: Boundary, Square, Patch, Dome · from surfaces: Offset, Thicken, Flange (and draft surface), Convert Blender Surface |
+| **Create Surfaces** | Draw Plane, Cylinder · Plane, Disk, Box, Cylinder, Cone, Sphere, Torus · from curves: Loft, Loft Rails, Curve Network, Sweep, Pipe, Extrude, Revolve, Rail Revolve, Planar · filling a gap: Boundary, Square, Patch, Dome · from surfaces: Offset, Thicken, Flange (and draft surface), Convert Blender Surface |
 | **Curve Edit** | Join / Unjoin Curves, Trim / Split Curves, Rebuild / Extend Curve, Align Curve |
 | **Surface Edit** | Edit CVs, Flip Normal, Rebuild Surface, Extend Surface, Surface Align, Match Surface, Refit to Trim, Merge Patches · Trim, Split, Untrim, Join, Unjoin, Detach at Isoparm · Surface Fillet, Edge Fillet · solids: Union, Difference, Intersection, Boundary Fill |
 | **Convert** (closed at first) | BREP to Mesh, Mesh to BREP, SubD to BREP (all also in Object › Convert) · fit to a scan: Tube Cage from Scan, Fit Cage to Scan, Refine Cage to Scan, Trim Cage to Curve, Drape Patch to Scan |
@@ -180,6 +180,11 @@ the Feature panel.
   * **3 Points:** through three points.
   * **Tangent:** click two straight lines or edges, then move into the corner you want: the circle touches both; its
     size follows the mouse, or type the radius.
+  * **Type** (**D** while drawing; shown in the key hints, kept for the next circle, in the redo panel too):
+    **Exact** is the rational circle (degree 2): a true circle, for exact cylinders, holes and revolves.
+    **Smooth** is a periodic degree-3 curve with **Spans** CVs (8 by default; not rational, within 0.1 % of the
+    radius): even CVs to pull and blend, as Alias's default circle or Rhino's deformable one. The Feature panel's
+    Degree changes it later either way.
 * **Arc**
   * **3 Points:** start, end, then a point the arc passes through.
   * **Centre:** centre, start (the radius), then the end. The mouse sweeps either way round, past 180 degrees too;
@@ -385,6 +390,21 @@ Sidebar **Create Curves** / **Create Surfaces** panels, the **NURBS Proto** head
 * **Degree**: **Exact** (rational: true circles, arcs, spheres, cylinders, cones and tori) or **1–5** with **Spans U/V**. Non-rational versions are built periodic, so closed directions stay smooth across the seam (as in Alias's degree / sections options).
 * **Caps** on Cylinder and Cone joins planar caps into a healed solid (true volume).
 * **Helix Taper °** leans the helix in (positive: narrower on top) or out (negative: wider), like a thread on a cone; 0 is a straight helix. It is in the Feature panel with the radius, height and turns.
+
+### Cylinder (Draw)
+
+Under Create Surfaces, next to Draw Plane: a cylinder drawn in place, with Helix's steps and snapping.
+
+* **Centre:** click the centre (on the grid, a face or a curve, like the other drawing tools), then the radius (or type
+  it), then the height: move along the axis (it stands square to the plane you started on) or type it; Ctrl snaps the
+  height to the grid, a snap to real geometry takes its level. A negative height goes the other way.
+* **Around** (**M**): click a circle or circular edge (a drawn circle, a hole's edge, a rim): the cylinder takes its
+  centre, radius and axis; then the height. A boss on a hole, a sleeve on a rim.
+* **D** switches **Exact** (a true rational cylinder) and **Smooth** (degree 3 round it, **Spans** in the redo panel),
+  as for Circle; **C** switches a capped solid (default) and an open tube. Both stay in the key hints and are kept for
+  the next one.
+* It is a Cylinder primitive placed where you drew it: radius, height, degree, spans and caps stay editable in the
+  Feature panel.
 
 ### Draw Plane
 

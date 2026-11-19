@@ -179,7 +179,7 @@ def circle_points(C, r, n, x=None, k=64):
 # --------------------------------------------------------------------------
 
 import bpy  # noqa: E402
-from bpy.props import EnumProperty, FloatProperty, StringProperty  # noqa: E402
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty  # noqa: E402
 from bpy_extras import view3d_utils  # noqa: E402
 from mathutils import Matrix, Vector  # noqa: E402
 
@@ -402,7 +402,8 @@ class _ShapeTool(SketchMixin):
             ov["refs"].append(([Vector(p) for p in ln[2]], COL_PICKED, 2.0))
         sh = self._shape(context, event)
         if sh is not None:
-            ov["curves"] = [[Vector(p) for p in self._polyline(sh)]]
+            ov["curves"] = [[Vector(p) for p in pl] for pl in sh["polys"]] if sh.get("polys") \
+                else [[Vector(p) for p in self._polyline(sh)]]
         self._status(context, sh)
         context.area.tag_redraw()
 
@@ -511,7 +512,8 @@ class _ShapeTool(SketchMixin):
             params = primitive_params("prim_arc", radius=float(self.radius), angle=float(self.angle), degree=0)
             obj = place_primitive(context, "NURBS Arc", "prim_arc", params, Matrix(d["matrix"]))
         else:
-            params = primitive_params("prim_circle", radius=float(self.radius), degree=0, elliptic=False)
+            params = primitive_params("prim_circle", radius=float(self.radius), elliptic=False,
+                                      **circle_degree(getattr(self, "ctype", "EXACT"), getattr(self, "spans_u", 8)))
             obj = place_primitive(context, "NURBS Circle", "prim_circle", params, Matrix(d["matrix"]))
         _select_new(context, [obj])
         return {'FINISHED'}
@@ -520,6 +522,32 @@ class _ShapeTool(SketchMixin):
 # --------------------------------------------------------------------------
 # Circle
 # --------------------------------------------------------------------------
+
+CIRCLE_TYPES = [("EXACT", "Exact", "Rational, a true circle (degree 2): exact cylinders, holes, revolves"),
+                ("SMOOTH", "Smooth", "Degree 3, periodic, not rational: even CVs to pull and blend (a close "
+                                     "approximation of the circle)")]
+SMOOTH_DEGREE = 3
+
+
+def circle_degree(ctype, spans):
+    """Primitive parameters for a circle / cylinder of that type."""
+    return {"degree": 0} if ctype == "EXACT" else {"degree": SMOOTH_DEGREE, "spans_u": int(spans)}
+
+
+def type_key(op, event):
+    """D: Exact <-> Smooth (not while a value is being typed)."""
+    if event.value == 'PRESS' and event.type == 'D' and not op._buf and not (event.ctrl or event.alt or event.oskey):
+        op.ctype = "SMOOTH" if getattr(op, "ctype", "EXACT") == "EXACT" else "EXACT"
+        return True
+    return False
+
+
+def type_rows(op):
+    ct, sp = getattr(op, "ctype", "EXACT"), getattr(op, "spans_u", 8)
+    return [("Type", [hints.cycle("D", ["exact", "smooth"], ct.lower()),
+                      hints.note(f"smooth: degree 3, {sp} spans (redo panel)" if ct == "SMOOTH"
+                                 else "rational: a true circle")])]
+
 
 CIRCLE_MODES = [("CENTER", "Centre", "Click the centre, then the radius"),
                 ("TWO", "2 Points", "Two points across the circle: its diameter"),
@@ -539,11 +567,23 @@ class NPROTO_OT_draw_circle(_ShapeTool, bpy.types.Operator):
 
     mode: EnumProperty(name="Mode", items=CIRCLE_MODES, default="CENTER")
     radius: FloatProperty(name="Radius", default=0.5, min=1e-6, unit='LENGTH')
+    ctype: EnumProperty(name="Type", items=CIRCLE_TYPES, default="EXACT")
+    spans_u: IntProperty(name="Spans", default=8, min=4, max=64,
+                         description="Smooth: spans round the circle (degree 3, periodic)")
     data: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
 
     def draw(self, context):
         self.layout.use_property_split = True
         self.layout.prop(self, "radius")
+        self.layout.row().prop(self, "ctype", expand=True)
+        if self.ctype == "SMOOTH":
+            self.layout.prop(self, "spans_u")
+
+    def _extra_key(self, context, event):
+        return type_key(self, event)
+
+    def _extra_rows(self):
+        return type_rows(self)
 
     def _needs_line(self):
         return self.mode == "TANGENT" and len(self._lines_picked) < 2
@@ -631,7 +671,9 @@ class NPROTO_OT_draw_circle(_ShapeTool, bpy.types.Operator):
     def execute(self, context):
         out = self._make(context, "circle")
         if out == {'FINISHED'}:
-            self.report({'INFO'}, f"Circle, radius {self.radius:.4g}")
+            ct = getattr(self, "ctype", "EXACT")
+            kind = "exact" if ct == "EXACT" else f"smooth, degree 3, {getattr(self, 'spans_u', 8)} spans"
+            self.report({'INFO'}, f"Circle ({kind}), radius {self.radius:.4g}")
         return out
 
 
@@ -1337,7 +1379,7 @@ class NPROTO_OT_draw_helix(_TwoStep, bpy.types.Operator):
         if self.mode == "AROUND" and not self._pts:
             ln = self._line_under(context, event)
             if ln is None:
-                self.report({'WARNING'}, "Helix: click a circle or a circular edge")
+                self.report({'WARNING'}, f"{self.TITLE}: click a circle or a circular edge")
                 return None
             C, r, nn = ln[3]
             self.fix_plane(context, C)
@@ -1368,6 +1410,33 @@ class NPROTO_OT_draw_helix(_TwoStep, bpy.types.Operator):
             return self._click(context, event)
         return _ShapeTool._enter(self, context, event)
 
+    def _axis_h(self, context, event, typed, P, snap, C, a):
+        """(signed height along the axis (C, a), the coaxial rim it snapped to or
+        None): typed, else level with real geometry snapped to, else where the
+        view ray passes the axis (Ctrl: on the grid)."""
+        rim = None
+        if "H" in typed:                                 # a negative height goes the other way
+            return (typed["H"] if typed["H"] < 0 else math.copysign(typed["H"], getattr(self, "_h_sign", 1.0))), None
+        h = None
+        if snap is not None and P is not None and (snap[0] in REAL_SNAPS):
+            rim = self._coaxial_rim(np.asarray(P, float), snap, C, a)
+            # level with what it snapped to; on the other rim of a cone: exactly that rim's level
+            h = rim[0] if rim is not None else float((np.asarray(P, float) - C) @ a)
+        if h is None:
+            region, rv3d = self._win(context)
+            m = Vector(self._mouse(context, event))
+            o = np.array(view3d_utils.region_2d_to_origin_3d(region, rv3d, m), float)
+            d = np.array(view3d_utils.region_2d_to_vector_3d(region, rv3d, m), float)
+            h = axis_height(C, a, o, _unit(d))
+            if h is None:                                    # looking down the axis: the distance on the plane
+                Pm = self._ray_point(context, m, (C, a))
+                h = float(np.linalg.norm(_flat(Pm - C, a))) if Pm is not None else 0.0
+            if event.ctrl:
+                st = self._grid_step(context, C)
+                h = round(h / st) * st
+        self._h_sign = 1.0 if h >= 0 else -1.0
+        return h, rim
+
     def _shape(self, context, event, final=False):
         if not self._pts:
             return None
@@ -1390,28 +1459,7 @@ class NPROTO_OT_draw_helix(_TwoStep, bpy.types.Operator):
             return {"kind": "helix", "poly": circle_points(C, r, n, S - C), "next": S, "ok": False, "vals": {"R": r}}
         S, a = self._pts[1], self._axis
         r = float(np.linalg.norm(_flat(S - C, a)))
-        rim = None
-        if "H" in typed:                                 # a negative height goes the other way
-            h = typed["H"] if typed["H"] < 0 else math.copysign(typed["H"], getattr(self, "_h_sign", 1.0))
-        else:
-            h = None
-            if snap is not None and P is not None and (snap[0] in REAL_SNAPS):
-                rim = self._coaxial_rim(np.asarray(P, float), snap, C, a)
-                # level with what it snapped to; on the other rim of a cone: exactly that rim's level
-                h = rim[0] if rim is not None else float((np.asarray(P, float) - C) @ a)
-            if h is None:
-                region, rv3d = self._win(context)
-                m = Vector(self._mouse(context, event))
-                o = np.array(view3d_utils.region_2d_to_origin_3d(region, rv3d, m), float)
-                d = np.array(view3d_utils.region_2d_to_vector_3d(region, rv3d, m), float)
-                h = axis_height(C, a, o, _unit(d))
-                if h is None:                                    # looking down the axis: the distance on the plane
-                    Pm = self._ray_point(context, m, (C, a))
-                    h = float(np.linalg.norm(_flat(Pm - C, a))) if Pm is not None else 0.0
-                if event.ctrl:
-                    st = self._grid_step(context, C)
-                    h = round(h / st) * st
-            self._h_sign = 1.0 if h >= 0 else -1.0
+        h, rim = self._axis_h(context, event, typed, P, snap, C, a)
         H = abs(h)
         if H < 1e-12:
             return None
@@ -1433,5 +1481,134 @@ class NPROTO_OT_draw_helix(_TwoStep, bpy.types.Operator):
                 "vals": {"H": H, "T": turns, "P": H / turns, "A": taper}, "note": note}
 
 
+# --------------------------------------------------------------------------
+# Cylinder: a circle, then its height along the axis (Helix's steps)
+# --------------------------------------------------------------------------
+
+CYLINDER_MODES = [("CENTER", "Centre", "The centre, the radius, then the height"),
+                  ("AROUND", "Around", "Click a circle or circular edge (a hole, a rim): its centre, radius and "
+                                       "axis; then the height")]
+
+
+def cylinder_outline(T, r, h, k=64):
+    """Rims and four rulings of a cylinder in its frame (centred, z from -h/2 to h/2), in world."""
+    rim = [(r * math.cos(2 * math.pi * j / k), r * math.sin(2 * math.pi * j / k)) for j in range(k + 1)]
+    lo = to_world(T, [(x, y, -h / 2) for x, y in rim])
+    hi = to_world(T, [(x, y, h / 2) for x, y in rim])
+    rul = [to_world(T, [(r * math.cos(t), r * math.sin(t), -h / 2), (r * math.cos(t), r * math.sin(t), h / 2)])
+           for t in (0.0, 0.5 * math.pi, math.pi, 1.5 * math.pi)]
+    return [lo, hi] + rul
+
+
+class NPROTO_OT_draw_cylinder(NPROTO_OT_draw_helix):
+    """Draw a cylinder: its centre, its radius, then its height along the axis
+    -- or around a circle or circular edge (M switches). Exact (a true,
+    rational cylinder) or Smooth (degree 3: D switches), a capped solid or an
+    open tube (C). Type the radius and the height. It stays editable in the
+    Feature panel"""
+    bl_idname = "nproto.draw_cylinder"
+    bl_label = "Cylinder"
+    bl_options = {'REGISTER', 'UNDO'}
+    MODES, TITLE, PARAMS = CYLINDER_MODES, "Cylinder", ("radius", "height")
+
+    mode: EnumProperty(name="Mode", items=CYLINDER_MODES, default="CENTER")
+    radius: FloatProperty(name="Radius", default=0.5, min=1e-6, unit='LENGTH')
+    height: FloatProperty(name="Height", default=1.0, min=1e-6, unit='LENGTH')
+    ctype: EnumProperty(name="Type", items=CIRCLE_TYPES, default="EXACT")
+    spans_u: IntProperty(name="Spans", default=8, min=4, max=64,
+                         description="Smooth: spans round the cylinder (degree 3, periodic)")
+    caps: BoolProperty(name="Caps (solid)", default=True, description="Close both ends: a solid body")
+    data: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+
+    def draw(self, context):
+        lay = self.layout
+        lay.use_property_split = True
+        col = lay.column(align=True)
+        col.prop(self, "radius")
+        col.prop(self, "height")
+        lay.row().prop(self, "ctype", expand=True)
+        if self.ctype == "SMOOTH":
+            lay.prop(self, "spans_u")
+        lay.prop(self, "caps")
+
+    def _fields(self):
+        if self._height_step():
+            return ["H"]
+        return ["R"] if self.mode == "CENTER" and len(self._pts) == 1 else []
+
+    def _step(self):
+        if self._height_step():
+            return "the height: move along the axis (or type it)"
+        if self.mode == "AROUND":
+            return "click a circle or circular edge"
+        return ["click the centre", "click the radius"][min(len(self._pts), 1)]
+
+    def _click(self, context, event):
+        out = super()._click(context, event)
+        if self.mode == "AROUND" and len(self._pts) == 1 and self._circle is not None:
+            Cc, rc, nc, W = self._circle                 # the circle gives the radius: straight to the height
+            w = _flat(np.asarray(W[0], float) - Cc, nc)
+            self._pts.append(Cc + rc * _unit(w if np.linalg.norm(w) > 1e-12 else np.cross(nc, [1.0, 0.0, 0.0])))
+            self._reset_typing()
+        return out
+
+    def _extra_key(self, context, event):
+        if type_key(self, event):
+            return True
+        if event.value == 'PRESS' and event.type == 'C' and not self._buf and not (event.ctrl or event.alt):
+            self.caps = not self.caps
+            return True
+        if event.value == 'PRESS' and event.type == 'BACK_SPACE' and self.mode == "AROUND" and not self._buf \
+                and not self._vals and self._pts:
+            self._pts, self._axis, self._circle = [], None, None      # back to picking a circle
+            return True
+        return False
+
+    def _extra_rows(self):
+        return type_rows(self) + [("Body", [hints.toggle("C", "caps (solid)", self.caps)])]
+
+    def _shape(self, context, event, final=False):
+        if not self._pts:
+            return None
+        if not self._height_step():
+            sh = super()._shape(context, event, final)
+            if sh is not None:
+                sh["kind"] = "cylinder"
+            return sh
+        typed = self._typed(context)
+        P, snap = self._point(context, event)
+        C, S, a = self._pts[0], self._pts[1], self._axis
+        r = float(np.linalg.norm(_flat(S - C, a)))
+        h, _ = self._axis_h(context, event, typed, P, snap, C, a)
+        H = abs(h)
+        if H < 1e-12 or r < 1e-12:
+            return None
+        T = frame(np.asarray(C, float) + a * (0.5 * h), S - C, a)
+        from .feature_ui import primitive_params
+        params = primitive_params("prim_cylinder", radius=r, height=H, spans_v=1, caps=bool(self.caps),
+                                  **circle_degree(self.ctype, self.spans_u))
+        return {"kind": "cylinder", "op": "prim_cylinder", "name": "NURBS Cylinder", "T": T, "params": params,
+                "polys": cylinder_outline(T, r, H), "poly": cylinder_outline(T, r, H)[0], "vals": {"H": H, "R": r}}
+
+    def execute(self, context):
+        # the redo panel's type, spans and caps go into the shape's parameters
+        try:
+            d = json.loads(self.data or "{}")
+        except ValueError:
+            d = {}
+        if d.get("params") is not None:
+            d["params"].update(circle_degree(self.ctype, self.spans_u))
+            d["params"]["caps"] = bool(self.caps)
+            if self.ctype == "EXACT":
+                d["params"].pop("spans_u", None)
+            self.data = json.dumps(d)
+        out = self._make_generic(context)
+        if out == {'FINISHED'}:
+            kind = "exact" if self.ctype == "EXACT" else f"smooth, degree 3, {self.spans_u} spans"
+            self.report({'INFO'}, f"Cylinder ({kind}{', solid' if self.caps else ''}): radius {self.radius:.4g}, "
+                                  f"height {self.height:.4g}")
+        return out
+
+
 classes = (NPROTO_OT_draw_circle, NPROTO_OT_draw_arc, NPROTO_OT_draw_ellipse, NPROTO_OT_draw_rectangle,
-           NPROTO_OT_draw_slot, NPROTO_OT_draw_polygon, NPROTO_OT_draw_helix)
+           NPROTO_OT_draw_slot, NPROTO_OT_draw_polygon, NPROTO_OT_draw_helix, NPROTO_OT_draw_cylinder)

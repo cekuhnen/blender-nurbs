@@ -64,7 +64,8 @@ everything built from it rebuilds.
 
 ### Create Surfaces
 
-- **Draw:** Draw Plane
+- **Draw:** Draw Plane, Cylinder (centre, radius, height, or around a circle or hole; exact or smooth, solid or
+  open)
 - **Primitives:** Plane, Disk, Box, Cylinder, Cone, Sphere, Torus
 - **From curves:** Loft (G0 to G3 to surface edges), Loft Rails, Curve Network (a grid of crossing curves, G0 / G1 /
   G2 to surface edges around it), Sweep, Pipe, Extrude, Revolve, Rail Revolve (exact), Planar
