@@ -1820,6 +1820,17 @@ def untrimmed_base(obj):
 
 
 NATURAL_STEPS = {"refit_trim", "merge_patches", "rebuild_surface", "extend_surface"}   # result is an untrimmed surface
+
+
+def _natural_result(obj, step):
+    """A NATURAL_STEPS step's result is untrimmed -- but Extend of a trimmed
+    surface keeps it trimmed (and after Untrim the same step extends the plain one)."""
+    if step["op"] != "extend_surface":
+        return True
+    from .extend import result_natural
+    return result_natural(obj)
+
+
 KEEP_STEPS = {"flip_normal"}     # result is plain / trimmed exactly when its input was
 PROP_STACK = "nproto_stack"   # JSON list of in-place steps: {"op", "refs", "params"}
 PROP_BASE = "nproto_base"     # brep text the stack starts from when there is no base feature
@@ -2332,7 +2343,7 @@ def _rebuild_inner(obj, context, h, entries, steps, turned):
         obj[store.PROP_NATURAL] = 1 if whole is None or whole[1] else 0
         if store.PROP_UNTRIM in obj:
             del obj[store.PROP_UNTRIM]
-    elif (core and core[-1]["op"] in NATURAL_STEPS) or (not core and natural):
+    elif (core and core[-1]["op"] in NATURAL_STEPS and _natural_result(obj, core[-1])) or (not core and natural):
         obj[store.PROP_NATURAL] = 1          # a plain surface (again)
         if store.PROP_UNTRIM in obj:
             del obj[store.PROP_UNTRIM]

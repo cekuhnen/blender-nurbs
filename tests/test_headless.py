@@ -1788,6 +1788,71 @@ h = 1e-3; kink = max(np.linalg.norm((_p(c + h, v) - 2 * _p(c, v) + _p(c - h, v))
 check("extend freeform: original part unchanged, curvature continuous across the old edge",
       dev < 1e-9 and abs(kink) < 1e-1, f"dev {dev:.2e} d2 jump {kink:.3e} c {c:.4f}")
 
+# trimmed surfaces: the edges still on the surface's own boundary extend, the trim edges are refused
+from blender_nurbs import extend as _ext
+bpy.ops.nproto.add_primitive(kind="PLANE", width=4, depth=4, pl_degree_u=3, pl_degree_v=3, spans_u=4, spans_v=4)
+etr = ctx.active_object; etr.name = "ExTrimmed"; etr.location = (0, 40, -80); ctx.view_layer.update()
+_xe = max(("U0", "U1", "V0", "V1"), key=lambda w: np.mean([p[0] for p in geom.boundary_points(store.get_surfaces(etr)[0], w, 8)]))
+bpy.ops.curve.primitive_bezier_circle_add(radius=1.0, location=(2, 40, -79)); _nc = ctx.active_object
+r = bpy.ops.nproto.trim(target=etr.name, cutters=ins((_nc, "S0")), ref_point=(2, 40, -80), normal=(0, 0, 1),
+                        view_dir=(0, 0, -1), action="DELETE")
+_a_notch = SA(etr)
+_be = _ext.boundary_edges(etr)
+_eb = store.get_brep(etr).edges()
+_mid = lambda i: np.array(_eb[i].point_at(sum(_eb[i].parameter_range()) / 2))
+_runs = sorted([i for i, v in _be.items() if v[0] == _xe], key=lambda i: _mid(i)[1])
+_arc = [i for i in range(len(_eb)) if i not in _be]
+check("extend trimmed: a notch in the +x edge leaves two boundary pieces there and the arc as trim edges",
+      r == {'FINISHED'} and abs(_a_notch - (16 - math.pi / 2)) < 2e-3 and len(_runs) == 2 and len(_arc) >= 1
+      and not store.is_natural(etr), f"{r} area {_a_notch:.4f} runs {_runs} trims {_arc} {_be}")
+_up = f"E{_runs[-1]}"
+check("extend trimmed: the trim edge is refused (why), the boundary piece taken",
+      _ext.refusal(etr, f"E{_arc[0]}") == _ext.TRIM_EDGE and _ext.refusal(etr, _up) == ""
+      and _ext.resolve(etr, _up)[0] == _xe, f"{_ext.refusal(etr, f'E{_arc[0]}')!r} {_ext.resolve(etr, _up)}")
+# the preview band spans only the picked piece (y 1..2) and lies on the result
+_x = _plain(_OpEx, inputs=json.dumps([[etr.name, _up]]), distance=1.0)
+_ok = _x.drag_setup(ctx, None)
+_rows, _path = _x._strip()
+_R = np.vstack(_rows)
+_sv = etr.copy(); _sv.data = etr.data.copy(); ctx.collection.objects.link(_sv)
+for k_ in etr.keys():
+    _sv[k_] = etr[k_]
+r = bpy.ops.nproto.extend(inputs=json.dumps([[_sv.name, _up]]), distance=1.0)
+def _xmax(o):       # local x extent of the edges (the brep's box is the carrier's, a little loose)
+    return max(e.point_at(float(t))[0] for e in store.get_brep(o).edges() for t in np.linspace(*e.parameter_range(), 33))
+_bb = _xmax(_sv)
+_on = max(store.get_brep(_sv).faces()[0].closest_point(tuple(map(float, q_ - np.array([0, 40, -80]))))[1] for q_ in _R[::7])
+check("extend trimmed: one boundary piece grows by 1 (area +1), the rest of the trim stays, still trimmed; "
+      "the preview band covers just that piece and lies on the result",
+      _ok and r == {'FINISHED'} and abs(SA(_sv) - _a_notch - 1.0) < 2e-3 and abs(_bb - 3.0) < 1e-3
+      and not store.is_natural(_sv) and abs(_R[:, 1].min() - 41) < 1e-3 and abs(_R[:, 1].max() - 42) < 1e-3
+      and _on < 1e-4 and features.stack(_sv)[-1]["params"].get("at") is not None,
+      f"{_ok} {r} dA {SA(_sv) - _a_notch:.5f} x {_bb:.4f} band y {_R[:, 1].min():.3f}..{_R[:, 1].max():.3f} on {_on:.1e}")
+# history: the step's distance edited to a shrink; the whole face is cut back at x = 1.5
+_hu.sync_step(_sv, len(features.stack(_sv)) - 1)
+_sv.nproto_step.distance = -0.5
+_cut = 16 - 2.0 - (math.pi / 2 - (0.5 * math.sqrt(0.75) + math.asin(0.5)))
+check("extend trimmed, history: distance -0.5 cuts the trimmed surface back at x = 1.5 (through the notch)",
+      abs(SA(_sv) - _cut) < 3e-3 and abs(_xmax(_sv) - 1.5) < 1e-3
+      and store.get_brep(_sv).face_count() == 1, f"area {SA(_sv):.5f} want {_cut:.5f} x {_xmax(_sv):.4f} faces {store.get_brep(_sv).face_count()}")
+# Untrim: the trim goes, the same step extends the plain plane's whole edge
+_sv.nproto_step.distance = 1.0
+bpy.ops.object.select_all(action='DESELECT'); _sv.select_set(True); ctx.view_layer.objects.active = _sv
+r = bpy.ops.nproto.untrim()
+check("extend trimmed, then Untrim: the plain plane with its whole edge extended (area 20), untrimmed",
+      r == {'FINISHED'} and abs(SA(_sv) - 20.0) < 2e-3 and store.is_natural(_sv), f"{r} area {SA(_sv):.5f}")
+bpy.data.objects.remove(_sv)
+# joined surfaces are refused with their reason
+bpy.ops.nproto.add_primitive(kind="PLANE", width=1, depth=1); _ja = ctx.active_object; _ja.location = (10, 40, -80)
+bpy.ops.nproto.add_primitive(kind="PLANE", width=1, depth=1); _jb = ctx.active_object; _jb.location = (11, 40, -80)
+ctx.view_layer.update()
+bpy.ops.object.select_all(action='DESELECT'); _ja.select_set(True); _jb.select_set(True); ctx.view_layer.objects.active = _ja
+bpy.ops.nproto.join(); _jj = ctx.active_object
+check("extend: an edge of joined surfaces is refused (Unjoin first)",
+      store.get_brep(_jj).face_count() == 2 and _ext.refusal(_jj, "E0") == _ext.JOINED, _ext.refusal(_jj, "E0"))
+bpy.data.objects.remove(_jj)
+bpy.data.objects.remove(etr); bpy.data.objects.remove(_nc)
+
 # --- Square (G0/G1/G2 four-sided patch) -------------------------------------
 from blender_nurbs import square as _sq
 def _qF(s1, s2, t1, t2):
