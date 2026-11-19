@@ -701,6 +701,7 @@ class NPROTO_OT_offset_curve(ValueDrag, AskValue, bpy.types.Operator):
     both_sides: BoolProperty(name="Both Sides", default=False, description="Offset to both sides")
     tolerance: FloatProperty(name="Tolerance", default=1e-4, min=1e-7, soft_max=0.01, precision=6, unit='LENGTH',
                              description="Largest deviation of a fitted free-form offset from the exact one")
+    start_value = 0.0           # the arrow on the curve: no offset until it is dragged (L: the last distance)
     names: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
 
     def _objs(self, context):

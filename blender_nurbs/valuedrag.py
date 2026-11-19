@@ -23,8 +23,11 @@ asking for the values in a dialog before anything can be seen.
 
 The value starts at the last one used, unless that would be tiny or run off
 the screen at this zoom: then a round length a quarter of the view is used.
-So pick + Enter is as quick as before. A tool with start_value (Extend: 0)
-starts there instead: nothing changes until the arrow is dragged or a value typed.
+So pick + Enter is as quick as before. A tool with start_value (Extend,
+Extrude, Offset Curve, Thicken, Surface Fillet: 0) starts there instead:
+nothing changes until the arrow is dragged or a value typed, and L brings
+back the value used last time (the hint panel shows it: a run of the same
+fillet is pick, L, Enter).
 The add-on preference Value Input = Dialog turns the stage off: every tool
 then asks in its dialog, as before.
 A tool mixes ValueDrag in before AskValue (whose dialog stays the fallback for
@@ -109,6 +112,24 @@ def _seg_dist(p, a, b):
     return (a + ab * t - p).length
 
 
+LAST = {}       # bl_idname -> {field: value}: what each value tool last made (this session), for L
+
+
+def _remembering(execute):
+    """execute, also noting the lengths it made with (the stage, Adjust Last Operation, a script)."""
+    def wrapped(self, context):
+        r = execute(self, context)
+        if r and 'FINISHED' in r:
+            try:
+                LAST[self.bl_idname] = {f: float(getattr(self, f)) for f in self._length_fields()}
+            except Exception:
+                pass
+        return r
+    wrapped.__doc__ = execute.__doc__
+    wrapped._remembers = True
+    return wrapped
+
+
 class ValueDrag:
     """Mixin for AskValue commands: the live value stage (see the module doc).
 
@@ -142,6 +163,12 @@ class ValueDrag:
                             # "shrink" only made smaller (a radius the part allows), "none" kept
     start_value = None      # a value the first field always starts at (Extend: 0, the arrow on the
                             # edge until it is dragged); None: the last value used, fitted to the view
+
+    def __init_subclass__(cls, **kw):
+        super().__init_subclass__(**kw)
+        ex = getattr(cls, "execute", None)       # its own, or one it shares (Extrude: _CurveTool's)
+        if ex is not None and not getattr(ex, "_remembers", False):
+            cls.execute = _remembering(ex)
 
     def invoke(self, context, event):
         self._start_event = (event.mouse_x, event.mouse_y, event.type, event.value)
@@ -177,9 +204,15 @@ class ValueDrag:
         self._pull = (se is not None and se[2] == 'LEFTMOUSE' and se[3] == 'PRESS'
                       and mouse is not None and getattr(self, "_base_at_mouse", False))
         self._pull_from = Vector((se[0], se[1])) if self._pull else None
-        name = self.drag_fields[0]
-        if self.start_value is not None:      # (the last value used comes along with the picks: not that)
-            setattr(self, name, self.start_value)
+        self._last = {}
+        if self.start_value is not None:
+            # start from nothing; what the tool last made (Adjust Last Operation
+            # included) stays one key away: L
+            made = LAST.get(self.bl_idname, {})
+            for f in self._length_fields():
+                if abs(made.get(f, 0.0)) > 1e-9:
+                    self._last[f] = made[f]
+                setattr(self, f, max(self.start_value, self.properties.bl_rna.properties[f].hard_min))
         else:
             try:
                 self._fit_start(context)
@@ -188,6 +221,22 @@ class ValueDrag:
         context.window_manager.modal_handler_add(self)
         self._drag_refresh(context)
         return {'RUNNING_MODAL'}
+
+    def _length_fields(self):
+        return [f for f in self.drag_fields if not self._is_angle(f)]
+
+    def _last_text(self, context):
+        """'2 mm' (or '2 mm / 1 mm' for two fields) of the value L brings back; '' if none."""
+        if not getattr(self, "_last", None):
+            return ""
+        return " / ".join(fmt_length(context, self._last[f]) for f in self._length_fields() if f in self._last)
+
+    def _reuse_last(self, context):
+        for f, v in self._last.items():
+            setattr(self, f, v)
+        self._typed = ""
+        self._edited = True
+        self._exact = True          # an exact value, as if typed: no on-screen length check
 
     def _fallback(self, context):
         return super().ask(context) if self.ask_dialog else self.execute(context)
@@ -341,6 +390,7 @@ class ValueDrag:
             return False
         self._grab = {"i": i, "t0": t, "p0": 0.0 if absolute else h["param"], "fine": False,
                       "abs": absolute}
+        self._exact = False
         if absolute:
             self._grab["t0"] = 0.0
         self._field = self.drag_fields.index(h["field"])
@@ -383,7 +433,7 @@ class ValueDrag:
         """A length dragged to (about) nothing -- the arrow back on the input:
         under 3 px on screen. A typed value is taken as it is."""
         name = self.drag_fields[0]
-        if self._typed or self._is_angle(name):
+        if self._typed or getattr(self, "_exact", False) or self._is_angle(name):
             return ""
         h = self._main_handle()
         if h is None or h.get("pick") is not None:
@@ -409,7 +459,8 @@ class ValueDrag:
             self._apply_typed(context)
         msg = self._too_short(context) or self.drag_check()
         if msg:                         # e.g. a zero distance: say so and keep going
-            self._msg = msg
+            last = self._last_text(context)
+            self._msg = msg + (f" · L: reuse {last}" if last else "")
             self._drag_refresh(context)
             return {'RUNNING_MODAL'}
         self._drag_end(context)
@@ -494,6 +545,10 @@ class ValueDrag:
             return {'RUNNING_MODAL'}
         ch = getattr(event, "unicode", "") or NUMPAD_CHARS.get(et, "")
         if ch and not event.ctrl and not event.oskey:
+            if not self._typed and ch.lower() == "l" and getattr(self, "_last", None):
+                self._reuse_last(context)        # the value used last time (a run of the same fillet)
+                self._drag_refresh(context)
+                return {'RUNNING_MODAL'}
             if self._typed or ch in NUMBER_START:
                 self._typed += ch        # once typing, letters are units (mm, ft)
                 self._apply_typed(context)
@@ -572,6 +627,9 @@ class ValueDrag:
                 ("Value", [hints.key("0-9", "type it", on=True if self._typed else None),
                            hints.key("Ctrl", "snap to grid"), hints.key("Shift", "precise"),
                            hints.key("Backspace", "erase")])]
+        last = self._last_text(context)
+        if last:
+            rows[1][1].append(hints.key("L", f"reuse {last}"))
         if len(self.drag_fields) > 1:
             rows[1][1].append(hints.cycle("Tab", [self._label(f) for f in self.drag_fields], self._label(name)))
         rows += list(self.drag_rows())

@@ -1796,6 +1796,7 @@ class NPROTO_OT_offset(ValueDrag, AskValue, bpy.types.Operator):
 
     # -- the live value stage (valuedrag.py) ----------------------------------
     MAX_FILL = 60000            # more triangles than this: the preview draws only the edges
+    start_value = 0.0           # the arrow on the surface: no offset until it is dragged (L: the last distance)
 
     def drag_setup(self, context, mouse):
         self._of, self._hv = offset_frames(context)
@@ -1868,6 +1869,7 @@ class NPROTO_OT_thicken(ValueDrag, AskValue, bpy.types.Operator):
     # -- the live value stage (valuedrag.py) ----------------------------------
     MAX_FILL = 60000            # more triangles than this: the preview draws only the edges
     fit_view = "shrink"         # a wall: the last thickness, made smaller only if it runs off the view
+    start_value = 0.0           # the arrow on the surface: nothing until it is dragged (L: the last thickness)
 
     def drag_setup(self, context, mouse):
         self._of, self._hv = offset_frames(context)
