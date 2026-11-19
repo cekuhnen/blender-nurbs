@@ -1851,6 +1851,18 @@ bpy.ops.nproto.join(); _jj = ctx.active_object
 check("extend: an edge of joined surfaces is refused (Unjoin first)",
       store.get_brep(_jj).face_count() == 2 and _ext.refusal(_jj, "E0") == _ext.JOINED, _ext.refusal(_jj, "E0"))
 bpy.data.objects.remove(_jj)
+# Edge mode names an untrimmed surface's edges E<i>; the pick tools call them U0 / U1 / V0 / V1
+from blender_nurbs.ops import natural_side as _nside
+bpy.ops.nproto.add_primitive(kind="PLANE", width=2, depth=2); _np_ = ctx.active_object
+_sides = [_nside(_np_, f"E{i}") for i in range(store.get_brep(_np_).edge_count())]
+_bd = {w: np.array(geom.boundary_points(store.get_surfaces(_np_)[0], w, 5)) for w in ("U0", "U1", "V0", "V1")}
+_eb2 = store.get_brep(_np_).edges()
+_same = all(min(np.linalg.norm(_bd[w] - np.array(_eb2[i].point_at(sum(_eb2[i].parameter_range()) / 2)), axis=1)) < 1e-6
+            for i, w in enumerate(_sides) if w)
+check("pre-picked edges: each edge of an untrimmed plane maps to the side it lies on (Edge mode E<i> -> U0..V1); "
+      "a trimmed surface's edges keep their E names",
+      sorted(_sides) == ["U0", "U1", "V0", "V1"] and _same and _nside(etr, "E0") is None, f"{_sides}")
+bpy.data.objects.remove(_np_)
 bpy.data.objects.remove(etr); bpy.data.objects.remove(_nc)
 
 # --- Square (G0/G1/G2 four-sided patch) -------------------------------------

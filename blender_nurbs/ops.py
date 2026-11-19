@@ -232,6 +232,39 @@ def _carry_props(op):
 GIZMO = {"held": False}     # the left button went down on the navigation gizmo (PickMixin._in_view)
 
 
+def natural_side(obj, ref):
+    """The side (U0 / U1 / V0 / V1) of an untrimmed surface that its edge
+    "E<i>" (Edge mode's name for it) lies on; None if it is not one."""
+    if not (ref.startswith("E") and ref[1:].isdigit() and store.is_nurbs(obj) and store.is_natural(obj)):
+        return None
+    try:
+        from .kernel import trimext
+        brep = store.get_brep(obj)
+        r = trimext.edge_on_iso(brep.faces()[0].surface(), brep.edges()[int(ref[1:])])
+    except Exception:
+        return None
+    return r[0] if r is not None else None
+
+
+def main_region(area):
+    """The 3D view's drawing region of an area (None if it has none)."""
+    if area is None:
+        return None
+    return next((r for r in area.regions if r.type == 'WINDOW'), None)
+
+
+class InView:
+    """The event with its mouse counted from the 3D view's main region."""
+
+    def __init__(self, event, region):
+        self._e = event
+        self.mouse_region_x = event.mouse_x - region.x
+        self.mouse_region_y = event.mouse_y - region.y
+
+    def __getattr__(self, name):
+        return getattr(self._e, name)
+
+
 class PickMixin:
     """Modal picking of curves / surface edges. Subclasses set:
     pick_count (min), pick_max, allow_edges, and implement finish_picks()."""
@@ -325,6 +358,9 @@ class PickMixin:
         for o, r in picked:
             cand = byref.get((o.name, r))
             if cand is None:
+                # an untrimmed surface's candidates are its sides U0 / U1 / V0 / V1, Edge mode names E<i>
+                cand = byref.get((o.name, natural_side(o, r)))
+            if cand is None:
                 return None
             for c in self.expand_pick(cand):
                 if (c[0], c[1]) not in out:
@@ -358,6 +394,15 @@ class PickMixin:
         hints.clear(context)
 
     def modal(self, context, event):
+        # started from a sidebar panel the tool's region is the panel's: no
+        # view there, the mouse counted from its corner. Pick in the 3D view's region.
+        reg = main_region(context.area)
+        if reg is None or reg == context.region:
+            return self._pick_modal(context, event)
+        with context.temp_override(region=reg):
+            return self._pick_modal(bpy.context, InView(event, reg))
+
+    def _pick_modal(self, context, event):
         if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM'}:
             return {'PASS_THROUGH'}
         if self.hints_key(context, event):
@@ -1087,6 +1132,9 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
             kd = kb + n // 5 if kb < n // 2 else kb - n // 5
         self._S, self._kb, self._kd, self._closed = S, kb, kd, closed
         return True
+
+    def drag_on_input(self, context, mouse):
+        return self._near_screen(context, self._S, mouse)
 
     def _dirs(self):
         p = self.params()

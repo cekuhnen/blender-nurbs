@@ -606,6 +606,7 @@ class NPROTO_OT_extend(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
                     best = ((q - mouse).length, j)
             if best is not None:
                 self._xj, self._base_at_mouse = best[1], True
+        self._xpts = [self._M @ Vector(surf.evaluate(*uv_at(j / 32))) for j in range(33)]   # the picked edge, world
         pt, du, dv = surf.derivatives(*uv_at(self._xj / 32))
         d = np.array(du if across_u else dv, float) * (1.0 if at_end else -1.0)
         M3 = np.array(self._M.to_3x3(), float)
@@ -614,6 +615,9 @@ class NPROTO_OT_extend(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
         self._xD = dw / (np.linalg.norm(dw) or 1.0)
         self._xcache = None
         return True
+
+    def drag_on_input(self, context, mouse):
+        return self._near_screen(context, self._xpts, mouse)
 
     def _strip(self):
         """(rows of world points from the old edge to the new one, the new edge

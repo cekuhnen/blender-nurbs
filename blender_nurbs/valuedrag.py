@@ -7,7 +7,10 @@ asking for the values in a dialog before anything can be seen.
                         only moves (a handle under it lights up)
     press on the input  and pull (when the tool was started by clicking the
                         curve): the arrow comes out of the curve under the
-                        cursor, in one motion
+                        cursor, in one motion. A press on the input later in
+                        the stage does the same (it never applies): the
+                        arrow stands where it was pressed and comes out
+                        (tools that say where their input is: drag_on_input)
     type                an exact value for the active field (unit letters
                         work: 25mm, 2ft); dragging a handle makes its field
                         the active one
@@ -47,6 +50,7 @@ PULL_PX = 6.0           # a press on the input becomes a pull once the mouse mov
 HANDLE_PX = 16.0        # a handle can be grabbed this close to it
 SHAFT_PX = 7.0          # ... or this close to the arrow's shaft
 BASE_PX = 40.0          # the arrow stands where the curve was clicked, if it was within this
+INPUT_PX = 14.0         # a press this close to the input pulls the arrow out of it again (not apply)
 MOUSE = [("MOUSE_LMB_DRAG", "Drag a handle"), ("MOUSE_LMB", "Apply"), ("EVENT_ESC", "Cancel")]
 
 
@@ -449,11 +453,18 @@ class ValueDrag:
         if event.value != 'PRESS':
             return {'RUNNING_MODAL'}
         if et == 'LEFTMOUSE':
-            i = self._handle_at(context, self._mouse(context, event))
-            if i is not None and self._start_grab(context, i, self._mouse(context, event)):
+            m = self._mouse(context, event)
+            i = self._handle_at(context, m)
+            if i is not None and self._start_grab(context, i, m):
                 self._drag_refresh(context)
                 return {'RUNNING_MODAL'}
-            return self._apply(context)   # a click away from the handles applies
+            if self._restand(context, m):
+                # a press on the input (the picked edge, the curve): the arrow
+                # stands there and comes out with the mouse -- it applies nothing
+                self._pull, self._pull_from = True, Vector((event.mouse_x, event.mouse_y))
+                self._drag_refresh(context)
+                return {'RUNNING_MODAL'}
+            return self._apply(context)   # a click away from the handles and the input applies
         if et in {'RET', 'NUMPAD_ENTER', 'SPACE'}:
             return self._apply(context)
         if et in {'ESC', 'RIGHTMOUSE'}:
@@ -485,6 +496,38 @@ class ValueDrag:
                 self._drag_refresh(context)
                 return {'RUNNING_MODAL'}
         return {'RUNNING_MODAL'}
+
+    def drag_on_input(self, context, mouse):
+        """Is region point mouse on the tool's input? Tools whose arrow stands
+        where the input was clicked say so: a press there then pulls the arrow
+        out again instead of applying (the input looks like the thing to drag)."""
+        return False
+
+    def _restand(self, context, m):
+        try:
+            if not self.drag_on_input(context, m):
+                return False
+            return bool(self.drag_setup(context, m))      # the arrow's foot moves to the press
+        except Exception as exc:
+            print("NURBS value preview:", exc)
+            return False
+
+    def _near_screen(self, context, pts, m, px=None):
+        """Is region point m within px (INPUT_PX) of the polyline of world points pts on screen?"""
+        px = INPUT_PX if px is None else px
+        prev = None
+        for p in pts:
+            q = self._screen(context, p)
+            if q is not None and prev is not None:
+                seg = q - prev
+                L = seg.length_squared
+                t = 0.0 if L == 0 else max(0.0, min(1.0, (m - prev).dot(seg) / L))
+                if (prev + seg * t - m).length <= px:
+                    return True
+            elif q is not None and (q - m).length <= px:
+                return True
+            prev = q
+        return False
 
     def _drag_refresh(self, context):
         name = self._field_name()
