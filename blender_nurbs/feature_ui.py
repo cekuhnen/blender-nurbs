@@ -70,7 +70,7 @@ LABELS = {"tan_a": "Tangent A", "tan_b": "Tangent B", "cur_a": "Curvature A", "c
           "w2": "Weight 3", "w3": "Weight 4", "sq_spans_u": "Spans U (0 auto)", "sq_spans_v": "Spans V (0 auto)"}
 PRETTY = {"patch": "Patch", "dome": "Dome", "square": "Square", "sweep": "Sweep", "pipe": "Pipe", "boundary": "Boundary", "iso_curve": "Iso Curve",
           "dup_edge": "Duplicate Edge", "project_curve": "Projected Curve", "intersect": "Intersection",
-          "join": "Join", "split_region": "Split", "boolean": "Boolean", "boundary_fill": "Boundary Fill", "join_curves": "Join Curves", "offset_curve": "Offset Curve", "loft_rails": "Loft Rails", "surface_fillet": "Surface Fillet", "loft": "Loft", "blend_curve": "Blend Curve", "extrude": "Extrude", "revolve": "Revolve",
+          "join": "Join", "split_region": "Split", "iso_detach": "Detach at Isoparm", "boolean": "Boolean", "boundary_fill": "Boundary Fill", "join_curves": "Join Curves", "offset_curve": "Offset Curve", "loft_rails": "Loft Rails", "surface_fillet": "Surface Fillet", "loft": "Loft", "blend_curve": "Blend Curve", "extrude": "Extrude", "revolve": "Revolve",
           "offset": "Offset", "thicken": "Thicken", "planar": "Planar", "perp_profile": "Profile",
           "subd_to_brep": "SubD to BREP"}
 

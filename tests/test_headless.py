@@ -11180,4 +11180,75 @@ check("edge fillet by chord on a twisted wall (angle 70 -> 110 deg along the edg
       and max(_angs) < 0.05 and _eb.face_count() == 3,
       f"chord {min(_fd):.6f}..{max(_fd):.6f} angle {max(_angs):.4f} faces {_eb.face_count()}")
 
+# --- Detach at Isoparm (isodetach.py): exact knot-insertion cuts of untrimmed surfaces
+from blender_nurbs import isodetach as _iso
+
+def _iso_err(src, pieces, cu, cv):
+    """Largest distance between each piece and the source over the sub-domain it covers."""
+    def ev(s_, fu, fv):
+        (u0, u1), (v0, v1) = s_.u_domain(), s_.v_domain()
+        return np.array(s_.evaluate(u0 + (u1 - u0) * fu, v0 + (v1 - v0) * fv))
+    doms = _iso.piece_domains(cu, cv, store._periodic(src))
+    err = 0.0
+    for pc, (a, b, c, d) in zip(pieces, doms):
+        for x in np.linspace(0, 1, 7):
+            for y in np.linspace(0, 1, 7):
+                fu, fv = a + (b - a) * x, c + (d - c) * y
+                err = max(err, np.linalg.norm(ev(pc, x, y) - ev(src, fu - (fu > 1), fv - (fv > 1))))
+    return len(pieces) == len(doms), err
+
+_hist0 = ctx.scene.nproto_settings.construction_history
+ctx.scene.nproto_settings.construction_history = False
+_rng = np.random.default_rng(7)                         # cubic x quadratic, non-uniform knots, rational
+_iso_P = [(i + 0.2 * _rng.standard_normal(), j + 0.2 * _rng.standard_normal(), 0.5 * _rng.standard_normal())
+          for i in range(6) for j in range(5)]
+_iso_src = ext.surface_from_cvs(3, 2, _iso_P, [0, 0, 0, 0, 0.15, 0.6, 1, 1, 1, 1], [0, 0, 0, 0.3, 0.45, 1, 1, 1],
+                                [float(0.6 + _rng.random()) for _ in range(30)])
+_n_ok, _e = _iso_err(_iso_src, _iso.detach(_iso_src, [0.37, 0.6], [0.2, 0.81]), [0.37, 0.6], [0.2, 0.81])
+check("detach at isoparm: a rational non-uniform surface cut at u 0.37 / 0.6 (on a knot) and v 0.2 / 0.81 "
+      "is 9 exact pieces", _n_ok and _e < 1e-12, f"err {_e:.1e}")
+bpy.ops.nproto.add_primitive(kind="CYLINDER"); _iso_cyl = ctx.active_object
+_iso_cs = store.get_surfaces(_iso_cyl)[0]
+_n_ok, _e = _iso_err(_iso_cs, _iso.detach(_iso_cs, [0.1, 0.6], [0.5]), [0.1, 0.6], [0.5])
+check("detach at isoparm: a rational closed cylinder cut at u 0.1 / 0.6 and v 0.5 is 4 exact pieces "
+      "(the piece across the seam joined)", _n_ok and _e < 1e-12, f"err {_e:.1e}")
+_one = _iso.detach(_iso_cs, [0.3], [])
+_n_ok, _e = _iso_err(_iso_cs, _one, [0.3], [])
+_ed = np.linalg.norm(np.array(_one[0].evaluate(0.0, 0.5)) - np.array(_iso_cs.evaluate(
+    _iso_cs.u_domain()[0] + 0.3 * (_iso_cs.u_domain()[1] - _iso_cs.u_domain()[0]), sum(_iso_cs.v_domain()) / 2)))
+check("detach at isoparm: one cut on a closed direction opens it there (one piece, its seam at the cut)",
+      _n_ok and len(_one) == 1 and _e < 1e-12 and _ed < 1e-12, f"err {_e:.1e} seam {_ed:.1e}")
+_iso_n0 = len(bpy.data.objects)
+r = bpy.ops.nproto.detach_iso(target=_iso_cyl.name, cuts_u="[0.0, 0.5]")
+_made = list(ctx.selected_objects)
+check("detach at isoparm (no history): a cylinder cut at the seam and at 0.5 is two untrimmed halves, "
+      "the first one in the source object",
+      r == {'FINISHED'} and len(_made) == 2 and _iso_cyl in _made and all(store.is_natural(o) for o in _made)
+      and len(bpy.data.objects) == _iso_n0 + 1
+      and abs(sum(store.get_brep(o).area(1e-7) for o in _made) - store.to_brep(_iso_cs).area(1e-7)) < 1e-5)
+bpy.ops.nproto.add_primitive(kind="DISK"); _iso_disk = ctx.active_object
+r = bpy.ops.nproto.detach_iso(target=_iso_disk.name, cuts_u="[0.5]")
+check("detach at isoparm refuses a trimmed surface", r == {'CANCELLED'} and not store.is_natural(_iso_disk))
+
+ctx.scene.nproto_settings.construction_history = True
+bpy.ops.nproto.add_primitive(kind="PLANE"); _iso_pl = ctx.active_object
+r = bpy.ops.nproto.detach_iso(target=_iso_pl.name, cuts_u="[0.5]", cuts_v="[0.25]")
+_made = sorted(ctx.selected_objects, key=lambda o: o.name)
+_hist_ok = all(features.history(o) is not None and features.history(o)["op"] == "iso_detach" for o in _made)
+check("detach at isoparm (history): 4 pieces follow the source, which is kept hidden",
+      r == {'FINISHED'} and len(_made) == 4 and _hist_ok and _iso_pl.hide_get() and _iso_pl not in _made)
+_s0 = store.get_surfaces(_iso_pl)[0]
+_d = ext.surface_cvs(_s0)
+_P = np.array(_d["points"], float).reshape(_d["count_u"], _d["count_v"], 3)
+_P[..., 2] += 0.3 * np.sin(_P[..., 0] * 2.0)            # bend the source
+store.set_geometry(_iso_pl, ext.surface_from_cvs(_d["degree_u"], _d["degree_v"], [tuple(x) for x in _P.reshape(-1, 3)],
+                                                 list(_d["knots_u"]), list(_d["knots_v"]), None), ctx)
+for o in _made:
+    features.rebuild(o, ctx, force=True)
+_s1 = store.get_surfaces(_iso_pl)[0]
+_n_ok, _e = _iso_err(_s1, [store.get_surfaces(o)[0] for o in sorted(_made, key=lambda o: features.history(o)["params"]["piece"])],
+                     [0.5], [0.25])
+check("detach at isoparm (history): pieces rebuild exactly from the edited source", _n_ok and _e < 1e-12, f"err {_e:.1e}")
+ctx.scene.nproto_settings.construction_history = _hist0
+
 print("ALL OK" if ok else "SOME FAILED")

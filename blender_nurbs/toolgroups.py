@@ -95,6 +95,7 @@ GROUPS = (
             (_t("nproto.trim", icon='MOD_BOOLEAN'), _t("nproto.split", icon='MOD_EDGESPLIT')),
             (_t("nproto.untrim", icon='LOOP_BACK'), _t("nproto.untrim_region", icon='SELECT_SUBTRACT')),
             (_t("nproto.join", icon='AUTOMERGE_ON'), _t("nproto.unjoin", icon='AUTOMERGE_OFF')),
+            (_t("nproto.detach_iso", icon='UV_EDGESEL'),),
         )),
         ("Fillets", (
             (_t("nproto.fillet", "Surface Fillet", 'MOD_BEVEL'), _t("nproto.edge_fillet", icon='MOD_BEVEL')),
