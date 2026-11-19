@@ -1072,6 +1072,7 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
     bl_label = "Extrude"
     bl_options = {'REGISTER', 'UNDO'}
     op_name = "extrude"
+    start_value = 0.0      # the arrow stands on the curve: nothing is extruded until it is dragged
 
     distance: FloatProperty(name="Distance", default=1.0, unit='LENGTH',
                             description="Height along the direction (with draft: the far edge also moves outward)")
@@ -1165,9 +1166,12 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
         h = self.distance
         B = self._S[self._kb]
         foot = self._S[self._kd] + d * h
+        arrow = {"field": "distance", "kind": "arrow", "origin": B, "dir": d, "param": h,
+                 "base": B, "to_value": lambda t: t}
+        if abs(h) <= 1e-9 * (float(np.ptp(self._S, axis=0).max()) or 1.0):
+            return [arrow]        # no height yet: no top edge to draft (the diamond would sit on the curve)
         nd = self._draft_normal(d)
-        return [{"field": "distance", "kind": "arrow", "origin": B, "dir": d, "param": h,
-                 "base": B, "to_value": lambda t: t},
+        return [arrow,
                 {"field": "draft", "kind": "draft", "origin": foot, "dir": nd,
                  "param": h * np.tan(np.radians(self.draft)),
                  "to_value": lambda t, h=h: draft_angle(t, h)}]
