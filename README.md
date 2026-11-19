@@ -57,9 +57,10 @@ everything built from it rebuilds.
 
 - Join Curves, Unjoin Curves, Trim Curves, Split Curves
 - Rebuild Curve, Extend Curve, Align Curve
-- **Pattern:** Linear and Circular Pattern of curves and NURBS objects: real copies with their exact geometry
-  (not Blender's mesh-only Array), a grid, an axis through the cursor or a picked circle; with history the copies
-  follow their source
+- **Pattern:** Linear, Circular and Path Pattern of curves and NURBS objects: real copies with their exact
+  geometry (not Blender's mesh-only Array), on a snapping widget: a row, grid or block along its X / Y / Z (turned
+  to any angle), around its axis, or along a curve or edge; number keys set the count; with history the copies
+  follow their source and path
 
 ### Create Surfaces
 

@@ -458,30 +458,29 @@ history. Trimmed and multi-face objects can be picked by their real B-rep edges
   parents, not the runtime `matrix_world`. That value can be stale right after the
   undo the F9 panel does on every change.
 
-## Pattern (Linear / Circular)
+## Pattern (Linear / Circular / Path)
 
-**Linear Pattern** and **Circular Pattern** (Surface Edit panel; they work on curves too) copy the selected NURBS objects and curves in a row, a grid or around an axis. Each copy is a NURBS object (or curve) of its own carrying the exact geometry, so it exports to STEP, shows its CV net and can be picked, trimmed and joined like any other. Blender's **Array** modifier copies only the display mesh, which has no B-rep behind it, so use it only for plain meshes. A copy is the source's B-rep under another matrix: it takes the source's mesh as is, so making 24 copies costs no extra tessellation (only when the source changes is each copy rebuilt).
+**Linear Pattern**, **Circular Pattern** and **Path Pattern** (Surface Edit panel; they work on curves too) copy the selected NURBS objects and curves. Each copy is a NURBS object (or curve) of its own carrying the exact geometry, so it exports to STEP, shows its CV net and can be picked, trimmed and joined like any other. Blender's **Array** modifier copies only the display mesh, which has no B-rep behind it, so use it only for plain meshes. A copy is the source's B-rep under another matrix: it takes the source's mesh as is, so making 24 copies costs no extra tessellation (only when the source changes is each copy rebuilt).
 
-The copies show as a preview with a handle, the way Extrude does:
+The pattern is laid out on a **widget**: a centre with X (red), Y (green) and Z (blue). Linear and circular show it; the copies show as a preview.
 
-| Key | Linear | Circular |
-|---|---|---|
-| drag the arrow | to the last copy (the spacing follows) | around the axis: the angle the copies spread over |
-| type a number | spacing (or length, see **E**) | angle |
-| **Up / Down** | one copy more / fewer | same |
-| **N** | type the count, Enter to finish typing | same |
-| **Left / Right** | one row more / fewer (a grid, second direction **Row Direction**) | - |
-| **X Y Z** | direction along that world axis; again: the object's local one | the axis |
-| **A** | pick a line or edge for the direction (start to end) | pick a line, straight edge or **circle** (a hole's edge): a circle's axis runs through its centre |
-| **O** | - | axis through the 3D cursor / world origin / each object's origin |
-| **E** | the value is the spacing between copies, or the length from first to last (the copies stay put) | - |
-| **R** | - | rotate copies on / off (off: moved round the axis, kept upright) |
-| **F** | other way | other way |
-| **M** | switch to circular | switch to linear |
+- **Drag the centre** to move the widget. It snaps like the sketch tools (ends, middles, face centres, CVs, edges; **Ctrl** the grid, **Alt** no snapping). Dropped on a flat face, the widget lines up with that face: its Z is the face's normal. **C / W / B** put it on the 3D cursor, the world origin or the middle of the sources.
+- **Number keys set the count**: of the active arrow (linear) or of the pattern (circular, path). **+ / -** (or Up / Down) one more or fewer.
+- **Tab** switches the number keys to the value instead (the active arrow's spacing, the angle, the path distance; unit letters work: `25mm`), Tab again back to the count.
+- **M** switches linear / circular / path. **Enter**, or a click away from the widget, makes the copies; **Esc** cancels.
 
-Linear starts at spacing 0 (the copies sit on the original until the arrow is dragged; **L** brings back the last spacing). A full 360° spreads the copies evenly (none lands on the original); less than 360° puts copies at both ends. The 3D cursor is read when the pattern is made: moving it later does not move the copies.
+| | Linear | Circular | Path |
+|---|---|---|---|
+| handles | an **arrow** per direction X, Y, Z: drag one out to the last copy along it (an unused arrow pulled out starts with 2); the **ring** turns the widget about its Z, so the rows run at an angle | the **arrow round the axis**: the angle the copies spread over (**Ctrl** 5° steps) | the **arrow along the path** to the last copy |
+| directions | one, two (a grid) or all three (a block); **X Y Z** make that arrow the active one | the axis is the widget's Z through its centre; **X Y Z** turn the widget so its Z is that axis | from the path point nearest the source on |
+| **A** | pick a line or edge for the widget's X | pick a line, straight edge or **circle** (a hole's edge): the centre goes to the circle's centre, Z along its axis | pick the path: a curve or a surface edge. With a curve active among the selection, it is the path |
+| **E** | spacing between copies or length from first to last (the copies stay put) | - | spacing or length; 0 = to the path's end (a closed path: evenly all the way round) |
+| **R** | - | rotate copies on / off (off: moved round, kept upright) | follow the path on / off (off: only moved) |
+| **F** | the active arrow the other way | the other way | - |
 
-With construction history every copy follows its source: change the source's shape (CVs, its own history) or move it and the copies update. A copy moved by hand keeps its offset. The Feature panel of a copy shows the pattern with **Edit Pattern** (the same handles, starting from the pattern as it is: more or fewer copies, another spacing; existing copies are kept and moved, extra ones deleted) and **Select All**. **Bake** on a copy makes it a plain object that no longer follows. Without history the copies are plain objects from the start.
+Linear starts with every spacing at 0 (the copies sit on the original until an arrow is dragged; **L** brings back the last spacings). A full 360° spreads the copies evenly (none lands on the original); less than 360° puts copies at both ends. Along a path, the copies keep the source's offset from the path and turn with it (a rotation-minimising frame, as a sweep's).
+
+With construction history every copy follows its source: change the source's shape (CVs, its own history) or move it and the copies update; along a path they also follow the path. A copy moved by hand keeps its offset. The Feature panel of a copy shows the pattern with **Edit Pattern** (the same widget, starting from the pattern as it is: more or fewer copies, another spacing; existing copies are kept and moved, extra ones deleted) and **Select All**. **Bake** on a copy makes it a plain object that no longer follows. Without history the copies are plain objects from the start.
 
 ## Analyze
 

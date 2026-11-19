@@ -51,7 +51,7 @@ GROUPS = (
     )),
     ("SURFACES", "Create Surfaces", (
         ("Draw", (
-            (_t("nproto.draw_plane", "Draw Plane", 'MESH_PLANE'),),
+            (_t("nproto.draw_plane", "Draw Plane", 'MESH_PLANE'), _t("nproto.draw_cylinder", "Cylinder", 'MESH_CYLINDER')),
         )),
         ("Primitives", (
             (_p("PLANE"), _p("DISK"), _p("BOX")),
@@ -105,6 +105,7 @@ GROUPS = (
         ("Pattern", (
             (("nproto.pattern", "Linear Pattern", 'MOD_ARRAY', {"mode": "LINEAR"}),
              ("nproto.pattern", "Circular Pattern", 'DRIVER_ROTATIONAL_DIFFERENCE', {"mode": "CIRCULAR"})),
+            (("nproto.pattern", "Path Pattern", 'CURVE_PATH', {"mode": "PATH"}),),
         )),
         ("Boolean (solids)", (
             (("nproto.boolean", "Union", 'SELECT_EXTEND', {"operation": "UNION"}),
