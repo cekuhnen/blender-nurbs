@@ -1536,4 +1536,36 @@ def draw_feature(box, context, obj, h):
     row.operator("nproto.pattern_select", text="Select All", icon='RESTRICT_SELECT_OFF').group = p.get("group", "")
 
 
+def patterns_from(obj, objects):
+    """The patterns made from obj: [(group, params, its copies of obj)], oldest group first."""
+    found = {}
+    for o in objects:
+        if o.get("nproto_in_0") is not obj:
+            continue
+        pg = pattern_of(o)
+        if pg is None or not pg[1].get("group"):
+            continue
+        g = pg[1]["group"]
+        if g not in found:
+            found[g] = [pg[1], 0, o.name]
+        found[g][1] += 1
+    return [(g, p, n) for g, (p, n, _) in sorted(found.items(), key=lambda kv: kv[1][2])]
+
+
+def draw_patterns_of(layout, context, obj):
+    """The Feature panel of an original: the patterns made from it, each with
+    Edit Pattern and Select All (as a copy's Feature panel has them)."""
+    pats = patterns_from(obj, context.scene.objects)
+    if not pats:
+        return
+    box = layout.box()
+    box.label(text="Patterns made from this object", icon='MOD_ARRAY')
+    for g, p, n in pats:
+        col = box.column(align=True)
+        col.label(text=f"{summary(p)} · {n} cop{'y' if n == 1 else 'ies'}")
+        row = col.row(align=True)
+        row.operator("nproto.pattern", text="Edit Pattern", icon='MODIFIER').group = g
+        row.operator("nproto.pattern_select", text="Select All", icon='RESTRICT_SELECT_OFF').group = g
+
+
 classes = (NPROTO_OT_pattern, NPROTO_OT_pattern_select)

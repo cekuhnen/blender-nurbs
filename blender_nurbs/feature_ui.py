@@ -699,6 +699,8 @@ def draw_feature(layout, context):
         elif features.PROP_HIST in obj:
             box.label(text="Feature: an input was deleted (history broken)", icon='ERROR')
         # (its steps -- fillets, trims ... -- are rows of the Construction Tree: click one to edit it)
+    from .pattern import draw_patterns_of
+    draw_patterns_of(layout, context, obj)          # patterns made from it: Edit Pattern from the original too
     history_ui.draw_tree(layout, context, obj)
 
 

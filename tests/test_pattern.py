@@ -311,6 +311,13 @@ except RuntimeError:
 check("path: no path given is refused", r == {'CANCELLED'})
 
 
+# the original lists the patterns made from it (the Feature panel: Edit Pattern from there too)
+pf = pattern.patterns_from(BX, ctx.scene.objects)
+check("original: lists its 3 circular patterns with their own copy counts",
+      [n for _, _, n in pf] == [5, 2, 3] and all(p["mode"] == "CIRCULAR" for _, p, _ in pf), f"{[n for _, _, n in pf]}")
+check("original: a copy is not listed as an original", pattern.patterns_from(bc[0], ctx.scene.objects) == [])
+
+
 # --- the first Pattern's params still build --------------------------------------
 old = {"mode": "LINEAR", "count": 3, "distance": 2.0, "axis": "Y", "count_b": 2, "distance_b": 1.0,
        "axis_b": "Z", "space": "SPACING"}
