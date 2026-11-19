@@ -38,7 +38,7 @@ GROUPS = (
             (_t("nproto.blend_curve", icon='IPO_EASE_IN_OUT'), _t("nproto.fillet_curves", "Fillet", 'SPHERECURVE')),
         )),
         ("From Curves", (
-            (_t("nproto.offset_curve", icon='MOD_OFFSET'),),
+            (_t("nproto.offset_curve", icon='MOD_OFFSET'), _t("nproto.offset_on_surface", icon='MOD_SHRINKWRAP')),
         )),
         ("Shapes", (                                         # at the 3D cursor: the menus only (the panel
             MenuOnly((_p("LINE"), _p("ARC"), _p("CIRCLE"), _p("ELLIPSE"), _p("RECTANGLE"), _p("POLYGON"),
@@ -51,7 +51,7 @@ GROUPS = (
     )),
     ("SURFACES", "Create Surfaces", (
         ("Draw", (
-            (_t("nproto.draw_plane", "Draw Plane", 'MESH_PLANE'),),
+            (_t("nproto.draw_plane", "Draw Plane", 'MESH_PLANE'), _t("nproto.draw_cylinder", "Cylinder", 'MESH_CYLINDER')),
         )),
         ("Primitives", (
             (_p("PLANE"), _p("DISK"), _p("BOX")),
@@ -59,6 +59,7 @@ GROUPS = (
         )),
         ("From Curves", (
             (_t("nproto.loft", icon='MOD_SIMPLEDEFORM'), _t("nproto.loft_rails", icon='MOD_SIMPLEDEFORM')),
+            (_t("nproto.network", icon='MESH_GRID'), _t("nproto.rail_revolve", icon='MOD_SCREW')),
             (_t("nproto.sweep", icon='MOD_CURVE'), _t("nproto.pipe", icon='META_CAPSULE')),
             (_t("nproto.extrude", icon='MOD_SOLIDIFY'), _t("nproto.revolve", icon='MOD_SCREW'),
              _t("nproto.planar", icon='MESH_PLANE')),
@@ -69,6 +70,7 @@ GROUPS = (
         )),
         ("From Surfaces", (
             (_t("nproto.offset", icon='MOD_OFFSET'), _t("nproto.thicken", icon='MOD_SOLIDIFY')),
+            (_t("nproto.flange", icon='MOD_SOLIDIFY'),),
             (_t("nproto.from_blender_surface", icon='SURFACE_NSURFACE'),),
         )),
     )),
@@ -95,9 +97,15 @@ GROUPS = (
             (_t("nproto.trim", icon='MOD_BOOLEAN'), _t("nproto.split", icon='MOD_EDGESPLIT')),
             (_t("nproto.untrim", icon='LOOP_BACK'), _t("nproto.untrim_region", icon='SELECT_SUBTRACT')),
             (_t("nproto.join", icon='AUTOMERGE_ON'), _t("nproto.unjoin", icon='AUTOMERGE_OFF')),
+            (_t("nproto.detach_iso", icon='UV_EDGESEL'),),
         )),
         ("Fillets", (
             (_t("nproto.fillet", "Surface Fillet", 'MOD_BEVEL'), _t("nproto.edge_fillet", icon='MOD_BEVEL')),
+        )),
+        ("Pattern", (
+            (("nproto.pattern", "Linear Pattern", 'MOD_ARRAY', {"mode": "LINEAR"}),
+             ("nproto.pattern", "Circular Pattern", 'DRIVER_ROTATIONAL_DIFFERENCE', {"mode": "CIRCULAR"})),
+            (("nproto.pattern", "Path Pattern", 'CURVE_PATH', {"mode": "PATH"}),),
         )),
         ("Boolean (solids)", (
             (("nproto.boolean", "Union", 'SELECT_EXTEND', {"operation": "UNION"}),
@@ -113,6 +121,13 @@ GROUPS = (
         ("To BREP", (
             (_t("nproto.mesh_to_brep", "Mesh to BREP", 'MESH_CUBE'),),
             (_t("nproto.subd_to_brep", "SubD to BREP", 'MOD_SUBSURF'),),
+        )),
+        ("Fit to Scan", (
+            (_t("nproto.scan_tube_cage", "Tube Cage from Scan", 'MESH_CYLINDER'),),
+            (_t("nproto.scan_fit_cage", "Fit Cage to Scan", 'MOD_SHRINKWRAP'),),
+            (_t("nproto.scan_refine_cage", "Refine Cage to Scan", 'MOD_MULTIRES'),),
+            (_t("nproto.scan_trim_cage", "Trim Cage to Curve", 'CURVE_DATA'),),
+            (_t("nproto.scan_drape_patch", "Drape Patch to Scan", 'SURFACE_NSURFACE'),),
         )),
     )),
 )

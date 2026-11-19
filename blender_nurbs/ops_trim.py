@@ -859,6 +859,7 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
 
     # -- the live value stage (valuedrag.py) ----------------------------------
     fit_view = "shrink"         # the radius fit_radius found for the part: only ever made smaller
+    start_value = 0.0           # the arrow at the crossing: no fillet until it is dragged (L: the last radius)
     SHAPES = ("CIRCULAR", "CHAMFER", "BLEND")
 
     @property
@@ -2276,6 +2277,7 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
     # -- the live value stage (valuedrag.py) ----------------------------------
     angle_fields = ()
     fit_view = "shrink"         # the radius fit_radius found for the part: only ever made smaller
+    start_value = 0.0           # the radius handle on the edges: no fillet until it is dragged (L: the last radius)
     SHAPES = ("CIRCULAR", "CHAMFER", "BLEND")
 
     @property

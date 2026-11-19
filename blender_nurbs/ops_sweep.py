@@ -9,7 +9,7 @@ import numpy as np
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
 from mathutils import Vector
 
-from . import features, geom, store, sweeps
+from . import draw, features, geom, store, sweeps
 from . import hints
 from .kernel import load as load_kernel
 from .ops import AskValue, PickMixin, _decode_inputs, _encode_inputs, _kernel_ok, _select_only
@@ -485,7 +485,8 @@ class NPROTO_OT_extend(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
     """Extend (or with a negative distance shrink) a surface at one boundary edge,
     continuing its own shape exactly (Alias "Natural" extend). Pick the edge,
     then drag the arrow on it (back into the surface: shrink), type a value,
-    click away or Enter to make it"""
+    click away or Enter to make it. A trimmed surface extends at the edges
+    that still lie on its own boundary; its trim edges cannot be extended"""
     bl_idname = "nproto.extend"
     bl_label = "Extend Surface"
     bl_options = {'REGISTER', 'UNDO'}
@@ -494,14 +495,72 @@ class NPROTO_OT_extend(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
     pick_min = 1
     pick_max = 1
     finish_on_min = True
+    start_value = 0.0      # the arrow stands on the edge: nothing is extended until it is dragged
     inputs: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     distance: FloatProperty(name="Distance", default=0.5, soft_min=-10.0, soft_max=10.0, unit='LENGTH',
                             description="How far the edge moves along the surface (negative: shrink)")
 
+    # -- picking: the edges it can take, and why the others are refused ------
     def pick_candidates(self, context):
-        from .extend import EDGES
-        return [c for c in super().pick_candidates(context)
-                if c[0].type != 'CURVE' and c[1] in EDGES and store.is_natural(c[0])]
+        from . import extend
+        ok, self._refused, self._why_of = [], [], {}
+        for c in super().pick_candidates(context):
+            if c[0].type == 'CURVE':
+                continue
+            try:
+                why = extend.refusal(c[0], c[1])
+            except Exception as exc:
+                why = f"Cannot extend this edge ({exc})"
+            if why:
+                self._refused.append(c)
+                self._why_of[(c[0].name, c[1])] = why
+            else:
+                ok.append(c)
+        return ok
+
+    def start_picking(self, context, event=None):
+        if not self.pick_candidates(context) and getattr(self, "_refused", None):
+            self.report({'WARNING'}, "Nothing to extend. " + self._why_of[(self._refused[0][0].name,
+                                                                          self._refused[0][1])])
+            return {'CANCELLED'}
+        self._why = ""
+        return super().start_picking(context, event)
+
+    def _update_hover(self, context, event):
+        from .ops import _near_candidates
+        cur = super()._update_hover(context, event)
+        why, line = "", None
+        if cur is None and getattr(self, "_refused", None):
+            near = _near_candidates(context, event, self._refused)
+            if near:
+                why, line = self._why_of[(near[0][0].name, near[0][1])], near[0][2]
+        draw.pick_overlay["refused"] = line
+        if why != getattr(self, "_why", ""):
+            self._why = why
+            self._status(context)
+            context.area.tag_redraw()
+        return cur
+
+    def tool_key(self, context, event):
+        if event.type == 'LEFTMOUSE' and getattr(self, "_why", "") and self._in_view(context, event):
+            if self._update_hover(context, event) is None and self._why:
+                self.report({'WARNING'}, self._why)
+                return True
+        return False
+
+    def pick_state(self):
+        return self._why if getattr(self, "_why", "") else "click a boundary edge of a surface"
+
+    def pick_rows(self):
+        rows = super().pick_rows()
+        rows.append(("", [hints.note("Edges on the surface's own boundary extend, on trimmed surfaces too. "
+                                     "Trim edges (red) do not: Untrim or Refit to Trim first. "
+                                     "Joined surfaces: Unjoin first")]))
+        return rows
+
+    def _end(self, context):
+        draw.pick_overlay["refused"] = None
+        super()._end(context)
 
     def invoke(self, context, event):
         if not _kernel_ok(self):
@@ -513,18 +572,20 @@ class NPROTO_OT_extend(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
 
     # -- the live value stage (valuedrag.py) ----------------------------------
     def drag_setup(self, context, mouse):
-        from .extend import EDGES
+        from . import extend
         picks = _decode_inputs(self.inputs)
         if not picks:
             return False
-        obj, edge = picks[0]
-        if edge not in EDGES or not store.is_natural(obj) or store.get_brep(obj).face_count() != 1:
+        obj, ref = picks[0]
+        r = extend.resolve(obj, ref)
+        if r is None:
             return False
+        edge, self._xat, (lo, hi), self._xtrimmed = r
         from .kernel import load
         self._ext = load().blender_ext
         surf = store.get_surfaces(obj)[0]
-        self._xd = self._ext.surface_cvs(surf)
-        self._xs, self._xobj, self._xedge = surf, obj, edge
+        self._xs, self._xobj, self._xedge, self._xrange = surf, obj, edge, (lo, hi)
+        self._xface = store.get_brep(obj).faces()[0]
         self._M = geom.world_matrix(obj)
         self._scale = sum(self._M.to_scale()) / 3.0 or 1.0
         # the arrow: where the edge was clicked (else its middle), along the surface out of it
@@ -533,9 +594,10 @@ class NPROTO_OT_extend(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
         at_end = edge in ("U1", "V1")
 
         def uv_at(f):
+            a = lo + (hi - lo) * f
             if across_u:
-                return (u1 if at_end else u0), v0 + (v1 - v0) * f
-            return u0 + (u1 - u0) * f, (v1 if at_end else v0)
+                return (u1 if at_end else u0), a
+            return a, (v1 if at_end else v0)
         self._xj, self._base_at_mouse = 16, False
         if mouse is not None:
             best = None
@@ -545,6 +607,7 @@ class NPROTO_OT_extend(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
                     best = ((q - mouse).length, j)
             if best is not None:
                 self._xj, self._base_at_mouse = best[1], True
+        self._xpts = [self._M @ Vector(surf.evaluate(*uv_at(j / 32))) for j in range(33)]   # the picked edge, world
         pt, du, dv = surf.derivatives(*uv_at(self._xj / 32))
         d = np.array(du if across_u else dv, float) * (1.0 if at_end else -1.0)
         M3 = np.array(self._M.to_3x3(), float)
@@ -554,39 +617,37 @@ class NPROTO_OT_extend(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
         self._xcache = None
         return True
 
+    def drag_on_input(self, context, mouse):
+        return self._near_screen(context, self._xpts, mouse)
+
     def _strip(self):
         """(rows of world points from the old edge to the new one, the new edge
         surface's arrow path): the band the extension adds (or, shrinking, cuts)."""
-        from .extend import extend_grid
+        from .kernel import trimext
         key = round(float(self.distance), 12)
         if self._xcache is not None and self._xcache[0] == key:
             return self._xcache[1]
-        sm = load_kernel()
-        ext = self._ext
         dist = float(self.distance) / self._scale
         edge = self._xedge
         across_u = edge in ("U0", "U1")
-        at_end = edge in ("U1", "V1")
-        new = ext.surface_from_cvs(*extend_grid(self._xd, edge, dist))
+        new = trimext.extended_surface(self._xs, edge, dist)      # same parameters as the old part
+        c_old, c_new = trimext._boundary_value(self._xs, edge), trimext._boundary_value(new, edge)
         big = new if dist >= 0 else self._xs           # the surface the band lies on
-        small = self._xs if dist >= 0 else new
-        (bu0, bu1), (bv0, bv1) = big.u_domain(), big.v_domain()
-        (su0, su1), (sv0, sv1) = small.u_domain(), small.v_domain()
-        # the band's inner end: the small surface's edge, found on the big one
-        sm_u = (su1 if at_end else su0) if across_u else 0.5 * (su0 + su1)
-        sm_v = 0.5 * (sv0 + sv1) if across_u else (sv1 if at_end else sv0)
-        q = small.evaluate(sm_u, sm_v)
-        _, uvs, _ = sm.surface_closest_point(big, tuple(q))
-        uv = uvs[0]
-        cu, cv = (uv.x, uv.y) if hasattr(uv, "x") else (uv[0], uv[1])
-        if across_u:
-            a, b = cu, (bu1 if at_end else bu0)
-            grid = [[big.evaluate(a + (b - a) * i / 8, bv0 + (bv1 - bv0) * j / 32) for j in range(33)] for i in range(9)]
-        else:
-            a, b = cv, (bv1 if at_end else bv0)
-            grid = [[big.evaluate(bu0 + (bu1 - bu0) * j / 32, a + (b - a) * i / 8) for j in range(33)] for i in range(9)]
+        a, b = (c_old, c_new) if dist >= 0 else (c_new, c_old)    # inner end first, out to big's edge
+        lo, hi = self._xrange
+        if dist < 0 and self._xtrimmed:
+            # cutting back a trimmed surface: the band spans what the new edge line crosses of the face
+            (u0, u1), (v0, v1) = self._xs.u_domain(), self._xs.v_domain()
+            A0, A1 = (v0, v1) if across_u else (u0, u1)
+            ins = [A0 + (A1 - A0) * k / 64 for k in range(65)]
+            ins = [t for t in ins if self._xface.classify_uv(*((c_new, t) if across_u else (t, c_new))) != "outside"]
+            if ins:
+                lo, hi = min(ins + [lo]), max(ins + [hi])
+
+        def P(x, t):
+            return big.evaluate(x, t) if across_u else big.evaluate(t, x)
+        grid = [[P(a + (b - a) * i / 8, lo + (hi - lo) * j / 32) for j in range(33)] for i in range(9)]
         M = np.array(self._M, float)
-        # inner end first: the old edge (extending) or the new one (shrinking), out to the big surface's edge
         rows = [np.asarray(r, float) @ M[:3, :3].T + M[:3, 3] for r in grid]
         path = np.array([r[self._xj] for r in rows])
         self._xcache = (key, (rows, path))
@@ -623,22 +684,27 @@ class NPROTO_OT_extend(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
         from . import extend
         picks = _decode_inputs(self.inputs)
         if not picks:
-            self.report({'WARNING'}, "Pick a boundary edge of an untrimmed surface")
+            self.report({'WARNING'}, "Pick a boundary edge of a surface")
             return {'CANCELLED'}
-        obj, edge = picks[0]
-        if edge not in extend.EDGES or not store.is_natural(obj) or store.get_brep(obj).face_count() != 1:
-            self.report({'WARNING'}, "Only boundary edges of untrimmed single surfaces can be extended")
+        obj, ref = picks[0]
+        why = extend.refusal(obj, ref) if store.is_nurbs(obj) else "Pick a boundary edge of a surface"
+        r = None if why else extend.resolve(obj, ref)
+        if r is None:
+            self.report({'WARNING'}, why or extend.TRIM_EDGE)
             return {'CANCELLED'}
+        edge, at, _, trimmed = r
         scale = sum(geom.world_matrix(obj).to_scale()) / 3.0 or 1.0
         p = {"edge": edge, "distance": float(self.distance) / scale}
+        if at is not None:
+            p["at"] = float(at)
         try:
             if features.history_enabled(context):
                 features.push_step(obj, "extend_surface", [], p)
                 features.rebuild(obj, context, force=True)
             else:
-                store.set_geometry_text(obj, extend.extend_surface_text(obj[store.PROP_BREP], edge, p["distance"]),
+                store.set_geometry_text(obj, extend.extend_surface_text(obj[store.PROP_BREP], edge, p["distance"], at),
                                         context, keep_untrimmed=False)
-            obj[store.PROP_NATURAL] = 1
+                obj[store.PROP_NATURAL] = 1 if extend.result_natural(obj) else 0
         except Exception as exc:
             if features.history_enabled(context):
                 try:

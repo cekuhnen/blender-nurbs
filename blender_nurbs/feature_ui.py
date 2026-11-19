@@ -38,6 +38,11 @@ FIELDS = {
                    "lr_degree", "lr_spans_u", "lr_spans_v"],
     "join_curves": ["jc_mode", "tolerance", "jc_degree", "jc_cvs"],
     "offset_curve": ["distance", "oc_mode", "oc_corner", "flip", "both_sides", "tolerance"],
+    "offset_on_surface": ["distance", "os_corner", "flip", "both_sides", "tolerance"],
+    "rail_revolve": ["rr_axis", "pivot", "rr_height"],
+    "network": ["nw_cont", "nw_degree", "nw_spans_u", "nw_spans_v"],
+    "flange": ["fl_mode", "fl_length", "angle", "draft_angle", "pull_flip", "measure", "flip", "both_sides",
+               "tolerance"],
     "sweep": ["samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height", "flip_normal"],
     "pipe": ["radius", "samples"],
     "patch": ["pt_cvs", "pt_cvs_v", "pt_auto_cvs", "pt_degree", "pt_fair", "pt_surface_fair", "pt_quad",
@@ -70,9 +75,9 @@ LABELS = {"tan_a": "Tangent A", "tan_b": "Tangent B", "cur_a": "Curvature A", "c
           "w2": "Weight 3", "w3": "Weight 4", "sq_spans_u": "Spans U (0 auto)", "sq_spans_v": "Spans V (0 auto)"}
 PRETTY = {"patch": "Patch", "dome": "Dome", "square": "Square", "sweep": "Sweep", "pipe": "Pipe", "boundary": "Boundary", "iso_curve": "Iso Curve",
           "dup_edge": "Duplicate Edge", "project_curve": "Projected Curve", "intersect": "Intersection",
-          "join": "Join", "split_region": "Split", "boolean": "Boolean", "boundary_fill": "Boundary Fill", "join_curves": "Join Curves", "offset_curve": "Offset Curve", "loft_rails": "Loft Rails", "surface_fillet": "Surface Fillet", "loft": "Loft", "blend_curve": "Blend Curve", "extrude": "Extrude", "revolve": "Revolve",
+          "join": "Join", "split_region": "Split", "iso_detach": "Detach at Isoparm", "boolean": "Boolean", "boundary_fill": "Boundary Fill", "join_curves": "Join Curves", "offset_curve": "Offset Curve", "offset_on_surface": "Offset on Surface", "flange": "Flange", "network": "Curve Network", "rail_revolve": "Rail Revolve", "loft_rails": "Loft Rails", "surface_fillet": "Surface Fillet", "loft": "Loft", "blend_curve": "Blend Curve", "extrude": "Extrude", "revolve": "Revolve",
           "offset": "Offset", "thicken": "Thicken", "planar": "Planar", "perp_profile": "Profile",
-          "subd_to_brep": "SubD to BREP"}
+          "subd_to_brep": "SubD to BREP", "pattern": "Pattern"}
 
 
 def _on_change(self, context):
@@ -407,6 +412,13 @@ class NprotoFeature(bpy.types.PropertyGroup):
     lr_mode: EnumProperty(name="Mode", items=[("RAILS", "Rails", ""), ("CENTRELINE", "Centreline", "")], **_F())
     lr_spans_u: IntProperty(name="Spans U (0 auto)", min=0, max=32, **_F())
     lr_spans_v: IntProperty(name="Spans V (0 auto)", min=0, max=32, **_F())
+    rr_axis: EnumProperty(name="Axis", items=[("RAIL", "Rail Centre", "")] + REVOLVE_AXIS_ITEMS, **_F())
+    rr_height: EnumProperty(name="Height", items=[("KEEP", "Keep", ""), ("SHIFT", "Shift", ""), ("SCALE", "Scale", "")],
+                            **_F())
+    nw_cont: EnumProperty(name="Edges", items=[("G0", "G0", ""), ("G1", "G1", ""), ("G2", "G2", "")], **_F())
+    nw_degree: IntProperty(name="Degree (0 auto)", min=0, max=5, **_F())
+    nw_spans_u: IntProperty(name="Spans U (0 auto)", min=0, max=48, **_F())
+    nw_spans_v: IntProperty(name="Spans V (0 auto)", min=0, max=48, **_F())
     bool_op: EnumProperty(name="Operation", items=[("UNION", "Union", ""), ("DIFFERENCE", "Difference", ""),
                                                    ("INTERSECTION", "Intersection", "")], **_F())
     jc_mode: EnumProperty(name="Mode", items=[("EXACT", "Exact", "Keep every piece's shape exactly"),
@@ -416,6 +428,13 @@ class NprotoFeature(bpy.types.PropertyGroup):
                                                 ("JOINED", "Joined", "Chain touching curves, offset each chain")], **_F())
     oc_corner: EnumProperty(name="Corners", items=[("SHARP", "Sharp", ""), ("ROUND", "Round", ""),
                                                    ("CHAMFER", "Chamfer", "")], **_F())
+    os_corner: EnumProperty(name="Corners", items=[("SHARP", "Sharp", ""), ("ROUND", "Round", ""),
+                                                   ("CHAMFER", "Chamfer", "")], **_F())
+    fl_mode: EnumProperty(name="Mode", items=[("FLANGE", "Flange", ""), ("DRAFT", "Draft", "")], **_F())
+    fl_length: FloatProperty(name="Length", unit='LENGTH', **_F())
+    draft_angle: FloatProperty(name="Draft °", min=-89.0, max=89.0, **_F())
+    pull_flip: BoolProperty(name="Flip Pull", **_F())
+    measure: EnumProperty(name="Measure", items=[("RULING", "Along Surface", ""), ("HEIGHT", "Height", "")], **_F())
     flip: BoolProperty(name="Flip", **_F())
     both_sides: BoolProperty(name="Both Sides", **_F())
     jc_cvs: IntProperty(name="CVs (Rebuild, 0 auto)", min=0, max=200, **_F())
@@ -587,6 +606,9 @@ def draw_feature(layout, context):
                 pg = obj.nproto_feature
                 if op == "patch":
                     _draw_patch(box, obj, pg, h)
+                elif op == "pattern":
+                    from .pattern import draw_feature as _draw_pattern
+                    _draw_pattern(box, context, obj, h)
                 for name in FIELDS.get(op, []) if op != "patch" else []:
                     if op == "square" and name[0] in "ew" and name[1:].isdigit():
                         if name[0] == "e":
@@ -641,10 +663,14 @@ def draw_feature(layout, context):
                         if name == "width" and shp == "SQUARE":
                             col.prop(pg, name, text="Size")
                             continue
+                    if op == "flange" and (name == "angle" and pg.fl_mode == "DRAFT" or name in (
+                            "draft_angle", "pull_flip", "measure") and pg.fl_mode == "FLANGE"):
+                        continue
                     if op == "dome" and name == "dome_cvs" and pg.dome_layout != "DRAPED":
                         continue
                     if name in ("degree", "square_degree", "jc_mode", "bool_op", "lr_degree", "lr_mode", "pp_shape",
-                                "dome_cont", "dome_layout", "oc_mode", "oc_corner"):
+                                "dome_cont", "dome_layout", "oc_mode", "oc_corner", "os_corner", "fl_mode", "measure",
+                                "nw_cont", "rr_height"):
                         col.row().prop(pg, name, expand=True)
                     elif name in ("jc_degree", "jc_cvs") and pg.jc_mode != "REBUILD":
                         continue
@@ -673,6 +699,8 @@ def draw_feature(layout, context):
         elif features.PROP_HIST in obj:
             box.label(text="Feature: an input was deleted (history broken)", icon='ERROR')
         # (its steps -- fillets, trims ... -- are rows of the Construction Tree: click one to edit it)
+    from .pattern import draw_patterns_of
+    draw_patterns_of(layout, context, obj)          # patterns made from it: Edit Pattern from the original too
     history_ui.draw_tree(layout, context, obj)
 
 

@@ -1788,6 +1788,83 @@ h = 1e-3; kink = max(np.linalg.norm((_p(c + h, v) - 2 * _p(c, v) + _p(c - h, v))
 check("extend freeform: original part unchanged, curvature continuous across the old edge",
       dev < 1e-9 and abs(kink) < 1e-1, f"dev {dev:.2e} d2 jump {kink:.3e} c {c:.4f}")
 
+# trimmed surfaces: the edges still on the surface's own boundary extend, the trim edges are refused
+from blender_nurbs import extend as _ext
+bpy.ops.nproto.add_primitive(kind="PLANE", width=4, depth=4, pl_degree_u=3, pl_degree_v=3, spans_u=4, spans_v=4)
+etr = ctx.active_object; etr.name = "ExTrimmed"; etr.location = (0, 40, -80); ctx.view_layer.update()
+_xe = max(("U0", "U1", "V0", "V1"), key=lambda w: np.mean([p[0] for p in geom.boundary_points(store.get_surfaces(etr)[0], w, 8)]))
+bpy.ops.curve.primitive_bezier_circle_add(radius=1.0, location=(2, 40, -79)); _nc = ctx.active_object
+r = bpy.ops.nproto.trim(target=etr.name, cutters=ins((_nc, "S0")), ref_point=(2, 40, -80), normal=(0, 0, 1),
+                        view_dir=(0, 0, -1), action="DELETE")
+_a_notch = SA(etr)
+_be = _ext.boundary_edges(etr)
+_eb = store.get_brep(etr).edges()
+_mid = lambda i: np.array(_eb[i].point_at(sum(_eb[i].parameter_range()) / 2))
+_runs = sorted([i for i, v in _be.items() if v[0] == _xe], key=lambda i: _mid(i)[1])
+_arc = [i for i in range(len(_eb)) if i not in _be]
+check("extend trimmed: a notch in the +x edge leaves two boundary pieces there and the arc as trim edges",
+      r == {'FINISHED'} and abs(_a_notch - (16 - math.pi / 2)) < 2e-3 and len(_runs) == 2 and len(_arc) >= 1
+      and not store.is_natural(etr), f"{r} area {_a_notch:.4f} runs {_runs} trims {_arc} {_be}")
+_up = f"E{_runs[-1]}"
+check("extend trimmed: the trim edge is refused (why), the boundary piece taken",
+      _ext.refusal(etr, f"E{_arc[0]}") == _ext.TRIM_EDGE and _ext.refusal(etr, _up) == ""
+      and _ext.resolve(etr, _up)[0] == _xe, f"{_ext.refusal(etr, f'E{_arc[0]}')!r} {_ext.resolve(etr, _up)}")
+# the preview band spans only the picked piece (y 1..2) and lies on the result
+_x = _plain(_OpEx, inputs=json.dumps([[etr.name, _up]]), distance=1.0)
+_ok = _x.drag_setup(ctx, None)
+_rows, _path = _x._strip()
+_R = np.vstack(_rows)
+_sv = etr.copy(); _sv.data = etr.data.copy(); ctx.collection.objects.link(_sv)
+for k_ in etr.keys():
+    _sv[k_] = etr[k_]
+r = bpy.ops.nproto.extend(inputs=json.dumps([[_sv.name, _up]]), distance=1.0)
+def _xmax(o):       # local x extent of the edges (the brep's box is the carrier's, a little loose)
+    return max(e.point_at(float(t))[0] for e in store.get_brep(o).edges() for t in np.linspace(*e.parameter_range(), 33))
+_bb = _xmax(_sv)
+_on = max(store.get_brep(_sv).faces()[0].closest_point(tuple(map(float, q_ - np.array([0, 40, -80]))))[1] for q_ in _R[::7])
+check("extend trimmed: one boundary piece grows by 1 (area +1), the rest of the trim stays, still trimmed; "
+      "the preview band covers just that piece and lies on the result",
+      _ok and r == {'FINISHED'} and abs(SA(_sv) - _a_notch - 1.0) < 2e-3 and abs(_bb - 3.0) < 1e-3
+      and not store.is_natural(_sv) and abs(_R[:, 1].min() - 41) < 1e-3 and abs(_R[:, 1].max() - 42) < 1e-3
+      and _on < 1e-4 and features.stack(_sv)[-1]["params"].get("at") is not None,
+      f"{_ok} {r} dA {SA(_sv) - _a_notch:.5f} x {_bb:.4f} band y {_R[:, 1].min():.3f}..{_R[:, 1].max():.3f} on {_on:.1e}")
+# history: the step's distance edited to a shrink; the whole face is cut back at x = 1.5
+_hu.sync_step(_sv, len(features.stack(_sv)) - 1)
+_sv.nproto_step.distance = -0.5
+_cut = 16 - 2.0 - (math.pi / 2 - (0.5 * math.sqrt(0.75) + math.asin(0.5)))
+check("extend trimmed, history: distance -0.5 cuts the trimmed surface back at x = 1.5 (through the notch)",
+      abs(SA(_sv) - _cut) < 3e-3 and abs(_xmax(_sv) - 1.5) < 1e-3
+      and store.get_brep(_sv).face_count() == 1, f"area {SA(_sv):.5f} want {_cut:.5f} x {_xmax(_sv):.4f} faces {store.get_brep(_sv).face_count()}")
+# Untrim: the trim goes, the same step extends the plain plane's whole edge
+_sv.nproto_step.distance = 1.0
+bpy.ops.object.select_all(action='DESELECT'); _sv.select_set(True); ctx.view_layer.objects.active = _sv
+r = bpy.ops.nproto.untrim()
+check("extend trimmed, then Untrim: the plain plane with its whole edge extended (area 20), untrimmed",
+      r == {'FINISHED'} and abs(SA(_sv) - 20.0) < 2e-3 and store.is_natural(_sv), f"{r} area {SA(_sv):.5f}")
+bpy.data.objects.remove(_sv)
+# joined surfaces are refused with their reason
+bpy.ops.nproto.add_primitive(kind="PLANE", width=1, depth=1); _ja = ctx.active_object; _ja.location = (10, 40, -80)
+bpy.ops.nproto.add_primitive(kind="PLANE", width=1, depth=1); _jb = ctx.active_object; _jb.location = (11, 40, -80)
+ctx.view_layer.update()
+bpy.ops.object.select_all(action='DESELECT'); _ja.select_set(True); _jb.select_set(True); ctx.view_layer.objects.active = _ja
+bpy.ops.nproto.join(); _jj = ctx.active_object
+check("extend: an edge of joined surfaces is refused (Unjoin first)",
+      store.get_brep(_jj).face_count() == 2 and _ext.refusal(_jj, "E0") == _ext.JOINED, _ext.refusal(_jj, "E0"))
+bpy.data.objects.remove(_jj)
+# Edge mode names an untrimmed surface's edges E<i>; the pick tools call them U0 / U1 / V0 / V1
+from blender_nurbs.ops import natural_side as _nside
+bpy.ops.nproto.add_primitive(kind="PLANE", width=2, depth=2); _np_ = ctx.active_object
+_sides = [_nside(_np_, f"E{i}") for i in range(store.get_brep(_np_).edge_count())]
+_bd = {w: np.array(geom.boundary_points(store.get_surfaces(_np_)[0], w, 5)) for w in ("U0", "U1", "V0", "V1")}
+_eb2 = store.get_brep(_np_).edges()
+_same = all(min(np.linalg.norm(_bd[w] - np.array(_eb2[i].point_at(sum(_eb2[i].parameter_range()) / 2)), axis=1)) < 1e-6
+            for i, w in enumerate(_sides) if w)
+check("pre-picked edges: each edge of an untrimmed plane maps to the side it lies on (Edge mode E<i> -> U0..V1); "
+      "a trimmed surface's edges keep their E names",
+      sorted(_sides) == ["U0", "U1", "V0", "V1"] and _same and _nside(etr, "E0") is None, f"{_sides}")
+bpy.data.objects.remove(_np_)
+bpy.data.objects.remove(etr); bpy.data.objects.remove(_nc)
+
 # --- Square (G0/G1/G2 four-sided patch) -------------------------------------
 from blender_nurbs import square as _sq
 def _qF(s1, s2, t1, t2):
@@ -5018,11 +5095,13 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cy
               "patch_auto_corners", "patch_corner", "patch_remove_guide", "rebuild", "rebuild_waiting", "remove_step",
               "restore_inputs", "sync_feature", "tab_edit", "continuity", "continuity_clear", "section_add", "section_orient",
               "section_targets", "section_curves", "section_remove", "subsel_picker", "bake_feature", "delete_feature",
-              "curve_degree", "fix_clip_start", "delete_faces", "move_pivot", "cv_nudge",
+              "curve_degree", "fix_clip_start", "delete_faces", "move_pivot", "cv_nudge", "pattern_select",
+              "measure",    # Measure: in the Analyze panel / header popover, with Continuity Check
               "square"}     # Square: merged into Patch (Quad Sided); kept for older files, off the menus
 _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto)
               if n not in _not_tools and not n.startswith("workplane_")}   # the Work Planes panel's own
-_tool_ops = [o_ for o_ in _in_panels if o_ not in ("nproto.add_primitive", "nproto.boolean")] + ["nproto.boolean"]
+_tool_ops = [o_ for o_ in _in_panels if o_ not in ("nproto.add_primitive", "nproto.boolean", "nproto.pattern")] + \
+    ["nproto.boolean", "nproto.pattern"]           # (one button per operation / mode)
 _bool_ops = sorted(e["props"].get("operation") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r
                    if e.get("op") == "nproto.boolean")
 _kinds = [e["props"].get("kind") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r
@@ -11102,5 +11181,189 @@ check("edge fillet by chord on a twisted wall (angle 70 -> 110 deg along the edg
       _n_shared == 1 and _r == {'FINISHED'} and abs(min(_fd) - 0.3) < 1e-4 and abs(max(_fd) - 0.3) < 1e-4
       and max(_angs) < 0.05 and _eb.face_count() == 3,
       f"chord {min(_fd):.6f}..{max(_fd):.6f} angle {max(_angs):.4f} faces {_eb.face_count()}")
+
+# --- Detach at Isoparm (isodetach.py): exact knot-insertion cuts of untrimmed surfaces
+from blender_nurbs import isodetach as _iso
+
+def _iso_err(src, pieces, cu, cv):
+    """Largest distance between each piece and the source over the sub-domain it covers."""
+    def ev(s_, fu, fv):
+        (u0, u1), (v0, v1) = s_.u_domain(), s_.v_domain()
+        return np.array(s_.evaluate(u0 + (u1 - u0) * fu, v0 + (v1 - v0) * fv))
+    doms = _iso.piece_domains(cu, cv, store._periodic(src))
+    err = 0.0
+    for pc, (a, b, c, d) in zip(pieces, doms):
+        for x in np.linspace(0, 1, 7):
+            for y in np.linspace(0, 1, 7):
+                fu, fv = a + (b - a) * x, c + (d - c) * y
+                err = max(err, np.linalg.norm(ev(pc, x, y) - ev(src, fu - (fu > 1), fv - (fv > 1))))
+    return len(pieces) == len(doms), err
+
+_hist0 = ctx.scene.nproto_settings.construction_history
+ctx.scene.nproto_settings.construction_history = False
+_rng = np.random.default_rng(7)                         # cubic x quadratic, non-uniform knots, rational
+_iso_P = [(i + 0.2 * _rng.standard_normal(), j + 0.2 * _rng.standard_normal(), 0.5 * _rng.standard_normal())
+          for i in range(6) for j in range(5)]
+_iso_src = ext.surface_from_cvs(3, 2, _iso_P, [0, 0, 0, 0, 0.15, 0.6, 1, 1, 1, 1], [0, 0, 0, 0.3, 0.45, 1, 1, 1],
+                                [float(0.6 + _rng.random()) for _ in range(30)])
+_n_ok, _e = _iso_err(_iso_src, _iso.detach(_iso_src, [0.37, 0.6], [0.2, 0.81]), [0.37, 0.6], [0.2, 0.81])
+check("detach at isoparm: a rational non-uniform surface cut at u 0.37 / 0.6 (on a knot) and v 0.2 / 0.81 "
+      "is 9 exact pieces", _n_ok and _e < 1e-12, f"err {_e:.1e}")
+bpy.ops.nproto.add_primitive(kind="CYLINDER"); _iso_cyl = ctx.active_object
+_iso_cs = store.get_surfaces(_iso_cyl)[0]
+_n_ok, _e = _iso_err(_iso_cs, _iso.detach(_iso_cs, [0.1, 0.6], [0.5]), [0.1, 0.6], [0.5])
+check("detach at isoparm: a rational closed cylinder cut at u 0.1 / 0.6 and v 0.5 is 4 exact pieces "
+      "(the piece across the seam joined)", _n_ok and _e < 1e-12, f"err {_e:.1e}")
+_one = _iso.detach(_iso_cs, [0.3], [])
+_n_ok, _e = _iso_err(_iso_cs, _one, [0.3], [])
+_ed = np.linalg.norm(np.array(_one[0].evaluate(0.0, 0.5)) - np.array(_iso_cs.evaluate(
+    _iso_cs.u_domain()[0] + 0.3 * (_iso_cs.u_domain()[1] - _iso_cs.u_domain()[0]), sum(_iso_cs.v_domain()) / 2)))
+check("detach at isoparm: one cut on a closed direction opens it there (one piece, its seam at the cut)",
+      _n_ok and len(_one) == 1 and _e < 1e-12 and _ed < 1e-12, f"err {_e:.1e} seam {_ed:.1e}")
+_iso_n0 = len(bpy.data.objects)
+r = bpy.ops.nproto.detach_iso(target=_iso_cyl.name, cuts_u="[0.0, 0.5]")
+_made = list(ctx.selected_objects)
+check("detach at isoparm (no history): a cylinder cut at the seam and at 0.5 is two untrimmed halves, "
+      "the first one in the source object",
+      r == {'FINISHED'} and len(_made) == 2 and _iso_cyl in _made and all(store.is_natural(o) for o in _made)
+      and len(bpy.data.objects) == _iso_n0 + 1
+      and abs(sum(store.get_brep(o).area(1e-7) for o in _made) - store.to_brep(_iso_cs).area(1e-7)) < 1e-5)
+
+# trimmed surfaces: the trim clipped to each piece, the cut lines exact isoparms of the piece's surface
+from blender_nurbs.kernel import trimext as _te
+def _iso_trim_err(src_brep, out, cu, cv):
+    """(area error, largest distance of a cut edge off the source / off its cut line (fraction))."""
+    s_ = src_brep.faces()[0].surface()
+    (a0, a1), (b0, b1) = s_.u_domain(), s_.v_domain()
+    tot, off = 0.0, 0.0
+    for g, _ in out:
+        if g is None:
+            continue
+        pb = g if isinstance(g, _kl().Brep) else store.to_brep(_iso.copy(g))
+        tot += pb.area(1e-7)
+        for e in pb.edges():
+            t0, t1 = e.parameter_range()
+            P = [np.array(e.point_at(float(t))) for t in np.linspace(t0, t1, 7)]
+            F = [((u - a0) / (a1 - a0), (v - b0) / (b1 - b0)) for u, v in (_te._uv(_kl(), s_, p) for p in P)]
+            d = max(min([_iso._circ(fu - x) for x in cu] + [_iso._circ(fv - x) for x in cv] + [1.0]) for fu, fv in F)
+            if d < 1e-6:               # a cut edge: on the source, on its line
+                off = max(off, d, max(np.linalg.norm(np.array(s_.evaluate(*_te._uv(_kl(), s_, p))) - p) for p in P))
+    return abs(tot - src_brep.area(1e-7)), off
+def _iso_kinds(out):
+    return "".join("-" if g is None else ("T" if isinstance(g, _kl().Brep) else "N") for g, _ in out)
+def _iso_holed_plane():
+    bpy.ops.nproto.add_primitive(kind="PLANE"); o = ctx.active_object
+    bpy.ops.curve.primitive_bezier_circle_add(radius=0.3, location=(0.2, 0.1, 1)); c_ = ctx.active_object
+    bpy.ops.nproto.trim(target=o.name, cutters=ins((c_, "S0")), ref_point=(0.2, 0.1, 0), normal=(0, 0, 1),
+                        view_dir=(0, 0, -1), action="DELETE")
+    bpy.data.objects.remove(c_)
+    return o
+_iso_hp = _iso_holed_plane()
+_out = _iso.detach_trimmed(store.get_brep(_iso_hp), [0.6, 0.9], [])
+_ae, _off = _iso_trim_err(store.get_brep(_iso_hp), _out, [0.6, 0.9], [])
+check("detach at isoparm (trimmed): a plane with a hole cut through the hole and beside it -- two trimmed "
+      "pieces and one the trim does not cut into, untrimmed", _iso_kinds(_out) == "TTN" and _ae < 1e-5 and _off < 1e-9,
+      f"{_iso_kinds(_out)} area err {_ae:.1e} cut edges off {_off:.1e}")
+_iso_hs, _iso_hf = store.get_surfaces(_iso_hp)[0], store.get_brep(_iso_hp).faces()[0]
+check("detach at isoparm (trimmed): the picked isoparm is drawn where it runs on the face (broken by the hole)",
+      len(_iso.iso_runs(_iso_hs, _iso_hf, "U", 0.6)) == 2 and len(_iso.iso_runs(_iso_hs, _iso_hf, "U", 0.2)) == 1)
+bpy.ops.nproto.add_primitive(kind="DISK"); _iso_disk = ctx.active_object
+_out = _iso.detach_trimmed(store.get_brep(_iso_disk), [0.5], [0.5])
+_ae, _off = _iso_trim_err(store.get_brep(_iso_disk), _out, [0.5], [0.5])
+check("detach at isoparm (trimmed): a disk cut at u 0.5 and v 0.5 is four exact quarters",
+      _iso_kinds(_out) == "TTTT" and _ae < 1e-6 and _off < 1e-9
+      and all(abs(g.area(1e-7) - math.pi / 4) < 1e-5 for g, _ in _out), f"area err {_ae:.1e} off {_off:.1e}")
+bpy.ops.nproto.add_primitive(kind="PLANE"); _iso_star = ctx.active_object     # a five-pointed star trim
+_cu = bpy.data.curves.new("IsoStar", 'CURVE'); _cu.dimensions = '3D'
+_sp = _cu.splines.new('BEZIER'); _sp.bezier_points.add(9); _sp.use_cyclic_u = True
+for _k_, _bp in enumerate(_sp.bezier_points):
+    _r_, _a_ = (0.9 if _k_ % 2 == 0 else 0.35), 2 * math.pi * _k_ / 10
+    _bp.co = (_r_ * math.cos(_a_), _r_ * math.sin(_a_), 1.0); _bp.handle_left_type = _bp.handle_right_type = 'AUTO'
+_st = bpy.data.objects.new("IsoStar", _cu); ctx.collection.objects.link(_st)
+bpy.ops.nproto.trim(target=_iso_star.name, cutters=ins((_st, "S0")), ref_point=(0, 0, 0), normal=(0, 0, 1),
+                    view_dir=(0, 0, -1), action="KEEP")
+_ss = store.get_surfaces(_iso_star)[0]
+_fv = (_te._uv(_kl(), _ss, (0.0, 0.45, 0.0))[1] - _ss.v_domain()[0]) / (_ss.v_domain()[1] - _ss.v_domain()[0])
+_out = _iso.detach_trimmed(store.get_brep(_iso_star), [], [_fv])      # the line y = 0.45: above two inner corners
+_ae, _off = _iso_trim_err(store.get_brep(_iso_star), _out, [], [_fv])
+check("detach at isoparm (trimmed): a star cut across two of its points -- the piece beyond the cut is the two "
+      "point tips (two faces)", _iso_kinds(_out) == "TT" and _out[1][0].face_count() == 2 and _ae < 1e-5 and _off < 1e-9,
+      f"faces {[g.face_count() for g, _ in _out]} area err {_ae:.1e} off {_off:.1e}")
+_vp = nurbs("IsoVaseProf", [(1.2, 0, 0), (1.5, 0, 0.8), (0.8, 0, 1.8), (1.1, 0, 3.0)])
+_vp.location = (90, 0, 0); ctx.view_layer.update()
+bpy.ops.nproto.revolve(inputs=ins((_vp, "S0")), axis="Z", pivot="OBJECT", angle=360); _iso_vase = ctx.active_object
+bpy.ops.curve.primitive_nurbs_circle_add(radius=0.4, location=(90, 0, 1.5), rotation=(math.pi / 2, 0, 0))
+_vc = ctx.active_object
+bpy.ops.nproto.trim(target=_iso_vase.name, cutters=ins((_vc, "S0")), ref_point=(90, 1.25, 1.5), normal=(0, 1, 0),
+                    view_dir=(0, -1, 0), action="DELETE")
+_vb = store.get_brep(_iso_vase)
+_res = []
+for _cu_, _cv_ in (([0.25], []), ([0.1, 0.6], []), ([0.3, 0.8], [0.45]), ([0.0], [0.5])):
+    _out = _iso.detach_trimmed(_vb, _cu_, _cv_)
+    _ae, _off = _iso_trim_err(_vb, _out, _cu_, _cv_)
+    _res.append((_iso_kinds(_out), _ae < 1e-5 and _off < 1e-9))
+check("detach at isoparm (trimmed): a closed revolve with holes -- one cut through the holes moves the seam "
+      "(one piece), two cuts, cuts both ways, a cut at the seam", [k for k, _ in _res] == ["T", "TT", "TTTT", "TT"]
+      and all(g for _, g in _res), str(_res))
+bpy.ops.nproto.add_primitive(kind="CYLINDER"); _iso_cy = ctx.active_object
+_iso_cy.location = (95, 0, 0); ctx.view_layer.update()
+bpy.ops.curve.primitive_bezier_circle_add(radius=0.3, location=(95, -3, 0), rotation=(math.pi / 2, 0, 0))
+_c2 = ctx.active_object
+bpy.ops.nproto.trim(target=_iso_cy.name, cutters=ins((_c2, "S0")), ref_point=(95, -1, 0), normal=(0, -1, 0),
+                    view_dir=(0, 1, 0), action="DELETE")
+_A = store.get_brep(_iso_cy).area(1e-7)
+r = bpy.ops.nproto.detach_iso(target=_iso_cy.name, cuts_u="[0.25, 0.75]")
+_made = list(ctx.selected_objects)
+_ok = r == {'FINISHED'} and len(_made) == 2 and not any(store.is_natural(o) for o in _made)
+_ok = _ok and abs(sum(store.get_brep(o).area(1e-7) for o in _made) - _A) < 1e-5
+for o in _made:
+    bpy.ops.object.select_all(action='DESELECT'); o.select_set(True); ctx.view_layer.objects.active = o
+    bpy.ops.nproto.untrim()
+check("detach at isoparm (no history): a tube with a hole across its seam cut in two; Untrim gives each half "
+      "its own half tube", _ok and all(store.is_natural(o) and abs(store.get_brep(o).area(1e-7) - 2 * math.pi) < 1e-4
+                                    for o in _made),
+      ", ".join(f"{store.get_brep(o).area(1e-7):.5f}" for o in _made))
+bpy.ops.nproto.add_primitive(kind="BOX"); _iso_box = ctx.active_object
+r = bpy.ops.nproto.detach_iso(target=_iso_box.name, cuts_u="[0.5]")
+check("detach at isoparm refuses a joined surface (several faces)", r == {'CANCELLED'})
+
+ctx.scene.nproto_settings.construction_history = True
+bpy.ops.nproto.add_primitive(kind="PLANE"); _iso_pl = ctx.active_object
+r = bpy.ops.nproto.detach_iso(target=_iso_pl.name, cuts_u="[0.5]", cuts_v="[0.25]")
+_made = sorted(ctx.selected_objects, key=lambda o: o.name)
+_hist_ok = all(features.history(o) is not None and features.history(o)["op"] == "iso_detach" for o in _made)
+check("detach at isoparm (history): 4 pieces follow the source, which is kept hidden",
+      r == {'FINISHED'} and len(_made) == 4 and _hist_ok and _iso_pl.hide_get() and _iso_pl not in _made)
+_s0 = store.get_surfaces(_iso_pl)[0]
+_d = ext.surface_cvs(_s0)
+_P = np.array(_d["points"], float).reshape(_d["count_u"], _d["count_v"], 3)
+_P[..., 2] += 0.3 * np.sin(_P[..., 0] * 2.0)            # bend the source
+store.set_geometry(_iso_pl, ext.surface_from_cvs(_d["degree_u"], _d["degree_v"], [tuple(x) for x in _P.reshape(-1, 3)],
+                                                 list(_d["knots_u"]), list(_d["knots_v"]), None), ctx)
+for o in _made:
+    features.rebuild(o, ctx, force=True)
+_s1 = store.get_surfaces(_iso_pl)[0]
+_n_ok, _e = _iso_err(_s1, [store.get_surfaces(o)[0] for o in sorted(_made, key=lambda o: features.history(o)["params"]["piece"])],
+                     [0.5], [0.25])
+check("detach at isoparm (history): pieces rebuild exactly from the edited source", _n_ok and _e < 1e-12, f"err {_e:.1e}")
+_iso_hp2 = _iso_holed_plane()
+_A = store.get_brep(_iso_hp2).area(1e-7)
+r = bpy.ops.nproto.detach_iso(target=_iso_hp2.name, cuts_u="[0.6]", cuts_v="[0.55]")
+_made = sorted(ctx.selected_objects, key=lambda o: features.history(o)["params"]["piece"])
+_a0 = [store.get_brep(o).area(1e-7) for o in _made]
+for o in _made:
+    features.rebuild(o, ctx, force=True)
+_a1 = [store.get_brep(o).area(1e-7) for o in _made]
+_carrier = _iso.detach(store.get_surfaces(_iso_hp2)[0], [0.6], [0.55], clamp_all=True)[0]
+_ca = store.to_brep(_carrier).area(1e-7)
+o = _made[0]
+bpy.ops.object.select_all(action='DESELECT'); o.select_set(True); ctx.view_layer.objects.active = o
+r2 = bpy.ops.nproto.untrim()
+check("detach at isoparm (history): a trimmed plane cut both ways is 4 trimmed pieces that rebuild the same; "
+      "Untrim on one gives its own quarter of the surface",
+      r == {'FINISHED'} and len(_made) == 4 and _iso_hp2.hide_get() and abs(sum(_a0) - _A) < 1e-5
+      and max(abs(x - y) for x, y in zip(_a0, _a1)) < 1e-9 and r2 == {'FINISHED'} and store.is_natural(o)
+      and abs(store.get_brep(o).area(1e-7) - _ca) < 1e-7, f"{_a0} -> {_a1}; untrim {store.get_brep(o).area(1e-7):.5f} vs {_ca:.5f}")
+ctx.scene.nproto_settings.construction_history = _hist0
 
 print("ALL OK" if ok else "SOME FAILED")

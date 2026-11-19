@@ -11,6 +11,7 @@ _handle = None
 _handle_px = None
 _label_cache = {}
 pick_overlay = {"hover": None, "picked": [], "colors": [],   # filled by the modal pick operator
+                "refused": None,        # the edge under the mouse the tool cannot take (red): Extend
                 # Trim's regions before it commits: [(world tris (n,3,3), outline (m,2,3), keep?)]
                 "regions": [], "region_hover": None,
                 "region_pal": None,     # (colour of keep, of not): Split uses its own pair
@@ -41,6 +42,7 @@ COL_GHOST = (0.2, 0.85, 1.0, 0.9)
 # ghost; an object hidden with H while active is not one
 ghost = {"name": None}
 COL_HOVER = (1.0, 0.95, 0.2, 1.0)
+COL_REFUSED = (1.0, 0.25, 0.2, 0.9)   # an edge the running tool cannot take
 # the curve a drawing tool is making: as thin as the curvature comb outline
 SKETCH_W = 1.5
 COL_PICKS = [(0.1, 0.8, 1.0, 1.0), (1.0, 0.25, 0.6, 1.0), (0.3, 1.0, 0.4, 1.0), (1.0, 0.75, 0.1, 1.0)]  # last: Loft rails
@@ -420,6 +422,11 @@ def _draw():
     from . import diagnostics
     if v is not None:
         diagnostics.draw_zebra(ctx)          # under the edges
+        from . import scanfit
+        try:
+            scanfit.draw_scan_dev(ctx)
+        except Exception as exc:
+            print("NURBS scan deviation:", exc)
     _draw_merge_devmap(ctx)
     chord = store.tess_settings(ctx)[0]
     curves = []
@@ -556,8 +563,11 @@ def _draw():
         cols = [c % len(COL_PICKS) for c in cols]     # Loft: one colour per side
     for pl, c in zip(pick_overlay["picked"], cols):
         _draw_lines(_lines_from_polylines([pl], _IDENT), COL_PICKS[c], 4.0)
-    if pick_overlay["hover"]:
-        _draw_lines(_lines_from_polylines([pick_overlay["hover"]], _IDENT), COL_HOVER, 4.0)
+    hov = pick_overlay["hover"]
+    if hov:                 # one polyline, or several (an isoparm broken by a trim)
+        _draw_lines(_lines_from_polylines(hov if isinstance(hov[0], list) else [hov], _IDENT), COL_HOVER, 4.0)
+    if pick_overlay.get("refused"):
+        _draw_lines(_lines_from_polylines([pick_overlay["refused"]], _IDENT), COL_REFUSED, 3.0)
     pv = pick_overlay.get("preview")
     if pv:
         _draw_preview(pv)

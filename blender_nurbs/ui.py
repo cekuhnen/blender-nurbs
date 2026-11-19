@@ -118,7 +118,7 @@ def _env_source_items(self, context):
 def _one_map(settings, which):
     """Zebra, Draft Angle and Curvature Map are exclusive (one surface overlay)."""
     if getattr(settings, which):
-        for other in ("show_zebra", "show_draft", "show_curvature", "show_matcap"):
+        for other in ("show_zebra", "show_draft", "show_curvature", "show_matcap", "show_scan_dev"):
             if other != which and getattr(settings, other):
                 setattr(settings, other, False)
     _redraw_views(bpy.context)
@@ -184,6 +184,10 @@ class NprotoSettings(bpy.types.PropertyGroup):
         description="Live SubD to BREP bodies are built again once their cage has been still this long (seconds), "
                     "not while it is being dragged: dragging stays smooth, the body follows when you stop. "
                     "0: right away, as other features")
+    scan_object: PointerProperty(
+        name="Scan", type=bpy.types.Object, poll=lambda s, o: o.type == 'MESH' and "nproto_brep" not in o,
+        update=lambda s, c: _redraw_views(c),
+        description="The scan mesh that Scan Deviation measures against and Fit Cage to Scan fits to")
     show_tree: BoolProperty(name="Construction Tree", default=True,
                             description="Show what the active object is built from and what uses it")
     chord_tolerance: FloatProperty(
@@ -388,6 +392,17 @@ class NprotoView(bpy.types.PropertyGroup):
                              description="Points per iso-curve")
     iso_scale: FloatProperty(name="Scale", default=1.0, min=0.0, soft_max=10.0, update=lambda s, c: _redraw_views(c),
                              description="1: the longest combs are about a fifth of the object's size")
+    show_scan_dev: BoolProperty(name="Scan Deviation", default=False, update=lambda s, c: _one_map(s, "show_scan_dev"),
+                                description="Colour NURBS surfaces and SubD models by their distance from a scan "
+                                            "(red outside, blue inside, grey where there is no scan under them)")
+    scan_dev_range: FloatProperty(update=_rd, name="Range", default=0.002, min=1e-6, soft_max=0.05, precision=4,
+                                  subtype='DISTANCE', unit='LENGTH',
+                                  description="Distance shown as full red (outside the scan) and full blue (inside)")
+    scan_dev_center: FloatProperty(update=_rd, name="Centre", default=0.0, soft_min=-0.02, soft_max=0.02, precision=4,
+                                   subtype='DISTANCE', unit='LENGTH',
+                                   description="Distance shown green: 0 on the scan, or a housing's clearance")
+    scan_dev_bands: FloatProperty(update=_rd, name="Contours", default=10.0, min=0.0, max=50.0,
+                                  description="Contour lines across the range (0 = off)")
     show_comb: BoolProperty(name="Curvature Comb", default=False, description="Curvature comb on curves", update=lambda s, c: _redraw_views(c))
 
 
@@ -425,6 +440,8 @@ def draw_analyze(col, context):
     """Zebra / Draft / Curvature / Comb / Matcap toggles and their settings
     (sidebar and the viewport header's Analyze popover)."""
     v = context.window_manager.nproto_view
+    col.operator("nproto.measure", icon='DRIVER_DISTANCE')
+    col.separator(factor=0.5)
     row = col.row(align=True)
     row.prop(v, "show_zebra", toggle=True, icon='MOD_WAVE')
     row.prop(v, "show_draft", toggle=True, icon='MOD_SIMPLEDEFORM')
@@ -434,6 +451,10 @@ def draw_analyze(col, context):
     row = col.row(align=True)
     row.prop(v, "show_iso_combs", toggle=True, icon='MOD_LATTICE')
     row.prop(v, "show_matcap", toggle=True, icon='MATSPHERE')
+    col.prop(v, "show_scan_dev", toggle=True, icon='MOD_SHRINKWRAP')
+    if v.show_scan_dev:
+        from . import scanfit
+        scanfit.draw_panel(col, context)
     if v.show_iso_combs:
         row = col.row(align=True)
         row.prop(v, "iso_along_u", toggle=True)
@@ -493,6 +514,8 @@ def draw_analyze(col, context):
         col.prop(v, "env_coat", toggle=True, icon='SHADING_RENDERED')
         if v.env_coat:
             _draw_env(col, v, material=False)
+    if v.show_scan_dev and not (v.show_zebra or v.show_draft or v.show_curvature or v.show_matcap):
+        col.prop(v, "zebra_opacity", slider=True)
     if v.show_zebra or v.show_draft or v.show_curvature or v.show_matcap:
         col.row(align=True).prop(v, "analysis_quality", expand=True)
         row = col.row(align=True)
@@ -500,7 +523,8 @@ def draw_analyze(col, context):
         sp = context.space_data
         if sp is not None and sp.type == 'VIEW_3D':
             row.prop(sp.shading, "show_xray", text="See-Through", toggle=True, icon='XRAY')
-    if v.show_zebra or v.show_comb or v.show_iso_combs or v.show_draft or v.show_curvature or v.show_matcap:
+    if (v.show_zebra or v.show_comb or v.show_iso_combs or v.show_draft or v.show_curvature or v.show_matcap
+            or v.show_scan_dev):
         col.prop(v, "diag_selected_only")
 
 
@@ -541,7 +565,8 @@ def header_analyze(self, context):
             warn.alert = True
             warn.operator("nproto.fix_clip_start", text="", icon='ERROR')
     on = [n for n, k in (("Zebra", "show_zebra"), ("Draft", "show_draft"), ("Curvature", "show_curvature"),
-                         ("Matcap", "show_matcap"), ("Comb", "show_comb"), ("Surface Combs", "show_iso_combs"))
+                         ("Matcap", "show_matcap"), ("Comb", "show_comb"), ("Surface Combs", "show_iso_combs"),
+                         ("Scan", "show_scan_dev"))
           if getattr(v, k)]
     if v.env_coat and coat_applies(v):
         on.append("Coat")

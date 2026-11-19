@@ -7,7 +7,10 @@ asking for the values in a dialog before anything can be seen.
                         only moves (a handle under it lights up)
     press on the input  and pull (when the tool was started by clicking the
                         curve): the arrow comes out of the curve under the
-                        cursor, in one motion
+                        cursor, in one motion. A press on the input later in
+                        the stage does the same (it never applies): the
+                        arrow stands where it was pressed and comes out
+                        (tools that say where their input is: drag_on_input)
     type                an exact value for the active field (unit letters
                         work: 25mm, 2ft); dragging a handle makes its field
                         the active one
@@ -20,7 +23,11 @@ asking for the values in a dialog before anything can be seen.
 
 The value starts at the last one used, unless that would be tiny or run off
 the screen at this zoom: then a round length a quarter of the view is used.
-So pick + Enter is as quick as before.
+So pick + Enter is as quick as before. A tool with start_value (Extend,
+Extrude, Offset Curve, Thicken, Surface Fillet: 0) starts there instead:
+nothing changes until the arrow is dragged or a value typed, and L brings
+back the value used last time (the hint panel shows it: a run of the same
+fillet is pick, L, Enter).
 The add-on preference Value Input = Dialog turns the stage off: every tool
 then asks in its dialog, as before.
 A tool mixes ValueDrag in before AskValue (whose dialog stays the fallback for
@@ -47,6 +54,7 @@ PULL_PX = 6.0           # a press on the input becomes a pull once the mouse mov
 HANDLE_PX = 16.0        # a handle can be grabbed this close to it
 SHAFT_PX = 7.0          # ... or this close to the arrow's shaft
 BASE_PX = 40.0          # the arrow stands where the curve was clicked, if it was within this
+INPUT_PX = 14.0         # a press this close to the input pulls the arrow out of it again (not apply)
 MOUSE = [("MOUSE_LMB_DRAG", "Drag a handle"), ("MOUSE_LMB", "Apply"), ("EVENT_ESC", "Cancel")]
 
 
@@ -104,6 +112,24 @@ def _seg_dist(p, a, b):
     return (a + ab * t - p).length
 
 
+LAST = {}       # bl_idname -> {field: value}: what each value tool last made (this session), for L
+
+
+def _remembering(execute):
+    """execute, also noting the lengths it made with (the stage, Adjust Last Operation, a script)."""
+    def wrapped(self, context):
+        r = execute(self, context)
+        if r and 'FINISHED' in r:
+            try:
+                LAST[self.bl_idname] = {f: float(getattr(self, f)) for f in self._length_fields()}
+            except Exception:
+                pass
+        return r
+    wrapped.__doc__ = execute.__doc__
+    wrapped._remembers = True
+    return wrapped
+
+
 class ValueDrag:
     """Mixin for AskValue commands: the live value stage (see the module doc).
 
@@ -135,6 +161,14 @@ class ValueDrag:
     ask_dialog = True       # False: without the stage (Value Input = Dialog) run at once, as the tool always did
     fit_view = "both"       # a start length that is off-screen at this zoom: "both" sized to the view,
                             # "shrink" only made smaller (a radius the part allows), "none" kept
+    start_value = None      # a value the first field always starts at (Extend: 0, the arrow on the
+                            # edge until it is dragged); None: the last value used, fitted to the view
+
+    def __init_subclass__(cls, **kw):
+        super().__init_subclass__(**kw)
+        ex = getattr(cls, "execute", None)       # its own, or one it shares (Extrude: _CurveTool's)
+        if ex is not None and not getattr(ex, "_remembers", False):
+            cls.execute = _remembering(ex)
 
     def invoke(self, context, event):
         self._start_event = (event.mouse_x, event.mouse_y, event.type, event.value)
@@ -170,13 +204,39 @@ class ValueDrag:
         self._pull = (se is not None and se[2] == 'LEFTMOUSE' and se[3] == 'PRESS'
                       and mouse is not None and getattr(self, "_base_at_mouse", False))
         self._pull_from = Vector((se[0], se[1])) if self._pull else None
-        try:
-            self._fit_start(context)
-        except Exception as exc:
-            print("NURBS value preview:", exc)
+        self._last = {}
+        if self.start_value is not None:
+            # start from nothing; what the tool last made (Adjust Last Operation
+            # included) stays one key away: L
+            made = LAST.get(self.bl_idname, {})
+            for f in self._length_fields():
+                if abs(made.get(f, 0.0)) > 1e-9:
+                    self._last[f] = made[f]
+                setattr(self, f, max(self.start_value, self.properties.bl_rna.properties[f].hard_min))
+        else:
+            try:
+                self._fit_start(context)
+            except Exception as exc:
+                print("NURBS value preview:", exc)
         context.window_manager.modal_handler_add(self)
         self._drag_refresh(context)
         return {'RUNNING_MODAL'}
+
+    def _length_fields(self):
+        return [f for f in self.drag_fields if not self._is_angle(f)]
+
+    def _last_text(self, context):
+        """'2 mm' (or '2 mm / 1 mm' for two fields) of the value L brings back; '' if none."""
+        if not getattr(self, "_last", None):
+            return ""
+        return " / ".join(fmt_length(context, self._last[f]) for f in self._length_fields() if f in self._last)
+
+    def _reuse_last(self, context):
+        for f, v in self._last.items():
+            setattr(self, f, v)
+        self._typed = ""
+        self._edited = True
+        self._exact = True          # an exact value, as if typed: no on-screen length check
 
     def _fallback(self, context):
         return super().ask(context) if self.ask_dialog else self.execute(context)
@@ -330,6 +390,7 @@ class ValueDrag:
             return False
         self._grab = {"i": i, "t0": t, "p0": 0.0 if absolute else h["param"], "fine": False,
                       "abs": absolute}
+        self._exact = False
         if absolute:
             self._grab["t0"] = 0.0
         self._field = self.drag_fields.index(h["field"])
@@ -372,7 +433,7 @@ class ValueDrag:
         """A length dragged to (about) nothing -- the arrow back on the input:
         under 3 px on screen. A typed value is taken as it is."""
         name = self.drag_fields[0]
-        if self._typed or self._is_angle(name):
+        if self._typed or getattr(self, "_exact", False) or self._is_angle(name):
             return ""
         h = self._main_handle()
         if h is None or h.get("pick") is not None:
@@ -398,7 +459,8 @@ class ValueDrag:
             self._apply_typed(context)
         msg = self._too_short(context) or self.drag_check()
         if msg:                         # e.g. a zero distance: say so and keep going
-            self._msg = msg
+            last = self._last_text(context)
+            self._msg = msg + (f" · L: reuse {last}" if last else "")
             self._drag_refresh(context)
             return {'RUNNING_MODAL'}
         self._drag_end(context)
@@ -449,11 +511,18 @@ class ValueDrag:
         if event.value != 'PRESS':
             return {'RUNNING_MODAL'}
         if et == 'LEFTMOUSE':
-            i = self._handle_at(context, self._mouse(context, event))
-            if i is not None and self._start_grab(context, i, self._mouse(context, event)):
+            m = self._mouse(context, event)
+            i = self._handle_at(context, m)
+            if i is not None and self._start_grab(context, i, m):
                 self._drag_refresh(context)
                 return {'RUNNING_MODAL'}
-            return self._apply(context)   # a click away from the handles applies
+            if self._restand(context, m):
+                # a press on the input (the picked edge, the curve): the arrow
+                # stands there and comes out with the mouse -- it applies nothing
+                self._pull, self._pull_from = True, Vector((event.mouse_x, event.mouse_y))
+                self._drag_refresh(context)
+                return {'RUNNING_MODAL'}
+            return self._apply(context)   # a click away from the handles and the input applies
         if et in {'RET', 'NUMPAD_ENTER', 'SPACE'}:
             return self._apply(context)
         if et in {'ESC', 'RIGHTMOUSE'}:
@@ -476,6 +545,10 @@ class ValueDrag:
             return {'RUNNING_MODAL'}
         ch = getattr(event, "unicode", "") or NUMPAD_CHARS.get(et, "")
         if ch and not event.ctrl and not event.oskey:
+            if not self._typed and ch.lower() == "l" and getattr(self, "_last", None):
+                self._reuse_last(context)        # the value used last time (a run of the same fillet)
+                self._drag_refresh(context)
+                return {'RUNNING_MODAL'}
             if self._typed or ch in NUMBER_START:
                 self._typed += ch        # once typing, letters are units (mm, ft)
                 self._apply_typed(context)
@@ -485,6 +558,38 @@ class ValueDrag:
                 self._drag_refresh(context)
                 return {'RUNNING_MODAL'}
         return {'RUNNING_MODAL'}
+
+    def drag_on_input(self, context, mouse):
+        """Is region point mouse on the tool's input? Tools whose arrow stands
+        where the input was clicked say so: a press there then pulls the arrow
+        out again instead of applying (the input looks like the thing to drag)."""
+        return False
+
+    def _restand(self, context, m):
+        try:
+            if not self.drag_on_input(context, m):
+                return False
+            return bool(self.drag_setup(context, m))      # the arrow's foot moves to the press
+        except Exception as exc:
+            print("NURBS value preview:", exc)
+            return False
+
+    def _near_screen(self, context, pts, m, px=None):
+        """Is region point m within px (INPUT_PX) of the polyline of world points pts on screen?"""
+        px = INPUT_PX if px is None else px
+        prev = None
+        for p in pts:
+            q = self._screen(context, p)
+            if q is not None and prev is not None:
+                seg = q - prev
+                L = seg.length_squared
+                t = 0.0 if L == 0 else max(0.0, min(1.0, (m - prev).dot(seg) / L))
+                if (prev + seg * t - m).length <= px:
+                    return True
+            elif q is not None and (q - m).length <= px:
+                return True
+            prev = q
+        return False
 
     def _drag_refresh(self, context):
         name = self._field_name()
@@ -522,6 +627,9 @@ class ValueDrag:
                 ("Value", [hints.key("0-9", "type it", on=True if self._typed else None),
                            hints.key("Ctrl", "snap to grid"), hints.key("Shift", "precise"),
                            hints.key("Backspace", "erase")])]
+        last = self._last_text(context)
+        if last:
+            rows[1][1].append(hints.key("L", f"reuse {last}"))
         if len(self.drag_fields) > 1:
             rows[1][1].append(hints.cycle("Tab", [self._label(f) for f in self.drag_fields], self._label(name)))
         rows += list(self.drag_rows())

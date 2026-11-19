@@ -701,6 +701,7 @@ class NPROTO_OT_offset_curve(ValueDrag, AskValue, bpy.types.Operator):
     both_sides: BoolProperty(name="Both Sides", default=False, description="Offset to both sides")
     tolerance: FloatProperty(name="Tolerance", default=1e-4, min=1e-7, soft_max=0.01, precision=6, unit='LENGTH',
                              description="Largest deviation of a fitted free-form offset from the exact one")
+    start_value = 0.0           # the arrow on the curve: no offset until it is dragged (L: the last distance)
     names: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
 
     def _objs(self, context):
@@ -729,6 +730,7 @@ class NPROTO_OT_offset_curve(ValueDrag, AskValue, bpy.types.Operator):
         self._hint = _hint(context)
         # the arrow stands where the curve is nearest the mouse (a shortcut in the view), else halfway along
         self._anchor = P[len(P) // 2]
+        self._oc_pts = [curvetrim.sample_spans(sp, 16)[0] for _, pcs in self._oc for sp in pcs]
         self._base_at_mouse = False
         if mouse is not None:
             best = None
@@ -740,6 +742,9 @@ class NPROTO_OT_offset_curve(ValueDrag, AskValue, bpy.types.Operator):
                 self._anchor, self._base_at_mouse = best[1], True
         self._cache = None
         return True
+
+    def drag_on_input(self, context, mouse):
+        return any(self._near_screen(context, P, mouse) for P in self._oc_pts)
 
     def _groups(self):
         pieces = [pc for _, pcs in self._oc for pc in pcs]
