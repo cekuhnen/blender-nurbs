@@ -563,8 +563,9 @@ def _draw():
         cols = [c % len(COL_PICKS) for c in cols]     # Loft: one colour per side
     for pl, c in zip(pick_overlay["picked"], cols):
         _draw_lines(_lines_from_polylines([pl], _IDENT), COL_PICKS[c], 4.0)
-    if pick_overlay["hover"]:
-        _draw_lines(_lines_from_polylines([pick_overlay["hover"]], _IDENT), COL_HOVER, 4.0)
+    hov = pick_overlay["hover"]
+    if hov:                 # one polyline, or several (an isoparm broken by a trim)
+        _draw_lines(_lines_from_polylines(hov if isinstance(hov[0], list) else [hov], _IDENT), COL_HOVER, 4.0)
     if pick_overlay.get("refused"):
         _draw_lines(_lines_from_polylines([pick_overlay["refused"]], _IDENT), COL_REFUSED, 3.0)
     pv = pick_overlay.get("preview")

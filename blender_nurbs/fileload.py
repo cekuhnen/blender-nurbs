@@ -16,7 +16,7 @@ import bpy
 from bpy.app.handlers import persistent
 
 from . import (anamesh, brep_mesh, contlabels, cvnudge, cvs, curvejoin, curveoffset, diagnostics, draw,
-               drawtools, extend, feature_ui, features, hints, history, isocombs, loft_rails, merge, ops, patch, refit,
+               drawtools, extend, feature_ui, features, hints, history, isocombs, isodetach, loft_rails, merge, ops, patch, refit,
                scanfit, scanpatch, sections, snapping, square, steps, store, subd_brep, subsel, surfoffset, flange, network, railrevolve, measure, sweeps,
                workplanes)
 
@@ -45,7 +45,7 @@ def _emptied():
         diagnostics._sag_cache, diagnostics._curv_batches, diagnostics._value_batches,
         snapping._CENTERS, snapping._FACES, snapping._SURF_FLAT, snapping.MESH_CACHE,
         scanfit._SCANS, scanfit._SAMPLERS, scanfit.DEV_CACHE, scanfit.DEV_BATCHES, scanfit.STATS,
-        extend._EDGE_CACHE,
+        extend._EDGE_CACHE, isodetach._trim_cache,
         subsel._valid, subsel._ftris, subsel._epts, subsel._stepf, subsel._mtris, subsel._cpoly,
     )
 

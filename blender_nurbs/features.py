@@ -1797,7 +1797,7 @@ def history(obj):
     return h
 
 
-SPLIT_OPS = {"split_region"}     # features whose result is a piece trimmed out of their first input
+SPLIT_OPS = {"split_region", "iso_detach"}     # features whose result is a piece trimmed out of their first input
 
 
 def untrimmed_base(obj):
@@ -1808,6 +1808,10 @@ def untrimmed_base(obj):
     if h is None or h["op"] not in SPLIT_OPS or not h["inputs"]:
         return None
     src = h["inputs"][0][0]
+    if h["op"] == "iso_detach":          # a detached piece: its own carrier, not the whole source
+        from .isodetach import piece_carrier_text
+        text = piece_carrier_text(src, h["params"])
+        return None if text is None else (placed(obj, ("brep_text", text))[1], True)
     text = src.get(store.PROP_UNTRIM)
     if text:
         nat = bool(src.get(store.PROP_UNTRIM + "_natural", 0))
