@@ -100,6 +100,10 @@ GROUPS = (
         ("Fillets", (
             (_t("nproto.fillet", "Surface Fillet", 'MOD_BEVEL'), _t("nproto.edge_fillet", icon='MOD_BEVEL')),
         )),
+        ("Pattern", (
+            (("nproto.pattern", "Linear Pattern", 'MOD_ARRAY', {"mode": "LINEAR"}),
+             ("nproto.pattern", "Circular Pattern", 'DRIVER_ROTATIONAL_DIFFERENCE', {"mode": "CIRCULAR"})),
+        )),
         ("Boolean (solids)", (
             (("nproto.boolean", "Union", 'SELECT_EXTEND', {"operation": "UNION"}),
              ("nproto.boolean", "Difference", 'SELECT_SUBTRACT', {"operation": "DIFFERENCE"}),

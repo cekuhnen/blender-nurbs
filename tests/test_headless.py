@@ -5095,11 +5095,12 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cy
               "patch_auto_corners", "patch_corner", "patch_remove_guide", "rebuild", "rebuild_waiting", "remove_step",
               "restore_inputs", "sync_feature", "tab_edit", "continuity", "continuity_clear", "section_add", "section_orient",
               "section_targets", "section_curves", "section_remove", "subsel_picker", "bake_feature", "delete_feature",
-              "curve_degree", "fix_clip_start", "delete_faces", "move_pivot", "cv_nudge",
+              "curve_degree", "fix_clip_start", "delete_faces", "move_pivot", "cv_nudge", "pattern_select",
               "square"}     # Square: merged into Patch (Quad Sided); kept for older files, off the menus
 _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto)
               if n not in _not_tools and not n.startswith("workplane_")}   # the Work Planes panel's own
-_tool_ops = [o_ for o_ in _in_panels if o_ not in ("nproto.add_primitive", "nproto.boolean")] + ["nproto.boolean"]
+_tool_ops = [o_ for o_ in _in_panels if o_ not in ("nproto.add_primitive", "nproto.boolean", "nproto.pattern")] + \
+    ["nproto.boolean", "nproto.pattern"]           # (one button per operation / mode)
 _bool_ops = sorted(e["props"].get("operation") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r
                    if e.get("op") == "nproto.boolean")
 _kinds = [e["props"].get("kind") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r

@@ -455,6 +455,31 @@ history. Trimmed and multi-face objects can be picked by their real B-rep edges
   parents, not the runtime `matrix_world`. That value can be stale right after the
   undo the F9 panel does on every change.
 
+## Pattern (Linear / Circular)
+
+**Linear Pattern** and **Circular Pattern** (Surface Edit panel; they work on curves too) copy the selected NURBS objects and curves in a row, a grid or around an axis. Each copy is a NURBS object (or curve) of its own carrying the exact geometry, so it exports to STEP, shows its CV net and can be picked, trimmed and joined like any other. Blender's **Array** modifier copies only the display mesh, which has no B-rep behind it, so use it only for plain meshes. A copy is the source's B-rep under another matrix: it takes the source's mesh as is, so making 24 copies costs no extra tessellation (only when the source changes is each copy rebuilt).
+
+The copies show as a preview with a handle, the way Extrude does:
+
+| Key | Linear | Circular |
+|---|---|---|
+| drag the arrow | to the last copy (the spacing follows) | around the axis: the angle the copies spread over |
+| type a number | spacing (or length, see **E**) | angle |
+| **Up / Down** | one copy more / fewer | same |
+| **N** | type the count, Enter to finish typing | same |
+| **Left / Right** | one row more / fewer (a grid, second direction **Row Direction**) | - |
+| **X Y Z** | direction along that world axis; again: the object's local one | the axis |
+| **A** | pick a line or edge for the direction (start to end) | pick a line, straight edge or **circle** (a hole's edge): a circle's axis runs through its centre |
+| **O** | - | axis through the 3D cursor / world origin / each object's origin |
+| **E** | the value is the spacing between copies, or the length from first to last (the copies stay put) | - |
+| **R** | - | rotate copies on / off (off: moved round the axis, kept upright) |
+| **F** | other way | other way |
+| **M** | switch to circular | switch to linear |
+
+Linear starts at spacing 0 (the copies sit on the original until the arrow is dragged; **L** brings back the last spacing). A full 360° spreads the copies evenly (none lands on the original); less than 360° puts copies at both ends. The 3D cursor is read when the pattern is made: moving it later does not move the copies.
+
+With construction history every copy follows its source: change the source's shape (CVs, its own history) or move it and the copies update. A copy moved by hand keeps its offset. The Feature panel of a copy shows the pattern with **Edit Pattern** (the same handles, starting from the pattern as it is: more or fewer copies, another spacing; existing copies are kept and moved, extra ones deleted) and **Select All**. **Bake** on a copy makes it a plain object that no longer follows. Without history the copies are plain objects from the start.
+
 ## Analyze
 
 | Tool | Inputs | Notes |

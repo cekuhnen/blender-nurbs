@@ -73,7 +73,7 @@ PRETTY = {"patch": "Patch", "dome": "Dome", "square": "Square", "sweep": "Sweep"
           "dup_edge": "Duplicate Edge", "project_curve": "Projected Curve", "intersect": "Intersection",
           "join": "Join", "split_region": "Split", "iso_detach": "Detach at Isoparm", "boolean": "Boolean", "boundary_fill": "Boundary Fill", "join_curves": "Join Curves", "offset_curve": "Offset Curve", "offset_on_surface": "Offset on Surface", "loft_rails": "Loft Rails", "surface_fillet": "Surface Fillet", "loft": "Loft", "blend_curve": "Blend Curve", "extrude": "Extrude", "revolve": "Revolve",
           "offset": "Offset", "thicken": "Thicken", "planar": "Planar", "perp_profile": "Profile",
-          "subd_to_brep": "SubD to BREP"}
+          "subd_to_brep": "SubD to BREP", "pattern": "Pattern"}
 
 
 def _on_change(self, context):
@@ -590,6 +590,9 @@ def draw_feature(layout, context):
                 pg = obj.nproto_feature
                 if op == "patch":
                     _draw_patch(box, obj, pg, h)
+                elif op == "pattern":
+                    from .pattern import draw_feature as _draw_pattern
+                    _draw_pattern(box, context, obj, h)
                 for name in FIELDS.get(op, []) if op != "patch" else []:
                     if op == "square" and name[0] in "ew" and name[1:].isdigit():
                         if name[0] == "e":
