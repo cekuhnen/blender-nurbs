@@ -832,6 +832,34 @@ def primitive_params(op, **values):
     return p
 
 
+# Exact / Smooth for the round shapes (as D in the drawing tools): a view of Degree,
+# so a script that passes degree= still works
+ROUND_KINDS = {"ARC", "CIRCLE", "ELLIPSE", "CYLINDER", "CONE", "SPHERE", "TORUS", "DISK"}
+ROUND_TYPE_ITEMS = [("EXACT", "Exact", "Rational: true circles, arcs, cylinders, spheres (degree 2)", 0),
+                    ("SMOOTH", "Smooth", "Not rational, degree 3 by default: even CVs to pull and blend "
+                                         "(a close approximation)", 1)]
+SMOOTH_DEGREE_ITEMS = [(str(d), str(d), f"Degree {d}", d) for d in range(1, 6)]
+
+
+def _get_round_type(self):
+    return 0 if self.degree == "0" else 1
+
+
+def _set_round_type(self, value):
+    if value == 0:
+        self.degree = "0"
+    elif self.degree == "0":
+        self.degree = "3"
+
+
+def _get_smooth_degree(self):
+    return 3 if self.degree == "0" else int(self.degree)
+
+
+def _set_smooth_degree(self, value):
+    self.degree = str(max(1, min(5, int(value))))
+
+
 class NPROTO_OT_add_primitive(bpy.types.Operator):
     """Add a NURBS curve or surface primitive at the 3D cursor (editable later in the Feature panel)"""
     bl_idname = "nproto.add_primitive"
@@ -855,6 +883,10 @@ class NPROTO_OT_add_primitive(bpy.types.Operator):
     sides: IntProperty(name="Sides", default=6, min=3, max=64)
     angle: FloatProperty(name="Angle", default=90.0, min=0.01, max=360.0)
     degree: EnumProperty(name="Degree", items=DEGREE_ITEMS, default="0")
+    ctype: EnumProperty(name="Type", items=ROUND_TYPE_ITEMS, get=_get_round_type, set=_set_round_type,
+                        options={'SKIP_SAVE'})
+    smooth_degree: EnumProperty(name="Degree", items=SMOOTH_DEGREE_ITEMS, get=_get_smooth_degree,
+                                set=_set_smooth_degree, options={'SKIP_SAVE'})
     spans_u: IntProperty(name="Spans U", default=8, min=1, max=64)
     spans_v: IntProperty(name="Spans V", default=4, min=1, max=64)
     pl_degree_u: IntProperty(name="Degree U", default=3, min=1, max=7, description="Degree along X")
@@ -921,8 +953,15 @@ class NPROTO_OT_add_primitive(bpy.types.Operator):
                 if not is_ellipse:          # the Ellipse kind is always elliptic
                     col.prop(self, n)
                 continue
-            if n == "degree":
+            if n == "degree" and self.kind in ROUND_KINDS:
+                col.row().prop(self, "ctype", expand=True)
+                if self.ctype == "SMOOTH":
+                    col.row().prop(self, "smooth_degree", expand=True)
+            elif n == "degree":
                 col.row().prop(self, "degree", expand=True)
+            elif self.kind in ROUND_KINDS and self.degree == "0" and (
+                    n == "spans_u" or (n == "spans_v" and self.kind in ("SPHERE", "TORUS"))):
+                continue                    # an exact circle has no spans to set
             elif n == "radius2" and op == "prim_circle":
                 row = col.row()
                 row.active = is_ellipse or self.elliptic   # Radius 2 only shapes an ellipse

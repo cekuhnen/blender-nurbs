@@ -103,6 +103,78 @@ check("D key: exact -> smooth -> exact", ds.type_key(o_, _Ev()) and o_.ctype == 
       and ds.type_key(o_, _Ev()) and o_.ctype == "EXACT")
 check("hints name the shape", "a true arc" in str(ds.type_rows(o_, "arc")) and "a true ellipse" in str(ds.type_rows(o_, "ellipse")))
 
+# --- Shift+A: the round shapes' Exact / Smooth (a view of Degree) ------------------
+def add(kind, **kw):
+    r = bpy.ops.nproto.add_primitive(kind=kind, **kw)
+    return r, ctx.active_object, features.history(ctx.active_object)["params"]
+
+def rational_faces(o):
+    return [surfeval.Surf(f.surface()).rational for f in store.get_brep(o).faces()]
+
+r, o, h = add("CIRCLE", radius=0.5, ctype="SMOOTH")
+check("Shift+A circle, Smooth: degree 3, not rational", r == {'FINISHED'} and h["degree"] == 3
+      and o.data.splines[0].order_u == 4 and all(p.co[3] == 1.0 for p in o.data.splines[0].points), str(h["degree"]))
+r, o, h = add("CIRCLE", radius=0.5, ctype="EXACT")
+check("Shift+A circle, Exact: degree 0, rational", h["degree"] == 0 and o.data.splines[0].order_u == 3)
+r, o, h = add("ARC", radius=0.5, angle=120.0, ctype="SMOOTH", smooth_degree="5")
+check("Shift+A arc, Smooth degree 5", h["degree"] == 5 and o.data.splines[0].order_u == 6, str(h["degree"]))
+r, o, h = add("ELLIPSE", radius=0.8, radius2=0.3, ctype="SMOOTH")
+check("Shift+A ellipse, Smooth", h["degree"] == 3 and h["elliptic"] and o.data.splines[0].use_cyclic_u)
+def rim_err(o, r_):
+    S = geom.sample_curve(features.input_curve(o, "E0"), 360)
+    return abs(np.linalg.norm(S[:, :2] - np.array(o.matrix_world.translation)[:2], axis=1) - r_).max()
+
+r, o, h = add("DISK", radius=0.5, ctype="SMOOTH")
+r2, o2, h2 = add("DISK", radius=0.5, ctype="EXACT")
+e1, e2 = rim_err(o, 0.5), rim_err(o2, 0.5)
+check("Shift+A disk: Smooth rim close, Exact rim exact", h["degree"] == 3 and h2["degree"] == 0
+      and 1e-6 < e1 < 0.005 and e2 < 1e-6, f"{e1:.1e} / {e2:.1e}")
+for kind in ("CYLINDER", "CONE", "SPHERE", "TORUS"):
+    r, o, h = add(kind, ctype="SMOOTH")
+    rs = rational_faces(o)
+    r2, o2, h2 = add(kind, ctype="EXACT")
+    check(f"Shift+A {kind.lower()}: Smooth not rational, Exact rational", r == r2 == {'FINISHED'} and h["degree"] == 3
+          and h2["degree"] == 0 and rs and not any(rs) and any(rational_faces(o2)), f"{rs} / {rational_faces(o2)}")
+r, o, h = add("CIRCLE", radius=0.5, degree="2")           # scripts that pass degree= still work
+check("Shift+A degree= (old calls) still works", h["degree"] == 2 and o.data.splines[0].order_u == 3
+      and all(p.co[3] == 1.0 for p in o.data.splines[0].points))
+from blender_nurbs.feature_ui import ROUND_KINDS, NPROTO_OT_add_primitive as _AP
+
+class _Lay:                     # a stand-in layout: records what the redo panel shows
+    def __init__(self, out): self.out = out
+    def column(self, **k): return self
+    def row(self, **k): return self
+    def label(self, **k): pass
+    def prop(self, owner, name, **k): self.out.append(name)
+
+def panel(kind, degree):
+    out = []
+    class F:
+        elliptic = False
+        layout = _Lay(out)
+        _op = _AP._op
+        @property
+        def ctype(self): return "EXACT" if self.degree == "0" else "SMOOTH"
+    f = F(); f.kind, f.degree = kind, degree
+    _AP.draw(f, ctx)
+    return out
+
+check("redo panel, exact sphere: Exact/Smooth, no spans", panel("SPHERE", "0") == ["radius", "ctype"], panel("SPHERE", "0"))
+check("redo panel, smooth sphere: its degree and spans", panel("SPHERE", "3") == ["radius", "ctype", "smooth_degree",
+      "spans_u", "spans_v"], panel("SPHERE", "3"))
+check("redo panel, exact cylinder keeps Spans V (along it)", "spans_v" in panel("CYLINDER", "0")
+      and "spans_u" not in panel("CYLINDER", "0"), panel("CYLINDER", "0"))
+last = ctx.window_manager.operator_properties_last("nproto.add_primitive")
+last.degree = "4"
+check("the real properties read back: Smooth, degree 4", last.ctype == "SMOOTH" and last.smooth_degree == "4"
+      and last.degree == "4", f"{last.ctype} {last.smooth_degree} {last.degree}")
+last.ctype = "EXACT"
+check("setting Exact sets Degree 0", last.degree == "0" and last.ctype == "EXACT" and last.smooth_degree == "3")
+last.ctype = "SMOOTH"
+check("Smooth again: degree 3", last.degree == "3")
+check("redo panel, line keeps its plain Degree", "degree" in panel("LINE", "1") and "ctype" not in panel("LINE", "1"))
+check("round kinds", ROUND_KINDS == {"ARC", "CIRCLE", "ELLIPSE", "CYLINDER", "CONE", "SPHERE", "TORUS", "DISK"})
+
 # --- Cylinder: what the tool places (its execute: matrix + parameters) -------------
 def cyl(ctype, caps, spans=8, r_=0.5, h_=1.2):
     Tc = ds.frame(np.array([0.0, 0.0, 0.0]) + np.array([0, 0, 1.0]) * (0.5 * h_), np.array([1.0, 0, 0]), np.array([0, 0, 1.0]))

@@ -392,7 +392,7 @@ Sidebar **Create Curves** / **Create Surfaces** panels, the **NURBS Proto** head
 |---|---|
 | Line, Arc, Circle, Ellipse, Rectangle, Polygon, Helix | Plane, Box (solid), Cylinder, Cone, Sphere, Torus, Disk |
 
-* **Degree**: **Exact** (rational: true circles, arcs, spheres, cylinders, cones and tori) or **1–5** with **Spans U/V**. Non-rational versions are built periodic, so closed directions stay smooth across the seam (as in Alias's degree / sections options).
+* **Exact / Smooth** for the round shapes (Arc, Circle, Ellipse, Cylinder, Cone, Sphere, Torus, Disk), as **D** gives in the drawing tools: **Exact** is rational (true circles, arcs, spheres, cylinders, cones and tori); **Smooth** is not rational, degree 3 unless you pick **1–5**, with **Spans U/V** (spans an exact circle has no use for are hidden). Shift+A places at once, so there is no key to press: the choice is in the Adjust Last Operation panel and is kept for the next shape. Line, Plane, Box and Helix have no exact form and keep their plain **Degree**. Non-rational versions are built periodic, so closed directions stay smooth across the seam (as in Alias's degree / sections options). Scripts can still pass `degree=` ("0" is Exact).
 * **Caps** on Cylinder and Cone joins planar caps into a healed solid (true volume).
 * **Helix Taper °** leans the helix in (positive: narrower on top) or out (negative: wider), like a thread on a cone; 0 is a straight helix. It is in the Feature panel with the radius, height and turns.
 
