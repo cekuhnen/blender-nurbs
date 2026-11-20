@@ -2177,10 +2177,10 @@ _sc_.location = (0, 0, -200)
 bpy.ops.object.select_all(action='DESELECT'); _sc_.select_set(True); lf.select_set(True)
 r = bpy.ops.nproto.export_step(filepath=_stp, use_selection=True, unit="MM")
 _txt = open(_stp).read()
-check("STEP export: valid Part 21 file, one solid + one sheet, rational surfaces, mm",
+check("STEP export: valid Part 21 file, one solid + one sheet, the exact cylinder a true cylinder, mm",
       r == {'FINISHED'} and _txt.startswith("ISO-10303-21;") and _txt.rstrip().endswith("END-ISO-10303-21;")
       and _txt.count("MANIFOLD_SOLID_BREP(") == 1 and _txt.count("SHELL_BASED_SURFACE_MODEL(") == 1
-      and "RATIONAL_B_SPLINE_SURFACE" in _txt and "SI_UNIT(.MILLI.,.METRE.)" in _txt
+      and "CYLINDRICAL_SURFACE(" in _txt and "SI_UNIT(.MILLI.,.METRE.)" in _txt
       and _txt.count("ADVANCED_FACE(") == 3 + store.get_brep(lf).face_count(),
       f"faces {_txt.count('ADVANCED_FACE(')}")
 # every #ref used is defined
