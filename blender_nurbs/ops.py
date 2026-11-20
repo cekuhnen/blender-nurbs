@@ -652,13 +652,154 @@ CHAIN_ITEMS = [("TANGENT", "Tangent Chain", "A click picks the edge and every ed
                ("SINGLE", "Single Edge", "A click picks just that edge (Shift+click more edges that touch it)")]
 
 
-class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
+BODY_ITEMS = [("SURFACE", "Surface", "The walls only: an open surface"),
+              ("NEW", "New Solid", "A closed solid: the walls with flat caps on the open ends "
+                                   "(a profile inside another is its hole)"),
+              ("JOIN", "Join", "The solid added to the body it touches"),
+              ("CUT", "Cut", "The solid cut out of the body it overlaps"),
+              ("INTERSECT", "Intersect", "Only what the solid and the body share")]
+BODY_CYCLE = [k for k, _, _ in BODY_ITEMS]
+BODY_BOOL = {"JOIN": "UNION", "CUT": "DIFFERENCE", "INTERSECT": "INTERSECTION"}
+
+
+def _is_solid(obj):
+    try:
+        return bool(store.get_brep(obj).is_manifold_solid())
+    except Exception:
+        return False
+
+
+def _world_box(obj):
+    lo, hi = store.get_brep(obj).bounding_box()
+    M = geom.world_matrix(obj)
+    P = np.array([M @ Vector((x, y, z)) for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
+    return P.min(axis=0), P.max(axis=0)
+
+
+class SolidBody:
+    """Body option of Extrude, Revolve, Sweep, Pipe and Loft: the surface as before, or a closed
+    solid (walls and flat caps) kept as a new body or joined to, cut from or
+    intersected with a target body (the existing Boolean, history kept)."""
+    body: EnumProperty(name="Body", items=BODY_ITEMS, default="SURFACE",
+                       description="Surface, or a closed solid: new, or joined to / cut from / "
+                                   "intersected with a body")
+    target: StringProperty(name="Target", default="", options={'SKIP_SAVE'},
+                           description="The body to join to, cut or intersect (a closed NURBS solid). "
+                                       "Empty: the selected solid, else the one the new solid overlaps most")
+
+    def body_prefer(self, context):
+        """A closed solid selected with the profiles: the target the user means."""
+        self._prefer = [o.name for o in context.selected_objects if store.is_nurbs(o) and _is_solid(o)]
+
+    def find_target(self, context, tools):
+        if self.target:
+            o = bpy.data.objects.get(self.target)
+            if o is not None and o not in tools and store.is_nurbs(o) and _is_solid(o):
+                return o
+        from .cvs import is_cage
+        cands = [o for o in context.visible_objects
+                 if o not in tools and store.is_nurbs(o) and not is_cage(o) and _is_solid(o)]
+        if not cands:
+            return None
+        boxes = [_world_box(t) for t in tools]
+        lo, hi = np.min([b[0] for b in boxes], axis=0), np.max([b[1] for b in boxes], axis=0)
+        pad = 1e-3 * (float(np.linalg.norm(hi - lo)) or 1.0)
+        best = None
+        for o in cands:
+            a, b = _world_box(o)
+            ext_ = np.minimum(hi, b) - np.maximum(lo, a) + pad     # > 0 on every axis: the boxes meet
+            if (ext_ <= 0).any():
+                continue
+            score = (o.name in getattr(self, "_prefer", []), float(np.prod(ext_)))
+            if best is None or score > best[0]:
+                best = (score, o)
+        return best[1] if best else None
+
+    def solid_groups(self, ins):
+        """The inputs of each solid to make: Extrude / Revolve one per outline
+        (with its holes); Sweep and Loft all inputs together, Pipe one per curve."""
+        return features.solid_regions(ins)
+
+    def make_solids(self, context, ins, params):
+        """(objects made, failure texts): a solid per group of inputs,
+        then Join / Cut / Intersect with the target."""
+        from . import jobs
+        made, failed = [], []
+        groups = self.solid_groups(ins)
+        for reg in groups:
+            try:
+                made.append(_make_result(context, self.bl_label, self.op_name, reg, dict(params, caps=True)))
+            except Exception as exc:
+                failed.append(f"{reg[0][0].name}: {exc}" if len(groups) > 1 else str(exc))
+        if not made or self.body == "NEW":
+            return made, failed
+        word = {"JOIN": "join to", "CUT": "cut", "INTERSECT": "intersect with"}[self.body]
+        target = self.find_target(context, made)
+        if target is None:
+            self.report({'WARNING'}, f"No closed solid to {word} (none overlaps the new solid): "
+                                     "kept as a new solid")
+            return made, failed
+        self.target = target.name
+        from .ops_trim import combine_solids
+        name = target.name
+        hist = features.history_enabled(context)
+        if hist:                       # the result keeps the body's name; the hidden input is the base
+            target.name = name + "_base"
+        try:
+            res, _ = combine_solids(context, [target] + made, BODY_BOOL[self.body], self, name=name)
+        except (jobs.JobError, RuntimeError) as exc:
+            if hist:
+                target.name = name
+            failed.append(f"{self.body.title()} with {name} failed ({exc}); the solid is kept as a new body")
+            return made, failed
+        if hist:
+            res.name = name
+        return [res], failed
+
+    def execute_solid(self, context, ins=None, params=None):
+        try:
+            if ins is None:
+                ins = self.usable_inputs(_decode_inputs(self.inputs))
+            made, failed = self.make_solids(context, ins, self.params() if params is None else params)
+        except Exception as exc:
+            self.report({'ERROR'}, f"{self.bl_label} failed: {exc}")
+            return {'CANCELLED'}
+        if failed:
+            self.report({'ERROR'} if not made else {'WARNING'}, f"{self.bl_label} failed: " + "; ".join(failed))
+        if not made:
+            return {'CANCELLED'}
+        _select_only(context, made)
+        return {'FINISHED'}
+
+    def draw_body(self, layout):
+        row = layout.row(align=True)
+        row.prop(self, "body", text="Body")
+        if self.body in BODY_BOOL:
+            layout.prop(self, "target", icon='MESH_CUBE')
+
+    # -- the live value stage: B cycles the body --------------------------------
+    def body_key(self, ch):
+        if ch != "b":
+            return False
+        self.body = BODY_CYCLE[(BODY_CYCLE.index(self.body) + 1) % len(BODY_CYCLE)]
+        return True
+
+    def body_row(self):
+        names = ["surface", "solid", "join", "cut", "intersect"]
+        return ("Body", [hints.cycle("B", names, names[BODY_CYCLE.index(self.body)])])
+
+    def body_state(self):
+        return [] if self.body == "SURFACE" else [dict((k, n) for k, n, _ in BODY_ITEMS)[self.body]]
+
+
+class NPROTO_OT_loft(SolidBody, PickMixin, bpy.types.Operator):
     """Loft a surface between curves or surface edges (G0 / G1 / G2 / G3). A side
     can be several edges end to end: picked edges that touch form one side
     (Tangent Chain picks a smooth run of edges with one click)"""
     bl_idname = "nproto.loft"
     bl_label = "Loft"
     bl_options = {'REGISTER', 'UNDO'}
+    op_name = "loft"
 
     accepts_picks = True
     pick_min = 2
@@ -724,6 +865,7 @@ class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
     def invoke(self, context, event):
         if not _kernel_ok(self):
             return {'CANCELLED'}
+        self.body_prefer(context)
         sel = [o for o in context.selected_objects if o.type == 'CURVE']
         if self.use_selection or (len(sel) >= 2 and not event.alt):
             sel = loft_selection_order(sel, context.active_object, self.closed)
@@ -871,6 +1013,17 @@ class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
     def execute(self, context):
         if not _kernel_ok(self):
             return {'CANCELLED'}
+        if self.body != "SURFACE":
+            try:
+                inputs = _decode_inputs(self.inputs)
+            except ValueError as exc:
+                self.report({'ERROR'}, f"Loft failed: {exc}")
+                return {'CANCELLED'}
+            features.LOFT_NOTES.clear()
+            r = self.execute_solid(context, inputs, self._params())
+            for note in features.LOFT_NOTES:
+                self.report({'WARNING'}, note)
+            return r
         try:
             inputs = _decode_inputs(self.inputs)
             features.LOFT_NOTES.clear()
@@ -883,8 +1036,12 @@ class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
         _select_only(context, [obj])
         return {'FINISHED'}
 
+    def solid_groups(self, ins):
+        return [ins]                  # one solid through all the sections
+
     def draw(self, context):
         lay = self.layout
+        self.draw_body(lay)
         try:
             refs = [r for _, r in json.loads(self.inputs or "[]")]
         except ValueError:
@@ -1014,7 +1171,7 @@ class _CurveTool(PickMixin):
             except Exception as exc:
                 failed.append(f"{inp[0].name}: {exc}")
         if failed:
-            self.report({'ERROR'} if not made else {'WARNING'}, f"{self.bl_label} failed on " + "; ".join(failed))
+            self.report({'ERROR'} if not made else {'WARNING'}, f"{self.bl_label} failed: " + "; ".join(failed))
         if not made:
             return {'CANCELLED'}
         _select_only(context, made)
@@ -1063,133 +1220,6 @@ def extrude_rows(P, d, h, draft=0.0, flip=False, symmetric=False, smooth=True, c
     if symmetric:
         return [P - h * d, P + h * d]
     return [P, P + h * d]
-
-
-BODY_ITEMS = [("SURFACE", "Surface", "The walls only: an open surface"),
-              ("NEW", "New Solid", "A closed solid: the walls with flat caps on the open ends "
-                                   "(a profile inside another is its hole)"),
-              ("JOIN", "Join", "The solid added to the body it touches"),
-              ("CUT", "Cut", "The solid cut out of the body it overlaps"),
-              ("INTERSECT", "Intersect", "Only what the solid and the body share")]
-BODY_CYCLE = [k for k, _, _ in BODY_ITEMS]
-BODY_BOOL = {"JOIN": "UNION", "CUT": "DIFFERENCE", "INTERSECT": "INTERSECTION"}
-
-
-def _is_solid(obj):
-    try:
-        return bool(store.get_brep(obj).is_manifold_solid())
-    except Exception:
-        return False
-
-
-def _world_box(obj):
-    lo, hi = store.get_brep(obj).bounding_box()
-    M = geom.world_matrix(obj)
-    P = np.array([M @ Vector((x, y, z)) for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
-    return P.min(axis=0), P.max(axis=0)
-
-
-class SolidBody:
-    """Body option of Extrude / Revolve: the surface as before, or a closed
-    solid (walls and flat caps) kept as a new body or joined to, cut from or
-    intersected with a target body (the existing Boolean, history kept)."""
-    body: EnumProperty(name="Body", items=BODY_ITEMS, default="SURFACE",
-                       description="Surface, or a closed solid: new, or joined to / cut from / "
-                                   "intersected with a body")
-    target: StringProperty(name="Target", default="", options={'SKIP_SAVE'},
-                           description="The body to join to, cut or intersect (a closed NURBS solid). "
-                                       "Empty: the selected solid, else the one the new solid overlaps most")
-
-    def body_prefer(self, context):
-        """A closed solid selected with the profiles: the target the user means."""
-        self._prefer = [o.name for o in context.selected_objects if store.is_nurbs(o) and _is_solid(o)]
-
-    def find_target(self, context, tools):
-        if self.target:
-            o = bpy.data.objects.get(self.target)
-            if o is not None and o not in tools and store.is_nurbs(o) and _is_solid(o):
-                return o
-        from .cvs import is_cage
-        cands = [o for o in context.visible_objects
-                 if o not in tools and store.is_nurbs(o) and not is_cage(o) and _is_solid(o)]
-        if not cands:
-            return None
-        boxes = [_world_box(t) for t in tools]
-        lo, hi = np.min([b[0] for b in boxes], axis=0), np.max([b[1] for b in boxes], axis=0)
-        pad = 1e-3 * (float(np.linalg.norm(hi - lo)) or 1.0)
-        best = None
-        for o in cands:
-            a, b = _world_box(o)
-            ext_ = np.minimum(hi, b) - np.maximum(lo, a) + pad     # > 0 on every axis: the boxes meet
-            if (ext_ <= 0).any():
-                continue
-            score = (o.name in getattr(self, "_prefer", []), float(np.prod(ext_)))
-            if best is None or score > best[0]:
-                best = (score, o)
-        return best[1] if best else None
-
-    def make_solids(self, context, ins, params):
-        """(objects made, failure texts): a solid per outline (holes inside it),
-        then Join / Cut / Intersect with the target."""
-        from . import jobs
-        made, failed = [], []
-        for reg in features.solid_regions(ins):
-            try:
-                made.append(_make_result(context, self.bl_label, self.op_name, reg, dict(params, caps=True)))
-            except Exception as exc:
-                failed.append(f"{reg[0][0].name}: {exc}")
-        if not made or self.body == "NEW":
-            return made, failed
-        word = {"JOIN": "join to", "CUT": "cut", "INTERSECT": "intersect with"}[self.body]
-        target = self.find_target(context, made)
-        if target is None:
-            self.report({'WARNING'}, f"No closed solid to {word} (none overlaps the new solid): "
-                                     "kept as a new solid")
-            return made, failed
-        self.target = target.name
-        from .ops_trim import combine_solids
-        name = target.name
-        hist = features.history_enabled(context)
-        if hist:                       # the result keeps the body's name; the hidden input is the base
-            target.name = name + "_base"
-        try:
-            res, _ = combine_solids(context, [target] + made, BODY_BOOL[self.body], self, name=name)
-        except (jobs.JobError, RuntimeError) as exc:
-            if hist:
-                target.name = name
-            failed.append(f"{self.body.title()} with {name} failed ({exc}); the solid is kept as a new body")
-            return made, failed
-        if hist:
-            res.name = name
-        return [res], failed
-
-    def execute_solid(self, context):
-        try:
-            ins = self.usable_inputs(_decode_inputs(self.inputs))
-            made, failed = self.make_solids(context, ins, self.params())
-        except Exception as exc:
-            self.report({'ERROR'}, f"{self.bl_label} failed: {exc}")
-            return {'CANCELLED'}
-        if failed:
-            self.report({'ERROR'} if not made else {'WARNING'}, f"{self.bl_label} failed on " + "; ".join(failed))
-        if not made:
-            return {'CANCELLED'}
-        _select_only(context, made)
-        return {'FINISHED'}
-
-    # -- the live value stage: B cycles the body --------------------------------
-    def body_key(self, ch):
-        if ch != "b":
-            return False
-        self.body = BODY_CYCLE[(BODY_CYCLE.index(self.body) + 1) % len(BODY_CYCLE)]
-        return True
-
-    def body_row(self):
-        names = ["surface", "solid", "join", "cut", "intersect"]
-        return ("Body", [hints.cycle("B", names, names[BODY_CYCLE.index(self.body)])])
-
-    def body_state(self):
-        return [] if self.body == "SURFACE" else [dict((k, n) for k, n, _ in BODY_ITEMS)[self.body]]
 
 
 class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
@@ -1270,7 +1300,7 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
             except Exception as exc:
                 failed.append(f"{g[0][0].name}: {exc}")
         if failed:
-            self.report({'ERROR'} if not made else {'WARNING'}, f"{self.bl_label} failed on " + "; ".join(failed))
+            self.report({'ERROR'} if not made else {'WARNING'}, f"{self.bl_label} failed: " + "; ".join(failed))
         if not made:
             return {'CANCELLED'}
         _select_only(context, made)

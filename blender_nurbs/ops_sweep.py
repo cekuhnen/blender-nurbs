@@ -12,7 +12,7 @@ from mathutils import Vector
 from . import draw, features, geom, store, sweeps, workplanes
 from . import hints
 from .kernel import load as load_kernel
-from .ops import AskValue, PickMixin, _decode_inputs, _encode_inputs, _kernel_ok, _select_only
+from .ops import AskValue, PickMixin, SolidBody, _decode_inputs, _encode_inputs, _kernel_ok, _select_only
 from .valuedrag import BASE_PX, ValueDrag, ruled_preview
 
 
@@ -40,13 +40,14 @@ def _new_curves(context, name, op, inputs, params):
 # Sweep
 # --------------------------------------------------------------------------
 
-class NPROTO_OT_sweep(PickMixin, bpy.types.Operator):
+class NPROTO_OT_sweep(SolidBody, PickMixin, bpy.types.Operator):
     """Sweep a profile along one rail, two rails (Shift+click the 1st rail), or a
     surface edge (tangent to that surface). Select the profile, then the path
     (last); or with nothing selected click the profile, then the path"""
     bl_idname = "nproto.sweep"
     bl_label = "Sweep"
     bl_options = {'REGISTER', 'UNDO'}
+    op_name = "sweep"
 
     pick_min = 2
     pick_max = 3
@@ -64,6 +65,7 @@ class NPROTO_OT_sweep(PickMixin, bpy.types.Operator):
     def invoke(self, context, event):
         if not _kernel_ok(self):
             return {'CANCELLED'}
+        self.body_prefer(context)
         crv = [o for o in context.selected_objects if o.type == 'CURVE']
         act = context.active_object
         if len(crv) in (2, 3) and act in crv and not event.alt:
@@ -89,12 +91,25 @@ class NPROTO_OT_sweep(PickMixin, bpy.types.Operator):
             inputs = _decode_inputs(self.inputs)
             if len(inputs) < 2:
                 raise ValueError("pick a profile and a rail (Shift+click for a second rail)")
+            if self.body != "SURFACE":
+                return self.execute_solid(context, inputs, self._params())
             obj = _new_surface(context, "Sweep", "sweep", inputs, self._params())
         except Exception as exc:
             self.report({'ERROR'}, f"Sweep failed: {exc}")
             return {'CANCELLED'}
         _select_only(context, [obj])
         return {'FINISHED'}
+
+
+    def solid_groups(self, ins):
+        return [ins]                  # the profile and its rail(s): one solid
+
+    def draw(self, context):
+        lay = self.layout
+        self.draw_body(lay)
+        col = lay.column()
+        for k in ("samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height"):
+            col.prop(self, k)
 
 
 def sweep_profile(crv, act):
@@ -113,11 +128,12 @@ def sweep_profile(crv, act):
     return min(crv, key=lambda c: sum(gap(c, o) for o in crv if o != c))
 
 
-class NPROTO_OT_pipe(AskValue, PickMixin, bpy.types.Operator):
+class NPROTO_OT_pipe(SolidBody, AskValue, PickMixin, bpy.types.Operator):
     """Sweep an exact circle along curves (selected, or pick one)"""
     bl_idname = "nproto.pipe"
     bl_label = "Pipe"
     bl_options = {'REGISTER', 'UNDO'}
+    op_name = "pipe"
 
     accepts_picks = True
     pick_min = 1
@@ -129,6 +145,7 @@ class NPROTO_OT_pipe(AskValue, PickMixin, bpy.types.Operator):
     def invoke(self, context, event):
         if not _kernel_ok(self):
             return {'CANCELLED'}
+        self.body_prefer(context)
         if self.inputs:                     # picked already (see PickMixin._finish)
             return self.ask(context)
         crv = [o for o in context.selected_objects if o.type == 'CURVE']
@@ -140,15 +157,32 @@ class NPROTO_OT_pipe(AskValue, PickMixin, bpy.types.Operator):
     def execute(self, context):
         if not _kernel_ok(self):
             return {'CANCELLED'}
+        params = {"radius": self.radius, "samples": self.samples}
+        if self.body != "SURFACE":
+            try:
+                inputs = _decode_inputs(self.inputs)
+            except ValueError as exc:
+                self.report({'ERROR'}, f"Pipe failed: {exc}")
+                return {'CANCELLED'}
+            return self.execute_solid(context, inputs, params)
         made = []
         try:
             for inp in _decode_inputs(self.inputs):
-                made.append(_new_surface(context, "Pipe", "pipe", [inp], {"radius": self.radius, "samples": self.samples}))
+                made.append(_new_surface(context, "Pipe", "pipe", [inp], params))
         except Exception as exc:
             self.report({'ERROR'}, f"Pipe failed: {exc}")
             return {'CANCELLED'}
         _select_only(context, made)
         return {'FINISHED'} if made else {'CANCELLED'}
+
+    def solid_groups(self, ins):
+        return [[i] for i in ins]     # a solid rod per curve
+
+    def draw(self, context):
+        lay = self.layout
+        self.draw_body(lay)
+        lay.prop(self, "radius")
+        lay.prop(self, "samples")
 
 
 BD_DEG = [("0", "Auto", "Auto: exact edges keep the curves' own degree; a fit uses 3")] + \

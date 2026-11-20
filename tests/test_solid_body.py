@@ -1,4 +1,5 @@
-"""Extrude / Revolve Body option (Surface, New Solid, Join, Cut, Intersect):
+"""Body option (Surface, New Solid, Join, Cut, Intersect) of Extrude, Revolve,
+Sweep, Pipe and Loft:
     blender -b --factory-startup --python tests/test_solid_body.py"""
 import json, math, os, sys
 import bpy
@@ -27,6 +28,10 @@ def poly(name, pts, cyclic=True):
     for p, c in zip(sp.points, pts): p.co = (*c, 1.0)
     sp.use_cyclic_u = cyclic
     o = bpy.data.objects.new(name, cu); ctx.collection.objects.link(o); return o
+
+def ncircle(name, r, loc):
+    bpy.ops.curve.primitive_nurbs_circle_add(radius=r, location=loc)
+    o = ctx.active_object; o.name = name; return o
 
 def circle(name, r, loc):
     bpy.ops.curve.primitive_bezier_circle_add(radius=r, location=loc)
@@ -193,6 +198,101 @@ features.rebuild(tool, ctx)
 features.rebuild(J, ctx)
 check("history: a smaller circle rebuilds the joined body", abs(vol(J) - (24.0 + math.pi * 0.25)) < 1e-3,
       f"vol {vol(J):.5f} (was {v0:.5f})")
+
+# --- Sweep, Pipe, Loft ------------------------------------------------------
+for hist in (True, False):
+    hist_on(hist)
+    tag = "history" if hist else "no history"
+    clear()
+    rod = math.pi * 0.25 * 3.0                   # r 0.5, length 3
+    # Sweep: a circle along a line
+    P = ncircle("P", 0.5, (0, 0, 0)); L = poly("L", [(0, 0, 0), (0, 0, 3)], cyclic=False)
+    r = run(bpy.ops.nproto.sweep, inputs=ins((P, "S0"), (L, "S0")), body="NEW")
+    S = ctx.active_object
+    check(f"[{tag}] sweep new solid", r == {'FINISHED'} and solid(S) and abs(vol(S) - rod) < 1e-4,
+          f"vol {vol(S):.5f} want {rod:.5f}")
+    # Sweep along a bent rail: a solid, the volume by Pappus (rail length x area)
+    P2 = ncircle("P2", 0.5, (10, 0, 0)); A = poly("A", [(10, 0, 0), (10, 0, 2), (12, 0, 4)], cyclic=False)
+    r = run(bpy.ops.nproto.sweep, inputs=ins((P2, "S0"), (A, "S0")), body="NEW")
+    want = math.pi * 0.25 * (2 + 2 * math.sqrt(2))
+    check(f"[{tag}] sweep bent rail solid", r == {'FINISHED'} and solid(ctx.active_object)
+          and abs(vol(ctx.active_object) - want) / want < 0.02, f"vol {vol(ctx.active_object):.5f} ~ {want:.5f}")
+    # open profile refused
+    O = poly("O", [(20, 0, 0), (21, 0, 0)], cyclic=False); L3 = poly("L3", [(20, 0, 0), (20, 0, 1)], cyclic=False)
+    try:
+        r = bpy.ops.nproto.sweep(inputs=ins((O, "S0"), (L3, "S0")), body="NEW")
+    except RuntimeError as exc:
+        r = str(exc)
+    check(f"[{tag}] sweep open profile refused", "closed profile" in str(r), str(r)[:90])
+    # Pipe: two lines, a rod each
+    clear()
+    L1 = poly("L1", [(0, 0, 0), (0, 0, 3)], cyclic=False); L2 = poly("L2", [(5, 0, 0), (5, 0, 3)], cyclic=False)
+    r = run(bpy.ops.nproto.pipe, inputs=ins((L1, "S0"), (L2, "S0")), radius=0.5, body="NEW")
+    made = list(ctx.selected_objects)
+    check(f"[{tag}] pipe new solids, one per curve", r == {'FINISHED'} and len(made) == 2
+          and all(solid(o) and abs(vol(o) - rod) < 1e-4 for o in made), [f"{vol(o):.5f}" for o in made])
+    # Pipe round a closed circle: a torus (one face closed both ways), halved by Intersect with a box
+    C = ncircle("C", 3.0, (20, 0, 0))
+    Rb = rect("Rb", 20, -5, 25, 5, -1.0)
+    run(bpy.ops.nproto.extrude, inputs=ins((Rb, "S0")), distance=2.0, direction="Z", body="NEW")
+    box = ctx.active_object
+    torus = 2 * math.pi * 3.0 * math.pi * 0.25
+    r = run(bpy.ops.nproto.pipe, inputs=ins((C, "S0")), radius=0.5, body="INTERSECT", target=box.name)
+    I = ctx.active_object
+    check(f"[{tag}] pipe torus intersected with a box: half the torus", r == {'FINISHED'} and solid(I)
+          and abs(vol(I) - torus / 2) < 2e-3, f"vol {vol(I):.5f} want {torus / 2:.5f}")
+    # Pipe Cut: a hole through a box
+    clear()
+    R = rect("R", 0, 0, 4, 4)
+    run(bpy.ops.nproto.extrude, inputs=ins((R, "S0")), distance=4.0, direction="Z", body="NEW")
+    H = poly("H", [(2, 2, -1), (2, 2, 5)], cyclic=False)
+    r = run(bpy.ops.nproto.pipe, inputs=ins((H, "S0")), radius=0.5, body="CUT")
+    X = ctx.active_object
+    want = 64.0 - math.pi * 0.25 * 4.0
+    check(f"[{tag}] pipe cut a hole", r == {'FINISHED'} and solid(X) and abs(vol(X) - want) < 1e-3
+          and X.name == "Extrude", f"vol {vol(X):.5f} want {want:.5f} {X.name}")
+    # Loft: two circles (a frustum) joined on top of the box
+    a = ncircle("a", 1.0, (2, 2, 4)); b = ncircle("b", 0.5, (2, 2, 6))
+    r = run(bpy.ops.nproto.loft, inputs=ins((a, "S0"), (b, "S0")), body="JOIN")
+    J = ctx.active_object
+    fr = math.pi * 2 / 3 * (1 + 0.5 + 0.25)
+    check(f"[{tag}] loft join a frustum", r == {'FINISHED'} and solid(J) and abs(vol(J) - (want + fr)) < 1e-3
+          and J.name == "Extrude", f"vol {vol(J):.5f} want {want + fr:.5f} {J.name}")
+    # Loft through three squares (folds: a body of faces), new solid
+    sq = [rect(f"q{i}", 10 - s, -s, 10 + s, s, z) for i, (s, z) in enumerate([(1, 0), (0.5, 1), (1, 2)])]
+    r = run(bpy.ops.nproto.loft, inputs=ins(*[(o, "S0") for o in sq]), body="NEW")
+    want = 2 / 5 + 4 / 3 + 2                   # side z^2 - 2z + 2 (through 2, 1, 2): its square integrated
+    check(f"[{tag}] loft through squares solid", r == {'FINISHED'} and solid(ctx.active_object)
+          and abs(vol(ctx.active_object) - want) < 1e-3, f"vol {vol(ctx.active_object):.5f} want {want:.5f}")
+    # open sections refused
+    o1 = poly("o1", [(20, 0, 0), (21, 0, 0)], cyclic=False); o2 = poly("o2", [(20, 0, 1), (21, 0, 1)], cyclic=False)
+    try:
+        r = bpy.ops.nproto.loft(inputs=ins((o1, "S0"), (o2, "S0")), body="NEW")
+    except RuntimeError as exc:
+        r = str(exc)
+    check(f"[{tag}] loft open sections refused", "closed sections" in str(r), str(r)[:90])
+    # Surface stays the default
+    r = run(bpy.ops.nproto.loft, inputs=ins((o1, "S0"), (o2, "S0")))
+    r2 = run(bpy.ops.nproto.pipe, inputs=ins((o1, "S0"),), radius=0.1)
+    check(f"[{tag}] surface loft / pipe still work", r == {'FINISHED'} and r2 == {'FINISHED'}
+          and not solid(ctx.active_object))
+
+# --- history: a smaller sweep profile rebuilds the cut body
+hist_on(True)
+clear()
+R = rect("R", 0, 0, 4, 4)
+bpy.ops.nproto.extrude(inputs=ins((R, "S0")), distance=4.0, direction="Z", body="NEW")
+P = ncircle("P", 0.5, (2, 2, -1)); L = poly("L", [(2, 2, -1), (2, 2, 5)], cyclic=False)
+bpy.ops.nproto.sweep(inputs=ins((P, "S0"), (L, "S0")), body="CUT")
+X = ctx.active_object
+P.scale = (0.5, 0.5, 1.0)
+tool = next(o for o in bpy.data.objects if features.history(o) and features.history(o)["op"] == "sweep")
+features.rebuild(tool, ctx)
+features.rebuild(X, ctx)
+want = 64.0 - math.pi * 0.0625 * 4.0
+check("history: a smaller sweep profile rebuilds the cut body", abs(vol(X) - want) < 1e-3,
+      f"vol {vol(X):.5f} want {want:.5f}")
+check("history: the sweep tool keeps caps", features.history(tool)["params"].get("caps") is True)
 
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)

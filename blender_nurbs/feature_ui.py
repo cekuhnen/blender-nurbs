@@ -24,7 +24,7 @@ DIR_ITEMS = [("NORMAL", "Curve Normal", "")] + AXIS_ITEMS + [("VECTOR", "Vector"
 FIELDS = {
     "loft": ["closed", "cont_a", "tan_a", "cur_a", "cont_b", "tan_b", "cur_b", "auto_align", "flip_b", "ruled", "samples",
              "edges_a", "edges_b", "fit", "span_degree", "span_faces", "cont_ra", "tan_ra", "cont_rb", "tan_rb", "corner_ease", "even_net",
-             "flip_normal"],
+             "flip_normal", "caps"],
     "blend_curve": ["cont_a", "w_a", "c_a", "flip_a", "cont_b", "w_b", "c_b", "flip_b"],
     "extrude": ["distance", "direction", "dir_vec", "tilt", "tilt_azimuth", "draft", "draft_flip", "symmetric", "caps"],
     "revolve": ["angle", "axis", "pivot", "seam_angle", "axis_point", "axis_dir", "caps"],
@@ -43,8 +43,8 @@ FIELDS = {
     "network": ["nw_cont", "nw_degree", "nw_spans_u", "nw_spans_v"],
     "flange": ["fl_mode", "fl_length", "angle", "draft_angle", "pull_flip", "measure", "flip", "both_sides",
                "fl_corner", "tolerance"],
-    "sweep": ["samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height", "flip_normal"],
-    "pipe": ["radius", "samples"],
+    "sweep": ["samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height", "flip_normal", "caps"],
+    "pipe": ["radius", "samples", "caps"],
     "patch": ["pt_cvs", "pt_cvs_v", "pt_auto_cvs", "pt_degree", "pt_fair", "pt_surface_fair", "pt_quad",
               "pt_quad_ease", "pt_even", "pt_quad_degree", "pt_quad_spans_u", "pt_quad_spans_v"],
     "dome": ["dome_layout", "dome_cont", "dome_height", "dome_fullness", "dome_cvs"],
@@ -467,7 +467,7 @@ def sync_from_history(obj):
                 params.setdefault(k_, v_)
         if h["op"] in features.ORIENT_OPS:
             params.setdefault("flip_normal", False)
-        if h["op"] in ("extrude", "revolve"):                      # surfaces before Body: Solid
+        if h["op"] in ("extrude", "revolve", "sweep", "pipe", "loft"):     # surfaces before Body: Solid
             params.setdefault("caps", False)
         if h["op"] == "loft":                    # older lofts: square to the side, or the Match Edges switch
             old = "EDGES" if params.get("match_edges") else "FREE"

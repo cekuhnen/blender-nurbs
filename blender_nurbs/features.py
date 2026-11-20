@@ -1610,29 +1610,73 @@ def _solid(inputs, p, side_of, closed_only=True):
     """A closed solid: the walls of every profile in inputs (an outline and its
     holes), flat caps on the open ends (in the worker). Holes draft the other
     way, so the material's walls all lean the same way."""
-    from . import jobs
-    from .steps import IDENT
     groups = profile_groups(inputs)
     curves = [profile_curve(g) for g in groups]
     if closed_only:
         open_ = [g[0][0].name for g, c in zip(groups, curves) if not is_closed_curve(c)]
         if open_:
-            raise RuntimeError("a solid needs closed profiles: " + ", ".join(open_) + " is open "
+            raise RuntimeError("a solid needs closed profiles: " + ", ".join(open_) + _is_are(open_) +
                                "(Body: Surface extrudes it as a wall)")
     depth = nesting(curves)
-    walls = {}
+    walls = []
     for i, (g, c) in enumerate(zip(groups, curves)):
         q = dict(p)
         q.pop("draft_centre", None)          # each closed profile drafts away from its own middle
         if depth[i] % 2:
             q["draft_flip"] = not q.get("draft_flip", False)
         w = side_of(g[0][0], c, q)
-        sm, ext = _k()
-        for k, piece in enumerate(w if isinstance(w, list) else [w]):
+        walls += w if isinstance(w, list) else [w]
+    return cap_walls(walls)
+
+
+def cap_walls(pieces):
+    """A closed solid (('brep_text', world text)) from walls in world space --
+    surfaces, Breps or ('brep_text', text) -- with flat caps on their open
+    ends (the worker's cap_solid)."""
+    from . import jobs
+    from .steps import IDENT
+    sm, ext = _k()
+    walls = {}
+    for k, piece in enumerate(pieces):
+        if isinstance(piece, tuple) and piece and piece[0] == "brep_text":
+            text = piece[1]
+        else:
             b = piece if isinstance(piece, sm.Brep) else ext.brep_from_surface(piece)
-            walls[f"w{i}_{k}"] = (store.brep_to_text(b), IDENT)
+            text = store.brep_to_text(b)
+        walls[f"w{k}"] = (text, IDENT)
     _, breps = jobs.run("cap_solid", walls, ["result"], order=list(walls), into="_world_")
     return ("brep_text", breps["result"])
+
+
+def _is_are(names):
+    return " is open " if len(names) == 1 else " are open "
+
+
+def _closed_side(side):
+    try:
+        return is_closed_curve(profile_curve(side))
+    except Exception:
+        return False
+
+
+def check_cap_inputs(op, inputs, p):
+    """Refuse a Sweep / Loft solid of open profiles up front, with a reason."""
+    if op == "sweep":
+        if not is_closed_curve(input_curve(*inputs[0])):
+            raise RuntimeError(f"a solid needs a closed profile: {inputs[0][0].name} is open "
+                               "(Body: Surface sweeps it as a wall)")
+    elif op == "loft":
+        sides = loft_sides(inputs, p)
+        sides = sides[:len(sides) - loft_rail_count(inputs, p)]
+        open_ = [s[0][0].name for s in sides if not _closed_side(s)]
+        if open_:
+            raise RuntimeError("a solid needs closed sections: " + ", ".join(open_) + _is_are(open_) +
+                               "(Body: Surface lofts them as a wall)")
+
+
+# Features whose wall becomes a solid with caps=True (Extrude and Revolve do it
+# in their builders: they group profiles into outlines and holes)
+CAP_OPS = {"sweep", "pipe", "loft"}
 
 
 @builder("offset")
@@ -2208,8 +2252,13 @@ LAST_FLIP = [None]                # the last run()'s decision for an ORIENT_OPS 
 def run(op, inputs, params):
     if op not in BUILDERS:
         raise RuntimeError(f"no builder for feature '{op}' (reload the add-on)")
+    capped = bool(params.get("caps")) and op in CAP_OPS
+    if capped:
+        check_cap_inputs(op, inputs, params)
     g = BUILDERS[op](inputs, params)
     LAST_FLIP[0] = None
+    if capped:
+        return cap_walls([g])      # the worker turns the solid outward
     if op in ORIENT_OPS:
         sm, _ = _k()
         if isinstance(g, sm.Surface):
