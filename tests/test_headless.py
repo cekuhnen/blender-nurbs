@@ -6646,6 +6646,30 @@ check("G2 dome: as round at its top as the G1 one (no flat tip) -- round rim and
       _ka2[0] > 0.9 * _ka1[0] and _ka2[0] > 0.5 and _ke2[0] > 0.85 * _ke1[0] and _ke2[0] > 0.3,
       f"round G1 {_ka1} G2 {_ka2}; ellipse G1 {_ke1} G2 {_ke2}")
 
+# Dome's live stage: the preview lies on the dome it makes, the arrow's tip is its top, the diamond is on it and
+# moves along its line as Fullness changes; both handles give their values back (round rim and ellipse)
+_dm_rep = []
+for _dbase, _dref in ((_g1["base"], _g1["ref"]), (_el["base"], _el["ref"])):
+    for _cont, _hh, _ff in (("G2", 1.0, 1.0), ("G1", 0.7, 1.4), ("G2", 1.6, 0.6)):
+        _x = _plain(_dome.NPROTO_OT_dome, inputs=ins((_dbase, _dref)), dome_cont=_cont, dome_height=_hh,
+                    dome_fullness=_ff, dome_layout="POLAR", dome_cvs=20)
+        _ok = _x.drag_setup(ctx, None)
+        _pv, _hs = _x.drag_preview(), _x.drag_handles()
+        _hf = _hs[1]
+        _x.dome_fullness = _hf["to_value"](1.1 * _hf["param"])
+        _lin = float(np.linalg.norm(_vd.ValueDrag._pos(_x.drag_handles()[1]) - (_hf["origin"] + 1.1 * _hf["param"] * _hf["dir"])))
+        _x.dome_fullness = _ff
+        r = bpy.ops.nproto.dome(inputs=ins((_dbase, _dref)), dome_cont=_cont, dome_height=_hh, dome_fullness=_ff)
+        _res = ctx.active_object; ctx.view_layer.update(); _t = _tree(_res)
+        _gap = max(_t.find_nearest(Vector(q_))[3] for q_ in np.vstack([_pv["tris"]] + list(_pv["lines"])))
+        _on = max(_t.find_nearest(Vector(_vd.ValueDrag._pos(h_)))[3] for h_ in _hs)
+        _dm_rep.append((_ok and r == {'FINISHED'}, round(_gap, 5), round(_on, 5), round(_lin, 5),
+                        round(_hs[0]["to_value"](_hs[0]["param"]) - _hh, 9), round(_hf["to_value"](_hf["param"]) - _ff, 9)))
+        bpy.data.objects.remove(_res)
+check("dome live stage: preview on the dome it makes, height arrow's tip its top, fullness diamond on it and moving "
+      "along its line, values back from the handles",
+      all(v[0] and v[1] < 2e-3 and v[2] < 2e-3 and v[3] < 0.01 and v[4] == 0 and v[5] == 0 for v in _dm_rep), str(_dm_rep))
+
 # a loft of selected curves goes along them (a selection has no order: bottom, top, middle folded back)
 from blender_nurbs.ops import loft_selection_order as _lso
 _ls = []

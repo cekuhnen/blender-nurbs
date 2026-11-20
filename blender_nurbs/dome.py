@@ -19,10 +19,12 @@ import json
 import numpy as np
 
 import bpy
+from mathutils import Vector
 from bpy.props import EnumProperty, FloatProperty, IntProperty, StringProperty
 
-from . import features, store
+from . import features, hints, store
 from .ops import AskValue, PickMixin, _decode_inputs, _encode_inputs, _kernel_ok, _make_result, _pick_candidates, _select_only
+from .valuedrag import ValueDrag, fmt_length, ruled_preview
 
 K_CIRCLE = 0.5522847498            # cubic Bezier quarter circle: tangent length / radius
 S2 = np.sqrt(0.5)
@@ -206,9 +208,21 @@ def revolved(rim, cv):
 # the dome of any planar rim: rows on the rim's own basis
 # --------------------------------------------------------------------------
 
-def _across(obj, kc, ts, size, r_ref):
+def _across(obj, kc, ts, size, r_ref, memo=None):
     """Outward tangent T (unit, world) across the rim and the surface's normal
-    curvature along it, at the curve parameters ts."""
+    curvature along it, at the curve parameters ts. memo: a dict that keeps
+    them per parameter set (the live preview builds the dome again and again;
+    these closest-point probes are what takes the time)."""
+    key = tuple(np.round(np.asarray(ts, float), 12))
+    if memo is not None and key in memo:
+        return memo[key]
+    out = _across_probe(obj, kc, ts, size, r_ref)
+    if memo is not None:
+        memo[key] = out
+    return out
+
+
+def _across_probe(obj, kc, ts, size, r_ref):
     from . import geom
     sm, _ = _k()
     M = np.array(geom.world_matrix(obj), float)
@@ -242,12 +256,16 @@ def _across(obj, kc, ts, size, r_ref):
     return np.array(P), np.array(T), NS
 
 
-def free_dome(obj, ref, cont="G2", height=1.0, fullness=1.0):
+def free_dome(obj, ref, cont="G2", height=1.0, fullness=1.0, memo=None):
     """A dome over any planar rim: u = the profile (rim -> top), v = the rim's
     own curve (its CVs, knots and weights). Row 0 is the rim itself; the next
     one (G1) or two (G2) rows are fitted on the rim's basis to leave it along
     the surface (and with its curvature); the top rows are the rim scaled
-    towards the top point, so the top is smooth."""
+    towards the top point, so the top is smooth.
+
+    memo (the live preview): keeps the probes of the surface, and the rim's
+    knots as the first build refined them -- later builds fit once on those
+    (within the fit's tolerance of a fresh build, many times faster)."""
     from .kernel.classa import basis, insert_knot
     sm, ext = _k()
     kc = features.input_curve(obj, ref)
@@ -274,10 +292,13 @@ def free_dome(obj, ref, cont="G2", height=1.0, fullness=1.0):
     m = 3 if cont == "G1" else 5
     tol = 1e-5 * size
     last = None
+    frozen = memo is not None and "knots" in memo
+    if frozen:
+        Pw, U = memo["knots"]
     for _ in range(12):
         br = sorted(set(U))
         ts = np.concatenate([np.linspace(x, y, 12, endpoint=False) for x, y in zip(br[:-1], br[1:])])
-        P, T, NS = _across(obj, kc, ts, size, rbar)
+        P, T, NS = _across(obj, kc, ts, size, rbar, memo)
         if _ == 0 and float(np.mean(T @ a)) < 0:
             a = -a
         tz = T @ a
@@ -326,7 +347,7 @@ def free_dome(obj, ref, cont="G2", height=1.0, fullness=1.0):
         # done: within tolerance, or no longer getting better (the surface itself
         # turns a little at its own seam: more knots only chase that), or out of
         # room -- the rows always match the knots they were fitted on
-        if err <= tol or (last is not None and err > 0.9 * last) or _ == 11 or len(Pw) > 400:
+        if frozen or err <= tol or (last is not None and err > 0.9 * last) or _ == 11 or len(Pw) > 400:
             break
         last = err
         spans = sorted({max(i for i, b in enumerate(br) if b <= t and i < len(br) - 1)
@@ -334,6 +355,8 @@ def free_dome(obj, ref, cont="G2", height=1.0, fullness=1.0):
         for i in spans:
             Pw, U = insert_knot(Pw, U, p, 0.5 * (br[i] + br[i + 1]))
         Pw = np.asarray(Pw, float)
+    if memo is not None and not frozen:
+        memo["knots"] = (np.array(Pw, float), list(U))
     Qc = Pw[:, :3] / Pw[:, 3:]
     inq = (Qc - c) - np.outer((Qc - c) @ a, a)
     allrows = [Qc] + rows + [A + s_ * inq for s_ in top] + [np.repeat(A[None, :], len(Qc), axis=0)]
@@ -539,16 +562,19 @@ def _open_rims(context, objs=None):
     return out
 
 
-class NPROTO_OT_dome(AskValue, PickMixin, bpy.types.Operator):
+class NPROTO_OT_dome(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
     """Close an open end (rim) of a surface with a dome, G1 or G2 to it. A round rim gets an
     exact surface of revolution; any other planar rim a dome on the rim's own curve. With one open
-    rim on the selection it domes that; otherwise pick the rim (or pick its edge in Edge mode first)"""
+    rim on the selection it domes that; otherwise pick the rim (or pick its edge in Edge mode first).
+    Then drag the arrow (height) and the diamond (fullness), type, Enter"""
     bl_idname = "nproto.dome"
     bl_label = "Dome"
     bl_options = {'REGISTER', 'UNDO'}
 
     pick_min = 1
     pick_max = 1
+    drag_fields = ("dome_height", "dome_fullness")
+    ratio_fields = ("dome_height", "dome_fullness")
 
     inputs: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     dome_layout: EnumProperty(name="Layout", default="POLAR",
@@ -573,6 +599,7 @@ class NPROTO_OT_dome(AskValue, PickMixin, bpy.types.Operator):
     def invoke(self, context, event):
         if not _kernel_ok(self):
             return {'CANCELLED'}
+        self._start_event = (event.mouse_x, event.mouse_y, event.type, event.value)
         if self.inputs:                     # picked already: the settings, then the dome
             return self.ask(context)
         from . import subsel
@@ -592,6 +619,117 @@ class NPROTO_OT_dome(AskValue, PickMixin, bpy.types.Operator):
             self.report({'WARNING'}, "No open rim (a closed open edge) to dome")
             return {'CANCELLED'}
         return self.start_picking(context, event)
+
+    # -- the live value stage (valuedrag.py) ----------------------------------
+    # The preview is the polar dome (Draped is fitted to it on apply), drawn
+    # from its own net in numpy. The arrow stands on the rim's centre along the
+    # axis, its tip the top: Height. The diamond sits halfway up the profile on
+    # the side facing the screen's right and moves the way Fullness moves it.
+    def drag_setup(self, context, mouse):
+        ins = _decode_inputs(self.inputs)
+        if len(ins) != 1:
+            return False
+        self._in = ins[0]
+        self._rim = rim_data(*self._in)
+        if "a" not in self._rim:
+            return False
+        self._memo = {}
+        self._cache = {}
+        self._base_at_mouse = False
+        a = np.array(self._rim["a"], float)
+        _, rv3d = self._win(context)
+        right = np.array(rv3d.view_rotation @ Vector((1.0, 0.0, 0.0))) if rv3d else np.zeros(3)
+        e = right - (right @ a) * a
+        if np.linalg.norm(e) < 0.2:
+            e = np.array(self._rim["x0"], float)
+        self._side = e / np.linalg.norm(e)
+        st = self._state(self.dome_cont, self.dome_height, self.dome_fullness)
+        rim = st["grid"][0]
+        d = rim - rim.mean(axis=0)
+        d -= np.outer(d @ a, a)
+        self._j = int(np.argmax((d / np.maximum(np.linalg.norm(d, axis=1), 1e-12)[:, None]) @ self._side))
+        return True
+
+    def _polar(self, cont, h, f):
+        if self._rim["round"]:
+            return revolved(self._rim, profile(self._rim, cont, h, f))
+        return free_dome(*self._in, cont, h, f, memo=self._memo)
+
+    def _state(self, cont, h, f):
+        """The polar dome for these settings on a grid (rim row first, top last), cached."""
+        from . import surfeval
+        key = (cont, round(float(h), 6), round(float(f), 6))
+        st = self._cache.get(key)
+        if st is None:
+            S = surfeval.Surf(self._polar(cont, h, f))
+            us = np.linspace(*S.u_domain, 17)
+            vs = np.linspace(*S.v_domain, 73)
+            G = S.grid(us, vs, nd=0)[0, 0]
+            if len(self._cache) > 64:
+                self._cache.clear()
+            st = self._cache[key] = {"grid": G}
+        return st
+
+    def _mid(self, f):
+        """The diamond's place: halfway up the profile on the handle's side."""
+        G = self._state(self.dome_cont, self.dome_height, f)["grid"]
+        return G[len(G) // 2, getattr(self, "_j", 0)]
+
+    def _height_now(self):
+        """(the top, the rim's centre below it, the height)."""
+        G = self._state(self.dome_cont, self.dome_height, self.dome_fullness)["grid"]
+        a = np.array(self._rim["a"], float)
+        top = G[-1].mean(axis=0)
+        H = float((top - G[0].mean(axis=0)) @ a)
+        return top, top - H * a, H
+
+    def drag_handles(self):
+        a = np.array(self._rim["a"], float)
+        top, base, H = self._height_now()
+        H1 = H / max(float(self.dome_height), 0.02) or 1.0
+        hs = [{"field": "dome_height", "kind": "arrow", "origin": base, "dir": a, "param": H, "base": base,
+               "to_value": lambda t, H1=H1: t / H1, "snap": (0.1, 0.01)}]
+        f = float(self.dome_fullness)
+        f1, f2 = max(0.3, f - 0.05), min(2.0, f + 0.05)
+        d = (self._mid(f2) - self._mid(f1)) / (f2 - f1)
+        dl = float(np.linalg.norm(d))
+        if dl > 1e-9 * (abs(H) or 1.0):
+            hs.append({"field": "dome_fullness", "kind": "draft", "origin": self._mid(f) - f * d, "dir": d / dl,
+                       "param": f * dl, "to_value": lambda t, dl=dl: t / dl, "snap": (0.05, 0.01)})
+        return hs
+
+    def drag_preview(self):
+        G = self._state(self.dome_cont, self.dome_height, self.dome_fullness)["grid"]
+        lines, tris = ruled_preview(list(G), ribs=8, row_every=4)
+        return {"lines": lines, "tris": tris}
+
+    def _fmt(self, context, name):
+        out = ValueDrag._fmt(self, context, name)
+        if name == "dome_height":
+            out += f" ({fmt_length(context, self._height_now()[2])})"
+        return out
+
+    def drag_key(self, context, event, ch):
+        if ch == "g":
+            self.dome_cont = "G1" if self.dome_cont == "G2" else "G2"
+        elif ch == "d":
+            self.dome_layout = "DRAPED" if self.dome_layout == "POLAR" else "POLAR"
+        else:
+            return False
+        return True
+
+    def drag_rows(self):
+        return [("Dome", [hints.cycle("G", ["G1", "G2"], self.dome_cont),
+                          hints.cycle("D", ["polar", "draped"], self.dome_layout.lower())])]
+
+    def drag_handle_hints(self):
+        return [hints.key("LMB drag", "arrow: height · diamond: fullness")]
+
+    def drag_state(self):
+        kind = "exact revolution" if self._rim["round"] else "on the rim curve"
+        if self.dome_layout == "DRAPED":
+            return [f"Draped ({self.dome_cvs} CVs), fitted to this shape on apply", self.dome_cont]
+        return [kind, self.dome_cont]
 
     def draw(self, context):
         lay = self.layout

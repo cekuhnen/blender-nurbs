@@ -134,7 +134,9 @@ class ValueDrag:
     """Mixin for AskValue commands: the live value stage (see the module doc).
 
     A tool sets drag_fields (the properties Tab steps through, the first
-    active; angle_fields are among them) and implements:
+    active; angle_fields and ratio_fields are among them -- a ratio is a plain
+    factor, Dome's Height x the round one: shown x1.00, typed as a number,
+    no units, no grid) and implements:
       drag_setup(context, mouse) -> bool
             gather what the preview needs; mouse: where the command was started
             (region pixels, or None outside the view), to stand the arrow
@@ -158,6 +160,7 @@ class ValueDrag:
 
     drag_fields = ("distance",)
     angle_fields = ()
+    ratio_fields = ()
     ask_dialog = True       # False: without the stage (Value Input = Dialog) run at once, as the tool always did
     fit_view = "both"       # a start length that is off-screen at this zoom: "both" sized to the view,
                             # "shrink" only made smaller (a radius the part allows), "none" kept
@@ -223,7 +226,7 @@ class ValueDrag:
         return {'RUNNING_MODAL'}
 
     def _length_fields(self):
-        return [f for f in self.drag_fields if not self._is_angle(f)]
+        return [f for f in self.drag_fields if not self._is_angle(f) and not self._is_ratio(f)]
 
     def _last_text(self, context):
         """'2 mm' (or '2 mm / 1 mm' for two fields) of the value L brings back; '' if none."""
@@ -279,22 +282,28 @@ class ValueDrag:
     def _is_angle(self, name=None):
         return (name or self._field_name()) in self.angle_fields
 
+    def _is_ratio(self, name=None):
+        return (name or self._field_name()) in self.ratio_fields
+
     def _label(self, name):
-        try:
-            return self.bl_rna.properties[name].name.replace(" °", "")
+        try:        # the operator's own properties (its bl_rna is the Operator type's: names not found there)
+            props = getattr(self, "properties", None)
+            return (props or self).bl_rna.properties[name].name.replace(" °", "")
         except Exception:
             return name.title()
 
     def _fmt(self, context, name):
         v = getattr(self, name)
+        if self._is_ratio(name):
+            return f"×{v:.2f}"
         return f"{v:.4g}°" if self._is_angle(name) else fmt_length(context, v)
 
     def _parse(self, context, text):
-        text = text.strip().replace("°", "")
+        text = text.strip().replace("°", "").replace("×", "").lstrip("x")
         if text in ("", "-", "+", "."):
             return None
         try:
-            if self._is_angle():
+            if self._is_angle() or self._is_ratio():
                 return float(eval(text, {"__builtins__": {}}, {}))      # 3*2, 45/2
             from .drawtools import parse_length
             return parse_length(context, text)
@@ -325,7 +334,7 @@ class ValueDrag:
         """A starting length that fits this view: the last value used unless
         its arrow would be shorter than 40 px or longer than about half the
         view; then a round length about a quarter of the view, same sign."""
-        if self._is_angle(self.drag_fields[0]) or self.fit_view == "none":
+        if self._is_angle(self.drag_fields[0]) or self._is_ratio(self.drag_fields[0]) or self.fit_view == "none":
             return
         region, rv3d = self._win(context)
         h = self._main_handle()
@@ -417,6 +426,8 @@ class ValueDrag:
                 v = snap(v, h["snap"][1] if fine else h["snap"][0])
             elif self._is_angle(name):
                 v = snap(v, 0.1 if fine else 1.0)
+            elif self._is_ratio(name):
+                v = snap(v, 0.01 if fine else 0.1)
             else:
                 d = np.asarray(h["dir"], float)
                 v = snap(v, self._grid_step(context, np.asarray(h["origin"], float), d) * (0.1 if fine else 1.0))
@@ -433,7 +444,7 @@ class ValueDrag:
         """A length dragged to (about) nothing -- the arrow back on the input:
         under 3 px on screen. A typed value is taken as it is."""
         name = self.drag_fields[0]
-        if self._typed or getattr(self, "_exact", False) or self._is_angle(name):
+        if self._typed or getattr(self, "_exact", False) or self._is_angle(name) or self._is_ratio(name):
             return ""
         h = self._main_handle()
         if h is None or h.get("pick") is not None:
