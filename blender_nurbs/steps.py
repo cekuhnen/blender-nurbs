@@ -354,7 +354,7 @@ def apply_push_pull(obj, text, inputs, p):
     N = M.to_3x3().inverted().transposed()
     nrm = [list((N @ Vector(n)).normalized()) for n in p["normals_local"]] if p.get("normals_local") else None
     _, breps = jobs.run("push_pull", {"target": (text, jobs.xform(obj))}, ["result"], face_pts=pts,
-                        face_normals=nrm, distance=float(p["distance"]), into="target")
+                        face_normals=nrm, face_flat=p.get("flat"), distance=float(p["distance"]), into="target")
     return breps["result"]
 
 

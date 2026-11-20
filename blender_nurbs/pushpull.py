@@ -1,10 +1,12 @@
-"""Push / Pull: a flat face of a closed solid moved along its normal, as in
+"""Push / Pull: a face of a closed solid moved along its normal, as in
 Shapr3D and Plasticity. Out (a positive distance) adds material, in removes
-it: the prism the face sweeps is joined to or cut from the body (the worker's
-push_pull job, which falls back to extruding the face and stitching it when
-the boolean can't). The face comes from Face mode (the picked faces of the
-selected bodies) or a click on a flat face; then an arrow stands on it, from
-0: drag it out or through the face, type a value, click away or Enter.
+it. A flat face moves: the prism it sweeps is joined to or cut from the body
+(the worker's push_pull job, which falls back to extruding the face and
+stitching it when the boolean can't). A curved face is offset (Offset Face):
+the slab between it and its offset is joined or cut, so a hole or boss
+changes radius. The face comes from Face mode (the picked faces of the
+selected bodies) or a click on a face; then an arrow stands on it, from 0:
+drag it out or through the face, type a value, click away or Enter.
 
 With history the move is a step on the body (push_pull, replayed on rebuilds,
 the faces found again by a point on each); without it the body changes in
@@ -46,15 +48,33 @@ def face_frame(obj, i):
     return p, np.array(M @ Vector(p), float), nw, bool(f.surface().is_planar())
 
 
+def normals_at(obj, i, P):
+    """World unit outward normals of face i at the local points P (on it or near)."""
+    sm, _ = store._k()
+    f = store.get_brep(obj).faces()[i]
+    srf = f.surface()
+    N = []
+    for q in np.asarray(P, float):
+        _, uvs, _ = sm.surface_closest_point(srf, tuple(map(float, q)))
+        N.append(f.outward_normal_at_uv(*_uvxy(uvs[0])))
+    N = np.asarray(N, float).reshape(-1, 3)
+    Nw = N @ np.array(geom.world_matrix(obj).to_3x3().inverted().transposed()).T
+    return Nw / np.maximum(np.linalg.norm(Nw, axis=1), 1e-300)[:, None]
+
+
+def _world(M, P):
+    return (np.c_[P, np.ones(len(P))] @ M.T)[:, :3]
+
+
 def _faces_json(items):
     return json.dumps([[o.name, [float(x) for x in p]] for o, p in items])
 
 
 class NPROTO_OT_push_pull(ValueDrag, AskValue, bpy.types.Operator):
-    """Push or pull flat faces of a solid along their normals: out adds
-    material, in removes it. Faces picked in Face mode, or click a flat face;
-    then drag the arrow (through the face to push), type a value, click away
-    or Enter"""
+    """Push or pull faces of a solid along their normals: out adds material,
+    in removes it; a curved face is offset (a hole or boss changes radius).
+    Faces picked in Face mode, or click a face; then drag the arrow (through
+    the face to push), type a value, click away or Enter"""
     bl_idname = "nproto.push_pull"
     bl_label = "Push / Pull"
     bl_options = {'REGISTER', 'UNDO'}
@@ -66,6 +86,7 @@ class NPROTO_OT_push_pull(ValueDrag, AskValue, bpy.types.Operator):
                                         "in (negative) removes it")
 
     fit_view = "shrink"
+    MAX_FILL = 3000             # a curved face with more tessellation points than this: outlines only
     start_value = 0.0           # the arrow on the face: nothing moves until it is dragged (L: the last distance)
 
     # -- the faces ------------------------------------------------------------
@@ -83,9 +104,6 @@ class NPROTO_OT_push_pull(ValueDrag, AskValue, bpy.types.Operator):
         for o, p in items:
             if not store.is_nurbs(o) or not _is_solid(o):
                 return f"{o.name} is not a closed solid (Join its faces into a closed body first)"
-            i = _face_index(o, p)
-            if not face_frame(o, i)[3]:
-                return f"Push / Pull moves flat faces: the picked face of {o.name} is curved"
         return ""
 
     def _take_picks(self, context):
@@ -114,9 +132,9 @@ class NPROTO_OT_push_pull(ValueDrag, AskValue, bpy.types.Operator):
                 return {'CANCELLED'}
             return self.ask(context)
         if bpy.app.background:
-            self.report({'WARNING'}, "Pick a flat face of a solid (Face mode)")
+            self.report({'WARNING'}, "Pick a face of a solid (Face mode)")
             return {'CANCELLED'}
-        # pick a face: the next click on a flat face starts the value stage
+        # pick a face: the next click on a face of a solid starts the value stage
         self._dragging = False
         self._hover = None
         context.window_manager.modal_handler_add(self)
@@ -125,7 +143,7 @@ class NPROTO_OT_push_pull(ValueDrag, AskValue, bpy.types.Operator):
 
     # -- picking a face ---------------------------------------------------------
     def _pick_hints(self, context, msg=""):
-        state = ["click a flat face of a solid"] + ([msg] if msg else [])
+        state = ["click a face of a solid (curved: offset)"] + ([msg] if msg else [])
         hints.show(context, self.bl_label, state,
                    [("", [hints.note("or pick faces in Face mode first: they all move together")])],
                    [("MOUSE_LMB", "Pick the face"), ("EVENT_ESC", "Cancel")])
@@ -145,7 +163,7 @@ class NPROTO_OT_push_pull(ValueDrag, AskValue, bpy.types.Operator):
                 return None
 
     def _show_face(self, hit):
-        """Outline and fill the face under the mouse (flat faces of solids only)."""
+        """Outline and fill the face under the mouse (faces of solids only)."""
         if hit == self._hover:
             return
         self._hover = hit
@@ -153,13 +171,17 @@ class NPROTO_OT_push_pull(ValueDrag, AskValue, bpy.types.Operator):
         if hit is not None:
             o, i = hit
             try:
-                fr = face_frame(o, i)
-                if fr[3] and _is_solid(o):
+                if _is_solid(o):
+                    fr = face_frame(o, i)
                     pts, tris, polys = subsel.face_tris(o, i)
                     M = np.array(geom.world_matrix(o))
-                    lift = 2e-3 * float(np.linalg.norm(np.ptp(np.vstack(polys), axis=0)) or 1.0) * fr[2]
-                    W = lambda P: (np.c_[P, np.ones(len(P))] @ M.T)[:, :3] + lift    # off the face: no z-fight
-                    pv = {"lines": [W(P) for P in polys], "tris": W(pts)[tris].reshape(-1, 3) if len(tris) else
+                    lift = 2e-3 * float(np.linalg.norm(np.ptp(np.vstack(polys), axis=0)) or 1.0)
+                    if fr[3]:                   # off the face: no z-fight
+                        W = lambda P: _world(M, P) + lift * fr[2]
+                    else:
+                        W = lambda P: _world(M, P) + lift * normals_at(o, i, P)
+                    pv = {"lines": [W(P) for P in polys],
+                          "tris": W(pts)[tris].reshape(-1, 3) if len(tris) and len(pts) <= self.MAX_FILL else
                           np.zeros((0, 3))}
             except Exception as exc:
                 print("NURBS push/pull hover:", exc)
@@ -206,48 +228,61 @@ class NPROTO_OT_push_pull(ValueDrag, AskValue, bpy.types.Operator):
 
     # -- the value stage (valuedrag.py) -----------------------------------------
     def drag_setup(self, context, mouse):
+        """Each face's outline and fill (world) with the normal at every point
+        (one normal for a flat face): the preview moves them by distance x normal."""
         self._frames = []
         for o, p in self._items():
             i = _face_index(o, p)
-            _, pw, nw, _ = face_frame(o, i)
+            _, pw, nw, flat = face_frame(o, i)
+            pts, tris, polys = subsel.face_tris(o, i)
             M = np.array(geom.world_matrix(o))
-            polys = [(np.c_[P, np.ones(len(P))] @ M.T)[:, :3] for P in subsel.face_tris(o, i)[2]]
-            self._frames.append((pw, nw, polys))
+            if not len(tris) or len(pts) > self.MAX_FILL:
+                pts, tris = np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
+            if flat:
+                Np = [np.broadcast_to(nw, P.shape) for P in polys]
+                Nt = np.broadcast_to(nw, pts.shape)
+            else:
+                Np = [normals_at(o, i, P) for P in polys]
+                Nt = normals_at(o, i, pts) if len(pts) else pts
+            self._frames.append({"P": pw, "n": nw, "flat": flat, "polys": [_world(M, P) for P in polys], "Np": Np,
+                                 "pts": _world(M, pts) if len(pts) else pts, "Nt": Nt, "tris": tris})
         if not self._frames:
             return False
-        B, n, _ = self._frames[0]
-        self._B = B
+        f0 = self._frames[0]
+        self._B, self._n = f0["P"], f0["n"]
         self._base_at_mouse = False
         if mouse is not None:           # the mouse on the (first) face: the arrow stands there
             region, rv3d = self._win(context)
-            first = self._items()[0]
-            with context.temp_override(region=region):
-                hit = subsel.face_under(bpy.context, (mouse[0], mouse[1]))
-            if hit is not None and hit[0] == first[0] and hit[1] == _face_index(*first):
-                from bpy_extras import view3d_utils
-                o = np.array(view3d_utils.region_2d_to_origin_3d(region, rv3d, mouse), float)
-                d = np.array(view3d_utils.region_2d_to_vector_3d(region, rv3d, mouse), float)
-                den = float(d @ n)
-                if abs(den) > 1e-6:
-                    self._B = o + d * float((B - o) @ n) / den
+            o0, p0 = self._items()[0]
+            i0 = _face_index(o0, p0)
+            from bpy_extras import view3d_utils
+            ro = view3d_utils.region_2d_to_origin_3d(region, rv3d, mouse)
+            rd = view3d_utils.region_2d_to_vector_3d(region, rv3d, mouse)
+            hit, loc, _, _, ob, _ = context.scene.ray_cast(context.evaluated_depsgraph_get(), ro, rd)
+            if hit and ob is not None and ob.original == o0:
+                q = np.array(geom.world_matrix(o0).inverted() @ loc, float)
+                if _face_index(o0, q) == i0:
+                    self._B = np.array(loc, float)
+                    self._n = f0["n"] if f0["flat"] else normals_at(o0, i0, [q])[0]
                     self._base_at_mouse = True
         return True
 
     def drag_handles(self):
-        _, n, _ = self._frames[0]
-        return [{"field": "distance", "kind": "arrow", "origin": self._B, "dir": n, "param": self.distance,
+        return [{"field": "distance", "kind": "arrow", "origin": self._B, "dir": self._n, "param": self.distance,
                  "base": self._B, "to_value": lambda t: t}]
 
     def drag_preview(self):
         d = self.distance
         lines, tris = [], []
-        for _, n, polys in self._frames:
-            for P in polys:
-                Q = P + d * n
+        for fr in self._frames:
+            for P, N in zip(fr["polys"], fr["Np"]):
+                Q = P + d * N
                 lines.append(Q)
                 L, T = ruled_preview([P, Q], ribs=4)
                 lines += L[2:]
                 tris.append(T)
+            if len(fr["pts"]) and not fr["flat"]:       # the offset face itself (a flat one: its outline says it)
+                tris.append((fr["pts"] + d * fr["Nt"])[fr["tris"]].reshape(-1, 3))
         return {"lines": lines, "tris": np.vstack(tris) if tris else np.zeros((0, 3))}
 
     def drag_check(self):
@@ -266,9 +301,10 @@ class NPROTO_OT_push_pull(ValueDrag, AskValue, bpy.types.Operator):
                                hints.note("drag through the face to push")])]
 
     def drag_state(self):
-        if abs(self.distance) <= 0.0:
-            return []
-        return ["pull: adds material" if self.distance > 0 else "push: removes material"]
+        out = ["curved: offset"] if any(not f["flat"] for f in getattr(self, "_frames", [])) else []
+        if abs(self.distance) > 0.0:
+            out.append("pull: adds material" if self.distance > 0 else "push: removes material")
+        return out
 
     def drag_handle_hints(self):
         return [hints.key("LMB drag", "the arrow (out: pull, in: push)")]
@@ -284,7 +320,7 @@ class NPROTO_OT_push_pull(ValueDrag, AskValue, bpy.types.Operator):
             self.report({'ERROR'}, f"Push / Pull: {exc}")
             return {'CANCELLED'}
         if not items:
-            self.report({'WARNING'}, "Pick a flat face of a solid (Face mode, or click it)")
+            self.report({'WARNING'}, "Pick a face of a solid (Face mode, or click it)")
             return {'CANCELLED'}
         if abs(self.distance) <= 0.0:
             self.report({'WARNING'}, "Push / Pull: the distance is 0")
@@ -303,6 +339,7 @@ class NPROTO_OT_push_pull(ValueDrag, AskValue, bpy.types.Operator):
                 info, breps = jobs.run("push_pull", {"target": o}, ["result"],
                                        face_pts=[[float(x) for x in f[1]] for f in frames],
                                        face_normals=[[float(x) for x in f[2]] for f in frames],
+                                       face_flat=[bool(f[3]) for f in frames],
                                        distance=float(self.distance), into="target")
             except jobs.JobError as exc:
                 self.report({'ERROR'}, f"Push / Pull on {o.name} failed: {exc}")
@@ -317,6 +354,7 @@ class NPROTO_OT_push_pull(ValueDrag, AskValue, bpy.types.Operator):
                     "faces_local": [[float(x) for x in f[0]] for f in frames],
                     "normals_local": [[float(x) for x in (M.to_3x3().transposed() @ Vector(f[2])).normalized()]
                                       for f in frames],
+                    "flat": [bool(f[3]) for f in frames],
                     "distance": float(self.distance)}, base_text=pre)
             # the moved faces stay picked (Face mode): push / pull them again
             if had_picks:
@@ -326,9 +364,16 @@ class NPROTO_OT_push_pull(ValueDrag, AskValue, bpy.types.Operator):
                 except Exception as exc:
                     print("NURBS push/pull picks:", exc)
             done.append(o)
-            how = "pulled" if self.distance > 0 else "pushed"
+            how = ("offset out" if self.distance > 0 else "offset in") if not any(f[3] for f in frames) else \
+                ("pulled" if self.distance > 0 else "pushed")
             self.report({'INFO'}, f"{o.name}: {len(pts)} face{'s' if len(pts) > 1 else ''} {how} "
                                   f"{abs(self.distance):.4g} · volume {info.get('volume', 0):.6g}")
+            lean = float(info.get("lean", 0.0))
+            if lean > 0.5:
+                step = abs(self.distance) * np.sin(np.radians(lean))
+                self.report({'WARNING'}, f"{o.name}: a neighbour meets the moved face {lean:.0f}° from square; "
+                                         f"the walls go along the face's normal, so a step of about {step:.3g} "
+                                         "is left along that edge")
         if not done:
             return {'CANCELLED'}
         _select_only(context, done)

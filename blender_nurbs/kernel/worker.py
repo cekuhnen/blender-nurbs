@@ -1765,15 +1765,69 @@ def _extruded_face(body, p, n, dist, tol):
     return b, (walls, cap)
 
 
+def _offset_slab(body, p, dist, eps):
+    """(slab, kept) the face at p of body sweeps when it is offset dist along
+    its outward normal (a curved face: the face, its offset and walls along
+    the normals at its edges -- Thicken's shell), reaching eps back into the
+    body so the boolean never meets the face exactly."""
+    np = _np()
+    b = body.copy()
+    F = _face_at(b, p)
+    ip = np.array(F.interior_point(), float)
+    out_n = _face_normal(F, ip)
+    _, uvs, _ = sm.surface_closest_point(F.surface(), tuple(map(float, ip)))
+    sn = np.array(sm.evaluate_surface_normal(F.surface(), *_uvxy(uvs[0])), float)
+    sgn = 1.0 if float(sn @ out_n) > 0 else -1.0      # the face alone offsets along its surface's normal
+    ext.delete_faces(b, [f for f in b.faces() if f != F])
+    start = -eps if dist > 0 else eps
+    why = "the face cannot be offset that far (the distance may be bigger than its radius of curvature)"
+    try:
+        s0 = sm.offset_brep(b, sgn * start, extended_offset=True, self_intersection=True)
+        slab = sm.shell_brep(s0, sgn * (dist - start), extended_offset=True, self_intersection=True,
+                             create_solid=True)
+    except Exception:
+        raise RuntimeError(why)
+    if slab is None or not slab.face_count() or not slab.is_manifold_solid():
+        raise RuntimeError(why)
+    return slab, (b, s0)
+
+
+def _lean(body, F, n_samples=5):
+    """How far (degrees) the face's neighbours are from square to it along
+    their shared edges: the walls go along the face's normal, so a neighbour
+    at an angle is left with a step about distance x sin(this)."""
+    np = _np()
+    worst = 0.0
+    for e in F.edges():
+        other = [g for g in e.faces() if g != F]
+        if not other:
+            continue
+        t0, t1 = e.parameter_range()
+        for t in np.linspace(t0, t1, n_samples + 2)[1:-1]:
+            q = np.array(e.point_at(t), float)
+            try:
+                a, b = _face_normal(F, q), _face_normal(other[0], q)
+            except Exception:
+                continue
+            worst = max(worst, float(np.degrees(np.arcsin(min(1.0, abs(float(a @ b)))))))
+    return worst
+
+
 def job_push_pull(job):
-    """Push / Pull flat faces of a closed solid (world space): each face at
+    """Push / Pull faces of a closed solid (world space): each face at
     job['face_pts'] moves job['distance'] along its outward normal -- out adds
-    material, in removes it. The face's prism is joined to / cut from the body
-    (the boolean merges faces that end up in one plane); when the boolean
-    leaves the body as it was (a prism whose side lies on a curved neighbour,
-    a cylinder's top pulled), the face is extruded and stitched instead,
-    accepted when its volume is the body's plus area x distance. Written in
-    the local space of job['into']."""
+    material, in removes it. A flat face: its prism is joined to / cut from
+    the body (the boolean merges faces that end up in one plane); when the
+    boolean leaves the body as it was (a prism whose side lies on a curved
+    neighbour, a cylinder's top pulled), the face is extruded and stitched
+    instead, accepted when its volume is the body's plus area x distance.
+    A curved face is offset: the slab between it and its offset (walls along
+    its normals) is joined / cut (a hole or boss changes radius). Either way
+    the walls go along the face's normal; 'lean' reports how far the
+    neighbours are from square to it (a step is left where they lean).
+    job['face_flat'] (optional): which faces were flat when picked -- a flat
+    one is found again on rebuild by its normal (job['face_normals']).
+    Written in the local space of job['into']."""
     np = _np()
     body = world_brep(job, "target")
     if not bool(body.is_manifold_solid()):
@@ -1784,11 +1838,14 @@ def job_push_pull(job):
     tol, eps = 1e-6 * size, 1e-5 * size
     if abs(dist) <= tol:
         raise RuntimeError("the distance is 0")
-    hows, keep = [], []
-    normals = job.get("face_normals") or [None] * len(job["face_pts"])
-    for p, want_n in zip(job["face_pts"], normals):
+    hows, keep, lean = [], [], 0.0
+    pts = job["face_pts"]
+    normals = job.get("face_normals") or [None] * len(pts)
+    flats = job.get("face_flat") or [True] * len(pts)
+    op = sm.BooleanOp.UNION if dist > 0 else sm.BooleanOp.DIFFERENCE
+    for p, want_n, was_flat in zip(pts, normals, flats):
         F = _face_at(body, p)
-        if want_n is not None:
+        if want_n is not None and was_flat:
             # a rebuild may have moved the face: the nearest flat face facing the same way
             same = []
             for f in body.faces():
@@ -1803,46 +1860,53 @@ def job_push_pull(job):
                 p = np.array(F.interior_point(), float)
         elif F.closest_point(tuple(float(x) for x in p))[1] > 1e-3 * size:
             raise RuntimeError("a picked face is no longer on the body")
-        if not F.surface().is_planar():
-            raise RuntimeError("Push / Pull moves flat faces: a picked face is curved")
+        p = np.asarray(p, float)
+        flat = bool(F.surface().is_planar())
+        try:
+            lean = max(lean, _lean(body, F))
+        except Exception:
+            pass
         n = _face_normal(F, np.array(F.interior_point(), float))
         area = float(sm.face_area(F, 1e-6))
         V = _volume(body)
         change = area * dist
         res = None
         try:
-            prism, walls = _face_prism(F, n, dist, eps, tol)
-            keep.append((prism, walls))
-            out = sm.boolean(body.copy(), prism.copy(),
-                             operation=sm.BooleanOp.UNION if dist > 0 else sm.BooleanOp.DIFFERENCE)
+            if flat:
+                tool, kept = _face_prism(F, n, dist, eps, tol)
+            else:
+                tool, kept = _offset_slab(body, p, dist, eps)
+            keep.append((tool, kept))
+            out = sm.boolean(body.copy(), tool.copy(), operation=op)
             if out is not None and out.face_count():
                 if out.is_manifold_solid() and abs(_volume(out) - V) > 1e-3 * abs(change):
-                    res = (out, "boolean")
+                    res = (out, "boolean" if flat else "offset")
             elif dist < 0:
                 raise RuntimeError("nothing left: the push removes the whole body")
         except RuntimeError as exc:
-            if "nothing left" in str(exc):
+            if "nothing left" in str(exc) or not flat:
                 raise
-        except Exception:
-            pass
-        if res is None:
+        except Exception as exc:
+            if not flat:
+                raise RuntimeError(f"the offset face could not be joined to the body ({exc})")
+        if res is None and flat:
             try:
-                out, kept = _extruded_face(body, np.asarray(p, float), n, dist, tol)
+                out, kept = _extruded_face(body, p, n, dist, tol)
                 keep.append(kept)
                 if out.is_manifold_solid() and abs(_volume(out) - (V + change)) <= 1e-3 * abs(change) + tol:
                     res = (out, "extrude")
             except Exception:
                 pass
         if res is None:
-            raise RuntimeError("the face could not be moved (the boolean failed and the extruded face "
-                               "does not close into a solid)")
+            raise RuntimeError("the face could not be moved (the boolean failed" +
+                               (" and the extruded face does not close into a solid)" if flat else ")"))
         body, how = res
         hows.append(how)
     volume = _volume(body)
     if volume <= 0:
         raise RuntimeError("nothing left: the push removes the whole body")
     save(to_local(body, job.get("xforms", {}).get(job.get("into"))), job["out"]["result"])
-    return {"faces": body.face_count(), "volume": volume, "how": hows}
+    return {"faces": body.face_count(), "volume": volume, "how": hows, "lean": lean}
 
 
 def job_boolean(job):

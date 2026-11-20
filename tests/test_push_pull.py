@@ -92,12 +92,58 @@ for hist in (True, False):
     r = run(bpy.ops.nproto.push_pull, faces=faces((Cy, (0.2, 0.2, 3))), distance=-2.0)
     check(f"[{tag}] cylinder top pushed", r == {'FINISHED'} and solid(Cy) and abs(vol(Cy) - v0 * 0.5) < 1e-4,
           f"vol {vol(Cy):.5f} want {v0 * 0.5:.5f}")
-    # refused: a curved face, a push through the whole body, an open sheet
-    v1 = vol(Cy)
+    # a curved face is offset: the cylinder's side, out then in (the radius changes)
+    v1 = vol(Cy)                                   # radius 1, height 1
     r = run(bpy.ops.nproto.push_pull, faces=faces((Cy, (1, 0, 0.5))), distance=0.2)
-    check(f"[{tag}] curved face refused", r == {'CANCELLED'} and abs(vol(Cy) - v1) < 1e-9)
+    check(f"[{tag}] cylinder side offset out", r == {'FINISHED'} and solid(Cy)
+          and abs(vol(Cy) / v1 - 1.44) < 1e-4, f"ratio {vol(Cy) / v1:.6f} want 1.44")
+    r = run(bpy.ops.nproto.push_pull, faces=faces((Cy, (1.2, 0, 0.5))), distance=-0.4)
+    check(f"[{tag}] cylinder side offset in", r == {'FINISHED'} and solid(Cy)
+          and abs(vol(Cy) / v1 - 0.64) < 1e-4, f"ratio {vol(Cy) / v1:.6f} want 0.64")
+    if hist:
+        e = features.stack(Cy)[-1]
+        check("[history] a curved face's step says so", e["params"].get("flat") == [False], e["params"].get("flat"))
+        v2 = vol(Cy)
+        features.rebuild(Cy, ctx)
+        check("[history] the offset replays on rebuild", abs(vol(Cy) - v2) < 1e-6, f"{vol(Cy):.6f} vs {v2:.6f}")
+    v1 = vol(Cy)
+    r = run(bpy.ops.nproto.push_pull, faces=faces((Cy, (0.8, 0, 0.5))), distance=-0.9)
+    check(f"[{tag}] offset past the axis refused", r == {'CANCELLED'} and abs(vol(Cy) - v1) < 1e-9)
     r = run(bpy.ops.nproto.push_pull, faces=faces((Cy, (0.2, 0.2, 1))), distance=-3.0)
     check(f"[{tag}] push through everything refused", r == {'CANCELLED'} and abs(vol(Cy) - v1) < 1e-9)
+
+# --- a hole through a box: offset smaller and bigger
+for hist in (True, False):
+    hist_on(hist)
+    tag = "history" if hist else "no history"
+    clear()
+    B, _ = box(-2, -1.5, 2, 1.5, 2)
+    bpy.ops.curve.primitive_nurbs_circle_add(radius=0.5, location=(0, 0, 2))
+    Hc = ctx.active_object
+    bpy.ops.nproto.extrude(inputs=ins((Hc, "S0")), distance=-2.0, direction="Z", body="CUT")
+    X = ctx.active_object
+    hole = (24 - vol(X)) / 2                       # the hole's cross-section (pi r^2 of this circle)
+    r = run(bpy.ops.nproto.push_pull, faces=faces((X, (0.5, 0, 1))), distance=0.1)
+    want = 24 - 2 * hole * 0.64
+    check(f"[{tag}] hole offset smaller", r == {'FINISHED'} and solid(X) and abs(vol(X) - want) < 1e-4,
+          f"vol {vol(X):.5f} want {want:.5f}")
+    r = run(bpy.ops.nproto.push_pull, faces=faces((X, (0.4, 0, 1))), distance=-0.3)
+    want = 24 - 2 * hole * 1.96
+    check(f"[{tag}] hole offset bigger", r == {'FINISHED'} and solid(X) and abs(vol(X) - want) < 1e-4,
+          f"vol {vol(X):.5f} want {want:.5f}")
+
+# --- a cone's side leans against its caps: made, with a warning (a small step at the caps)
+hist_on(False)
+clear()
+bpy.ops.curve.primitive_nurbs_circle_add(radius=1.0, location=(0, 0, 0))
+a = ctx.active_object
+bpy.ops.curve.primitive_nurbs_circle_add(radius=0.5, location=(0, 0, 2))
+b = ctx.active_object
+bpy.ops.nproto.loft(inputs=ins((a, "S0"), (b, "S0")), body="NEW")
+Fr = ctx.active_object
+v0 = vol(Fr)
+r = run(bpy.ops.nproto.push_pull, faces=faces((Fr, (0.75, 0, 1))), distance=0.1)
+check("frustum side offset (leaning caps)", r == {'FINISHED'} and solid(Fr) and vol(Fr) > v0, f"{vol(Fr):.5f} > {v0:.5f}")
 
 # --- history: the step follows the body's rebuild (a taller box: its top found by its normal)
 hist_on(True)
