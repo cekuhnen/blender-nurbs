@@ -1,4 +1,4 @@
-"""STEP export of true cylinders, cones, spheres, tori, extrusions, planes, circles, ellipses and lines:
+"""STEP export of true cylinders, cones, spheres, tori, revolutions, extrusions, planes, circles, ellipses and lines:
 blender -b --factory-startup --python tests/test_step_analytic.py"""
 import json, math, os, re, sys, tempfile
 import bpy
@@ -106,6 +106,17 @@ Gspin = np.array([3, 4, 5]) + (0.2 + 0.3 * np.cos(ps))[..., None] * (np.cos(uu[:
                                                                     + np.sin(uu[:, :1])[..., None] * e2) \
     + (0.3 * np.sin(ps))[..., None] * ax
 check("a spindle torus (tube wider than the ring) is not written as one", se.fit_torus(Gspin, 1e-9, 10) is None)
+# surfaces of revolution: the parallels' axis and their grid direction
+rv = se.fit_revolution(Gspin, 1e-9, 10)
+check("revolution: a spindle torus, its axis, the parallels along u", rv is not None and rv[2] == 0
+      and abs(abs(rv[1] @ ax) - 1) < 1e-12 and np.linalg.norm(np.cross(rv[0] - [3, 4, 5], ax)) < 1e-9, str(rv))
+Gelo = Gsph + 0.4 * ((Gsph - [3, 4, 5]) @ ax)[..., None] * ax          # a spheroid (stretched along its axis)
+rv = se.fit_revolution(Gelo.transpose(1, 0, 2), 1e-9, 10)
+check("revolution: a spheroid, transposed (parallels along v)", rv is not None and rv[2] == 1
+      and abs(abs(rv[1] @ ax) - 1) < 1e-12, str(rv))
+check("a squashed sphere (no round parallels) is no revolution; nor are parallels round wandering centres",
+      se.fit_revolution(Gsph + 0.1 * ((Gsph - [3, 4, 5]) @ e1)[..., None] * e1, 1e-9, 10) is None
+      and se.fit_revolution(Gsph + 0.05 * np.sin(ph)[..., None] * e1, 1e-9, 10) is None)
 # an extrusion: a wavy profile moved along a slanted direction
 pu, pv = np.meshgrid(np.linspace(0, 3, 31), np.linspace(0, 1.5, 7), indexing="ij")
 dx = np.array([0.2, 0.3, 1.0]) / np.linalg.norm([0.2, 0.3, 1.0])
@@ -125,7 +136,8 @@ def add(kind, **kw):
 
 def kinds(txt):
     return {k: len(re.findall(r"=%s\(" % k, txt)) for k in ("CYLINDRICAL_SURFACE", "CONICAL_SURFACE", "SPHERICAL_SURFACE",
-                                                             "TOROIDAL_SURFACE", "SURFACE_OF_LINEAR_EXTRUSION", "PLANE", "CIRCLE",
+                                                             "TOROIDAL_SURFACE", "SURFACE_OF_REVOLUTION", "SURFACE_OF_LINEAR_EXTRUSION",
+                                                             "PLANE", "CIRCLE",
                                                              "ELLIPSE", "LINE")} | {
         "BSPLINE_SURF": txt.count("B_SPLINE_SURFACE"), "BSPLINE_CURVE": txt.count("B_SPLINE_CURVE")}
 
@@ -146,7 +158,7 @@ ctx.view_layer.update()
 st, txt, res, rep = export(cyl, "cyl")
 k = kinds(txt)
 check("exact solid cylinder: a CYLINDRICAL_SURFACE, two PLANEs, two CIRCLEs, the seam a LINE; no B-splines",
-      k == {"CYLINDRICAL_SURFACE": 1, "CONICAL_SURFACE": 0, "SPHERICAL_SURFACE": 0, "TOROIDAL_SURFACE": 0, "SURFACE_OF_LINEAR_EXTRUSION": 0, "PLANE": 2, "CIRCLE": 2, "ELLIPSE": 0, "LINE": 1, "BSPLINE_SURF": 0, "BSPLINE_CURVE": 0}, str(k))
+      k == {"CYLINDRICAL_SURFACE": 1, "CONICAL_SURFACE": 0, "SPHERICAL_SURFACE": 0, "TOROIDAL_SURFACE": 0, "SURFACE_OF_REVOLUTION": 0, "SURFACE_OF_LINEAR_EXTRUSION": 0, "PLANE": 2, "CIRCLE": 2, "ELLIPSE": 0, "LINE": 1, "BSPLINE_SURF": 0, "BSPLINE_CURVE": 0}, str(k))
 r_ = float(re.search(r"=CYLINDRICAL_SURFACE\('',#\d+,([^)]+)\)", txt).group(1))
 # (within Blender's single-precision object matrix: rotated, it is a hair from rigid)
 check("its radius in millimetres", abs(r_ - 500) < 1e-4, f"{r_}")
@@ -198,7 +210,7 @@ ctx.view_layer.update()
 st, txt, res, rep = export(fr, "frustum")
 k = kinds(txt)
 check("exact frustum: a CONICAL_SURFACE, two PLANEs, two CIRCLEs, the seam a LINE; no B-splines",
-      k == {"CYLINDRICAL_SURFACE": 0, "CONICAL_SURFACE": 1, "SPHERICAL_SURFACE": 0, "TOROIDAL_SURFACE": 0, "SURFACE_OF_LINEAR_EXTRUSION": 0, "PLANE": 2, "CIRCLE": 2, "ELLIPSE": 0, "LINE": 1, "BSPLINE_SURF": 0,
+      k == {"CYLINDRICAL_SURFACE": 0, "CONICAL_SURFACE": 1, "SPHERICAL_SURFACE": 0, "TOROIDAL_SURFACE": 0, "SURFACE_OF_REVOLUTION": 0, "SURFACE_OF_LINEAR_EXTRUSION": 0, "PLANE": 2, "CIRCLE": 2, "ELLIPSE": 0, "LINE": 1, "BSPLINE_SURF": 0,
             "BSPLINE_CURVE": 0}, str(k))
 m = re.search(r"=CONICAL_SURFACE\('',(#\d+),([^,]+),([^)]+)\)", txt)
 check("its semi-angle atan(0.35 / 0.9)", m and abs(float(m.group(3)) - math.atan(0.35 / 0.9)) < 1e-6, m and m.group(3))
@@ -383,6 +395,51 @@ check("box with a wavy hole: its walls an extrusion, the box PLANEs", r == {'FIN
       and k["SURFACE_OF_LINEAR_EXTRUSION"] >= 1 and k["PLANE"] == 6, str(k))
 check("wavy hole reads back: one solid, the volume", rep["solids"] == 1 and rep["failed"] == 0 and res
       and abs(vol(res[0][1]) / v0 - 1) < 1e-5 and v0 < 9 - 0.5, f"{rep} {vol(res[0][1]) if res else None} vs {v0}")
+
+# revolutions: a vase (a B-spline profile from the axis round to it), whole and a third of a turn, a
+# spheroid (a sphere scaled along z) and a hyperboloid (a skew line turned round z)
+def nurbs(name, pts, order=4):
+    cu = bpy.data.curves.new(name, 'CURVE'); cu.dimensions = '3D'
+    sp = cu.splines.new('NURBS'); sp.points.add(len(pts) - 1)
+    for p, c in zip(sp.points, pts): p.co = (*c, 1.0)
+    sp.order_u = order; sp.use_endpoint_u = True
+    o = bpy.data.objects.new(name, cu); ctx.collection.objects.link(o); return o
+def revolve(prof, **kw):
+    r = bpy.ops.nproto.revolve(inputs=json.dumps([[prof.name, "S0"]]), axis="Z", pivot="WORLD", **kw)
+    return r, ctx.active_object
+VASE = [(0, 0, 0), (0.7, 0, 0), (0.9, 0, 0.5), (0.3, 0, 0.9), (0.7, 0, 1.3), (0, 0, 1.3)]
+r, vs = revolve(nurbs("vase", VASE), angle=360, body="NEW")
+vs.location, vs.rotation_euler = (1, 2, 0.5), (0.3, 0.4, 0.5)
+ctx.view_layer.update()
+v0 = vol(store.get_brep(vs))
+st, txt, res, rep = export(vs, "vase")
+k = kinds(txt)
+check("whole vase: one SURFACE_OF_REVOLUTION, its meridian a B-spline curve, no B-spline surface", r == {'FINISHED'}
+      and k["SURFACE_OF_REVOLUTION"] == 1 and k["BSPLINE_SURF"] == 0 and st["solids"] == 1, str(k))
+check("whole vase reads back (bounded by its seam only, the poles a hair off the axis): the volume",
+      rep["failed"] == 0 and res and abs(vol(res[0][1]) / v0 - 1) < 1e-6, f"{rep} {vol(res[0][1]) if res else None} vs {v0}")
+r, v3 = revolve(nurbs("vase3", VASE), angle=120, body="NEW")
+st, txt, res, rep = export(v3, "vase120")
+k = kinds(txt)
+check("a third of a vase: a SURFACE_OF_REVOLUTION and two PLANEs", r == {'FINISHED'}
+      and k["SURFACE_OF_REVOLUTION"] == 1 and k["PLANE"] == 2 and k["BSPLINE_SURF"] == 0, str(k))
+check("a third of a vase reads back: one solid, the volume", rep["solids"] == 1 and rep["failed"] == 0 and res
+      and abs(vol(res[0][1]) / vol(store.get_brep(v3)) - 1) < 1e-6, f"{rep} {vol(res[0][1]) if res else None}")
+sd = add("SPHERE", radius=0.7, degree="0")
+sd.scale = (1, 1, 1.6)
+ctx.view_layer.update()
+st, txt, res, rep = export(sd, "spheroid")
+k = kinds(txt)
+check("spheroid: a SURFACE_OF_REVOLUTION (no sphere), its seam an ELLIPSE", k["SURFACE_OF_REVOLUTION"] == 1
+      and k["SPHERICAL_SURFACE"] == 0 and k["ELLIPSE"] == 1 and k["BSPLINE_SURF"] == 0, str(k))
+check("spheroid reads back: the volume", rep["failed"] == 0 and res
+      and abs(vol(res[0][1]) / (4 / 3 * math.pi * 0.49 * 1.12) - 1) < 1e-6, f"{rep} {vol(res[0][1]) if res else None}")
+r, hy = revolve(nurbs("hyp", [(0.5, -0.5, 0), (0.5, 0.5, 1)], order=2), angle=360)
+st, txt, res, rep = export(hy, "hyperboloid")
+k = kinds(txt)
+check("hyperboloid: a SURFACE_OF_REVOLUTION, its rims CIRCLEs; reads back", r == {'FINISHED'}
+      and k["SURFACE_OF_REVOLUTION"] == 1 and k["CIRCLE"] == 2 and k["BSPLINE_SURF"] == 0 and rep["failed"] == 0
+      and res and abs(res[0][1].area() / store.get_brep(hy).area() - 1) < 1e-6, str(k))
 
 # the operator: the option, on by default, and the report
 p = os.path.join(TMP, "op.step")

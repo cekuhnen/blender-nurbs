@@ -4,7 +4,7 @@ Exact geometry: every face's surface is written as a B-spline surface (rational
 when it has weights), every edge as a B-spline curve cut exactly to the edge's
 range -- or, with analytic on (the default), as what it truly is when it is one
 within 1e-7 of the body's size: a PLANE, CYLINDRICAL_, CONICAL_, SPHERICAL_
-or TOROIDAL_SURFACE, a SURFACE_OF_LINEAR_EXTRUSION, a CIRCLE, ELLIPSE or LINE, as CAD programs write them (an exact cylinder is then
+or TOROIDAL_SURFACE, a SURFACE_OF_REVOLUTION or _LINEAR_EXTRUSION, a CIRCLE, ELLIPSE or LINE, as CAD programs write them (an exact cylinder is then
 a true cylinder in the file, its holes and bosses recognised by the reader) -- with full B-rep topology (vertices, edge curves shared by their two
 faces, oriented edges, outer / inner face bounds, face sense). Closed bodies
 become MANIFOLD_SOLID_BREPs, open ones SHELL_BASED_SURFACE_MODELs. Each object
@@ -270,8 +270,15 @@ def revolution_axis(G, tol, size):
     """(point, unit axis) of a grid of surface points G (mu, mv, 3) whose rows
     along u or v are circles round one axis (the parallels of a surface of
     revolution), else None. Rows shrunk to a point (a pole) are skipped."""
+    rv = fit_revolution(G, tol, size)
+    return None if rv is None else rv[:2]
+
+
+def fit_revolution(G, tol, size):
+    """(point, unit axis, k) of a surface of revolution: its parallels run along
+    grid axis k (0: u, 1: v), counter-clockwise round the axis; else None."""
     G = np.asarray(G, float)
-    for rows in (G.transpose(1, 0, 2), G):          # parallels along u, then along v
+    for k, rows in ((0, G.transpose(1, 0, 2)), (1, G)):   # parallels along u, then along v
         circles = []
         ok = True
         for R in rows:
@@ -292,7 +299,7 @@ def revolution_axis(G, tol, size):
                 ok = False
                 break
         if ok:
-            return C0, a
+            return C0, a, k
     return None
 
 
@@ -433,8 +440,8 @@ class StepExporter:
         self.analytic = analytic
         self.stats = {"bodies": 0, "faces": 0, "edges": 0, "solids": 0, "sheets": 0,
                       "analytic": {"CYLINDRICAL_SURFACE": 0, "CONICAL_SURFACE": 0, "SPHERICAL_SURFACE": 0,
-                                   "TOROIDAL_SURFACE": 0, "SURFACE_OF_LINEAR_EXTRUSION": 0,
-                                   "PLANE": 0, "CIRCLE": 0, "ELLIPSE": 0, "LINE": 0}}
+                                   "TOROIDAL_SURFACE": 0, "SURFACE_OF_REVOLUTION": 0,
+                                   "SURFACE_OF_LINEAR_EXTRUSION": 0, "PLANE": 0, "CIRCLE": 0, "ELLIPSE": 0, "LINE": 0}}
         self._dir_cache = {}
 
     # -- small geometry ----------------------------------------------------
@@ -477,9 +484,10 @@ class StepExporter:
     def analytic_surface(self, G, tol, size, cvs=None, X=None):
         """(entity, normal at a point: P -> unit normal, entity type) of a PLANE,
         CYLINDRICAL_, CONICAL_, SPHERICAL_ or TOROIDAL_SURFACE or a
-        SURFACE_OF_LINEAR_EXTRUSION through the surface samples G, else None.
+        SURFACE_OF_REVOLUTION or _LINEAR_EXTRUSION through the surface samples G, else None.
         cvs (the surface's CV net) and X (its point transform) give an
-        extrusion's profile when it is no circle or ellipse."""
+        revolution's meridian, and an extrusion's profile when it is no circle
+        or ellipse."""
         pl = fit_plane(G, tol)
         if pl is not None:
             c, n = pl
@@ -536,6 +544,31 @@ class StepExporter:
                 n = np.asarray(P, float) - e
                 return n / (np.linalg.norm(n) or 1.0)
             return ent, normal, "TOROIDAL_SURFACE"
+        rv = fit_revolution(G, tol, size)
+        if rv is not None:
+            C0, a, k = rv
+            H = np.asarray(G, float) if k == 0 else np.asarray(G, float).transpose(1, 0, 2)
+            # the meridian: the surface's own boundary across the parallels, exact and bounded (a CIRCLE
+            # or ELLIPSE would run round both sides of the axis and sweep the surface twice)
+            cur = None
+            iso = _iso_start(cvs, k) if cvs is not None else None
+            if iso is not None:
+                dg, P, U, W = iso
+                cur = self.bspline_curve(dg, [X(p) for p in P], U, W)
+            if cur is not None:
+                self.stats["analytic"]["SURFACE_OF_REVOLUTION"] += 1
+                ax1 = self.w.add(f"AXIS1_PLACEMENT('',{self.point(C0)},{self.direction(a)})")
+                ent = self.w.add(f"SURFACE_OF_REVOLUTION('',{cur},{ax1})")
+                # STEP's normal: d/d(angle) x d/d(meridian), the angle turning right-handed round the axis
+                # (the parallels' own way round); sampled on the grid, poles left out
+                Nn = np.cross(np.gradient(H, axis=0), np.gradient(H, axis=1)).reshape(-1, 3)
+                ln = np.linalg.norm(Nn, axis=1)
+                keep = ln > 1e-9 * max(float(ln.max()), 1e-300)
+                flat, Nn = H.reshape(-1, 3)[keep], Nn[keep] / ln[keep, None]
+
+                def normal(P):
+                    return Nn[int(np.argmin(np.linalg.norm(flat - np.asarray(P, float), axis=1)))]
+                return ent, normal, "SURFACE_OF_REVOLUTION"
         ex = fit_extrusion(G, tol, size)
         if ex is not None:
             ax, dvec = ex
@@ -880,7 +913,7 @@ from bpy_extras.io_utils import ExportHelper  # noqa: E402
 
 class NPROTO_OT_export_step(bpy.types.Operator, ExportHelper):
     """Export NURBS objects as STEP (AP214): exact B-spline surfaces and curves
-    (true cylinders, planes, extrusions, circles, ellipses and lines as STEP's own) with full B-rep
+    (true cylinders, planes, revolutions, extrusions, circles, ellipses and lines as STEP's own) with full B-rep
     topology; closed bodies as solids"""
     bl_idname = "nproto.export_step"
     bl_label = "Export STEP"
@@ -894,7 +927,7 @@ class NPROTO_OT_export_step(bpy.types.Operator, ExportHelper):
                        description="Length unit of the file; Blender units are taken as metres")
     global_scale: FloatProperty(name="Scale", default=1.0, min=1e-6, soft_max=1000.0)
     analytic: BoolProperty(name="Analytic Surfaces", default=True,
-                           description="Write true planes, cylinders, cones, spheres, tori, extrusions, circles, ellipses and lines as "
+                           description="Write true planes, cylinders, cones, spheres, tori, revolutions, extrusions, circles, ellipses and lines as "
                                        "STEP's own analytic entities, as CAD programs do (holes, bosses, countersinks "
                                        "and fillets are then recognised); off: everything as B-splines")
 
@@ -912,6 +945,7 @@ class NPROTO_OT_export_step(bpy.types.Operator, ExportHelper):
         an = stats["analytic"]
         parts = [f"{an[k]} {w}" for k, w in (("CYLINDRICAL_SURFACE", "cylinder"), ("CONICAL_SURFACE", "cone"),
                                               ("SPHERICAL_SURFACE", "sphere"), ("TOROIDAL_SURFACE", "torus"),
+                                              ("SURFACE_OF_REVOLUTION", "revolution"),
                                               ("SURFACE_OF_LINEAR_EXTRUSION", "extrusion"))
                  if an[k]]
         if self.analytic and parts:
