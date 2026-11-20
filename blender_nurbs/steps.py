@@ -347,7 +347,18 @@ def apply_untrim(obj, text, inputs, p):
     return whole[0] if whole is not None else text
 
 
-APPLY = {"trim": apply_trim, "edge_fillet": apply_edge_fillet, "fillet_trim": apply_fillet_trim,
+def apply_push_pull(obj, text, inputs, p):
+    """Push / Pull on rebuild: the faces at the stored points moved again."""
+    M = _world(obj)
+    pts = [list(M @ Vector(q)) for q in p["faces_local"]]
+    N = M.to_3x3().inverted().transposed()
+    nrm = [list((N @ Vector(n)).normalized()) for n in p["normals_local"]] if p.get("normals_local") else None
+    _, breps = jobs.run("push_pull", {"target": (text, jobs.xform(obj))}, ["result"], face_pts=pts,
+                        face_normals=nrm, distance=float(p["distance"]), into="target")
+    return breps["result"]
+
+
+APPLY = {"push_pull": apply_push_pull, "trim": apply_trim, "edge_fillet": apply_edge_fillet, "fillet_trim": apply_fillet_trim,
          "flip_normal": apply_flip, "untrim_region": apply_untrim_region, "untrim": apply_untrim}
 LABEL = {
     "trim": lambda p: "Trim · " + {"KEEP": "Keep", "DELETE": "Discard"}.get(p.get("action"), p.get("action", "")),
@@ -358,6 +369,9 @@ LABEL = {
     "flip_normal": lambda p: "Flip Normal",
     "untrim_region": lambda p: "Untrim Region",
     "untrim": lambda p: "Untrim",
+    "push_pull": lambda p: ("Pull" if float(p.get("distance", 0)) > 0 else "Push")
+                           + f" · {abs(float(p.get('distance', 0))):.3g}"
+                           + (f" · {len(p.get('faces_local', []))} faces" if len(p.get("faces_local", [])) > 1 else ""),
 }
 
 

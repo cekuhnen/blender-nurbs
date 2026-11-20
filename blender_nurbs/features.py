@@ -1636,8 +1636,14 @@ def cap_walls(pieces):
     from . import jobs
     from .steps import IDENT
     sm, ext = _k()
+    flat = []
+    for piece in pieces:
+        # a wall folded at its corners (an extruded rectangle) as one face per side,
+        # so each side is a face of its own (Push / Pull, Edge Fillet picks)
+        split = store._crease_pieces(piece, LOFT_FOLD_DEG) if isinstance(piece, sm.Surface) else None
+        flat += split or [piece]
     walls = {}
-    for k, piece in enumerate(pieces):
+    for k, piece in enumerate(flat):
         if isinstance(piece, tuple) and piece and piece[0] == "brep_text":
             text = piece[1]
         else:

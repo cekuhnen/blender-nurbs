@@ -226,6 +226,9 @@ jobs:
           "$BLENDER" -b --factory-startup --python tests/test_solid_body.py 2>&1 | tee solid.log
           grep -E "^FAIL" solid.log || true
           grep -q "^ALL OK" solid.log
+          "$BLENDER" -b --factory-startup --python tests/test_push_pull.py 2>&1 | tee pushpull.log
+          grep -E "^FAIL" pushpull.log || true
+          grep -q "^ALL OK" pushpull.log
 
   # After the tests, so the Linux test job has put Blender in the cache.
   package:

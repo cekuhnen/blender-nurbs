@@ -1699,6 +1699,152 @@ def job_cap_solid(job):
     return {"faces": b.face_count(), "caps": caps, "volume": volume}
 
 
+# ---------------------------------------------------------------------------
+# Push / Pull: a flat face moved along its normal (material added or removed)
+# ---------------------------------------------------------------------------
+
+def _moved_curve(c, v):
+    np = _np()
+    d = ext.curve_cvs(c)
+    P = np.array(d["points"], float) + np.asarray(v, float)
+    return ext.curve_from_cvs(int(d["degree"]), [tuple(map(float, q)) for q in P],
+                              [float(k) for k in d["knots"]], d.get("weights") or None)
+
+
+def _face_at(b, p):
+    return min(b.faces(), key=lambda f: f.closest_point(tuple(float(x) for x in p))[1])
+
+
+def _loop_edges(face, tol):
+    """The edges round a face's loops, each once (a seam used twice and
+    zero-length pole edges left out)."""
+    uses, order = {}, []
+    for loop in face.boundary_loops():
+        for e, _ in loop:
+            if e not in uses:
+                order.append(e)
+            uses[e] = uses.get(e, 0) + 1
+    return [e for e in order if uses[e] == 1 and e.length() > tol]
+
+
+def _face_prism(face, n, dist, eps, tol):
+    """(prism, walls) the face sweeps moving dist along n, reaching eps back
+    into the body so the boolean never meets the face exactly (a cap lying on
+    the face crashes it). Keep the walls alive with the prism."""
+    start = -eps if dist > 0 else eps
+    walls = [ext.brep_from_surface(sm.create_extrude_surface(_moved_curve(_edge_copy(e), start * n),
+                                                             tuple(float(x) for x in (dist - start) * n)))
+             for e in _loop_edges(face, tol)]
+    return _capped(walls, tol)[0], walls
+
+
+def _extruded_face(body, p, n, dist, tol):
+    """(solid, kept) of body with the face at p replaced by the walls its loops
+    sweep moving dist along n and the face moved there, stitched: Extrude Face,
+    no boolean. Exact when the walls meet nothing else of the body."""
+    np = _np()
+    b = body.copy()
+    F = _face_at(b, p)
+    # a face the move leaves alone sets the orientation afterwards
+    others = [f for f in b.faces() if f != F]
+    ref = max((np.array(f.interior_point(), float) for f in others),
+              key=lambda q: float(np.linalg.norm(q - np.asarray(p, float))))
+    v = tuple(float(x) for x in dist * n)
+    edges = _loop_edges(F, tol)
+    walls = [ext.brep_from_surface(sm.create_extrude_surface(_edge_copy(e), v)) for e in edges]
+    cap = sm.create_planar_faces([_moved_curve(_edge_copy(e), v) for e in edges])
+    ext.delete_faces(b, [F])
+    for w in walls:
+        ext.append_brep(b, w)
+    ext.append_brep(b, cap)
+    b = sm.stitch_advanced(b, tol, squeeze_small_edges=False, making_manifold_solid=True)[0]
+    try:
+        sm.unify_normals(b, _face_at(b, ref), 100)
+    except Exception:
+        pass
+    return b, (walls, cap)
+
+
+def job_push_pull(job):
+    """Push / Pull flat faces of a closed solid (world space): each face at
+    job['face_pts'] moves job['distance'] along its outward normal -- out adds
+    material, in removes it. The face's prism is joined to / cut from the body
+    (the boolean merges faces that end up in one plane); when the boolean
+    leaves the body as it was (a prism whose side lies on a curved neighbour,
+    a cylinder's top pulled), the face is extruded and stitched instead,
+    accepted when its volume is the body's plus area x distance. Written in
+    the local space of job['into']."""
+    np = _np()
+    body = world_brep(job, "target")
+    if not bool(body.is_manifold_solid()):
+        raise RuntimeError("Push / Pull needs a closed solid (all edges shared by two faces)")
+    dist = float(job["distance"])
+    lo, hi = (np.array(v, float) for v in body.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    tol, eps = 1e-6 * size, 1e-5 * size
+    if abs(dist) <= tol:
+        raise RuntimeError("the distance is 0")
+    hows, keep = [], []
+    normals = job.get("face_normals") or [None] * len(job["face_pts"])
+    for p, want_n in zip(job["face_pts"], normals):
+        F = _face_at(body, p)
+        if want_n is not None:
+            # a rebuild may have moved the face: the nearest flat face facing the same way
+            same = []
+            for f in body.faces():
+                try:
+                    if f.surface().is_planar() and float(
+                            _face_normal(f, np.array(f.interior_point(), float)) @ np.asarray(want_n, float)) > 0.9999:
+                        same.append(f)
+                except Exception:
+                    pass
+            if same:
+                F = min(same, key=lambda f: f.closest_point(tuple(float(x) for x in p))[1])
+                p = np.array(F.interior_point(), float)
+        elif F.closest_point(tuple(float(x) for x in p))[1] > 1e-3 * size:
+            raise RuntimeError("a picked face is no longer on the body")
+        if not F.surface().is_planar():
+            raise RuntimeError("Push / Pull moves flat faces: a picked face is curved")
+        n = _face_normal(F, np.array(F.interior_point(), float))
+        area = float(sm.face_area(F, 1e-6))
+        V = _volume(body)
+        change = area * dist
+        res = None
+        try:
+            prism, walls = _face_prism(F, n, dist, eps, tol)
+            keep.append((prism, walls))
+            out = sm.boolean(body.copy(), prism.copy(),
+                             operation=sm.BooleanOp.UNION if dist > 0 else sm.BooleanOp.DIFFERENCE)
+            if out is not None and out.face_count():
+                if out.is_manifold_solid() and abs(_volume(out) - V) > 1e-3 * abs(change):
+                    res = (out, "boolean")
+            elif dist < 0:
+                raise RuntimeError("nothing left: the push removes the whole body")
+        except RuntimeError as exc:
+            if "nothing left" in str(exc):
+                raise
+        except Exception:
+            pass
+        if res is None:
+            try:
+                out, kept = _extruded_face(body, np.asarray(p, float), n, dist, tol)
+                keep.append(kept)
+                if out.is_manifold_solid() and abs(_volume(out) - (V + change)) <= 1e-3 * abs(change) + tol:
+                    res = (out, "extrude")
+            except Exception:
+                pass
+        if res is None:
+            raise RuntimeError("the face could not be moved (the boolean failed and the extruded face "
+                               "does not close into a solid)")
+        body, how = res
+        hows.append(how)
+    volume = _volume(body)
+    if volume <= 0:
+        raise RuntimeError("nothing left: the push removes the whole body")
+    save(to_local(body, job.get("xforms", {}).get(job.get("into"))), job["out"]["result"])
+    return {"faces": body.face_count(), "volume": volume, "how": hows}
+
+
 def job_boolean(job):
     """Union / difference / intersection of closed solids (world space): the
     target job['order'][0] combined with each tool in turn. Written in the local
@@ -2949,7 +3095,7 @@ def job_mesh_to_brep(job):
             "filleted": done, "failed": failed}
 
 
-JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "untrim_region": job_untrim_region, "untrim_preview": job_untrim_preview, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean,
+JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "untrim_region": job_untrim_region, "untrim_preview": job_untrim_preview, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean, "push_pull": job_push_pull,
         "flip": job_flip, "cap_solid": job_cap_solid, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken,
         "mesh_to_brep": job_mesh_to_brep}
 
