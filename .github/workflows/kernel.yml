@@ -32,10 +32,11 @@ on:
         description: "Build the kernel from scratch (ignore the cached build)"
         type: boolean
         default: false
+  # every push, whatever it touches: main requires these checks, so a PR that
+  # changed only docs would otherwise never get them and could not merge
   push:
     branches: ["**"]
     tags: ["v*"]
-    paths: ["kernel_build/**", "blender_nurbs/**", "tests/**", "tools/**", ".github/workflows/kernel.yml"]
 
 env:
   USD_BREP_COMMIT: 3fd5b9548d19aa8c12c29bc9637a96d42a06f8a5   # the commit the macOS build uses
