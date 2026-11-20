@@ -595,9 +595,30 @@ class Importer:
             th0, th1 = self._angle_range(pts, o, x, y, seam_pts, from_zero=True)
             return self._revolve_3d(spans, o, x, y, z, th0, th1)
         if t == "SURFACE_OF_LINEAR_EXTRUSION":
-            cs = self.curve_spans(a[1], pts)
             va = sf.args(a[2])
             d = sf.direction(va[1])
+            g = a[1]
+            while sf.type(g) in ("SURFACE_CURVE", "SEAM_CURVE", "INTERSECTION_CURVE", "TRIMMED_CURVE"):
+                g = sf.args(g)[1]
+            if sf.type(g) in ("CIRCLE", "ELLIPSE") and abs(float(d @ placement(sf, sf.args(g)[1], self.f)[3])) > 1e-9:
+                # a circle or ellipse swept: only the face's angles, from its seam (as on a cylinder), the
+                # points slid along the sweep into the curve's plane
+                ga = sf.args(g)
+                o, x, y, z = placement(sf, ga[1], self.f)
+                r1 = float(ga[2]) * self.f
+                r2 = float(ga[3]) * self.f if sf.type(g) == "ELLIPSE" else r1
+
+                def angles(P):
+                    P = np.asarray(P, float).reshape(-1, 3)
+                    q = P - o - np.outer(((P - o) @ z) / float(d @ z), d)
+                    return np.arctan2((q @ y) / r2, (q @ x) / r1)
+                seam = float(angles(seam_pts).mean()) if seam_pts is not None and len(seam_pts) else None
+                th0, th1 = _cover(angles(pts), seam)
+                sp = arc_spans(o, x, y, r1, r2, th0, th1)
+                cs = [(s, th0 + (th1 - th0) * k / len(sp), th0 + (th1 - th0) * (k + 1) / len(sp))
+                      for k, s in enumerate(sp)]
+            else:
+                cs = self.curve_spans(a[1], pts)
             C = np.vstack([curvejoin.eval_span(s, np.linspace(0, 1, 9)) for s, _, _ in cs])
             s_lo = float((pts @ d).min() - (C @ d).max())
             s_hi = float((pts @ d).max() - (C @ d).min())

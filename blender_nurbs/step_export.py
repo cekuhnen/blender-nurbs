@@ -4,7 +4,7 @@ Exact geometry: every face's surface is written as a B-spline surface (rational
 when it has weights), every edge as a B-spline curve cut exactly to the edge's
 range -- or, with analytic on (the default), as what it truly is when it is one
 within 1e-7 of the body's size: a PLANE, CYLINDRICAL_, CONICAL_, SPHERICAL_
-or TOROIDAL_SURFACE, a CIRCLE, ELLIPSE or LINE, as CAD programs write them (an exact cylinder is then
+or TOROIDAL_SURFACE, a SURFACE_OF_LINEAR_EXTRUSION, a CIRCLE, ELLIPSE or LINE, as CAD programs write them (an exact cylinder is then
 a true cylinder in the file, its holes and bosses recognised by the reader) -- with full B-rep topology (vertices, edge curves shared by their two
 faces, oriented edges, outer / inner face bounds, face sense). Closed bodies
 become MANIFOLD_SOLID_BREPs, open ones SHELL_BASED_SURFACE_MODELs. Each object
@@ -333,6 +333,45 @@ def fit_torus(G, tol, size):
     return p + z0 * a, a, float(R), rm
 
 
+def fit_extrusion(G, tol, size):
+    """(axis, unit direction) of a surface of linear extrusion: every row of the
+    samples along `axis` (1: along v, 0: along u) the same straight run, only
+    moved along the profile; else None. Planes and cylinders are extrusions
+    too (check them first)."""
+    G = np.asarray(G, float)
+    for ax in (1, 0):
+        H = G if ax == 1 else G.transpose(1, 0, 2)
+        T = H - H[:, :1]                       # each row's run from its start
+        if float(np.abs(T - T[:1]).max()) > tol:
+            continue
+        ln = fit_line(H[0], tol)               # row 0 straight, so every row is
+        if ln is None:
+            continue
+        P = H[:, 0]
+        if float(np.linalg.norm(P - P[0], axis=1).max()) <= tol:
+            continue                           # no profile: a single line
+        return ax, ln[1]
+    return None
+
+
+def _iso_start(d, ax):
+    """(degree, points, knots, weights) of the surface's boundary iso-curve at
+    the start of the extrusion direction (ax 1: v, 0: u), read off the CV net;
+    None when that direction's knots are not clamped there."""
+    du, dv, nu, nv = d["degree_u"], d["degree_v"], d["count_u"], d["count_v"]
+    Uu, Uv = list(d["knots_u"]), list(d["knots_v"])
+    if len(Uu) != nu + du + 1 or len(Uv) != nv + dv + 1:
+        return None
+    dg, U = (dv, Uv) if ax == 1 else (du, Uu)
+    if max(U[:dg + 1]) - min(U[:dg + 1]) > 1e-12 * (1 + abs(U[0])):
+        return None
+    W = list(d["weights"]) if d.get("weights") else None
+    idx = [i * nv for i in range(nu)] if ax == 1 else list(range(nv))
+    if ax == 1:
+        return du, [d["points"][k] for k in idx], Uu, ([W[k] for k in idx] if W else None)
+    return dv, [d["points"][k] for k in idx], Uv, ([W[k] for k in idx] if W else None)
+
+
 def _regular(su, sv, rel):
     """Do su, sv span a tangent plane (not a pole: one of them ~0, or parallel)?"""
     m = max(float(np.linalg.norm(su)), float(np.linalg.norm(sv)))
@@ -394,8 +433,8 @@ class StepExporter:
         self.analytic = analytic
         self.stats = {"bodies": 0, "faces": 0, "edges": 0, "solids": 0, "sheets": 0,
                       "analytic": {"CYLINDRICAL_SURFACE": 0, "CONICAL_SURFACE": 0, "SPHERICAL_SURFACE": 0,
-                                   "TOROIDAL_SURFACE": 0, "PLANE": 0, "CIRCLE": 0, "ELLIPSE": 0,
-                                   "LINE": 0}}
+                                   "TOROIDAL_SURFACE": 0, "SURFACE_OF_LINEAR_EXTRUSION": 0,
+                                   "PLANE": 0, "CIRCLE": 0, "ELLIPSE": 0, "LINE": 0}}
         self._dir_cache = {}
 
     # -- small geometry ----------------------------------------------------
@@ -435,10 +474,12 @@ class StepExporter:
             return self.w.add(f"ELLIPSE('',{self.placement(C, n, _perp(n, U))},{_f(ra)},{_f(rb)})")
         return None
 
-    def analytic_surface(self, G, tol, size):
+    def analytic_surface(self, G, tol, size, cvs=None, X=None):
         """(entity, normal at a point: P -> unit normal, entity type) of a PLANE,
-        CYLINDRICAL_, CONICAL_, SPHERICAL_ or TOROIDAL_SURFACE through the
-        surface samples G, else None."""
+        CYLINDRICAL_, CONICAL_, SPHERICAL_ or TOROIDAL_SURFACE or a
+        SURFACE_OF_LINEAR_EXTRUSION through the surface samples G, else None.
+        cvs (the surface's CV net) and X (its point transform) give an
+        extrusion's profile when it is no circle or ellipse."""
         pl = fit_plane(G, tol)
         if pl is not None:
             c, n = pl
@@ -495,6 +536,33 @@ class StepExporter:
                 n = np.asarray(P, float) - e
                 return n / (np.linalg.norm(n) or 1.0)
             return ent, normal, "TOROIDAL_SURFACE"
+        ex = fit_extrusion(G, tol, size)
+        if ex is not None:
+            ax, dvec = ex
+            H = np.asarray(G, float) if ax == 1 else np.asarray(G, float).transpose(1, 0, 2)
+            prof = H[:, 0]
+            cur = None
+            if fit_circle(prof, tol, size) is not None or fit_ellipse(prof, tol, size) is not None:
+                cur = self.analytic_curve(prof, tol, size)        # a true circle or ellipse, run along prof
+            if cur is None and cvs is not None:
+                iso = _iso_start(cvs, ax)
+                if iso is not None:
+                    dg, P, U, W = iso
+                    cur = self.bspline_curve(dg, [X(p) for p in P], U, W)
+            if cur is None:
+                return None
+            self.stats["analytic"]["SURFACE_OF_LINEAR_EXTRUSION"] += 1
+            vec = self.w.add(f"VECTOR('',{self.direction(dvec)},1.)")
+            ent = self.w.add(f"SURFACE_OF_LINEAR_EXTRUSION('',{cur},{vec})")
+            # STEP's normal: the profile's tangent (as it runs) x the extrusion direction
+            tng = np.gradient(prof, axis=0)
+            flat = H.reshape(-1, 3)
+
+            def normal(P):
+                k = int(np.argmin(np.linalg.norm(flat - np.asarray(P, float), axis=1))) // H.shape[1]
+                n = np.cross(tng[k], dvec)
+                return n / (np.linalg.norm(n) or 1.0)
+            return ent, normal, "SURFACE_OF_LINEAR_EXTRUSION"
         return None
 
     # -- curves / surfaces -------------------------------------------------
@@ -627,7 +695,7 @@ class StepExporter:
                 nu, nv = (min(4 * (n - 1) + 1, 61) for n in (E.nu, E.nv))
                 us, vs = np.linspace(*E.u_domain, max(nu, 9)), np.linspace(*E.v_domain, max(nv, 9))
                 G = E.grid(us, vs, 0)[0, 0] @ A.T + t
-                an = self.analytic_surface(G, tol, xsize)
+                an = self.analytic_surface(G, tol, xsize, d, X)
             an_kind = None
             if an is not None:
                 srf, an_normal, an_kind = an
@@ -812,7 +880,7 @@ from bpy_extras.io_utils import ExportHelper  # noqa: E402
 
 class NPROTO_OT_export_step(bpy.types.Operator, ExportHelper):
     """Export NURBS objects as STEP (AP214): exact B-spline surfaces and curves
-    (true cylinders, planes, circles, ellipses and lines as STEP's own) with full B-rep
+    (true cylinders, planes, extrusions, circles, ellipses and lines as STEP's own) with full B-rep
     topology; closed bodies as solids"""
     bl_idname = "nproto.export_step"
     bl_label = "Export STEP"
@@ -826,7 +894,7 @@ class NPROTO_OT_export_step(bpy.types.Operator, ExportHelper):
                        description="Length unit of the file; Blender units are taken as metres")
     global_scale: FloatProperty(name="Scale", default=1.0, min=1e-6, soft_max=1000.0)
     analytic: BoolProperty(name="Analytic Surfaces", default=True,
-                           description="Write true planes, cylinders, cones, spheres, tori, circles, ellipses and lines as "
+                           description="Write true planes, cylinders, cones, spheres, tori, extrusions, circles, ellipses and lines as "
                                        "STEP's own analytic entities, as CAD programs do (holes, bosses, countersinks "
                                        "and fillets are then recognised); off: everything as B-splines")
 
@@ -843,7 +911,8 @@ class NPROTO_OT_export_step(bpy.types.Operator, ExportHelper):
                f"{stats['faces']} faces, {stats['edges']} edges")
         an = stats["analytic"]
         parts = [f"{an[k]} {w}" for k, w in (("CYLINDRICAL_SURFACE", "cylinder"), ("CONICAL_SURFACE", "cone"),
-                                              ("SPHERICAL_SURFACE", "sphere"), ("TOROIDAL_SURFACE", "torus"))
+                                              ("SPHERICAL_SURFACE", "sphere"), ("TOROIDAL_SURFACE", "torus"),
+                                              ("SURFACE_OF_LINEAR_EXTRUSION", "extrusion"))
                  if an[k]]
         if self.analytic and parts:
             msg += f"; true {', '.join(parts)} faces"

@@ -1,4 +1,4 @@
-"""STEP export of true cylinders, cones, spheres, tori, planes, circles, ellipses and lines:
+"""STEP export of true cylinders, cones, spheres, tori, extrusions, planes, circles, ellipses and lines:
 blender -b --factory-startup --python tests/test_step_analytic.py"""
 import json, math, os, re, sys, tempfile
 import bpy
@@ -106,6 +106,17 @@ Gspin = np.array([3, 4, 5]) + (0.2 + 0.3 * np.cos(ps))[..., None] * (np.cos(uu[:
                                                                     + np.sin(uu[:, :1])[..., None] * e2) \
     + (0.3 * np.sin(ps))[..., None] * ax
 check("a spindle torus (tube wider than the ring) is not written as one", se.fit_torus(Gspin, 1e-9, 10) is None)
+# an extrusion: a wavy profile moved along a slanted direction
+pu, pv = np.meshgrid(np.linspace(0, 3, 31), np.linspace(0, 1.5, 7), indexing="ij")
+dx = np.array([0.2, 0.3, 1.0]) / np.linalg.norm([0.2, 0.3, 1.0])
+Gex = np.stack([pu, 0.3 * np.sin(2 * pu), np.zeros_like(pu)], -1) + pv[..., None] * dx
+ex = se.fit_extrusion(Gex, 1e-9, 10)
+check("extrusion: along v, its direction", ex is not None and ex[0] == 1 and np.allclose(ex[1], dx), str(ex))
+ex = se.fit_extrusion(Gex.transpose(1, 0, 2), 1e-9, 10)
+check("extrusion, rulings along u (transposed grid)", ex is not None and ex[0] == 0 and np.allclose(ex[1], dx))
+Gtw = Gex + (pu * pv)[..., None] * np.array([0, 0.01, 0])          # the rulings fan out: ruled, no extrusion
+check("a ruled surface whose rulings turn is no extrusion; a cone is none",
+      se.fit_extrusion(Gtw, 1e-9, 10) is None and se.fit_extrusion(Gcone, 1e-9, 10) is None)
 
 # --- export: what each shape is written as ------------------------------------------------
 def add(kind, **kw):
@@ -114,7 +125,8 @@ def add(kind, **kw):
 
 def kinds(txt):
     return {k: len(re.findall(r"=%s\(" % k, txt)) for k in ("CYLINDRICAL_SURFACE", "CONICAL_SURFACE", "SPHERICAL_SURFACE",
-                                                             "TOROIDAL_SURFACE", "PLANE", "CIRCLE", "ELLIPSE", "LINE")} | {
+                                                             "TOROIDAL_SURFACE", "SURFACE_OF_LINEAR_EXTRUSION", "PLANE", "CIRCLE",
+                                                             "ELLIPSE", "LINE")} | {
         "BSPLINE_SURF": txt.count("B_SPLINE_SURFACE"), "BSPLINE_CURVE": txt.count("B_SPLINE_CURVE")}
 
 def export(o, name, **kw):
@@ -134,7 +146,7 @@ ctx.view_layer.update()
 st, txt, res, rep = export(cyl, "cyl")
 k = kinds(txt)
 check("exact solid cylinder: a CYLINDRICAL_SURFACE, two PLANEs, two CIRCLEs, the seam a LINE; no B-splines",
-      k == {"CYLINDRICAL_SURFACE": 1, "CONICAL_SURFACE": 0, "SPHERICAL_SURFACE": 0, "TOROIDAL_SURFACE": 0, "PLANE": 2, "CIRCLE": 2, "ELLIPSE": 0, "LINE": 1, "BSPLINE_SURF": 0, "BSPLINE_CURVE": 0}, str(k))
+      k == {"CYLINDRICAL_SURFACE": 1, "CONICAL_SURFACE": 0, "SPHERICAL_SURFACE": 0, "TOROIDAL_SURFACE": 0, "SURFACE_OF_LINEAR_EXTRUSION": 0, "PLANE": 2, "CIRCLE": 2, "ELLIPSE": 0, "LINE": 1, "BSPLINE_SURF": 0, "BSPLINE_CURVE": 0}, str(k))
 r_ = float(re.search(r"=CYLINDRICAL_SURFACE\('',#\d+,([^)]+)\)", txt).group(1))
 # (within Blender's single-precision object matrix: rotated, it is a hair from rigid)
 check("its radius in millimetres", abs(r_ - 500) < 1e-4, f"{r_}")
@@ -154,8 +166,11 @@ check("analytic off: B-splines only, as before", k["CYLINDRICAL_SURFACE"] == k["
 smooth = add("CYLINDER", radius=0.5, height=1.2, caps=True, degree="3")
 st, txt, res, rep = export(smooth, "smooth")
 k = kinds(txt)
-check("smooth cylinder: its side and rims stay B-splines (not a true cylinder); the caps are flat",
-      k["CYLINDRICAL_SURFACE"] == 0 and k["CIRCLE"] == 0 and k["PLANE"] == 2 and rep["solids"] == 1, str(k))
+check("smooth cylinder: no true cylinder; its side an extrusion of its B-spline rim; the caps are flat",
+      k["CYLINDRICAL_SURFACE"] == 0 and k["CIRCLE"] == 0 and k["PLANE"] == 2 and rep["solids"] == 1
+      and k["SURFACE_OF_LINEAR_EXTRUSION"] == 1 and k["BSPLINE_SURF"] == 0, str(k))
+check("smooth cylinder reads back: the volume", res and abs(vol(res[0][1]) / vol(store.get_brep(smooth)) - 1) < 1e-6,
+      f"{vol(res[0][1]) if res else None} vs {vol(store.get_brep(smooth))}")
 
 tube = add("CYLINDER", radius=0.5, height=1.2, caps=False, degree="0")
 st, txt, res, rep = export(tube, "tube")
@@ -183,7 +198,7 @@ ctx.view_layer.update()
 st, txt, res, rep = export(fr, "frustum")
 k = kinds(txt)
 check("exact frustum: a CONICAL_SURFACE, two PLANEs, two CIRCLEs, the seam a LINE; no B-splines",
-      k == {"CYLINDRICAL_SURFACE": 0, "CONICAL_SURFACE": 1, "SPHERICAL_SURFACE": 0, "TOROIDAL_SURFACE": 0, "PLANE": 2, "CIRCLE": 2, "ELLIPSE": 0, "LINE": 1, "BSPLINE_SURF": 0,
+      k == {"CYLINDRICAL_SURFACE": 0, "CONICAL_SURFACE": 1, "SPHERICAL_SURFACE": 0, "TOROIDAL_SURFACE": 0, "SURFACE_OF_LINEAR_EXTRUSION": 0, "PLANE": 2, "CIRCLE": 2, "ELLIPSE": 0, "LINE": 1, "BSPLINE_SURF": 0,
             "BSPLINE_CURVE": 0}, str(k))
 m = re.search(r"=CONICAL_SURFACE\('',(#\d+),([^,]+),([^)]+)\)", txt)
 check("its semi-angle atan(0.35 / 0.9)", m and abs(float(m.group(3)) - math.atan(0.35 / 0.9)) < 1e-6, m and m.group(3))
@@ -287,31 +302,87 @@ check("extruded exact circle: a CYLINDRICAL_SURFACE", kinds(txt)["CYLINDRICAL_SU
 bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=0.6, degree="3"); c = ctx.active_object
 bpy.ops.nproto.extrude(inputs=json.dumps([[c.name, "S0"]]), distance=1.5, direction="Z")
 st, txt, res, rep = export(ctx.active_object, "ext_smooth")
-check("extruded smooth circle: stays a B-spline", kinds(txt)["CYLINDRICAL_SURFACE"] == 0 and kinds(txt)["BSPLINE_SURF"] == 1)
+check("extruded smooth circle: no cylinder, an extrusion of its B-spline", kinds(txt)["CYLINDRICAL_SURFACE"] == 0
+      and kinds(txt)["SURFACE_OF_LINEAR_EXTRUSION"] == 1 and kinds(txt)["BSPLINE_SURF"] == 0 and rep["failed"] == 0)
 
 # an elliptic cylinder (a cylinder scaled 1.6 x 0.6, tilted): its rims ELLIPSEs, the caps PLANEs, the side
-# a B-spline (no cylinder); a smooth one's rims stay B-splines
+# an extrusion of an ELLIPSE (no cylinder); a smooth one's rims stay B-splines
 ee = add("CYLINDER", radius=0.5, height=1.2, caps=True, degree="0")
 ee.location, ee.rotation_euler, ee.scale = (1, -2, 0.5), (0.3, -0.5, 0.8), (1.6, 0.6, 1.0)
 ctx.view_layer.update()
 st, txt, res, rep = export(ee, "ellipse")
 k = kinds(txt)
-check("elliptic cylinder: two ELLIPSEs, two PLANEs, the seam a LINE; no cylinder, the side a B-spline",
-      k["ELLIPSE"] == 2 and k["PLANE"] == 2 and k["CIRCLE"] == 0 and k["CYLINDRICAL_SURFACE"] == 0
-      and k["BSPLINE_SURF"] >= 1 and k["LINE"] == 1 and k["BSPLINE_CURVE"] == 0, str(k))
+check("elliptic cylinder: ELLIPSE rims, two PLANEs, the seam a LINE; the side an extrusion of an ELLIPSE",
+      k["ELLIPSE"] == 3 and k["PLANE"] == 2 and k["CIRCLE"] == 0 and k["CYLINDRICAL_SURFACE"] == 0
+      and k["SURFACE_OF_LINEAR_EXTRUSION"] == 1 and k["BSPLINE_SURF"] == 0 and k["LINE"] == 1
+      and k["BSPLINE_CURVE"] == 0, str(k))
 ax_ = [tuple(map(float, m)) for m in re.findall(r"=ELLIPSE\('',#\d+,([^,]+),([^)]+)\)", txt)]
 # (within Blender's single-precision object matrix)
-check("ellipse: semi-axes 800 and 300 mm, the major one first", len(ax_) == 2
+check("ellipse: semi-axes 800 and 300 mm, the major one first", len(ax_) == 3
       and all(abs(a1 / 800 - 1) < 1e-6 and abs(a2 / 300 - 1) < 1e-6 for a1, a2 in ax_), str(ax_))
 check("elliptic cylinder reads back: one solid, the volume", rep["solids"] == 1 and rep["failed"] == 0 and res
       and abs(vol(res[0][1]) / (math.pi * 0.8 * 0.3 * 1.2) - 1) < 1e-5, f"{rep} {vol(res[0][1]) if res else None}")
 check("elliptic cylinder: no open loops", not se.loop_problems(txt), str(se.loop_problems(txt)))
+eu = add("CYLINDER", radius=0.5, height=1.2, caps=True, degree="0")
+eu.scale = (1.6, 0.6, 1.0)
+ctx.view_layer.update()
+st, txt, res, rep = export(eu, "ellipse_upright")
+check("upright elliptic cylinder reads back (the swept ellipse cut at the face's seam): one solid, the volume",
+      rep["solids"] == 1 and rep["failed"] == 0 and res
+      and abs(vol(res[0][1]) / (math.pi * 0.8 * 0.3 * 1.2) - 1) < 1e-5, f"{rep} {vol(res[0][1]) if res else None}")
 es = add("CYLINDER", radius=0.5, height=1.2, caps=True, degree="3")
 es.scale = (1.6, 0.6, 1.0)
 ctx.view_layer.update()
 st, txt, res, rep = export(es, "ellipse_smooth")
 check("smooth elliptic cylinder: its rims stay B-splines", kinds(txt)["ELLIPSE"] == 0 and kinds(txt)["BSPLINE_CURVE"] >= 2,
       str(kinds(txt)))
+
+# extrusions: a wavy closed profile and a circle extruded at a slant, as solids (Extrude, New Solid)
+def solid_extrude(prof, **kw):
+    r = bpy.ops.nproto.extrude(inputs=json.dumps([[prof.name, "S0"]]), body="NEW", **kw)
+    return r, ctx.active_object
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=0.6, degree="0"); c = ctx.active_object
+r, sl = solid_extrude(c, distance=1.5, direction="Z", tilt=25.0)
+st, txt, res, rep = export(sl, "slant")
+k = kinds(txt)
+check("slanted circle: its side an extrusion of a CIRCLE, the caps PLANEs, no B-splines", r == {'FINISHED'}
+      and k["SURFACE_OF_LINEAR_EXTRUSION"] >= 1 and k["CYLINDRICAL_SURFACE"] == 0 and k["PLANE"] == 2
+      and k["BSPLINE_SURF"] == k["BSPLINE_CURVE"] == 0, str(k))
+# (its slanted caps read back 1e-5 small from an all-B-spline file too: the reader's trim, not the file;
+# FreeCAD gets this file's volume to 1e-7)
+check("slanted circle reads back: one solid, the volume", rep["solids"] == 1 and rep["failed"] == 0 and res
+      and abs(vol(res[0][1]) / (math.pi * 0.36 * 1.5 * math.cos(math.radians(25))) - 1) < 3e-5,
+      f"{rep} {vol(res[0][1]) if res else None} kernel {vol(store.get_brep(sl))}")
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=0.6, degree="3"); c = ctx.active_object
+for sp in list(c.data.splines[0].points)[::2]:
+    sp.co = (sp.co[0] * 1.3, sp.co[1] * 1.3, sp.co[2], sp.co[3])            # a wavy flower
+c.location, c.rotation_euler = (2, 1, -1), (0.4, 0.3, 0.2)
+ctx.view_layer.update()
+r, wv = solid_extrude(c, distance=0.8, direction="NORMAL")
+st, txt, res, rep = export(wv, "wavy")
+k = kinds(txt)
+check("wavy profile: its side an extrusion of a B-spline curve, the caps PLANEs, no B-spline surface", r == {'FINISHED'}
+      and k["SURFACE_OF_LINEAR_EXTRUSION"] >= 1 and k["PLANE"] == 2 and k["BSPLINE_SURF"] == 0, str(k))
+check("wavy profile reads back: one solid, the volume", rep["solids"] == 1 and rep["failed"] == 0 and res
+      and abs(vol(res[0][1]) / vol(store.get_brep(wv)) - 1) < 1e-5, f"{rep} {vol(res[0][1]) if res else None}")
+check("wavy profile: no open loops", not se.loop_problems(txt), str(se.loop_problems(txt)))
+# a drilled box minus a wavy prism: the pocket's walls are extrusions, facing in
+bx = add("BOX", width=3, depth=3, height=1)
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=0.6, degree="3"); c = ctx.active_object
+for sp in list(c.data.splines[0].points)[::2]:
+    sp.co = (sp.co[0] * 1.3, sp.co[1] * 1.3, sp.co[2], sp.co[3])
+c.location = (0, 0, -1)
+ctx.view_layer.update()
+r, pr = solid_extrude(c, distance=2.0, direction="Z")
+r = bpy.ops.nproto.boolean(operation="DIFFERENCE", names=json.dumps([bx.name, pr.name]))
+pk = ctx.active_object
+v0 = vol(store.get_brep(pk))
+st, txt, res, rep = export(pk, "pocket")
+k = kinds(txt)
+check("box with a wavy hole: its walls an extrusion, the box PLANEs", r == {'FINISHED'}
+      and k["SURFACE_OF_LINEAR_EXTRUSION"] >= 1 and k["PLANE"] == 6, str(k))
+check("wavy hole reads back: one solid, the volume", rep["solids"] == 1 and rep["failed"] == 0 and res
+      and abs(vol(res[0][1]) / v0 - 1) < 1e-5 and v0 < 9 - 0.5, f"{rep} {vol(res[0][1]) if res else None} vs {v0}")
 
 # the operator: the option, on by default, and the report
 p = os.path.join(TMP, "op.step")
