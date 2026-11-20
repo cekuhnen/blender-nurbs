@@ -805,6 +805,43 @@ def curve_plane_normal(curve, n=32):
     return Vector(vt[2]).normalized(), Vector(c)
 
 
+def _square_to(h, L):
+    """Unit h made square to the unit line direction L (a world axis when h runs along L)."""
+    for cand in (h, (0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)):
+        c = np.asarray(cand, float)
+        c = c - (c @ L) * L
+        if np.linalg.norm(c) > 1e-6:
+            return c / np.linalg.norm(c)
+    return np.array([0.0, 0.0, 1.0])
+
+
+def profile_normal(curve, hint=None, n=32):
+    """The plane normal an extrude of `curve` goes along ("Curve Normal").
+    A straight curve lies in every plane through it, so the plane alone picks
+    a direction at random (rounding decided it): it gets the hint (the work
+    plane's normal when the tool started, else world Z) made square to it, as
+    Rhino's ExtrudeCrv takes the CPlane's Z. A planar curve's normal is turned
+    to the hint's side when one is given (older extrudes without one keep the
+    plane's own sign)."""
+    P = sample_curve(curve, n)
+    c = P.mean(axis=0)
+    _, S, vt = np.linalg.svd(P - c)
+    h = np.asarray(hint if hint is not None else (0.0, 0.0, 1.0), float)
+    h = h / (np.linalg.norm(h) or 1.0)
+    if S[0] <= 1e-300 or S[1] <= 1e-7 * S[0]:
+        return Vector(_square_to(h, vt[0]))
+    nrm = vt[2]
+    if hint is not None:
+        dot = float(nrm @ h)
+        if abs(dot) < 1e-6:                 # square to the hint: a stable choice
+            k = int(np.argmax(np.abs(nrm)))
+            if nrm[k] < 0:
+                nrm = -nrm
+        elif dot < 0:
+            nrm = -nrm
+    return Vector(nrm).normalized()
+
+
 # ---------------------------------------------------------------------------
 # Surface edge sampling for G0/G1/G2/G3 lofts
 # ---------------------------------------------------------------------------
@@ -1518,7 +1555,16 @@ def tilt_direction(d, tilt_deg, azimuth_deg):
     return Vector(np.cos(t) * dn + np.sin(t) * side)
 
 
-def _draft_normals(P, d, closed, flip):
+def draft_reference(P, closed, centre=None):
+    """The point a draft opens away from: a closed profile's own centre; an
+    open one's the given centre (the middle of everything extruded together,
+    so open pieces of one outline all lean out of it), else its own."""
+    if closed or centre is None:
+        return np.asarray(P, float).mean(axis=0)
+    return np.asarray(centre, float)
+
+
+def _draft_normals(P, d, closed, flip, centre=None):
     """Unit in-plane 'outward' directions (perpendicular to the curve and to d)
     at curve samples P. Sharp corners get a mitred normal (length 1/cos(half
     angle)), so offset polylines keep straight, parallel sides."""
@@ -1539,8 +1585,8 @@ def _draft_normals(P, d, closed, flip):
             m = prev + nxt
             c = np.linalg.norm(m) / 2.0                      # cos(half angle between the sides)
             out[i] = (m / (np.linalg.norm(m) or 1.0)) / max(c, 0.05)
-    # outward = away from the curve's centre (closed), else the side of +x; flip on request
-    c = P.mean(axis=0)
+    # outward = away from the curve's centre (closed) or the given one; flip on request
+    c = draft_reference(P, closed, centre)
     rel = P - c
     rel -= np.outer(rel @ d, d)
     sgn = 1.0 if np.sum(out * rel) >= 0 else -1.0
@@ -1549,7 +1595,7 @@ def _draft_normals(P, d, closed, flip):
     return sgn * out
 
 
-def _exact_draft(cv, d, h, off, flip, symmetric):
+def _exact_draft(cv, d, h, off, flip, symmetric, centre=None):
     """Draft rows on the profile's own basis: the base row IS the profile (its
     CVs, knots and weights unchanged), the far row(s) are fitted on the same
     knots and weights -- exact for lines, circles and arcs (a cone), with knots
@@ -1611,7 +1657,7 @@ def _exact_draft(cv, d, h, off, flip, symmetric):
     nrm = unit_n(T)
     if nrm is None:
         return None
-    rel = C - C.mean(axis=0)
+    rel = C - draft_reference(C, closed, centre)
     rel -= np.outer(rel @ d, d)
     sgn = 1.0 if np.sum(nrm * rel) >= 0 else -1.0
     if flip:
@@ -1698,7 +1744,7 @@ def _exact_draft(cv, d, h, off, flip, symmetric):
     return rows, Ut, p, w
 
 
-def draft_extrude(kcurve, d, h, draft_deg, flip=False, symmetric=False):
+def draft_extrude(kcurve, d, h, draft_deg, flip=False, symmetric=False, centre=None):
     """Ruled draft surface: height h along d, outward offset h*tan(draft).
     Degree-1 profiles (polylines) are exact with mitred corners. Smooth
     profiles keep their own CVs, knots and weights for the base row, and the
@@ -1712,11 +1758,11 @@ def draft_extrude(kcurve, d, h, draft_deg, flip=False, symmetric=False):
     cv = ext.curve_cvs(kcurve)
     closed = False
     wts = None
-    exact = None if cv["degree"] == 1 else _exact_draft(cv, d, h, off, flip, symmetric)
+    exact = None if cv["degree"] == 1 else _exact_draft(cv, d, h, off, flip, symmetric, centre)
     if cv["degree"] == 1 and not cv.get("weights"):
         P = np.array(cv["points"], float)
         closed = np.linalg.norm(P[0] - P[-1]) < 1e-9 * (np.ptp(P, axis=0).max() or 1.0)
-        nrm = _draft_normals(P[:-1] if closed else P, d, closed, flip)
+        nrm = _draft_normals(P[:-1] if closed else P, d, closed, flip, centre)
         if closed:
             nrm = np.vstack([nrm, nrm[:1]])
         rows = _draft_rows(P, nrm, d, h, off, symmetric)
@@ -1735,7 +1781,7 @@ def draft_extrude(kcurve, d, h, draft_deg, flip=False, symmetric=False):
             nrm = _draft_normals(P[:-1], d, True, flip)
             nrm = np.vstack([nrm, nrm[:1]])
         else:
-            nrm = _draft_normals(P, d, False, flip)
+            nrm = _draft_normals(P, d, False, flip, centre)
         rows = _draft_rows(P, nrm, d, h, off, symmetric)
         size = float(np.linalg.norm(np.ptp(np.vstack(rows), axis=0))) or 1.0
         X, knots_c, deg_c = fit_rows(rows, 3, tol=1e-5 * size)

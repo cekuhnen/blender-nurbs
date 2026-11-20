@@ -19,8 +19,13 @@ rulings square to the edge:
 The base row IS the edge: its own CVs, knots and weights (knots added only
 where the far edge needs them, which leaves the edge unchanged), so the
 flange meets the surface exactly. The far row is fitted on that basis within
-Tolerance. Edges are split at their corners; each smooth piece is one face
-(the corners are left open: a gap outside, an overlap inside).
+Tolerance. Edges are split at their corners; each smooth piece is one face.
+Where two faces meet at a corner (two picked edges, or a corner inside one)
+Corners decides what happens there: Mitre moves both far edges to where they
+meet (an outside gap closes, an inside overlap is cut back), Blend fills an
+outside gap with a round corner (a cone from the corner point, its far edge
+an arc tangent to both far edges; inside corners are mitred), Open leaves them
+as they are. The faces are stitched into one body where they meet.
 
 Edges: a free edge of a face (on a trimmed face too); the side away from the
 face is found by probing it. Curves on a surface: the left side seen from
@@ -257,6 +262,224 @@ def _faces_hint(surf, Pw, U, p, field):
 
 
 # --------------------------------------------------------------------------
+# Corners: where two faces meet at one base point
+# --------------------------------------------------------------------------
+
+def _unit(v):
+    n = float(np.linalg.norm(v))
+    return v / n if n > 1e-300 else v
+
+
+def _end(B, F, e):
+    """(base point, far point, the far edge's direction leaving the face) at end e (0 start, 1 end)."""
+    if e:
+        return B[-1], F[-1], _unit(F[-1] - F[-2])
+    return B[0], F[0], _unit(F[0] - F[1])
+
+
+def corner_pairs(rows, size):
+    """[((i, e), (j, f))]: ends of faces (rows [(base, far)]) that meet at one
+    base point, paired by the closest ruling directions (on both sides of a
+    curve, each side meets its own side)."""
+    tol = 1e-4 * size
+    ends = [(i, e) for i in range(len(rows)) for e in (0, 1)]
+    cand = []
+    for a in range(len(ends)):
+        for b in range(a + 1, len(ends)):
+            (i, e), (j, f) = ends[a], ends[b]
+            Va, Fa, _ = _end(*rows[i], e)
+            Vb, Fb, _ = _end(*rows[j], f)
+            if np.linalg.norm(Va - Vb) > tol:
+                continue
+            dot = float(_unit(Fa - Va) @ _unit(Fb - Vb))
+            if dot > -0.5:
+                cand.append((-dot, a, b))
+    cand.sort()
+    used, pairs = set(), []
+    for _, a, b in cand:
+        if a not in used and b not in used:
+            used |= {a, b}
+            pairs.append((ends[a], ends[b]))
+    return pairs
+
+
+def corner_meet(rows, pair, size):
+    """(kind, M, phi): where the two far edges' end directions meet. kind:
+    'meets' (the far ends already coincide), 'smooth' (the faces run on
+    tangentially: snap them together), 'outside' (a gap: both far edges reach
+    on to M), 'inside' (an overlap: both are cut back to M), 'skew' (one
+    each), 'open' (a hairpin, no sane meeting point). phi: the turn at M."""
+    (i, e), (j, f) = pair
+    Va, Fa, ta = _end(*rows[i], e)
+    Vb, Fb, tb = _end(*rows[j], f)
+    tol = 1e-6 * size
+    mid = 0.5 * (Fa + Fb)
+    if np.linalg.norm(Fa - Fb) <= tol:
+        return "meets", mid, 0.0
+    A = np.array([[ta @ ta, -(ta @ tb)], [ta @ tb, -(tb @ tb)]])
+    phi = math.acos(max(-1.0, min(1.0, float(ta @ -tb))))
+    if abs(np.linalg.det(A)) < 1e-10 or phi < math.radians(0.5):
+        return "smooth", mid, phi
+    s_, u_ = np.linalg.solve(A, np.array([(Fb - Fa) @ ta, (Fb - Fa) @ tb]))
+    M = 0.5 * (Fa + s_ * ta + Fb + u_ * tb)
+    reach = max(float(np.linalg.norm(Fa - Va)), float(np.linalg.norm(Fb - Vb)), tol)
+    if np.linalg.norm(M - mid) > 20.0 * reach:
+        return "open", mid, phi
+    if s_ > 0 and u_ > 0:
+        return "outside", M, phi
+    if s_ < 0 and u_ < 0:
+        return "inside", M, phi
+    return "skew", M, phi
+
+
+def _straight(X, size):
+    if len(X) <= 2:
+        return True
+    a, b = X[0], X[-1]
+    L = _unit(b - a)
+    R = (X - a) - np.outer((X - a) @ L, L)
+    return float(np.linalg.norm(R, axis=1).max()) <= 1e-7 * size
+
+
+def move_far_end(B, F, e, delta, size, movable=None):
+    """Move the far edge's end e by delta, the rest following: a straight face
+    (base and far edge lines) is stretched along its line (an affine map: it
+    stays straight and flat), a curved one only near the corner (over about
+    3 |delta|; with movable -- a CV row -- only those CVs, whose spans lie
+    near the corner, ramping down along them). False when the far edge would
+    fold back on itself."""
+    n = len(F)
+    if n == 2 or (_straight(B, size) and _straight(F, size)):
+        seg = np.linalg.norm(np.diff(F, axis=0), axis=1)
+        cum = np.concatenate([[0.0], np.cumsum(seg)])
+        tot = cum[-1]
+        if tot <= 1e-300 or (delta @ _end(B, F, e)[2] < 0 and np.linalg.norm(delta) > 0.9 * tot):
+            return False
+        g = cum / tot if e else 1.0 - cum / tot
+    else:
+        order = np.arange(n)[::-1] if e else np.arange(n)
+        seg = np.linalg.norm(np.diff(F[order], axis=0), axis=1)
+        dist = np.concatenate([[0.0], np.cumsum(seg)])           # from the end, along the far edge
+        tot = dist[-1]
+        r = min(0.5 * tot, 3.0 * float(np.linalg.norm(delta)))
+        if movable is not None:
+            mv = np.asarray(movable, bool)[order]
+            k = int(np.argmin(mv)) if not mv.all() else n - 1     # the first CV that must stay
+            r = max(dist[k], 1e-300)
+        if delta @ _end(B, F, e)[2] < 0 and np.linalg.norm(delta) > 0.9 * r:
+            return False
+        g = np.zeros(n)
+        g[order] = np.maximum(0.0, 1.0 - dist / r)
+        if movable is not None:
+            g[~np.asarray(movable, bool)] = 0.0
+    F += np.outer(g, delta)
+    return True
+
+
+def conic(Fa, M, Fb, w, n):
+    """Points of the rational quadratic arc Fa -> Fb with middle CV M (weight w)."""
+    t = np.linspace(0.0, 1.0, n)[:, None]
+    b0, b1, b2 = (1 - t) ** 2, 2 * t * (1 - t) * w, t ** 2
+    return (b0 * Fa + b1 * M + b2 * Fb) / (b0 + b1 + b2)
+
+
+def apply_corners(rows, mode, size, movable=None):
+    """Corner the faces (rows [(base, far)], far rows moved in place) as mode
+    says: returns (fans [(V, Fa, M, Fb, w)] for Blend, counts). movable:
+    {(face, end): CV mask} for CV rows (see move_far_end)."""
+    movable = movable or {}
+    counts = {"mitre": 0, "blend": 0, "open": 0}
+    fans = []
+    for pair in corner_pairs(rows, size):
+        (i, e), (j, f) = pair
+        kind, M, phi = corner_meet(rows, pair, size)
+        if kind == "meets":
+            continue
+        Fa, Fb = _end(*rows[i], e)[1], _end(*rows[j], f)[1]
+        if kind == "smooth":                      # tangent faces: one far point
+            move_far_end(*rows[i], e, M - Fa, size, movable.get((i, e)))
+            move_far_end(*rows[j], f, M - Fb, size, movable.get((j, f)))
+            continue
+        if mode == "OPEN" or kind == "open":
+            counts["open"] += 1
+            continue
+        if mode == "BLEND" and kind == "outside":
+            fans.append((_end(*rows[i], e)[0].copy(), Fa.copy(), M, Fb.copy(), math.cos(0.5 * phi)))
+            counts["blend"] += 1
+            continue
+        Fa0, Fb0 = rows[i][1].copy(), rows[j][1].copy()
+        if move_far_end(*rows[i], e, M - Fa, size, movable.get((i, e))) and \
+                move_far_end(*rows[j], f, M - Fb, size, movable.get((j, f))):
+            counts["mitre"] += 1
+        else:                                     # (folds: put both back)
+            rows[i][1][:] = Fa0
+            rows[j][1][:] = Fb0
+            counts["open"] += 1
+    return fans, counts
+
+
+def _refine_ends(fs, pairs, rows, size):
+    """Curved faces with a corner to move: degree + 1 knots |delta| apart at
+    that end (the edge and far edge unchanged), so the move stays near the
+    corner. Returns {(face, end): the CVs whose spans lie in that stretch}."""
+    from .kernel.classa import insert_knot
+    marks = {}
+    for pair in pairs:
+        kind, M, _ = corner_meet(rows, pair, size)
+        if kind in ("meets", "open"):
+            continue
+        for i, e in pair:
+            f = fs[i]
+            B, F = rows[i]
+            if _straight(B, size) and _straight(F, size):
+                continue
+            step = float(np.linalg.norm(M - _end(B, F, e)[1]))
+            p, U, Q = f["deg"], f["U"], f["Q"]
+            a, b = U[p], U[-p - 1]
+            n = len(Q) - 1
+            # the far edge's speed at that end, so the knots sit |delta|, 2|delta|, 3|delta| from it
+            if e:
+                speed = p / ((U[n + p] - U[n]) or 1.0) * float(np.linalg.norm(Q[n] - Q[n - 1]))
+            else:
+                speed = p / ((U[p + 1] - U[1]) or 1.0) * float(np.linalg.norm(Q[1] - Q[0]))
+            if speed <= 1e-300 or step <= 1e-12 * size:
+                continue
+            dt = min(step / speed, (b - a) / (2.0 * (p + 1)))
+            marks[(i, e)] = dt
+            for k in range(1, p + 2):
+                t = b - k * dt if e else a + k * dt
+                if any(abs(t - u) < 1e-9 * (b - a) for u in f["U"]):
+                    continue
+                w = f["Pw"][:, 3:4]
+                A, U2 = insert_knot(np.hstack([f["Pw"], f["Q"] * w]), f["U"], p, t)
+                A = np.asarray(A, float)
+                f["Pw"], f["U"], f["Q"] = A[:, :4], list(U2), A[:, 4:] / A[:, 3:4]
+            rows[i] = (f["Pw"][:, :3] / f["Pw"][:, 3:4], f["Q"])
+    movable = {}
+    for (i, e), dt in marks.items():      # (after every insertion: a face can have a corner at both ends)
+        p, U = fs[i]["deg"], fs[i]["U"]
+        a, b = U[p], U[-p - 1]
+        n = len(fs[i]["Q"])
+        lim = (p + 1) * dt * (1.0 + 1e-9)
+        movable[(i, e)] = [(b - U[k]) <= lim if e else (U[k + p + 1] - a) <= lim for k in range(n)]
+    return movable
+
+
+def fan_surface(V, Fa, M, Fb, w):
+    """A Blend corner: rulings from V to the arc Fa -> Fb (a cone when the arc is round)."""
+    _, ext = so.store._k()
+    pts = [tuple(map(float, V))] * 3 + [tuple(map(float, x)) for x in (Fa, M, Fb)]
+    return ext.surface_from_cvs(1, 2, pts, [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+                                [1.0, float(w), 1.0] * 2)
+
+
+def _normal_at(surf, u, v):
+    E = surfeval.Surf(surf)
+    n, _ = surfeval.normals(E.at(np.array([u]), np.array([v]), 1))
+    return n[0]
+
+
+# --------------------------------------------------------------------------
 # Whole inputs
 # --------------------------------------------------------------------------
 
@@ -302,7 +525,8 @@ def _sigmas(kind, s, p):
 
 
 def faces_rows(prepared, p, n=48):
-    """Preview: per face, the base and far rows of points (no fitting)."""
+    """Preview: per face, the base and far rows of points (no fitting), the
+    corners done as the build does them (Blend corners as extra faces)."""
     rows = []
     for deg, Pw, U, tg, kind, s in prepared:
         for sigma in _sigmas(kind, s, p):
@@ -310,8 +534,15 @@ def faces_rows(prepared, p, n=48):
             ts = np.linspace(U[deg], U[-deg - 1], n)
             C, T = _frame(Pw, U, deg, ts)
             d, L = field(C, T)
-            rows.append([C, C + L[:, None] * d])
-    return rows
+            rows.append((C, C + L[:, None] * d))
+    if not rows:
+        return []
+    size = float(np.linalg.norm(np.ptp(np.vstack([r[0] for r in rows]), axis=0))) or 1.0
+    fans, _ = apply_corners(rows, p.get("fl_corner", "OPEN"), size)
+    out = [[B, F] for B, F in rows]
+    for V, Fa, M, Fb, w in fans:
+        out.append([np.repeat(V[None, :], 17, axis=0), conic(Fa, M, Fb, w, 17)])
+    return out
 
 
 def anchor(prepared, p, at):
@@ -350,29 +581,62 @@ def build(inputs, p, prepared=None):
     if prepared is None:
         prepared = prepare(inputs)
     pieces, corners = prepared
-    info = {"faces": 0, "corners": corners, "err": 0.0, "steep": 0, "cvs": 0}
+    mode = p.get("fl_corner", "OPEN")
+    info = {"faces": 0, "corners": corners, "err": 0.0, "steep": 0, "cvs": 0, "mitre": 0, "blend": 0, "open": 0}
     tol = float(p.get("tolerance", 1e-4))
-    brep = None
+    fs = []
     for deg, Pw0, U0, tg, kind, s in pieces:
         for sigma in _sigmas(kind, s, p):
             field = Field(tg, p, sigma)
             Pw, U, Q, err = fit_far(Pw0, U0, deg, field, tol)
             info["steep"] += field.steep
-            surf = ruled_surface(Pw, U, deg, Q)
-            if _faces_hint(surf, Pw, U, deg, field) < 0:
-                # turned over: the far row first
-                w = Pw[:, 3]
-                surf = ruled_surface(np.c_[Q * w[:, None], w], U, deg, Pw[:, :3] / w[:, None])
-            info["faces"] += 1
             info["err"] = max(info["err"], err)
-            info["cvs"] += 2 * len(Q)
-            b = ext.brep_from_surface(surf)
-            if brep is None:
-                brep = b
-            else:
-                ext.append_brep(brep, b)
-    if brep is None:
+            fs.append({"Pw": np.asarray(Pw, float), "U": list(U), "deg": deg, "Q": Q, "field": field})
+    if not fs:
         raise ValueError("nothing to grow a flange from")
+    # corners, on the CV rows (a CV row's end and end direction are the edge's)
+    rows = [(f["Pw"][:, :3] / f["Pw"][:, 3:4], f["Q"]) for f in fs]
+    size = float(np.linalg.norm(np.ptp(np.vstack([r[0] for r in rows]), axis=0))) or 1.0
+    movable = _refine_ends(fs, corner_pairs(rows, size), rows, size) if mode != "OPEN" else {}
+    fans, counts = apply_corners(rows, mode, size, movable)
+    info.update(counts)
+    parts, surfs = [], []
+    for f, (_, Q) in zip(fs, rows):
+        Pw, U, deg = f["Pw"], f["U"], f["deg"]
+        surf = ruled_surface(Pw, U, deg, Q)
+        flipped = _faces_hint(surf, Pw, U, deg, f["field"]) < 0
+        if flipped:
+            # turned over: the far row first
+            w = Pw[:, 3]
+            surf = ruled_surface(np.c_[Q * w[:, None], w], U, deg, Pw[:, :3] / w[:, None])
+        surfs.append((surf, Pw[:, :3] / Pw[:, 3:4], U, deg))
+        info["faces"] += 1
+        info["cvs"] += 2 * len(Q)
+        parts.append(ext.brep_from_surface(surf))
+    for V, Fa, M, Fb, w in fans:
+        surf = fan_surface(V, Fa, M, Fb, w)
+        # face the way the flange it starts from does (its ruling to Fa)
+        k = min(range(len(rows)), key=lambda i: min(np.linalg.norm(rows[i][1][0] - Fa),
+                                                    np.linalg.norm(rows[i][1][-1] - Fa)))
+        nb, B, U, deg = surfs[k]
+        at_end = np.linalg.norm(rows[k][1][-1] - Fa) < np.linalg.norm(rows[k][1][0] - Fa)
+        v = U[-deg - 1] if at_end else U[deg]
+        v += (-1e-3 if at_end else 1e-3) * (U[-deg - 1] - U[deg])
+        if float(_normal_at(surf, 0.5, 0.0) @ _normal_at(nb, 0.5, v)) < 0:
+            surf = fan_surface(V, Fb, M, Fa, w)
+        info["faces"] += 1
+        info["cvs"] += 6
+        parts.append(ext.brep_from_surface(surf))
+    brep = parts[0]
+    for b in parts[1:]:
+        ext.append_brep(brep, b)
+    if len(parts) > 1:
+        sm, _ = so.store._k()
+        try:
+            brep = sm.stitch_advanced(brep, 1e-6 * size, squeeze_small_edges=False,
+                                      making_manifold_solid=False)[0]
+        except Exception as exc:
+            print("NURBS flange stitch:", exc)
     LAST_INFO.clear()
     LAST_INFO.update(info)
     return brep
@@ -386,8 +650,9 @@ def build_flange(inputs, p):
 def report_text(info, mode):
     msg = f"{'Flange' if mode == 'FLANGE' else 'Draft surface'}: {info['faces']} face(s)"
     notes = [f"far edge within {info['err']:.2g}"]
-    if info["corners"]:
-        notes.append(f"{info['corners']} corner(s) left open")
+    for k, word in (("mitre", "mitred"), ("blend", "blended"), ("open", "left open")):
+        if info.get(k):
+            notes.append(f"{info[k]} corner(s) {word}")
     return msg + " · " + ", ".join(notes)
 
 
@@ -421,6 +686,11 @@ PULL_ITEMS = [("Z", "World Z", ""), ("X", "World X", ""), ("Y", "World Y", ""),
 MEASURE_ITEMS = [("RULING", "Along Surface", "Length along the rulings"),
                  ("HEIGHT", "Height", "Height along the pull direction (a planar edge gives a flat top)")]
 PULLS = ("Z", "X", "Y", "WORKPLANE", "VIEW")
+CORNER_ITEMS = [("MITRE", "Mitre", "Both far edges run on (or are cut back) to where they meet: a sharp corner"),
+                ("BLEND", "Blend", "An outside corner gets a round corner (a cone from the corner point, tangent "
+                                   "to both); inside corners are mitred"),
+                ("OPEN", "Open", "Leave the corners as they are (a gap outside, an overlap inside)")]
+CORNERS = ("MITRE", "BLEND", "OPEN")
 
 
 def _free_edge(obj, ref):
@@ -467,6 +737,8 @@ class NPROTO_OT_flange(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
     flip: BoolProperty(name="Flip Side", default=False,
                        description="Edges: grow over the face instead of away from it. Curves: the right side")
     both_sides: BoolProperty(name="Both Sides", default=False, description="Curves on a surface: both sides")
+    fl_corner: EnumProperty(name="Corners", items=CORNER_ITEMS, default="MITRE",
+                            description="Where two flanges meet at a corner")
     tolerance: FloatProperty(name="Tolerance", default=1e-4, min=1e-7, soft_max=0.01, precision=6, unit='LENGTH',
                              description="Largest deviation of the fitted far edge")
     view_dir: FloatVectorProperty(subtype='XYZ', options={'HIDDEN'}, default=(0.0, 0.0, 1.0))
@@ -537,7 +809,7 @@ class NPROTO_OT_flange(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
         return {"fl_mode": self.fl_mode, "fl_length": self.length, "angle": self.angle,
                 "draft_angle": self.draft, "pull": [float(x) for x in pull], "pull_flip": self.pull_flip,
                 "measure": self.measure, "flip": self.flip, "both_sides": self.both_sides,
-                "tolerance": self.tolerance}
+                "fl_corner": self.fl_corner, "tolerance": self.tolerance}
 
     # -- the live value stage (valuedrag.py) ----------------------------------
     def drag_setup(self, context, mouse):
@@ -631,6 +903,8 @@ class NPROTO_OT_flange(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
             self.fl_pull = PULLS[(PULLS.index(self.fl_pull) + 1) % len(PULLS)]
         elif ch == "h" and self.fl_mode == "DRAFT":
             self.measure = "HEIGHT" if self.measure == "RULING" else "RULING"
+        elif ch == "c":
+            self.fl_corner = CORNERS[(CORNERS.index(self.fl_corner) + 1) % len(CORNERS)]
         else:
             return False
         return True
@@ -638,7 +912,8 @@ class NPROTO_OT_flange(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
     def drag_rows(self):
         rows = [("Mode", [hints.cycle("M", ["flange", "draft"], self.fl_mode.lower()),
                           hints.key("Tab", "length / angle")]),
-                ("Side", [hints.key("F", "flip side"), hints.toggle("B", "both sides (curves)", self.both_sides)])]
+                ("Side", [hints.key("F", "flip side"), hints.toggle("B", "both sides (curves)", self.both_sides)]),
+                ("Corners", [hints.cycle("C", ["mitre", "blend", "open"], self.fl_corner.lower())])]
         if self.fl_mode == "DRAFT":
             rows.append(("Pull", [hints.cycle("P", ["Z", "X", "Y", "work plane", "view"],
                                               {"WORKPLANE": "work plane", "VIEW": "view"}.get(self.fl_pull, self.fl_pull)),
@@ -659,6 +934,7 @@ class NPROTO_OT_flange(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
             lay.row().prop(self, "measure", expand=True)
         lay.prop(self, "flip")
         lay.prop(self, "both_sides")
+        lay.row().prop(self, "fl_corner", expand=True)
         lay.prop(self, "tolerance")
 
     def execute(self, context):

@@ -42,7 +42,7 @@ FIELDS = {
     "rail_revolve": ["rr_axis", "pivot", "rr_height"],
     "network": ["nw_cont", "nw_degree", "nw_spans_u", "nw_spans_v"],
     "flange": ["fl_mode", "fl_length", "angle", "draft_angle", "pull_flip", "measure", "flip", "both_sides",
-               "tolerance"],
+               "fl_corner", "tolerance"],
     "sweep": ["samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height", "flip_normal"],
     "pipe": ["radius", "samples"],
     "patch": ["pt_cvs", "pt_cvs_v", "pt_auto_cvs", "pt_degree", "pt_fair", "pt_surface_fair", "pt_quad",
@@ -68,6 +68,9 @@ FIELDS = {
     "prim_torus": ["radius", "radius2", "degree", "spans_u", "spans_v"],
     "prim_disk": ["radius", "degree", "spans_u"],
 }
+
+# what a feature made before a setting existed was built with (shown when its history lacks it)
+MISSING = {"fl_corner": "OPEN"}
 LABELS = {"tan_a": "Tangent A", "tan_b": "Tangent B", "cur_a": "Curvature A", "cur_b": "Curvature B",
           "w_a": "Weight A", "w_b": "Weight B", "c_a": "Curvature A", "c_b": "Curvature B",
           "spans_u": "Spans U", "spans_v": "Spans V", "radius2": "Radius 2", "width": "Size X", "depth": "Size Y",
@@ -432,6 +435,9 @@ class NprotoFeature(bpy.types.PropertyGroup):
     os_corner: EnumProperty(name="Corners", items=[("SHARP", "Sharp", ""), ("ROUND", "Round", ""),
                                                    ("CHAMFER", "Chamfer", "")], **_F())
     fl_mode: EnumProperty(name="Mode", items=[("FLANGE", "Flange", ""), ("DRAFT", "Draft", "")], **_F())
+    fl_corner: EnumProperty(name="Corners", items=[("MITRE", "Mitre", "Far edges run on (or back) to where they meet"),
+                                                   ("BLEND", "Blend", "Round outside corners, inside ones mitred"),
+                                                   ("OPEN", "Open", "Corners left as they are")], **_F())
     fl_length: FloatProperty(name="Length", unit='LENGTH', **_F())
     draft_angle: FloatProperty(name="Draft °", min=-89.0, max=89.0, **_F())
     pull_flip: BoolProperty(name="Flip Pull", **_F())
@@ -497,9 +503,9 @@ def sync_from_history(obj):
             vals = {round(float(tens[i]), 9) if i < len(tens) else 1.0 for i in range(len(h["inputs"])) if i not in guides}
             pg.pt_tension_all = vals.pop() if len(vals) == 1 else 1.0
         for name in FIELDS.get(h["op"], []):
-            if name not in params:
+            if name not in params and name not in MISSING:
                 continue
-            v = params[name]
+            v = params.get(name, MISSING.get(name))
             try:
                 setattr(pg, name, str(v) if name in ("degree", "square_degree", "sq_degree_u", "sq_degree_v", "lr_degree",
                                                     "pt_quad_degree") else v)
@@ -670,7 +676,8 @@ def draw_feature(layout, context):
                     if op == "dome" and name == "dome_cvs" and pg.dome_layout != "DRAPED":
                         continue
                     if name in ("degree", "square_degree", "jc_mode", "bool_op", "lr_degree", "lr_mode", "pp_shape",
-                                "dome_cont", "dome_layout", "oc_mode", "oc_corner", "os_corner", "fl_mode", "measure",
+                                "dome_cont", "dome_layout", "oc_mode", "oc_corner", "os_corner", "fl_mode", "fl_corner",
+                                "measure",
                                 "nw_cont", "rr_height"):
                         col.row().prop(pg, name, expand=True)
                     elif name in ("jc_degree", "jc_cvs") and pg.jc_mode != "REBUILD":
