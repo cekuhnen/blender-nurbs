@@ -716,6 +716,125 @@ def _merge(x, tol):
 
 # -- the mesh ------------------------------------------------------------------
 
+def _ekey(e):
+    a, b = e.verts
+    return (a.index, b.index) if a.index < b.index else (b.index, a.index)
+
+
+def _hole_dissolve_edges(fs):
+    """The edges to dissolve in one flat face's triangles (fs) so it becomes as
+    few n-gons as Blender allows, in a fixed order. A face can't have a hole,
+    so a face with holes needs two pieces at least: two discs that meet along
+    a cut running from the outer loop through every hole and back out.
+
+    Blender's dissolve joins greedily, and with the triangles all in one plane
+    the joins it picks hang on the order of the edges: the cuts it ends with
+    could land side by side round a hole and leave a sliver quad, or more
+    pieces than needed. (In a set the edges were in memory-address order,
+    which Windows changes from run to run.) So the cut is chosen here: the
+    holes in a row along their spread, one triangle edge from each loop to the
+    next (outer -> holes -> outer), leaving each hole about opposite where it
+    came in. When those edges don't part the face into two discs, every inner
+    edge goes, in vertex order."""
+    fset = set(fs)
+    edges = {}
+    for f in fs:
+        for e in f.edges:
+            edges.setdefault(_ekey(e), e)
+    inner = [edges[k] for k in sorted(edges)
+             if len(edges[k].link_faces) == 2 and all(f in fset for f in edges[k].link_faces)]
+    border = [edges[k] for k in sorted(edges) if sum(f in fset for f in edges[k].link_faces) == 1]
+    parent = {}                     # the boundary loops: vertices joined by border edges
+
+    def find(v):
+        while parent.setdefault(v, v) != v:
+            parent[v] = parent[parent[v]]
+            v = parent[v]
+        return v
+    for e in border:
+        a, b = (find(v.index) for v in e.verts)
+        if a != b:
+            parent[max(a, b)] = min(a, b)
+    loops, co = {}, {}
+    for e in border:
+        for v in e.verts:
+            loops.setdefault(find(v.index), set()).add(v.index)
+            co[v.index] = np.array(v.co, float)
+    if len(loops) < 2:
+        return inner
+    loop_of = {v: r for r, vs in loops.items() for v in vs}
+    cen = {r: np.mean([co[v] for v in sorted(vs)], axis=0) for r, vs in loops.items()}
+    ext = {r: float(np.ptp(np.array([co[v] for v in vs]), axis=0).max()) for r, vs in loops.items()}
+    outer = max(sorted(loops), key=lambda r: ext[r])
+    holes = [r for r in sorted(loops) if r != outer]
+    if len(holes) > 1:              # in a row along the holes' spread
+        C = np.array([cen[h] for h in holes])
+        ax = np.linalg.svd(C - C.mean(axis=0))[2][0]
+        ax = ax if ax[int(np.argmax(np.abs(ax)))] > 0 else -ax
+        holes.sort(key=lambda h: float(cen[h] @ ax))
+    bridges = {}                    # (loop, loop) -> [(length, key, vertex on the 1st, on the 2nd, edge)]
+    for e in inner:
+        a, b = (v.index for v in e.verts)
+        la, lb = loop_of.get(a), loop_of.get(b)
+        if la is None or lb is None or la == lb:
+            continue
+        L = float(np.linalg.norm(co[a] - co[b]))
+        bridges.setdefault((la, lb), []).append((L, _ekey(e), a, b, e))
+        bridges.setdefault((lb, la), []).append((L, _ekey(e), b, a, e))
+    chain = [outer] + holes + [outer]
+    used, keep = set(), {}
+    p_in = None                     # where the cut came into the current loop
+    for i in range(len(chain) - 1):
+        x, y = chain[i], chain[i + 1]
+        cand = [t for t in bridges.get((x, y), ()) if t[2] not in used and t[3] not in used]
+        if not cand:
+            return inner
+        # towards the next hole (away from it on the way in), about opposite where the cut came in
+        to = cen[chain[i + 2]] if i + 2 < len(chain) - 1 else None
+
+        def score(t):
+            s = 0.0
+            if p_in is not None:              # leaving hole x
+                s += float(_unit(co[p_in] - cen[x]) @ _unit(co[t[2]] - cen[x]))
+            if to is not None and y != outer:  # entering hole y: on the side away from the next one
+                s -= float(_unit(co[t[3]] - cen[y]) @ _unit(cen[y] - to))
+            return (round(s, 3), t[0], t[1])
+        best = min(cand, key=score)
+        keep[best[1]] = best[4]
+        used.update((best[2], best[3]))
+        p_in = best[3]
+    # the pieces the kept edges cut: two, each a disc (one boundary, no vertex on it twice)
+    cut = [e for e in inner if _ekey(e) not in keep]
+    cutset = set(cut)
+    seen, pieces = set(), 0
+    for f0 in fs:
+        if f0 in seen:
+            continue
+        pieces += 1
+        comp, stack = [], [f0]
+        seen.add(f0)
+        while stack:
+            f = stack.pop()
+            comp.append(f)
+            for e in f.edges:
+                if e in cutset:
+                    for g in e.link_faces:
+                        if g not in seen:
+                            seen.add(g)
+                            stack.append(g)
+        cset = set(comp)
+        ce = {_ekey(e): e for f in comp for e in f.edges}
+        cv = {v.index for f in comp for v in f.verts}
+        deg = {}
+        for e in ce.values():
+            if sum(g in cset for g in e.link_faces) == 1:
+                for v in e.verts:
+                    deg[v.index] = deg.get(v.index, 0) + 1
+        if len(cv) - len(ce) + len(comp) != 1 or any(d != 2 for d in deg.values()):
+            return inner
+    return cut if pieces == 2 else inner
+
+
 def build_bmesh(m, light=True, uvs=True):
     """bmesh of a Mesher's polygons: corner UVs and normals (layer "nproto_n"),
     the "brep_face" face layer; Light joins each curved face's triangles into
@@ -744,11 +863,10 @@ def build_bmesh(m, light=True, uvs=True):
         if kind in groups:
             groups[kind].setdefault(fi, []).append(bf)
     bm.normal_update()                  # join_triangles compares the faces' normals
+    bm.verts.index_update()
     if light:
         for fs in groups["holes"].values():           # a flat face with holes: as few n-gons as Blender allows
-            fs = set(fs)
-            inner = [e for e in {e for f in fs for e in f.edges}
-                     if len(e.link_faces) == 2 and all(f in fs for f in e.link_faces)]
+            inner = _hole_dissolve_edges(fs)
             if inner:
                 bmesh.ops.dissolve_limit(bm, angle_limit=math.radians(1.0), use_dissolve_boundaries=False,
                                          verts=[], edges=inner, delimit=set())

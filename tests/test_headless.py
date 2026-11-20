@@ -8693,6 +8693,11 @@ me, m, c, (op_, ar_, vo_) = _bm_of(_bo)
 _bab = store.get_brep(_bo).area(1e-7)
 _bmr["box with a hole: closed, n-gons around the hole, quads in it, area within 0.1%"] = \
     op_ == 0 and c["ngons"] == 4 and c["tris"] == 0 and abs(ar_ - _bab) < 1e-3 * _bab
+# what each part measured, and the B-rep's topology (edges per loop of each face): a failure says which part
+# went wrong and whether the boolean's result differed (it failed once on the Windows runner only)
+_bmr_hole = {"open": op_, "ngons": c["ngons"], "tris": c["tris"], "quads": c["quads"], "faces": c["faces"],
+             "area": round(ar_, 6), "brep area": round(_bab, 6), "problems": m.problems,
+             "loops": [[len(l_) for l_ in f_.boundary_loops()] for f_ in store.get_brep(_bo).faces()]}
 _bm_clear()
 bpy.ops.nproto.add_primitive(kind="SPHERE"); _s = ctx.active_object
 bpy.ops.nproto.add_primitive(kind="BOX", width=1.2, depth=1.2, height=1.2, degree="0"); _b = ctx.active_object
@@ -8713,7 +8718,7 @@ _shp = sum(e_.use_edge_sharp for e_ in me.edges)
 _bmr["filleted box: closed, area within 0.1%, no sharp edges (all tangent)"] = \
     op_ == 0 and abs(ar_ - _baf) < 1e-3 * _baf and _shp == 0
 check("BREP to Mesh: " + ", ".join(k_ for k_ in _bmr), all(_bmr.values()),
-      str({k_: v_ for k_, v_ in _bmr.items() if not v_}) + f" counts {_cnt}")
+      str({k_: v_ for k_, v_ in _bmr.items() if not v_}) + f" counts {_cnt} box with a hole {_bmr_hole}")
 
 # even, symmetric lines: a surface symmetric left to right (its curvature strongest at the sides) meshes into a
 # mirror-symmetric grid of quads (lines picked one by one from an end left a short piece at the far end);
