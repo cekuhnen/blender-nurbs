@@ -66,6 +66,29 @@ check("a cylinder is no cone; a bent cone is no cone", se.fit_cone(G, 1e-9, 10) 
 Gboth = np.array([3, 4, 5]) + (0.1 * vv)[..., None] * (np.cos(uu)[..., None] * e1 + np.sin(uu)[..., None] * e2) \
     + vv[..., None] * ax                                    # v from -1 to 2: through the apex, both nappes
 check("a double cone (both nappes) is not written as one", se.fit_cone(Gboth, 1e-9, 10) is None)
+# a sphere and a torus round the tilted axis, centre (3,4,5)
+ph = np.linspace(-1.2, 0.9, 9)[None, :]
+Gsph = np.array([3, 4, 5]) + 0.8 * (np.cos(ph)[..., None] * (np.cos(uu[:, :1])[..., None] * e1
+                                                            + np.sin(uu[:, :1])[..., None] * e2) + np.sin(ph)[..., None] * ax)
+sp = se.fit_sphere(Gsph, 1e-9, 10)
+check("sphere: centre and radius", sp is not None and np.allclose(sp[0], [3, 4, 5]) and abs(sp[1] - 0.8) < 1e-12, f"{sp}")
+ra = se.revolution_axis(Gsph, 1e-9, 10)
+check("sphere: its parallels give its axis", ra is not None and abs(abs(ra[1] @ ax) - 1) < 1e-12)
+check("an ellipsoid is no sphere", se.fit_sphere(Gsph + 0.1 * ((Gsph - [3, 4, 5]) @ ax)[..., None] * ax, 1e-9, 10) is None)
+ps = np.linspace(0, 2 * np.pi, 17)[None, :]
+Gtor = np.array([3, 4, 5]) + (1.0 + 0.3 * np.cos(ps))[..., None] * (np.cos(uu[:, :1])[..., None] * e1
+                                                                   + np.sin(uu[:, :1])[..., None] * e2) \
+    + (0.3 * np.sin(ps))[..., None] * ax
+to = se.fit_torus(Gtor, 1e-9, 10)
+check("torus: centre, axis, major and minor radius", to is not None and np.allclose(to[0], [3, 4, 5])
+      and abs(abs(to[1] @ ax) - 1) < 1e-12 and abs(to[2] - 1.0) < 1e-12 and abs(to[3] - 0.3) < 1e-12, f"{to}")
+check("torus, parallels along v (transposed grid)", se.fit_torus(Gtor.transpose(1, 0, 2), 1e-9, 10) is not None)
+check("a sphere is no torus; a cylinder is no torus", se.fit_torus(Gsph, 1e-9, 10) is None
+      and se.fit_torus(G, 1e-9, 10) is None)
+Gspin = np.array([3, 4, 5]) + (0.2 + 0.3 * np.cos(ps))[..., None] * (np.cos(uu[:, :1])[..., None] * e1
+                                                                    + np.sin(uu[:, :1])[..., None] * e2) \
+    + (0.3 * np.sin(ps))[..., None] * ax
+check("a spindle torus (tube wider than the ring) is not written as one", se.fit_torus(Gspin, 1e-9, 10) is None)
 
 # --- export: what each shape is written as ------------------------------------------------
 def add(kind, **kw):
@@ -73,8 +96,8 @@ def add(kind, **kw):
     return ctx.active_object
 
 def kinds(txt):
-    return {k: len(re.findall(r"=%s\(" % k, txt)) for k in ("CYLINDRICAL_SURFACE", "CONICAL_SURFACE", "PLANE",
-                                                             "CIRCLE", "LINE")} | {
+    return {k: len(re.findall(r"=%s\(" % k, txt)) for k in ("CYLINDRICAL_SURFACE", "CONICAL_SURFACE", "SPHERICAL_SURFACE",
+                                                             "TOROIDAL_SURFACE", "PLANE", "CIRCLE", "LINE")} | {
         "BSPLINE_SURF": txt.count("B_SPLINE_SURFACE"), "BSPLINE_CURVE": txt.count("B_SPLINE_CURVE")}
 
 def export(o, name, **kw):
@@ -94,7 +117,7 @@ ctx.view_layer.update()
 st, txt, res, rep = export(cyl, "cyl")
 k = kinds(txt)
 check("exact solid cylinder: a CYLINDRICAL_SURFACE, two PLANEs, two CIRCLEs, the seam a LINE; no B-splines",
-      k == {"CYLINDRICAL_SURFACE": 1, "CONICAL_SURFACE": 0, "PLANE": 2, "CIRCLE": 2, "LINE": 1, "BSPLINE_SURF": 0, "BSPLINE_CURVE": 0}, str(k))
+      k == {"CYLINDRICAL_SURFACE": 1, "CONICAL_SURFACE": 0, "SPHERICAL_SURFACE": 0, "TOROIDAL_SURFACE": 0, "PLANE": 2, "CIRCLE": 2, "LINE": 1, "BSPLINE_SURF": 0, "BSPLINE_CURVE": 0}, str(k))
 r_ = float(re.search(r"=CYLINDRICAL_SURFACE\('',#\d+,([^)]+)\)", txt).group(1))
 # (within Blender's single-precision object matrix: rotated, it is a hair from rigid)
 check("its radius in millimetres", abs(r_ - 500) < 1e-4, f"{r_}")
@@ -108,7 +131,7 @@ check("every referenced entity is defined", set(re.findall(r"#(\d+)", txt)) <= _
 
 st, txt, res, rep = export(cyl, "cyl_bspline", analytic=False)
 k = kinds(txt)
-check("analytic off: B-splines only, as before", k["CYLINDRICAL_SURFACE"] == k["CONICAL_SURFACE"] == k["PLANE"] == k["CIRCLE"] == k["LINE"] == 0
+check("analytic off: B-splines only, as before", k["CYLINDRICAL_SURFACE"] == k["CONICAL_SURFACE"] == k["SPHERICAL_SURFACE"] == k["TOROIDAL_SURFACE"] == k["PLANE"] == k["CIRCLE"] == k["LINE"] == 0
       and k["BSPLINE_SURF"] and rep["solids"] == 1, str(k))
 
 smooth = add("CYLINDER", radius=0.5, height=1.2, caps=True, degree="3")
@@ -143,7 +166,7 @@ ctx.view_layer.update()
 st, txt, res, rep = export(fr, "frustum")
 k = kinds(txt)
 check("exact frustum: a CONICAL_SURFACE, two PLANEs, two CIRCLEs, the seam a LINE; no B-splines",
-      k == {"CYLINDRICAL_SURFACE": 0, "CONICAL_SURFACE": 1, "PLANE": 2, "CIRCLE": 2, "LINE": 1, "BSPLINE_SURF": 0,
+      k == {"CYLINDRICAL_SURFACE": 0, "CONICAL_SURFACE": 1, "SPHERICAL_SURFACE": 0, "TOROIDAL_SURFACE": 0, "PLANE": 2, "CIRCLE": 2, "LINE": 1, "BSPLINE_SURF": 0,
             "BSPLINE_CURVE": 0}, str(k))
 m = re.search(r"=CONICAL_SURFACE\('',(#\d+),([^,]+),([^)]+)\)", txt)
 check("its semi-angle atan(0.35 / 0.9)", m and abs(float(m.group(3)) - math.atan(0.35 / 0.9)) < 1e-6, m and m.group(3))
@@ -179,6 +202,65 @@ check("tapered hole reads back: one solid, every face", rep["solids"] == 1 and r
       and res[0][1].face_count() == store.get_brep(sink).face_count()
       and abs(vol(res[0][1]) / (4 - math.pi / 3 * (0.65 ** 2 + 0.65 * 0.15 + 0.15 ** 2)) - 1) < 1e-4,
       f"{rep} {vol(res[0][1]) if res else None}")
+
+# spheres and tori: whole ones, a spherical dimple, a toroidal groove, a smooth sphere
+sph = add("SPHERE", radius=0.7, degree="0")
+sph.location, sph.rotation_euler = (1, 2, 3), (0.3, 0.5, 0.7)
+ctx.view_layer.update()
+st, txt, res, rep = export(sph, "sphere")
+k = kinds(txt)
+check("exact sphere: a SPHERICAL_SURFACE bounded by one VERTEX_LOOP (no seam), no B-splines",
+      k["SPHERICAL_SURFACE"] == 1 and txt.count("VERTEX_LOOP(") == 1 and "EDGE_LOOP(" not in txt
+      and k["BSPLINE_SURF"] == k["BSPLINE_CURVE"] == 0 and st["solids"] == 1, str(k))
+m = re.search(r"=SPHERICAL_SURFACE\('',#\d+,([^)]+)\)", txt)
+check("its radius in millimetres", m and abs(float(m.group(1)) - 700) < 1e-4, m and m.group(1))
+check("whole sphere reads back (a VERTEX_LOOP face is the whole sphere): one face, the volume",
+      rep["failed"] == 0 and res and res[0][1].face_count() == 1
+      and abs(vol(res[0][1]) / (4 / 3 * math.pi * 0.343) - 1) < 1e-4, f"{rep} {vol(res[0][1]) if res else None}")
+tor = add("TORUS", radius=1.0, radius2=0.3, degree="0")
+tor.location, tor.rotation_euler = (-1, 0, 2), (0.6, 0.1, -0.4)
+ctx.view_layer.update()
+st, txt, res, rep = export(tor, "torus")
+k = kinds(txt)
+check("exact torus: a TOROIDAL_SURFACE, its two seams CIRCLEs, no B-splines", k["TOROIDAL_SURFACE"] == 1
+      and k["CIRCLE"] == 2 and k["BSPLINE_SURF"] == k["BSPLINE_CURVE"] == 0 and st["solids"] == 1, str(k))
+m = re.search(r"=TOROIDAL_SURFACE\('',#\d+,([^,]+),([^)]+)\)", txt)
+check("its radii in millimetres", m and abs(float(m.group(1)) - 1000) < 1e-3 and abs(float(m.group(2)) - 300) < 1e-3,
+      m and m.groups())
+# (our importer splits a whole torus in two faces)
+check("torus reads back: every face, the volume 2 pi^2 R r^2", rep["failed"] == 0 and res
+      and abs(vol(res[0][1]) / (2 * math.pi ** 2 * 0.09) - 1) < 1e-4,
+      f"{rep} {vol(res[0][1]) if res else None}")
+bx = add("BOX", width=2, depth=2, height=1)
+s2 = add("SPHERE", radius=0.6, degree="0")
+s2.location = (0, 0, 0.5)           # centred on the box top: a half-sphere dimple
+ctx.view_layer.update()
+r = bpy.ops.nproto.boolean(operation="DIFFERENCE", names=json.dumps([bx.name, s2.name]))
+dim = ctx.active_object
+st, txt, res, rep = export(dim, "dimple")
+k = kinds(txt)
+check("box with a dimple: the dimple a SPHERICAL_SURFACE, the box PLANEs, no B-spline surfaces",
+      r == {'FINISHED'} and k["SPHERICAL_SURFACE"] == 1 and k["PLANE"] == 6 and k["BSPLINE_SURF"] == 0, str(k))
+check("dimple reads back: one solid, every face, the volume", rep["solids"] == 1 and rep["failed"] == 0 and res
+      and res[0][1].face_count() == 7 and abs(vol(res[0][1]) / (4 - 2 / 3 * math.pi * 0.216) - 1) < 1e-4,
+      f"{rep} {vol(res[0][1]) if res else None}")
+bx = add("BOX", width=3, depth=3, height=1)
+t2 = add("TORUS", radius=0.9, radius2=0.25, degree="0")
+t2.location = (0, 0, 0.5)           # centred on the box top: a half-round groove
+ctx.view_layer.update()
+r = bpy.ops.nproto.boolean(operation="DIFFERENCE", names=json.dumps([bx.name, t2.name]))
+gr = ctx.active_object
+st, txt, res, rep = export(gr, "groove")
+k = kinds(txt)
+check("box with a groove: TOROIDAL_SURFACEs, the box PLANEs, no B-spline surfaces",
+      r == {'FINISHED'} and k["TOROIDAL_SURFACE"] >= 1 and k["PLANE"] == 7 and k["BSPLINE_SURF"] == 0, str(k))
+check("groove reads back: one solid, every face, the volume", rep["solids"] == 1 and rep["failed"] == 0 and res
+      and res[0][1].face_count() == store.get_brep(gr).face_count()
+      and abs(vol(res[0][1]) / (9 - math.pi ** 2 * 0.9 * 0.0625) - 1) < 1e-4,
+      f"{rep} {vol(res[0][1]) if res else None}")
+ss = add("SPHERE", radius=0.7, degree="3")
+st, txt, res, rep = export(ss, "smooth_sphere")
+check("smooth sphere: stays a B-spline", kinds(txt)["SPHERICAL_SURFACE"] == 0 and kinds(txt)["BSPLINE_SURF"] == 1)
 
 # an extruded exact circle and an extruded smooth one
 bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=0.6, degree="0"); c = ctx.active_object

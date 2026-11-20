@@ -727,6 +727,9 @@ class Importer:
         a = sf.args(face_ref)
         loops, seams = self.face_loops(face_ref)
         if not loops:
+            whole = self._whole_surface(a[2], a[3] != "F")
+            if whole is not None:
+                return whole
             raise ValueError("face without edge loops")
         pts = np.vstack([curvejoin.eval_span(s, np.linspace(0, 1, 9)) for _, L in loops for e in L for s in e])
         seam_pts = None
@@ -754,6 +757,29 @@ class Importer:
         probe = self.make_surface(data, not same_sense)
         curves = [self._projected_curve(probe, e) for _, L in loops for e in L]
         return self.sm.trim_surface_with_3d_curves(surf, counts, curves)
+
+    def _whole_surface(self, ref, same_sense):
+        """A face with no edge loops (only a VERTEX_LOOP, as CAD programs write a
+        whole sphere, or none) on a closed surface: the whole surface, else None."""
+        sf = self.sf
+        st = sf.type(ref)
+        if st not in ("SPHERICAL_SURFACE", "TOROIDAL_SURFACE"):
+            return None
+        o, x, y, z = placement(sf, sf.args(ref)[1], self.f)
+        th = np.linspace(0, 2 * math.pi, 25)[:-1]
+        if st == "SPHERICAL_SURFACE":
+            R = float(sf.args(ref)[2]) * self.f
+            ph = np.linspace(-math.pi / 2, math.pi / 2, 9)
+            pts = np.array([o + R * (math.cos(p) * (math.cos(t) * x + math.sin(t) * y) + math.sin(p) * z)
+                            for p in ph for t in th])
+            seam_pts = np.array([o + R * (math.cos(p) * x + math.sin(p) * z) for p in ph[1:-1]])
+        else:
+            Rm, rm = (float(v) * self.f for v in sf.args(ref)[2:4])
+            pts = np.array([o + (Rm + rm * math.cos(p)) * (math.cos(t) * x + math.sin(t) * y) + rm * math.sin(p) * z
+                            for p in th for t in th])
+            seam_pts = np.array([o + (Rm + rm * math.cos(p)) * x + rm * math.sin(p) * z for p in th])
+        data = self.surface(ref, pts, seam_pts)
+        return self.ext.brep_from_surface(self.make_surface(data, not same_sense))
 
     def _projected_curve(self, surf, spans):
         from .drawtools import interpolate

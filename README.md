@@ -125,8 +125,8 @@ Exchange exact geometry with your CAD app: **File → Import / Export → NURBS 
 
 - **Import:** AP203, AP214 and AP242 solids and surface models, as exact trimmed NURBS,
   with units and assembly placements converted
-- **Export:** AP214 with exact B-spline surfaces and full B-rep topology; true cylinders,
-  cones, planes, circles and lines as STEP's own analytic entities; closed bodies as solids; in
+- **Export:** AP214 with exact B-spline surfaces and full B-rep topology; true planes,
+  cylinders, cones, spheres, tori, circles and lines as STEP's own analytic entities; closed bodies as solids; in
   mm, cm or m
 
 ## Learn more
