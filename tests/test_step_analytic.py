@@ -1,4 +1,4 @@
-"""STEP export of true cylinders, planes, circles and lines:
+"""STEP export of true cylinders, cones, spheres, tori, planes, circles, ellipses and lines:
 blender -b --factory-startup --python tests/test_step_analytic.py"""
 import json, math, os, re, sys, tempfile
 import bpy
@@ -35,6 +35,23 @@ check("circle: centre, radius; the normal makes the points run counter-clockwise
 check("a line is no circle", se.fit_circle(L, 1e-9, 10) is None)
 W = np.column_stack([np.cos(a), np.sin(a), 0.3 * np.sin(a)])        # a tilted ellipse
 check("an ellipse is no circle", se.fit_circle(W, 1e-9, 10) is None)
+el = se.fit_ellipse(W + [1, 2, 3], 1e-9, 10)
+mj = np.array([0, 1, 0.3]) / math.sqrt(1.09)
+check("ellipse: centre, major axis and radius, minor radius, normal counter-clockwise",
+      el is not None and np.allclose(el[0], [1, 2, 3]) and abs(abs(el[2] @ mj) - 1) < 1e-12
+      and abs(el[3] - math.sqrt(1.09)) < 1e-12 and abs(el[4] - 1) < 1e-12
+      and np.allclose(el[1], np.cross([1, 0, 0], mj)), str(el))
+check("ellipse, running the other way: the normal flips", se.fit_ellipse(W[::-1], 1e-9, 10) is not None
+      and np.allclose(se.fit_ellipse(W[::-1], 1e-9, 10)[1], -np.cross([1, 0, 0], mj)))
+ae = np.linspace(0, 2 * np.pi, 49)
+Wf = np.column_stack([0.8 * np.cos(ae), 0.3 * np.sin(ae), np.zeros_like(ae)])
+el = se.fit_ellipse(Wf, 1e-9, 10)
+check("whole ellipse: radii 0.8, 0.3", el is not None and abs(el[3] - 0.8) < 1e-12 and abs(el[4] - 0.3) < 1e-12)
+Hy = np.column_stack([np.cosh(t - 0.5), np.sinh(t - 0.5), np.zeros_like(t)])
+Ov = np.column_stack([np.cos(a) * (1 + 1e-6 * np.cos(3 * a)), 0.5 * np.sin(a), np.zeros_like(a)])
+check("a hyperbola, a non-planar run, an egg are no ellipses", se.fit_ellipse(Hy, 1e-9, 10) is None
+      and se.fit_ellipse(np.column_stack([np.cos(a), np.sin(a), 0.1 * a]), 1e-9, 10) is None
+      and se.fit_ellipse(Ov, 1e-9, 10) is None)
 uu, vv = np.meshgrid(np.linspace(0, 2 * np.pi, 25), np.linspace(-1, 2, 9), indexing="ij")
 ax = np.array([1.0, 1.0, 0.0]) / math.sqrt(2)
 e1 = np.array([0, 0, 1.0]); e2 = np.cross(ax, e1)
@@ -97,7 +114,7 @@ def add(kind, **kw):
 
 def kinds(txt):
     return {k: len(re.findall(r"=%s\(" % k, txt)) for k in ("CYLINDRICAL_SURFACE", "CONICAL_SURFACE", "SPHERICAL_SURFACE",
-                                                             "TOROIDAL_SURFACE", "PLANE", "CIRCLE", "LINE")} | {
+                                                             "TOROIDAL_SURFACE", "PLANE", "CIRCLE", "ELLIPSE", "LINE")} | {
         "BSPLINE_SURF": txt.count("B_SPLINE_SURFACE"), "BSPLINE_CURVE": txt.count("B_SPLINE_CURVE")}
 
 def export(o, name, **kw):
@@ -117,7 +134,7 @@ ctx.view_layer.update()
 st, txt, res, rep = export(cyl, "cyl")
 k = kinds(txt)
 check("exact solid cylinder: a CYLINDRICAL_SURFACE, two PLANEs, two CIRCLEs, the seam a LINE; no B-splines",
-      k == {"CYLINDRICAL_SURFACE": 1, "CONICAL_SURFACE": 0, "SPHERICAL_SURFACE": 0, "TOROIDAL_SURFACE": 0, "PLANE": 2, "CIRCLE": 2, "LINE": 1, "BSPLINE_SURF": 0, "BSPLINE_CURVE": 0}, str(k))
+      k == {"CYLINDRICAL_SURFACE": 1, "CONICAL_SURFACE": 0, "SPHERICAL_SURFACE": 0, "TOROIDAL_SURFACE": 0, "PLANE": 2, "CIRCLE": 2, "ELLIPSE": 0, "LINE": 1, "BSPLINE_SURF": 0, "BSPLINE_CURVE": 0}, str(k))
 r_ = float(re.search(r"=CYLINDRICAL_SURFACE\('',#\d+,([^)]+)\)", txt).group(1))
 # (within Blender's single-precision object matrix: rotated, it is a hair from rigid)
 check("its radius in millimetres", abs(r_ - 500) < 1e-4, f"{r_}")
@@ -166,7 +183,7 @@ ctx.view_layer.update()
 st, txt, res, rep = export(fr, "frustum")
 k = kinds(txt)
 check("exact frustum: a CONICAL_SURFACE, two PLANEs, two CIRCLEs, the seam a LINE; no B-splines",
-      k == {"CYLINDRICAL_SURFACE": 0, "CONICAL_SURFACE": 1, "SPHERICAL_SURFACE": 0, "TOROIDAL_SURFACE": 0, "PLANE": 2, "CIRCLE": 2, "LINE": 1, "BSPLINE_SURF": 0,
+      k == {"CYLINDRICAL_SURFACE": 0, "CONICAL_SURFACE": 1, "SPHERICAL_SURFACE": 0, "TOROIDAL_SURFACE": 0, "PLANE": 2, "CIRCLE": 2, "ELLIPSE": 0, "LINE": 1, "BSPLINE_SURF": 0,
             "BSPLINE_CURVE": 0}, str(k))
 m = re.search(r"=CONICAL_SURFACE\('',(#\d+),([^,]+),([^)]+)\)", txt)
 check("its semi-angle atan(0.35 / 0.9)", m and abs(float(m.group(3)) - math.atan(0.35 / 0.9)) < 1e-6, m and m.group(3))
@@ -271,6 +288,30 @@ bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=0.6, degree="3"); c = ctx.act
 bpy.ops.nproto.extrude(inputs=json.dumps([[c.name, "S0"]]), distance=1.5, direction="Z")
 st, txt, res, rep = export(ctx.active_object, "ext_smooth")
 check("extruded smooth circle: stays a B-spline", kinds(txt)["CYLINDRICAL_SURFACE"] == 0 and kinds(txt)["BSPLINE_SURF"] == 1)
+
+# an elliptic cylinder (a cylinder scaled 1.6 x 0.6, tilted): its rims ELLIPSEs, the caps PLANEs, the side
+# a B-spline (no cylinder); a smooth one's rims stay B-splines
+ee = add("CYLINDER", radius=0.5, height=1.2, caps=True, degree="0")
+ee.location, ee.rotation_euler, ee.scale = (1, -2, 0.5), (0.3, -0.5, 0.8), (1.6, 0.6, 1.0)
+ctx.view_layer.update()
+st, txt, res, rep = export(ee, "ellipse")
+k = kinds(txt)
+check("elliptic cylinder: two ELLIPSEs, two PLANEs, the seam a LINE; no cylinder, the side a B-spline",
+      k["ELLIPSE"] == 2 and k["PLANE"] == 2 and k["CIRCLE"] == 0 and k["CYLINDRICAL_SURFACE"] == 0
+      and k["BSPLINE_SURF"] >= 1 and k["LINE"] == 1 and k["BSPLINE_CURVE"] == 0, str(k))
+ax_ = [tuple(map(float, m)) for m in re.findall(r"=ELLIPSE\('',#\d+,([^,]+),([^)]+)\)", txt)]
+# (within Blender's single-precision object matrix)
+check("ellipse: semi-axes 800 and 300 mm, the major one first", len(ax_) == 2
+      and all(abs(a1 / 800 - 1) < 1e-6 and abs(a2 / 300 - 1) < 1e-6 for a1, a2 in ax_), str(ax_))
+check("elliptic cylinder reads back: one solid, the volume", rep["solids"] == 1 and rep["failed"] == 0 and res
+      and abs(vol(res[0][1]) / (math.pi * 0.8 * 0.3 * 1.2) - 1) < 1e-5, f"{rep} {vol(res[0][1]) if res else None}")
+check("elliptic cylinder: no open loops", not se.loop_problems(txt), str(se.loop_problems(txt)))
+es = add("CYLINDER", radius=0.5, height=1.2, caps=True, degree="3")
+es.scale = (1.6, 0.6, 1.0)
+ctx.view_layer.update()
+st, txt, res, rep = export(es, "ellipse_smooth")
+check("smooth elliptic cylinder: its rims stay B-splines", kinds(txt)["ELLIPSE"] == 0 and kinds(txt)["BSPLINE_CURVE"] >= 2,
+      str(kinds(txt)))
 
 # the operator: the option, on by default, and the report
 p = os.path.join(TMP, "op.step")

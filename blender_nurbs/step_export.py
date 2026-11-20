@@ -4,7 +4,7 @@ Exact geometry: every face's surface is written as a B-spline surface (rational
 when it has weights), every edge as a B-spline curve cut exactly to the edge's
 range -- or, with analytic on (the default), as what it truly is when it is one
 within 1e-7 of the body's size: a PLANE, CYLINDRICAL_, CONICAL_, SPHERICAL_
-or TOROIDAL_SURFACE, a CIRCLE or LINE, as CAD programs write them (an exact cylinder is then
+or TOROIDAL_SURFACE, a CIRCLE, ELLIPSE or LINE, as CAD programs write them (an exact cylinder is then
 a true cylinder in the file, its holes and bosses recognised by the reader) -- with full B-rep topology (vertices, edge curves shared by their two
 faces, oriented edges, outer / inner face bounds, face sense). Closed bodies
 become MANIFOLD_SOLID_BREPs, open ones SHELL_BASED_SURFACE_MODELs. Each object
@@ -125,6 +125,61 @@ def fit_circle(S, tol, size):
     if float(turn @ n) < 0:
         n = -n
     return C, n, r
+
+
+def fit_ellipse(S, tol, size):
+    """(centre, unit normal, major axis direction, major radius, minor radius)
+    of points on an ellipse or elliptic arc, the normal so that the points run
+    counter-clockwise round it; else None. Lines and circles are not ellipses
+    (check fit_line and fit_circle first)."""
+    S = np.asarray(S, float)
+    if len(S) < 6:
+        return None
+    pl = fit_plane(S, tol)
+    if pl is None:
+        return None
+    c, n = pl
+    x = S[0] - c
+    x -= (x @ n) * n
+    if np.linalg.norm(x) < 1e-12:
+        x = np.cross(n, [1.0, 0, 0]) if abs(n[0]) < 0.9 else np.cross(n, [0, 1.0, 0])
+    x /= np.linalg.norm(x)
+    y = np.cross(n, x)
+    Q = np.column_stack([(S - c) @ x, (S - c) @ y])
+    s = float(np.abs(Q).max())
+    if s <= tol:
+        return None
+    q = Q / s
+    # the conic A x² + B xy + C y² + D x + E y + F = 0 through the points
+    Dm = np.column_stack([q[:, 0] ** 2, q[:, 0] * q[:, 1], q[:, 1] ** 2, q[:, 0], q[:, 1], np.ones(len(q))])
+    A, B, C, D, E, F = np.linalg.svd(Dm)[2][-1]
+    if B * B - 4 * A * C >= 0:            # a parabola or hyperbola
+        return None
+    c2 = np.linalg.solve([[2 * A, B], [B, 2 * C]], [-D, -E])
+    Fc = F + 0.5 * (D * c2[0] + E * c2[1])
+    lam, vec = np.linalg.eigh([[A, B / 2], [B / 2, C]])
+    ax2 = -Fc / lam
+    if not (ax2 > 0).all():
+        return None
+    k = int(np.argmax(ax2))               # the major axis first
+    r = np.sqrt(ax2[[k, 1 - k]]) * s
+    if not (tol < r[1] and r[0] < 1e3 * size):
+        return None
+    u = vec[:, k]
+    C2 = c2 * s
+    # every point on it: the point at its own eccentric angle is no nearer than the foot
+    d = Q - C2
+    e1, e2 = d @ u, d @ np.array([-u[1], u[0]])
+    t = np.arctan2(e2 / r[1], e1 / r[0])
+    off = np.hypot(e1 - r[0] * np.cos(t), e2 - r[1] * np.sin(t))
+    if float(off.max()) > tol:
+        return None
+    Cw = c + C2[0] * x + C2[1] * y
+    U = u[0] * x + u[1] * y
+    turn = sum(np.cross(S[i] - Cw, S[i + 1] - Cw) for i in range(len(S) - 1))
+    if float(turn @ n) < 0:
+        n = -n
+    return Cw, n, U, float(r[0]), float(r[1])
 
 
 def fit_cylinder(G, tol, size):
@@ -339,7 +394,8 @@ class StepExporter:
         self.analytic = analytic
         self.stats = {"bodies": 0, "faces": 0, "edges": 0, "solids": 0, "sheets": 0,
                       "analytic": {"CYLINDRICAL_SURFACE": 0, "CONICAL_SURFACE": 0, "SPHERICAL_SURFACE": 0,
-                                   "TOROIDAL_SURFACE": 0, "PLANE": 0, "CIRCLE": 0, "LINE": 0}}
+                                   "TOROIDAL_SURFACE": 0, "PLANE": 0, "CIRCLE": 0, "ELLIPSE": 0,
+                                   "LINE": 0}}
         self._dir_cache = {}
 
     # -- small geometry ----------------------------------------------------
@@ -360,7 +416,7 @@ class StepExporter:
 
     # -- analytic ----------------------------------------------------------
     def analytic_curve(self, S, tol, size):
-        """LINE or CIRCLE through the edge's samples S (in its direction), else None."""
+        """LINE, CIRCLE or ELLIPSE through the edge's samples S (in its direction), else None."""
         ln = fit_line(S, tol)
         if ln is not None:
             o, d = ln
@@ -372,6 +428,11 @@ class StepExporter:
             C, n, r = ci
             self.stats["analytic"]["CIRCLE"] += 1
             return self.w.add(f"CIRCLE('',{self.placement(C, n, _perp(n, S[0] - C))},{_f(r)})")
+        el = fit_ellipse(S, tol, size)
+        if el is not None:
+            C, n, U, ra, rb = el
+            self.stats["analytic"]["ELLIPSE"] += 1
+            return self.w.add(f"ELLIPSE('',{self.placement(C, n, _perp(n, U))},{_f(ra)},{_f(rb)})")
         return None
 
     def analytic_surface(self, G, tol, size):
@@ -751,7 +812,7 @@ from bpy_extras.io_utils import ExportHelper  # noqa: E402
 
 class NPROTO_OT_export_step(bpy.types.Operator, ExportHelper):
     """Export NURBS objects as STEP (AP214): exact B-spline surfaces and curves
-    (true cylinders, planes, circles and lines as STEP's own) with full B-rep
+    (true cylinders, planes, circles, ellipses and lines as STEP's own) with full B-rep
     topology; closed bodies as solids"""
     bl_idname = "nproto.export_step"
     bl_label = "Export STEP"
@@ -765,7 +826,7 @@ class NPROTO_OT_export_step(bpy.types.Operator, ExportHelper):
                        description="Length unit of the file; Blender units are taken as metres")
     global_scale: FloatProperty(name="Scale", default=1.0, min=1e-6, soft_max=1000.0)
     analytic: BoolProperty(name="Analytic Surfaces", default=True,
-                           description="Write true planes, cylinders, cones, spheres, tori, circles and lines as "
+                           description="Write true planes, cylinders, cones, spheres, tori, circles, ellipses and lines as "
                                        "STEP's own analytic entities, as CAD programs do (holes, bosses, countersinks "
                                        "and fillets are then recognised); off: everything as B-splines")
 
@@ -788,6 +849,8 @@ class NPROTO_OT_export_step(bpy.types.Operator, ExportHelper):
             msg += f"; true {', '.join(parts)} faces"
         if self.analytic and an["CIRCLE"]:
             msg += f"; {an['CIRCLE']} circles"
+        if self.analytic and an["ELLIPSE"]:
+            msg += f"; {an['ELLIPSE']} ellipses"
         if stats.get("open_loops"):
             msg += f"; {len(stats['open_loops'])} edge loop(s) don't close -- other programs may drop those faces"
         if stats.get("failed"):
