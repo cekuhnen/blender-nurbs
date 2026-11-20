@@ -70,7 +70,59 @@ def _faces_json(items):
     return json.dumps([[o.name, [float(x) for x in p]] for o, p in items])
 
 
-class NPROTO_OT_push_pull(ValueDrag, AskValue, bpy.types.Operator):
+class _FacePicking:
+    """Clicking faces in the view (Push / Pull, Replace Face): what is under
+    the mouse, lit up."""
+    MAX_FILL = 3000             # a curved face with more tessellation points than this: outlines only
+
+    def _hit(self, context, event):
+        region, _ = ValueDrag._win(context)
+        if region is None:
+            return None
+        xy = (event.mouse_x - region.x, event.mouse_y - region.y)
+        if not (0 <= xy[0] < region.width and 0 <= xy[1] < region.height):
+            return None
+        with context.temp_override(region=region):
+            try:
+                return subsel.face_under(bpy.context, xy)
+            except Exception as exc:
+                print("NURBS push/pull pick:", exc)
+                return None
+
+    def _show_face(self, hit, solids=True):
+        """Outline and fill the face under the mouse (solids: of solids only;
+        False: of open surfaces only)."""
+        if hit == getattr(self, "_hover", None):
+            return
+        self._hover = hit
+        pv = None
+        if hit is not None:
+            o, i = hit
+            try:
+                if _is_solid(o) == solids:
+                    fr = face_frame(o, i)
+                    pts, tris, polys = subsel.face_tris(o, i)
+                    M = np.array(geom.world_matrix(o))
+                    lift = 2e-3 * float(np.linalg.norm(np.ptp(np.vstack(polys), axis=0)) or 1.0)
+                    if fr[3]:                   # off the face: no z-fight
+                        W = lambda P: _world(M, P) + lift * fr[2]
+                    else:
+                        W = lambda P: _world(M, P) + lift * normals_at(o, i, P)
+                    pv = {"lines": [W(P) for P in polys],
+                          "tris": W(pts)[tris].reshape(-1, 3) if len(tris) and len(pts) <= self.MAX_FILL else
+                          np.zeros((0, 3))}
+            except Exception as exc:
+                print("NURBS push/pull hover:", exc)
+        draw.pick_overlay["preview"] = pv
+
+    def _end_pick(self, context):
+        draw.pick_overlay["preview"] = None
+        hints.clear(context)
+        context.area.tag_redraw()
+
+
+
+class NPROTO_OT_push_pull(_FacePicking, ValueDrag, AskValue, bpy.types.Operator):
     """Push or pull faces of a solid along their normals: out adds material,
     in removes it; a curved face is offset (a hole or boss changes radius).
     Faces picked in Face mode, or click a face; then drag the arrow (through
@@ -86,7 +138,6 @@ class NPROTO_OT_push_pull(ValueDrag, AskValue, bpy.types.Operator):
                                         "in (negative) removes it")
 
     fit_view = "shrink"
-    MAX_FILL = 3000             # a curved face with more tessellation points than this: outlines only
     start_value = 0.0           # the arrow on the face: nothing moves until it is dragged (L: the last distance)
 
     # -- the faces ------------------------------------------------------------
@@ -147,50 +198,6 @@ class NPROTO_OT_push_pull(ValueDrag, AskValue, bpy.types.Operator):
         hints.show(context, self.bl_label, state,
                    [("", [hints.note("or pick faces in Face mode first: they all move together")])],
                    [("MOUSE_LMB", "Pick the face"), ("EVENT_ESC", "Cancel")])
-
-    def _hit(self, context, event):
-        region, _ = self._win(context)
-        if region is None:
-            return None
-        xy = (event.mouse_x - region.x, event.mouse_y - region.y)
-        if not (0 <= xy[0] < region.width and 0 <= xy[1] < region.height):
-            return None
-        with context.temp_override(region=region):
-            try:
-                return subsel.face_under(bpy.context, xy)
-            except Exception as exc:
-                print("NURBS push/pull pick:", exc)
-                return None
-
-    def _show_face(self, hit):
-        """Outline and fill the face under the mouse (faces of solids only)."""
-        if hit == self._hover:
-            return
-        self._hover = hit
-        pv = None
-        if hit is not None:
-            o, i = hit
-            try:
-                if _is_solid(o):
-                    fr = face_frame(o, i)
-                    pts, tris, polys = subsel.face_tris(o, i)
-                    M = np.array(geom.world_matrix(o))
-                    lift = 2e-3 * float(np.linalg.norm(np.ptp(np.vstack(polys), axis=0)) or 1.0)
-                    if fr[3]:                   # off the face: no z-fight
-                        W = lambda P: _world(M, P) + lift * fr[2]
-                    else:
-                        W = lambda P: _world(M, P) + lift * normals_at(o, i, P)
-                    pv = {"lines": [W(P) for P in polys],
-                          "tris": W(pts)[tris].reshape(-1, 3) if len(tris) and len(pts) <= self.MAX_FILL else
-                          np.zeros((0, 3))}
-            except Exception as exc:
-                print("NURBS push/pull hover:", exc)
-        draw.pick_overlay["preview"] = pv
-
-    def _end_pick(self, context):
-        draw.pick_overlay["preview"] = None
-        hints.clear(context)
-        context.area.tag_redraw()
 
     def modal(self, context, event):
         if getattr(self, "_dragging", False):
@@ -380,4 +387,156 @@ class NPROTO_OT_push_pull(ValueDrag, AskValue, bpy.types.Operator):
         return {'FINISHED'}
 
 
-classes = (NPROTO_OT_push_pull,)
+class NPROTO_OT_replace_face(_FacePicking, bpy.types.Operator):
+    """Replace faces of a solid by a surface: the face's sides are extended or
+    cut back along its normal to meet it (the surface above, below or across
+    the face). Faces picked in Face mode with the surface selected, or click
+    the face, then the surface"""
+    bl_idname = "nproto.replace_face"
+    bl_label = "Replace Face"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    faces: StringProperty(options={'HIDDEN', 'SKIP_SAVE'},
+                          description="The faces: [[body name, a point on the face (local)], ...]")
+    surface: StringProperty(name="Surface", options={'SKIP_SAVE'},
+                            description="The open NURBS surface that takes the faces' place")
+
+    def _items(self):
+        return NPROTO_OT_push_pull._items(self)
+
+    @staticmethod
+    def _is_sheet(o):
+        return store.is_nurbs(o) and not _is_solid(o)
+
+    def _take_selection(self, context):
+        """Face mode picks on the selected solids; the selected open surface."""
+        if not self.faces:
+            picked = []
+            for o in context.selected_objects:
+                if store.is_nurbs(o) and _is_solid(o):
+                    picked += [(o, face_frame(o, i)[0]) for i in subsel.picks(o, "FACE")]
+            if picked:
+                self.faces = _faces_json(picked)
+        if not self.surface:
+            bodies = {n for n, _ in json.loads(self.faces or "[]")}
+            sheets = [o for o in context.selected_objects if self._is_sheet(o) and o.name not in bodies]
+            if len(sheets) == 1:
+                self.surface = sheets[0].name
+
+    def invoke(self, context, event):
+        if not _kernel_ok(self):
+            return {'CANCELLED'}
+        self._take_selection(context)
+        if self.faces and self.surface:
+            return self.execute(context)
+        if bpy.app.background:
+            return self.execute(context)
+        self._stage = "SURFACE" if self.faces else "FACE"
+        self._hover = None
+        context.window_manager.modal_handler_add(self)
+        self._hints(context)
+        return {'RUNNING_MODAL'}
+
+    def _hints(self, context, msg=""):
+        step = ("click the face to replace (a face of a solid)" if self._stage == "FACE"
+                else "click the surface that replaces it (an open surface)")
+        hints.show(context, self.bl_label, [step] + ([msg] if msg else []),
+                   [("", [hints.note("or pick faces in Face mode and select the surface: no clicks")])],
+                   [("MOUSE_LMB", "Pick"), ("EVENT_ESC", "Cancel")])
+
+    def modal(self, context, event):
+        if event.type in NAV:
+            return {'PASS_THROUGH'}
+        face_stage = self._stage == "FACE"
+        if event.type == 'MOUSEMOVE':
+            self._show_face(self._hit(context, event), solids=face_stage)
+            context.area.tag_redraw()
+            return {'PASS_THROUGH'}
+        if event.type in ('ESC', 'RIGHTMOUSE') and event.value == 'PRESS':
+            self._end_pick(context)
+            return {'CANCELLED'}
+        if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            hit = self._hit(context, event)
+            if hit is None:
+                self._hints(context, "nothing there")
+                return {'RUNNING_MODAL'}
+            o, i = hit
+            if face_stage:
+                if not _is_solid(o):
+                    self._hints(context, f"{o.name} is not a closed solid")
+                    return {'RUNNING_MODAL'}
+                self.faces = _faces_json([(o, face_frame(o, i)[0])])
+                self._stage = "SURFACE"
+                self._hover = None
+                self._show_face(None)
+                self._hints(context)
+                return {'RUNNING_MODAL'}
+            bodies = {n for n, _ in json.loads(self.faces)}
+            if not self._is_sheet(o) or o.name in bodies:
+                self._hints(context, f"{o.name} is not an open surface")
+                return {'RUNNING_MODAL'}
+            self.surface = o.name
+            self._end_pick(context)
+            return self.execute(context)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        if not _kernel_ok(self):
+            return {'CANCELLED'}
+        self._take_selection(context)
+        try:
+            items = self._items()
+        except (ValueError, TypeError) as exc:
+            self.report({'ERROR'}, f"Replace Face: {exc}")
+            return {'CANCELLED'}
+        surf = bpy.data.objects.get(self.surface)
+        if not items or surf is None:
+            self.report({'WARNING'}, "Replace Face: pick the face of a solid (Face mode) and the surface "
+                                     "that replaces it")
+            return {'CANCELLED'}
+        if not self._is_sheet(surf):
+            self.report({'WARNING'}, f"Replace Face: {surf.name} is not an open NURBS surface")
+            return {'CANCELLED'}
+        by_obj = {}
+        for o, p in items:
+            if o == surf:
+                continue
+            by_obj.setdefault(o.name, (o, []))[1].append(p)
+        hist = features.history_enabled(context)
+        done = []
+        for o, pts in by_obj.values():
+            if not _is_solid(o):
+                self.report({'ERROR'}, f"Replace Face: {o.name} is not a closed solid")
+                continue
+            M = geom.world_matrix(o)
+            frames = [face_frame(o, _face_index(o, p)) for p in pts]
+            try:
+                info, breps = jobs.run("replace_face", {"target": o, "surface": surf}, ["result"],
+                                       face_pts=[[float(x) for x in f[1]] for f in frames],
+                                       face_normals=[[float(x) for x in f[2]] for f in frames],
+                                       face_flat=[bool(f[3]) for f in frames], into="target")
+            except jobs.JobError as exc:
+                self.report({'ERROR'}, f"Replace Face on {o.name} failed: {exc}")
+                continue
+            pre = o[store.PROP_BREP]
+            if not hist and features.has_history(o):
+                features.clear_history(o)
+                self.report({'INFO'}, f"{o.name}: construction history removed")
+            store.set_geometry_text(o, breps["result"], context, keep_untrimmed=False)
+            if hist:
+                features.push_step(o, "replace_face", [(surf, "SURF")], {
+                    "faces_local": [[float(x) for x in f[0]] for f in frames],
+                    "normals_local": [[float(x) for x in (M.to_3x3().transposed() @ Vector(f[2])).normalized()]
+                                      for f in frames],
+                    "flat": [bool(f[3]) for f in frames]}, base_text=pre)
+            subsel.set_picks(o, "FACE", [])        # the faces are gone: no pick moves onto a neighbour
+            done.append(o)
+            self.report({'INFO'}, f"{o.name}: {len(pts)} face{'s' if len(pts) > 1 else ''} replaced by "
+                                  f"{surf.name} · volume {info.get('volume', 0):.6g}")
+        if not done:
+            return {'CANCELLED'}
+        _select_only(context, done)
+        return {'FINISHED'}
+
+
+classes = (NPROTO_OT_push_pull, NPROTO_OT_replace_face)

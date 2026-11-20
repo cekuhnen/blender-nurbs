@@ -30,7 +30,7 @@ STEP_FIELDS = {
                       "merge_knots", "merge_seams", "merge_reduce_degree"],
 }
 CA_DEFAULTS = {"ca_tolerance": 1e-4, "ca_angle": 0.1, "ca_degree": 7}
-ROLE = {"trim": "trim cutter", "fillet_trim": "fillet partner"}
+ROLE = {"replace_face": "replacing surface", "trim": "trim cutter", "fillet_trim": "fillet partner"}
 STEP_NOTE = {"fillet_trim": "Follows its Surface Fillet (edit the fillet object)"}
 
 
@@ -418,7 +418,7 @@ def draw_steps(box, obj, only=None, bare=False):
                 inner.label(text=pg.error, icon='ERROR')
 
 
-STEP_ICON = {"push_pull": 'FACESEL', "untrim_region": 'SELECT_SUBTRACT', "untrim": 'LOOP_BACK', "edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
+STEP_ICON = {"replace_face": 'FACE_MAPS', "push_pull": 'FACESEL', "untrim_region": 'SELECT_SUBTRACT', "untrim": 'LOOP_BACK', "edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
              "flip_normal": 'NORMALS_FACE', "surface_align": 'SNAP_EDGE', "match_surface": 'SNAP_FACE', "extend_surface": 'FULLSCREEN_ENTER',
              "rebuild_surface": 'MOD_REMESH', "refit_trim": 'MOD_LATTICE', "merge_patches": 'MESH_GRID'}
 

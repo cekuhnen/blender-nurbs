@@ -358,7 +358,19 @@ def apply_push_pull(obj, text, inputs, p):
     return breps["result"]
 
 
-APPLY = {"push_pull": apply_push_pull, "trim": apply_trim, "edge_fillet": apply_edge_fillet, "fillet_trim": apply_fillet_trim,
+def apply_replace_face(obj, text, inputs, p):
+    """Replace Face on rebuild: the faces at the stored points replaced by the
+    surface (the step's input) as it is now."""
+    M = _world(obj)
+    pts = [list(M @ Vector(q)) for q in p["faces_local"]]
+    N = M.to_3x3().inverted().transposed()
+    nrm = [list((N @ Vector(n)).normalized()) for n in p["normals_local"]] if p.get("normals_local") else None
+    _, breps = jobs.run("replace_face", {"target": (text, jobs.xform(obj)), "surface": inputs[0][0]}, ["result"],
+                        face_pts=pts, face_normals=nrm, face_flat=p.get("flat"), into="target")
+    return breps["result"]
+
+
+APPLY = {"replace_face": apply_replace_face, "push_pull": apply_push_pull, "trim": apply_trim, "edge_fillet": apply_edge_fillet, "fillet_trim": apply_fillet_trim,
          "flip_normal": apply_flip, "untrim_region": apply_untrim_region, "untrim": apply_untrim}
 LABEL = {
     "trim": lambda p: "Trim · " + {"KEEP": "Keep", "DELETE": "Discard"}.get(p.get("action"), p.get("action", "")),
@@ -369,6 +381,8 @@ LABEL = {
     "flip_normal": lambda p: "Flip Normal",
     "untrim_region": lambda p: "Untrim Region",
     "untrim": lambda p: "Untrim",
+    "replace_face": lambda p: "Replace Face" + (f" · {len(p.get('faces_local', []))} faces"
+                                                if len(p.get("faces_local", [])) > 1 else ""),
     "push_pull": lambda p: ("Pull" if float(p.get("distance", 0)) > 0 else "Push")
                            + f" · {abs(float(p.get('distance', 0))):.3g}"
                            + (f" · {len(p.get('faces_local', []))} faces" if len(p.get("faces_local", [])) > 1 else ""),
