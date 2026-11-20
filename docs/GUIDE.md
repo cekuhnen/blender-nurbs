@@ -77,7 +77,7 @@ Every object with construction history shows a **Feature** box in the **Active O
 | **Blend Curve** | 2 curves (or surface edges): click each near the end to blend from, or select two curves (nearest ends) | A Blender NURBS curve, a single Bezier span (degree 1 / 3 / 5 up to G2-G2). Per side: **G0 / G1 / G2**, **Weight** (tangent length = weight × distance between the ends), **Curvature** (G2 shape) and **Flip**. Matches tangents and curvature exactly. Follows its inputs with construction history and works as input for every other tool. |
 | **Iso Curve** | An untrimmed surface | Isoparametric curve at a U or V position: the exact isoparm, its CVs blended from the surface's CV grid (same degree, knots and weights), not a dense fit. |
 | **Duplicate Edge** | Pick surface edges, Enter | The edges as Blender NURBS curves, each the edge's exact curve (degree, knots, weights), cyclic when closed: a cylinder rim is its 8-CV rational circle, a trimmed edge the trim's own curve. Only a curve above degree 5 (Blender curves stop at degree 5) is still fitted. |
-| **Project Curve** | Curves + the surface (active) | Curves on the surface, projected along the active work plane's normal (World Z when the World is active), the view or a world axis. A curve that misses the surface leaves Adjust Last Operation open to change the direction. |
+| **Project Curve** | Curves + the surface (active) | Curves on the surface, projected along the active work plane's normal (World Z when the World is active), the view or a world axis. Onto a flat face the result is exact: the curve's own CVs moved onto the plane along the direction (same degree, knots, weights and CV count), cut exactly where it runs over the face's edge. Onto a curved surface it is fitted within 1e-4 of its size. A curve that misses the surface leaves Adjust Last Operation open to change the direction. |
 | **Intersect** | Two surfaces | Their intersection curves. |
 
 ### CV Curve / Draw Line (sketch tools)
@@ -288,7 +288,7 @@ Trim, Split or Project.
   the selected NURBS object, else the one the curves lie on is found. With no curves selected (or **Alt**), click
   curves or **surface edges** (a trim edge, a hole's edge, a boundary) and press Enter. Curves a little off the surface
   are pulled onto it first (the report says how far). Touching inputs are chained and offset as one. A dense
-  polyline (Project Curve, Intersect) is made a smooth spline through its points first, within a quarter of Tolerance.
+  polyline (Intersect, Project Curve onto a curved surface) is made a smooth spline through its points first, within a quarter of Tolerance.
 * **Side**: a positive distance goes **outward** on a closed curve, to the **left** (seen from the surface's outside)
   on an open one. **Flip** goes to the other side, **Both Sides** makes both.
 * **Across faces**: on a joined body the walk goes on into the neighbouring face; where it crosses a crease (a box

@@ -1714,6 +1714,44 @@ ctx.scene.nproto_workplanes.active = -1
 ctx.scene.nproto_workplanes.planes.remove(len(ctx.scene.nproto_workplanes.planes) - 1)
 check("project curve: defaults to the work plane normal (World Z, then a tilted plane's)",
       all(r_ == {'FINISHED'} and z_ < 1e-4 and c_ < 1e-3 for r_, z_, c_ in _pjd), f"{_pjd}")
+# onto a plane the projection is exact: the curve's own CVs moved along the direction
+# (same degree and CV count), cut exactly where it runs over the plane's edge (x = 2);
+# a curved surface still gets a fitted curve on it
+def _proj(curves, surf, **kw):
+    bpy.ops.object.select_all(action='DESELECT')
+    for c_ in curves: c_.select_set(True)
+    surf.select_set(True); ctx.view_layer.objects.active = surf
+    r_ = bpy.ops.nproto.project_curve(**kw)
+    return r_, ctx.active_object
+_dP = np.array([0.2, -0.1, -1.0])
+_src = [(-1, Y0 + 44, 2), (0, Y0 + 46, 2.5), (1, Y0 + 44, 1.5), (1.5, Y0 + 46, 2)]
+_pa = nurbs("PrjA", _src)
+_rA, _oA = _proj([_pa], pl_, direction="VIEW", view_dir=tuple(_dP))
+_want = np.array([np.array(p_) - _dP * p_[2] / _dP[2] for p_ in _src])
+_got = np.array([p_.co[:3] for p_ in _oA.data.splines[0].points])
+_pb = nurbs("PrjB", [(1, Y0 + 45, 1), (1.7, Y0 + 45.5, 1), (2.4, Y0 + 44.5, 1), (3, Y0 + 45, 1)])
+_rB, _oB = _proj([_pb], pl_, direction="Z")
+_qB = geom.sample_curve(features.input_curve(_oB, "S0"), 200)
+_rC, _oC = _proj([pc], pl_, direction="Z")
+_qC = geom.sample_curve(features.input_curve(_oC, "S0"), 200)
+_sC = geom.sample_curve(features.input_curve(pc, "S0"), 4000)      # Blender's Bezier circle: not a true circle
+def _polar(Q):
+    a_ = np.arctan2(Q[:, 1] - (Y0 + 45), Q[:, 0]); o_ = np.argsort(a_)
+    return a_[o_], np.linalg.norm(Q[:, :2] - [0, Y0 + 45], axis=1)[o_]
+_aS, _rS = _polar(_sC); _aC, _rCC = _polar(_qC)
+_eC = float(np.abs(_rCC - np.interp(_aC, _aS, _rS, period=2 * np.pi)).max())
+bpy.ops.curve.primitive_bezier_circle_add(radius=0.5, location=(0, Y0 + 40, 3)); _pd = ctx.active_object
+_rD, _oD = _proj([_pd], sp_, direction="Z")
+_qD = np.vstack([geom.sample_curve(features.input_curve(_oD, f"S{i}"), 100) for i in range(len(_oD.data.splines))])
+_rr = np.linalg.norm(_qD - [0, Y0 + 40, 0], axis=1)
+check("project curve: exact onto a plane (CVs moved, cut on the edge), fitted onto a sphere",
+      [_rA, _rB, _rC, _rD] == [{'FINISHED'}] * 4 and _got.shape == (4, 3) and np.abs(_got - _want).max() < 5e-5
+      and len(_oB.data.splines[0].points) == 4 and abs(_qB[:, 0].max() - 2.0) < 1e-6 and np.abs(_qB[:, 2]).max() < 1e-9
+      and np.linalg.norm(_qB[np.argmin(_qB[:, 0])] - [1, Y0 + 45, 0]) < 1e-5
+      and _eC < 1e-6 and np.abs(_qC[:, 2]).max() < 1e-9
+      and np.abs(_rr - 1.0).max() < 1e-3,
+      f"A {np.abs(_got - _want).max():.1e}, B {len(_oB.data.splines[0].points)} CVs x {_qB[:, 0].max():.9f}, "
+      f"circle off its shadow {_eC:.1e}, sphere {np.abs(_rr - 1.0).max():.1e}")
 bpy.ops.object.select_all(action='DESELECT'); sp_.select_set(True)
 ctx.scene.cursor.location = (0, Y0 + 40, 0.5)
 bpy.ops.nproto.add_primitive(kind="PLANE", width=4, depth=4, pl_degree_u=1, pl_degree_v=1, spans_u=1, spans_v=1); cutp = ctx.active_object
