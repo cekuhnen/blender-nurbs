@@ -77,7 +77,7 @@ Every object with construction history shows a **Feature** box in the **Active O
 | **Blend Curve** | 2 curves (or surface edges): click each near the end to blend from, or select two curves (nearest ends) | A Blender NURBS curve, a single Bezier span (degree 1 / 3 / 5 up to G2-G2). Per side: **G0 / G1 / G2**, **Weight** (tangent length = weight × distance between the ends), **Curvature** (G2 shape) and **Flip**. Matches tangents and curvature exactly. Follows its inputs with construction history and works as input for every other tool. |
 | **Iso Curve** | An untrimmed surface | Isoparametric curve at a U or V position: the exact isoparm, its CVs blended from the surface's CV grid (same degree, knots and weights), not a dense fit. |
 | **Duplicate Edge** | Pick surface edges, Enter | The edges as Blender NURBS curves, each the edge's exact curve (degree, knots, weights), cyclic when closed: a cylinder rim is its 8-CV rational circle, a trimmed edge the trim's own curve. Only a curve above degree 5 (Blender curves stop at degree 5) is still fitted. |
-| **Project Curve** | Curves + the surface (active) | Curves on the surface, projected along the view or a world axis. |
+| **Project Curve** | Curves + the surface (active) | Curves on the surface, projected along the active work plane's normal (World Z when the World is active), the view or a world axis. A curve that misses the surface leaves Adjust Last Operation open to change the direction. |
 | **Intersect** | Two surfaces | Their intersection curves. |
 
 ### CV Curve / Draw Line (sketch tools)

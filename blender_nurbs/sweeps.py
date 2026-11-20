@@ -576,6 +576,16 @@ def build_dup_edge(inputs, p):
     return ("splines", [_kcurve_to_spec(features.input_curve(o, r)) for o, r in inputs])
 
 
+class ProjectMiss(RuntimeError):
+    """No curve lands on the surface along the projection direction."""
+
+
+# SmApiProjectCurve returns the bare SM_ERR (not SM_ERR_INVALID_INPUT) when
+# nothing lands on the Brep: the direction is parallel to the surface, or the
+# curve's shadow falls past the surface's edges.
+_PROJECT_MISS = "SM_ERR (1001)"
+
+
 @features.builder("project_curve")
 def build_project_curve(inputs, p):
     sm, _ = _k()
@@ -584,10 +594,15 @@ def build_project_curve(inputs, p):
     brep_w = _world_brep(surf_obj)
     out = []
     for o, r in curves:
-        for pc in sm.project_curve(brep_w, features.input_curve(o, r), tuple(d)):
-            out.append(_poly_to_spec(_kcurve_poly(pc)))
+        try:
+            pcs = sm.project_curve(brep_w, features.input_curve(o, r), tuple(d))
+        except RuntimeError as exc:
+            if _PROJECT_MISS not in str(exc):
+                raise
+            continue                    # this curve misses; keep the others
+        out.extend(_poly_to_spec(_kcurve_poly(pc)) for pc in pcs)
     if not out:
-        raise RuntimeError("the curve does not project onto the surface in that direction")
+        raise ProjectMiss("the curve misses the surface in that direction")
     return ("splines", out)
 
 

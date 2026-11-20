@@ -1689,6 +1689,31 @@ r = bpy.ops.nproto.project_curve(direction="Z")
 pcs = geom.sample_curve(features.input_curve(ctx.active_object, "S0"), 64)
 check("project curve onto a surface", r == {'FINISHED'} and np.abs(pcs[:, 2]).max() < 1e-4
       and abs(np.linalg.norm(pcs[:, :2] - [0, Y0 + 45], axis=1).mean() - 1.0) < 1e-3)
+# a shallow view sends the circle's shadow past the plane (kernel SM_ERR 1001): a warning,
+# FINISHED with nothing made, so Adjust Last Operation stays open to change the direction
+bpy.ops.object.select_all(action='DESELECT'); pc.select_set(True); pl_.select_set(True); ctx.view_layer.objects.active = pl_
+_nobj = len(bpy.data.objects)
+_miss = [bpy.ops.nproto.project_curve(direction="VIEW", view_dir=(-0.79, 0.41, -0.45)),
+         bpy.ops.nproto.project_curve(direction="X")]
+check("project curve: a miss along the view or parallel to the plane makes nothing, keeps the redo panel",
+      _miss == [{'FINISHED'}] * 2 and len(bpy.data.objects) == _nobj)
+# the default direction is the active work plane's normal: World Z with the World active,
+# a tilted plane's normal (the circle's centre lands along it) when that plane is active
+from blender_nurbs import workplanes as _wpp
+_pjd = []
+for _tilt in (False, True):
+    if _tilt:
+        _wpP = _wpp.add_plane(ctx.scene, "ProjTilt", _wpp.frame_from_normal(np.zeros(3), np.array([0.3, 0.0, 1.0])))
+        _nP = _wpp.active_frame(ctx.scene)[3]
+    bpy.ops.object.select_all(action='DESELECT'); pc.select_set(True); pl_.select_set(True); ctx.view_layer.objects.active = pl_
+    _r = bpy.ops.nproto.project_curve()
+    _q = geom.sample_curve(features.input_curve(ctx.active_object, "S0"), 64)
+    _want = np.array([0.0, Y0 + 45, 0.0]) - (3.0 * _nP / _nP[2] if _tilt else 0.0)
+    _pjd.append((_r, float(np.abs(_q[:, 2]).max()), float(np.linalg.norm((_q[:, :2].min(0) + _q[:, :2].max(0)) / 2 - _want[:2]))))
+ctx.scene.nproto_workplanes.active = -1
+ctx.scene.nproto_workplanes.planes.remove(len(ctx.scene.nproto_workplanes.planes) - 1)
+check("project curve: defaults to the work plane normal (World Z, then a tilted plane's)",
+      all(r_ == {'FINISHED'} and z_ < 1e-4 and c_ < 1e-3 for r_, z_, c_ in _pjd), f"{_pjd}")
 bpy.ops.object.select_all(action='DESELECT'); sp_.select_set(True)
 ctx.scene.cursor.location = (0, Y0 + 40, 0.5)
 bpy.ops.nproto.add_primitive(kind="PLANE", width=4, depth=4, pl_degree_u=1, pl_degree_v=1, spans_u=1, spans_v=1); cutp = ctx.active_object
