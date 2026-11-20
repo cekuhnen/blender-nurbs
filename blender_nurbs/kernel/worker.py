@@ -1482,6 +1482,223 @@ def job_join(job):
             "solid": solid, "volume": volume}
 
 
+def _edge_copy(e):
+    """A fresh exact copy of edge e's curve over its own range (the cap faces
+    adopt the curves they are given, so never the brep's own). The range is cut
+    out by knot insertion when the edge uses only part of its curve."""
+    np = _np()
+    d = ext.curve_cvs(e.curve())
+    p, U = int(d["degree"]), [float(k) for k in d["knots"]]
+    P = np.array(d["points"], float)
+    w = np.array(d["weights"], float) if d.get("weights") else np.ones(len(P))
+    Pw = [np.append(x * wi, wi) for x, wi in zip(P, w)]
+    t0, t1 = e.parameter_range()
+    span = (U[-1] - U[0]) or 1.0
+    eps = 1e-12 * span
+    for t, keep_left in ((t1, True), (t0, False)):    # cut the far end first: t0's knots stay put
+        if not U[0] + eps < t < U[-1] - eps:
+            continue
+        have = sum(1 for k in U if abs(k - t) <= eps)
+        Pw, U = _insert_knot(Pw, U, p, t, max(0, p - have))
+        first = min(i for i in range(len(U)) if abs(U[i] - t) <= eps)   # t now p times from here
+        if keep_left:            # CV first-1 is the curve's point at t
+            Pw, U = Pw[:first], U[:first] + [t] * (p + 1)
+        else:
+            Pw, U = Pw[first - 1:], [t] * (p + 1) + U[first + p:]
+    pts = [tuple(map(float, x[:3] / x[3])) for x in Pw]
+    wts = [float(x[3]) for x in Pw]
+    rational = max(abs(x - 1.0) for x in wts) > 1e-12
+    return ext.curve_from_cvs(p, pts, U, wts if rational else None)
+
+
+def _edge_points(e, n=17):
+    np = _np()
+    t0, t1 = e.parameter_range()
+    return np.array([e.point_at(float(t)) for t in np.linspace(t0, t1, n)], float)
+
+
+def _plane_of(P, tol):
+    """(unit normal, point) of the plane through points P, or None when they
+    stray from it by more than tol (or lie on a line)."""
+    np = _np()
+    c = P.mean(axis=0)
+    _, s, vt = np.linalg.svd(P - c)
+    n = vt[2]
+    if s[1] <= tol or np.abs((P - c) @ n).max() > tol:
+        return None
+    return n, c
+
+
+def _open_loops(b, tol):
+    """The open boundary of b as loops of edges (each a list of edges in
+    order). An edge is open when its one face uses it once (a periodic seam
+    is used twice by its face). Zero-length (pole) edges are left out."""
+    uses = {}
+    for f in b.faces():
+        for loop in f.boundary_loops():
+            for e, _ in loop:
+                uses[e] = uses.get(e, 0) + 1
+    free = [e for e in b.edges() if len(e.faces()) == 1 and uses.get(e, 0) == 1 and e.length() > tol]
+    ends = {}
+    for e in free:
+        t0, t1 = e.parameter_range()
+        ends[e] = (_np().array(e.point_at(t0), float), _np().array(e.point_at(t1), float))
+    loops, left = [], list(free)
+    while left:
+        e = left.pop(0)
+        chain, head, tail = [e], ends[e][0], ends[e][1]
+        while _np().linalg.norm(head - tail) > tol:
+            nxt = None
+            for f in left:
+                a, z = ends[f]
+                if _np().linalg.norm(a - tail) <= tol:
+                    nxt, tail = f, z
+                elif _np().linalg.norm(z - tail) <= tol:
+                    nxt, tail = f, a
+                if nxt is not None:
+                    break
+            if nxt is None:
+                raise RuntimeError("the open edges do not close into loops")
+            left.remove(nxt)
+            chain.append(nxt)
+        loops.append(chain)
+    return loops
+
+
+def _cap_pieces(loop, tol):
+    """[(plane, curves)] that close one open loop: the loop itself when it is
+    flat, else its runs of edges that share a plane, each closed by a straight
+    line (a revolve of less than a full turn whose profile ends on the axis:
+    two half caps meeting on the axis)."""
+    np = _np()
+    pts = [_edge_points(e) for e in loop]
+    pl = _plane_of(np.vstack(pts), tol)
+    if pl is not None:
+        return [(pl, [_edge_copy(e) for e in loop])]
+    runs, cur = [], [0]
+    for i in range(1, len(loop)):
+        if _plane_of(np.vstack([pts[j] for j in cur + [i]]), tol) is not None:
+            cur.append(i)
+        else:
+            runs.append(cur)
+            cur = [i]
+    if len(runs) and _plane_of(np.vstack([pts[j] for j in cur + runs[0]]), tol) is not None:
+        runs[0] = cur + runs[0]              # the loop started inside a run
+    else:
+        runs.append(cur)
+    if len(runs) < 2:
+        raise RuntimeError("an open end is not flat -- it cannot be capped")
+    out = []
+    for run in runs:
+        P = np.vstack([pts[j] for j in run])
+        pl = _plane_of(P, tol)
+        if pl is None:
+            raise RuntimeError("an open end is not flat -- it cannot be capped")
+        # the run's two loose ends: points used by one edge of the run only
+        E = [(pts[j][0], pts[j][-1]) for j in run]
+        loose = []
+        for a in [q for pair in E for q in pair]:
+            if sum(1 for pair in E for q in pair if np.linalg.norm(q - a) <= tol) == 1:
+                loose.append(a)
+        if len(loose) != 2:
+            raise RuntimeError("an open end is not flat -- it cannot be capped")
+        out.append((pl, [_edge_copy(loop[j]) for j in run]
+                    + [sm.create_line_segment(tuple(map(float, loose[0])), tuple(map(float, loose[1])))]))
+    return out
+
+
+def _capped(walls, tol):
+    """(brep, cap planes) of walls closed by flat caps, stitched and oriented
+    like the first wall's first face (raises when it does not close)."""
+    b = walls[0].copy()
+    for w in walls[1:]:
+        ext.append_brep(b, w)
+    if len(walls) > 1:                # walls meeting each other (half turns): their shared edges are not ends
+        b = sm.stitch_advanced(b, max(tol, 1e-7), squeeze_small_edges=False, making_manifold_solid=False)[0]
+    planes = []                                       # [(normal, point, [curves])]
+    for loop in _open_loops(b, tol):
+        for (n, c), curves in _cap_pieces(loop, tol):
+            for q in planes:
+                if abs(abs(float(n @ q[0])) - 1.0) < 1e-9 and abs(float((c - q[1]) @ q[0])) <= tol:
+                    q[2].extend(curves)
+                    break
+            else:
+                planes.append((n, c, list(curves)))
+    for _, _, curves in planes:
+        try:
+            cap = sm.create_planar_faces(curves)
+        except Exception as exc:
+            raise RuntimeError(f"a cap could not be made ({exc})")
+        ext.append_brep(b, cap)
+    # the walls come first in b: its first face is the first wall's
+    b = sm.stitch_advanced(b, max(tol, 1e-7), squeeze_small_edges=False, making_manifold_solid=True)[0]
+    first = walls[0].faces()[0]
+
+    def off_first(f):
+        try:
+            return first.closest_point(f.interior_point())[1]
+        except Exception:
+            return float("inf")
+    start = min(b.faces(), key=off_first)
+    try:
+        sm.unify_normals(b, start, 100)
+    except Exception:
+        pass
+    try:
+        solid = bool(b.is_manifold_solid())
+    except Exception:
+        solid = False
+    if not solid:
+        n_open = sum(1 for e in b.edges() if len(e.faces()) == 1)
+        raise RuntimeError(f"the walls and caps do not close into a solid ({n_open} open edges) -- "
+                           "use closed profiles, or open ones whose ends lie on the revolve axis")
+    return b, len(planes)
+
+
+def _volume(b):
+    try:
+        return float(b.volume(1e-6))
+    except Exception:
+        return 0.0
+
+
+def _turned_wall(w):
+    """A wall (one untrimmed face) with its normal turned over."""
+    return ext.brep_from_surface(_reverse_v(w.faces()[0].surface()))
+
+
+def job_cap_solid(job):
+    """A closed solid from walls (Extrude's / Revolve's sides, world space):
+    every open end is closed by a planar face -- loops in one plane make one
+    face, so a profile inside another is its hole -- then stitched, oriented
+    and healed. The walls set the orientation: when the solid comes out inside
+    out (negative volume) it is built again from the walls turned over.
+    Written in the local space of job['into']."""
+    np = _np()
+    walls = [world_brep(job, k) for k in job["order"]]
+    lo = np.min([np.array(w.bounding_box()[0], float) for w in walls], axis=0)
+    hi = np.max([np.array(w.bounding_box()[1], float) for w in walls], axis=0)
+    tol = 1e-6 * (float(np.linalg.norm(hi - lo)) or 1.0)
+    def build(ws):
+        b, caps = _capped(ws, tol)
+        v = _volume(b)
+        if abs(v) <= 0:               # no inside region yet: the healer makes one
+            try:
+                h = sm.heal_brep(b)
+                if h is not None and h.face_count() and h.is_manifold_solid():
+                    b, v = h, _volume(h)
+            except Exception:
+                pass
+        return b, caps, v
+    b, caps, volume = build(walls)
+    if volume < 0 and all(w.face_count() == 1 for w in walls):
+        b, caps, volume = build([_turned_wall(w) for w in walls])
+    if volume <= 0:
+        raise RuntimeError("the solid came out inside out (the kernel could not orient it)")
+    save(to_local(b, job.get("xforms", {}).get(job.get("into"))), job["out"]["result"])
+    return {"faces": b.face_count(), "caps": caps, "volume": volume}
+
+
 def job_boolean(job):
     """Union / difference / intersection of closed solids (world space): the
     target job['order'][0] combined with each tool in turn. Written in the local
@@ -2733,7 +2950,7 @@ def job_mesh_to_brep(job):
 
 
 JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "untrim_region": job_untrim_region, "untrim_preview": job_untrim_preview, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean,
-        "flip": job_flip, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken,
+        "flip": job_flip, "cap_solid": job_cap_solid, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken,
         "mesh_to_brep": job_mesh_to_brep}
 
 

@@ -1418,9 +1418,15 @@ def profile_curve(inputs):
 
 @builder("extrude")
 def build_extrude(inputs, p):
-    sm, _ = _k()
+    if p.get("caps"):
+        return _solid(inputs, p, _extrude_side)
     obj, ref = inputs[0]
-    curve = profile_curve(inputs)
+    return _extrude_side(obj, profile_curve(inputs), p)
+
+
+def _extrude_side(obj, curve, p):
+    """The extrude's wall (a surface) of one profile curve."""
+    sm, _ = _k()
     d = extrude_direction(obj, curve, p)
     h = float(p.get("distance", 1.0))
     draft = float(p.get("draft", 0.0))
@@ -1494,12 +1500,139 @@ def revolve_axis(obj, p):
 
 @builder("revolve")
 def build_revolve(inputs, p):
+    if p.get("caps"):
+        return _solid(inputs, p, _revolve_solid_side, closed_only=False)
     obj, ref = inputs[0]
-    curve = input_curve(obj, ref)
+    return _revolve_side(obj, input_curve(obj, ref), p)
+
+
+def _revolve_solid_side(obj, curve, p):
+    """A solid's revolved wall: a closed profile turned all the way round is
+    two half turns (one face closed both ways -- a torus-like ring -- has no
+    volume in the kernel: its integration needs a seam it can cross)."""
+    angle = float(p.get("angle", 360.0))
+    if abs(abs(angle) - 360.0) > 1e-9 or not is_closed_curve(curve):
+        return _revolve_side(obj, curve, p)
+    origin, axis = revolve_axis(obj, p)
+    seam = float(p.get("seam_angle", 0.0))
+    sm, ext = _k()
+    copy = lambda: ext.curve_from_cvs(*_cv_args(ext.curve_cvs(curve)))
+    return [revolve_exact(copy(), tuple(origin), tuple(axis), 180.0, seam),
+            revolve_exact(copy(), tuple(origin), tuple(axis), 180.0, seam + 180.0)]
+
+
+def _cv_args(d):
+    return (int(d["degree"]), [tuple(map(float, q)) for q in d["points"]], [float(k) for k in d["knots"]],
+            d.get("weights") or None)
+
+
+def _revolve_side(obj, curve, p):
+    """The revolve's wall (a surface) of one profile curve."""
     origin, axis = revolve_axis(obj, p)
     angle = float(p.get("angle", 360.0))
     seam = float(p.get("seam_angle", 0.0)) if abs(abs(angle) - 360.0) < 1e-9 else 0.0
     return revolve_exact(curve, tuple(origin), tuple(axis), angle, seam)
+
+
+# --------------------------------------------------------------------------
+# Solids: Extrude / Revolve with Caps (Body: New Solid, Join, Cut, Intersect)
+# --------------------------------------------------------------------------
+
+def is_closed_curve(curve, rel=1e-6):
+    P = geom.sample_curve(curve, 9)
+    size = float(np.ptp(P, axis=0).max()) or 1.0
+    return float(np.linalg.norm(P[0] - P[-1])) <= rel * size
+
+
+def _in_polygon(q, P, n):
+    """Is point q inside the closed polygon P (the plane with unit normal n)?"""
+    a = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    a = a - (a @ n) * n
+    a /= np.linalg.norm(a)
+    b = np.cross(n, a)
+    x, y = P @ a, P @ b
+    qx, qy = float(q @ a), float(q @ b)
+    inside = False
+    for i in range(len(P) - 1):
+        x0, y0, x1, y1 = x[i], y[i], x[i + 1], y[i + 1]
+        if (y0 > qy) != (y1 > qy) and qx < x0 + (qy - y0) * (x1 - x0) / (y1 - y0):
+            inside = not inside
+    return inside
+
+
+def nesting(curves):
+    """Depth of each closed profile: how many of the others (flat, in the same
+    plane) it lies inside. Even depth: an outline; odd: a hole in the one
+    around it. Open or curved profiles have depth 0."""
+    samples = [geom.sample_curve(c, 97) for c in curves]
+    planes = []
+    for P in samples:
+        c = P.mean(axis=0)
+        _, sv, vt = np.linalg.svd(P - c)
+        size = float(np.ptp(P, axis=0).max()) or 1.0
+        flat = sv[1] > 1e-9 * size and np.abs((P - c) @ vt[2]).max() <= 1e-6 * size
+        closed = np.linalg.norm(P[0] - P[-1]) <= 1e-6 * size
+        planes.append((vt[2], c, size) if flat and closed else None)
+    depth = [0] * len(curves)
+    for j, Q in enumerate(samples):
+        for i, P in enumerate(samples):
+            if i == j or planes[i] is None or planes[j] is None:
+                continue
+            n, c, size = planes[i]
+            if abs(abs(float(n @ planes[j][0])) - 1.0) > 1e-6 or np.abs((Q - c) @ n).max() > 1e-6 * size:
+                continue
+            if _in_polygon(Q[0], P, n):
+                depth[j] += 1
+    return depth
+
+
+def solid_regions(inputs):
+    """The inputs of a Caps tool grouped into the solids to make: each outline
+    with the profiles directly inside it (its holes). A list of input lists."""
+    groups = profile_groups(inputs)
+    curves = [profile_curve(g) for g in groups]
+    depth = nesting(curves)
+    samples = [geom.sample_curve(c, 97) for c in curves]
+    regions = {i: list(groups[i]) for i in range(len(groups)) if depth[i] % 2 == 0}
+    for j in range(len(groups)):
+        if depth[j] % 2 == 0:
+            continue
+        # the outline it is a hole of: the one around it, one level up
+        owners = [i for i in regions if depth[i] == depth[j] - 1 and nesting([curves[i], curves[j]])[1] == 1]
+        if owners:
+            regions[owners[0]] += groups[j]
+        else:
+            regions[j] = list(groups[j])
+    return [regions[i] for i in sorted(regions)]
+
+
+def _solid(inputs, p, side_of, closed_only=True):
+    """A closed solid: the walls of every profile in inputs (an outline and its
+    holes), flat caps on the open ends (in the worker). Holes draft the other
+    way, so the material's walls all lean the same way."""
+    from . import jobs
+    from .steps import IDENT
+    groups = profile_groups(inputs)
+    curves = [profile_curve(g) for g in groups]
+    if closed_only:
+        open_ = [g[0][0].name for g, c in zip(groups, curves) if not is_closed_curve(c)]
+        if open_:
+            raise RuntimeError("a solid needs closed profiles: " + ", ".join(open_) + " is open "
+                               "(Body: Surface extrudes it as a wall)")
+    depth = nesting(curves)
+    walls = {}
+    for i, (g, c) in enumerate(zip(groups, curves)):
+        q = dict(p)
+        q.pop("draft_centre", None)          # each closed profile drafts away from its own middle
+        if depth[i] % 2:
+            q["draft_flip"] = not q.get("draft_flip", False)
+        w = side_of(g[0][0], c, q)
+        sm, ext = _k()
+        for k, piece in enumerate(w if isinstance(w, list) else [w]):
+            b = piece if isinstance(piece, sm.Brep) else ext.brep_from_surface(piece)
+            walls[f"w{i}_{k}"] = (store.brep_to_text(b), IDENT)
+    _, breps = jobs.run("cap_solid", walls, ["result"], order=list(walls), into="_world_")
+    return ("brep_text", breps["result"])
 
 
 @builder("offset")

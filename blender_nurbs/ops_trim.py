@@ -2577,39 +2577,40 @@ class NPROTO_OT_boolean(bpy.types.Operator):
         if len(objs) < 2:
             self.report({'WARNING'}, "Select two or more closed NURBS solids (the active one is the target)")
             return {'CANCELLED'}
-        target = objs[0]
-        name = f"{target.name}_{BOOL_SUFFIX[self.operation]}"
-        if features.history_enabled(context):
-            try:
-                g = features.run("boolean", [(o, "SURF") for o in objs], {"bool_op": self.operation})
-            except jobs.JobError as exc:
-                self.report({'ERROR'}, f"Boolean failed: {exc}")
-                return {'CANCELLED'}
-            res = store.new_object_text(context, name, g[1])
-            features.record(res, "boolean", [(o, "SURF") for o in objs], {"bool_op": self.operation})
-            features.keep_inputs(context, objs)
-            features.mark_built(res)
-            _select_only(context, [res])
-            self.report({'INFO'}, f"Boolean {self.operation.lower()} of {len(objs)} solids "
-                                  "(inputs kept hidden: history; Restore Inputs brings them back)")
-            return {'FINISHED'}
-        keys = {f"s{i}": o for i, o in enumerate(objs)}
         try:
-            info, breps = jobs.run("boolean", keys, ["result"], order=list(keys), into="s0",
-                                   operation=self.operation, names={k: o.name for k, o in keys.items()})
+            res, msg = combine_solids(context, objs, self.operation, self)
         except jobs.JobError as exc:
             self.report({'ERROR'}, f"Boolean failed: {exc}")
             return {'CANCELLED'}
-        _frozen(target, self)
-        store.set_geometry_text(target, breps["result"], context, keep_untrimmed=False)
-        if store.PROP_UNTRIM in target:
-            del target[store.PROP_UNTRIM]
-        for o in objs[1:]:
-            _remove_object(o)
-        _select_only(context, [target])
-        self.report({'INFO'}, f"Boolean {self.operation.lower()}: {info['faces']} faces, "
-                              f"volume {info.get('volume', 0):.4g}")
+        _select_only(context, [res])
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
+
+
+def combine_solids(context, objs, operation, op, name=None):
+    """Boolean of closed solids objs (the first is the target) -> (result object,
+    message). With history: a new result that keeps the inputs hidden (named
+    `name`, else target_union...). Without: the target's geometry is replaced
+    and the tools are removed. Raises jobs.JobError."""
+    target = objs[0]
+    if features.history_enabled(context):
+        g = features.run("boolean", [(o, "SURF") for o in objs], {"bool_op": operation})
+        res = store.new_object_text(context, name or f"{target.name}_{BOOL_SUFFIX[operation]}", g[1])
+        features.record(res, "boolean", [(o, "SURF") for o in objs], {"bool_op": operation})
+        features.keep_inputs(context, objs)
+        features.mark_built(res)
+        return res, (f"Boolean {operation.lower()} of {len(objs)} solids "
+                     "(inputs kept hidden: history; Restore Inputs brings them back)")
+    keys = {f"s{i}": o for i, o in enumerate(objs)}
+    info, breps = jobs.run("boolean", keys, ["result"], order=list(keys), into="s0",
+                           operation=operation, names={k: o.name for k, o in keys.items()})
+    _frozen(target, op)
+    store.set_geometry_text(target, breps["result"], context, keep_untrimmed=False)
+    if store.PROP_UNTRIM in target:
+        del target[store.PROP_UNTRIM]
+    for o in objs[1:]:
+        _remove_object(o)
+    return target, f"Boolean {operation.lower()}: {info['faces']} faces, volume {info.get('volume', 0):.4g}"
 
 
 class NPROTO_OT_boundary_fill(bpy.types.Operator):

@@ -26,8 +26,8 @@ FIELDS = {
              "edges_a", "edges_b", "fit", "span_degree", "span_faces", "cont_ra", "tan_ra", "cont_rb", "tan_rb", "corner_ease", "even_net",
              "flip_normal"],
     "blend_curve": ["cont_a", "w_a", "c_a", "flip_a", "cont_b", "w_b", "c_b", "flip_b"],
-    "extrude": ["distance", "direction", "dir_vec", "tilt", "tilt_azimuth", "draft", "draft_flip", "symmetric"],
-    "revolve": ["angle", "axis", "pivot", "seam_angle", "axis_point", "axis_dir"],
+    "extrude": ["distance", "direction", "dir_vec", "tilt", "tilt_azimuth", "draft", "draft_flip", "symmetric", "caps"],
+    "revolve": ["angle", "axis", "pivot", "seam_angle", "axis_point", "axis_dir", "caps"],
     "offset": ["distance"],
     "thicken": ["distance", "symmetric"],
     "planar": [],
@@ -467,6 +467,8 @@ def sync_from_history(obj):
                 params.setdefault(k_, v_)
         if h["op"] in features.ORIENT_OPS:
             params.setdefault("flip_normal", False)
+        if h["op"] in ("extrude", "revolve"):                      # surfaces before Body: Solid
+            params.setdefault("caps", False)
         if h["op"] == "loft":                    # older lofts: square to the side, or the Match Edges switch
             old = "EDGES" if params.get("match_edges") else "FREE"
             params.setdefault("edges_a", old)
