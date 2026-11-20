@@ -1,4 +1,4 @@
-"""Dome: close an open end of a surface (a rim) with a dome, G1 or G2 to it.
+"""Dome: close an open end of a surface (a rim) with a dome, G0, G1 or G2 to it.
 
 A round rim -- the end of a cylinder, a cone or any surface of revolution --
 gets an exact surface of revolution: a Bezier profile from the rim to the
@@ -145,19 +145,33 @@ def arc_k(u):
     return (4.0 / 3.0) * np.tan(th / 4.0) / np.tan(th / 2.0)
 
 
+def sphere_dir(r, H):
+    """(radial, axial) direction out of the rim of radius r of the sphere
+    centred on the axis whose top is H above the rim: a G0 dome leaves the rim
+    this way instead of along the surface (round_height(r, it) == H)."""
+    R = (r * r + H * H) / (2.0 * H)
+    return np.array([(H - R) / R, r / R])
+
+
 def profile(rim, cont="G2", height=1.0, fullness=1.0):
     """The dome's profile: Bezier CVs (rows, 2) as (radius, height above the
-    rim). height 1 = the round dome (round_height); less: flatter."""
+    rim). height 1 = the round dome (round_height); less: flatter. G0 doesn't
+    look at the surface at all: a cap along the sphere through the rim
+    (sphere_dir), height 1 = a hemisphere."""
     r = rim["r"]
     u = np.array(rim["T2"], float)
-    H = max(height, 0.02) * round_height(r, u)
+    if cont == "G0":
+        H = max(height, 0.02) * r
+        u = sphere_dir(r, H)
+    else:
+        H = max(height, 0.02) * round_height(r, u)
     P0, A, e = np.array([r, 0.0]), np.array([0.0, H]), np.array([1.0, 0.0])
     X = P0 + (H / u[1]) * u                       # where the rim's tangent reaches the top's height
     L0 = float(np.linalg.norm(X - P0))
     Xr = max(float(X[0]), 0.25 * r)               # (a wall leaning in steeply: keep the top round)
     k = arc_k(u) * fullness
     C = [P0, P0 + k * L0 * u, A + k * Xr * e, A]       # the round arc (cubic)
-    if cont == "G1":
+    if cont in ("G0", "G1"):
         cv = C
     else:
         cv = _g2_rows(C, u, rim["kappa"])
@@ -289,7 +303,7 @@ def free_dome(obj, ref, cont="G2", height=1.0, fullness=1.0, memo=None):
     rho = np.linalg.norm((S - c) - np.outer((S - c) @ a, a), axis=1)
     rbar = float(rho.mean())
     Pw = np.c_[Q * w[:, None], w]
-    m = 3 if cont == "G1" else 5
+    m = 3 if cont in ("G0", "G1") else 5
     tol = 1e-5 * size
     last = None
     frozen = memo is not None and "knots" in memo
@@ -308,6 +322,11 @@ def free_dome(obj, ref, cont="G2", height=1.0, fullness=1.0, memo=None):
         rr = np.linalg.norm(inpl, axis=1)
         ur = np.einsum("ij,ij->i", T, inpl / rr[:, None])
         H = max(height, 0.02) * float(np.mean([round_height(r_, (x_, z_)) for r_, x_, z_ in zip(rr, ur, tz)]))
+        if cont == "G0":            # the surface ignored: along the sphere through each rim point, x1 = half the rim
+            H = max(height, 0.02) * float(rr.mean())
+            sd = np.array([sphere_dir(r_, H) for r_ in rr])
+            ur, tz = sd[:, 0], sd[:, 1]
+            T = ur[:, None] * (inpl / rr[:, None]) + tz[:, None] * a
         A = c + H * a
         X = P + (H - (P - c) @ a)[:, None] / tz[:, None] * T
         L0 = np.linalg.norm(X - P, axis=1)
@@ -563,7 +582,7 @@ def _open_rims(context, objs=None):
 
 
 class NPROTO_OT_dome(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
-    """Close an open end (rim) of a surface with a dome, G1 or G2 to it. A round rim gets an
+    """Close an open end (rim) of a surface with a dome, G0, G1 or G2 to it. A round rim gets an
     exact surface of revolution; any other planar rim a dome on the rim's own curve. With one open
     rim on the selection it domes that; otherwise pick the rim (or pick its edge in Edge mode first).
     Then drag the arrow (height) and the diamond (fullness), type, Enter"""
@@ -584,7 +603,8 @@ class NPROTO_OT_dome(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
     dome_cvs: IntProperty(name="CVs", default=20, min=8, max=24,
                           description="Draped: CVs in each direction of the surface")
     dome_cont: EnumProperty(name="Continuity", default="G2",
-                            items=[("G1", "G1", "Tangent to the surface"),
+                            items=[("G0", "G0", "Meets the rim only, whatever way the surface runs into it: a round cap (Height 1: a hemisphere)"),
+                                   ("G1", "G1", "Tangent to the surface"),
                                    ("G2", "G2", "Tangent, with the surface's curvature carried on")])
     dome_height: FloatProperty(name="Height", default=1.0, min=0.05, soft_max=3.0,
                                description="1: round (the sphere that carries the surface on over the rim); "
@@ -711,7 +731,7 @@ class NPROTO_OT_dome(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
 
     def drag_key(self, context, event, ch):
         if ch == "g":
-            self.dome_cont = "G1" if self.dome_cont == "G2" else "G2"
+            self.dome_cont = {"G0": "G1", "G1": "G2"}.get(self.dome_cont, "G0")
         elif ch == "d":
             self.dome_layout = "DRAPED" if self.dome_layout == "POLAR" else "POLAR"
         else:
@@ -719,7 +739,7 @@ class NPROTO_OT_dome(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
         return True
 
     def drag_rows(self):
-        return [("Dome", [hints.cycle("G", ["G1", "G2"], self.dome_cont),
+        return [("Dome", [hints.cycle("G", ["G0", "G1", "G2"], self.dome_cont),
                           hints.cycle("D", ["polar", "draped"], self.dome_layout.lower())])]
 
     def drag_handle_hints(self):

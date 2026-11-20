@@ -6695,6 +6695,36 @@ check("dome live stage: preview on the dome it makes, height arrow's tip its top
       "along its line, values back from the handles",
       all(v[0] and v[1] < 2e-3 and v[2] < 2e-3 and v[3] < 0.01 and v[4] == 0 and v[5] == 0 for v in _dm_rep), str(_dm_rep))
 
+# Dome's continuity label (as Patch's): one on the rim, G0 / G1 / G2, the polar dome holds each; G0 ignores the wall
+# (a hemisphere-like cap: the drafted cone's 8 degrees show as a kink); a click steps it through the history
+from blender_nurbs import contlabels as _cl
+# (the ellipse without draft: Extrude's draft on its rational circle creases the wall 0.1 degrees at the double
+# knots, which the label rightly shows for any dome)
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0); _dc = ctx.active_object
+_h = json.loads(_dc[features.PROP_HIST]); _h["params"]["elliptic"] = True; _h["params"]["radius2"] = 0.6
+_dc[features.PROP_HIST] = json.dumps(_h); features.rebuild(_dc, ctx, force=True)
+_dc.location = (12.0, 2100, 0); ctx.view_layer.update()
+bpy.ops.nproto.extrude(inputs=ins((_dc, "S0")), distance=2.0, direction="Z"); _el0 = ctx.active_object
+_dl_rep, _dl_ok = [], True
+for _dbase, _dref in ((_g1["base"], _g1["ref"]), (_el0, _top_rim(_el0))):
+    for _cont in ("G0", "G1", "G2"):
+        r = bpy.ops.nproto.dome(inputs=ins((_dbase, _dref)), dome_cont=_cont, dome_height=1.0, dome_fullness=1.0,
+                                dome_layout="POLAR")
+        _do = ctx.active_object
+        _L = _cl.labels(_do)
+        _kink = _cl.measure(_do, _dbase, _dref, 1)["angle"]
+        _dl_rep.append((_cont, len(_L), _L and _L[0]["value"], _L and _L[0]["check"]["ok"], round(_kink, 3)))
+        _dl_ok &= (r == {'FINISHED'} and len(_L) == 1 and _L[0]["values"] == ["G0", "G1", "G2"] and _L[0]["value"] == _cont
+                   and _L[0]["check"]["ok"] and ((_kink > 5.0) if _cont == "G0" else (_kink < 0.1)))
+        if _cont == "G2" and _dbase is _g1["base"]:
+            bpy.ops.nproto.cycle_continuity('EXEC_DEFAULT', obj_name=_do.name, index=0, step=1)
+            _L2 = _cl.labels(_do)
+            _dl_ok &= features.history(_do)["params"]["dome_cont"] == "G0" and _L2[0]["value"] == "G0" and _L2[0]["check"]["ok"]
+            _dl_rep.append(("click", features.history(_do)["params"]["dome_cont"]))
+        bpy.data.objects.remove(_do)
+check("dome continuity label: one on the rim (G0 / G1 / G2), polar dome holds each on a round rim and an ellipse; "
+      "G0 meets the rim with the wall's kink; a click steps it G2 -> G0", _dl_ok, str(_dl_rep))
+
 # a loft of selected curves goes along them (a selection has no order: bottom, top, middle folded back)
 from blender_nurbs.ops import loft_selection_order as _lso
 _ls = []

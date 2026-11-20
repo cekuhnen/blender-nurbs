@@ -276,7 +276,8 @@ class NprotoFeature(bpy.types.PropertyGroup):
                               ("DRAPED", "Draped", "One even four-sided surface over the opening, trimmed "
                                                    "to the rim (no pole: easy to edit)")], **_F())
     dome_cvs: IntProperty(name="CVs", min=8, max=24, description="Draped: CVs in each direction", **_F())
-    dome_cont: EnumProperty(name="Continuity", items=[("G1", "G1", "Tangent to the surface"),
+    dome_cont: EnumProperty(name="Continuity", items=[("G0", "G0", "Meets the rim only: a round cap (Height 1: a hemisphere)"),
+                                                      ("G1", "G1", "Tangent to the surface"),
                                                       ("G2", "G2", "Tangent, with the surface's curvature carried on")],
                             **_F())
     dome_height: FloatProperty(name="Height", min=0.05, soft_max=3.0,
