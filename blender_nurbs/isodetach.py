@@ -30,7 +30,9 @@ from mathutils import Vector
 from . import draw, features, geom, hints, store
 
 EPS = 1e-9          # cut positions closer than this (fraction of the domain) are the same
-SNAP_PX = 12        # a cut within this many pixels of a span line lands on it
+SNAP_PX = 12        # a cut within this many pixels of a span line, edge middle or CV lands on it
+SNAP_LABELS = {"mid": "Mid", "cv": "CV"}                      # beside the snap dot
+SNAP_STATE = {"span": "span line", "mid": "edge middle", "cv": "CV"}   # in the header
 COL_U, COL_V = 0, 3  # pick colours (draw.COL_PICKS): constant-u cuts cyan, constant-v amber
 
 
@@ -810,6 +812,78 @@ def iso_runs(surf, face, d, f, n=96):
     return [r for r in runs if len(r) > 1]
 
 
+def _greville_fracs(surf, d):
+    """Fraction of direction d at each CV row's Greville point (the average of
+    its p knots: where that row of CVs pulls hardest), one per row index."""
+    _, ext = _k()
+    c = ext.surface_cvs(surf)
+    U = [float(k) for k in (c["knots_u"] if d == "U" else c["knots_v"])]
+    p = int(c["degree_u"] if d == "U" else c["degree_v"])
+    n = int(c["count_u"] if d == "U" else c["count_v"])
+    a, b = U[p], U[len(U) - p - 1]
+    return [(sum(U[i + 1:i + p + 1]) / p - a) / (b - a) for i in range(n)]
+
+
+def _length_middle(fn, t0, t1, n=129):
+    """(point halfway along the curve t -> fn(t) by length, length)."""
+    ts = np.linspace(t0, t1, n)
+    P = np.array([fn(float(t)) for t in ts], float)
+    s = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))]
+    tm = float(np.interp(0.5 * s[-1], s, ts))
+    return np.array(fn(tm), float), float(s[-1])
+
+
+def snap_points(surf, brep, face, d, cvs=True):
+    """[(fraction, local point, kind)] a cut in direction d snaps to: the middle
+    (by length) of every edge of the face -- of the untrimmed surface's four
+    sides when brep is None -- ("mid"), and every CV at its row's Greville
+    fraction ("cv"). Fractions at an open direction's ends are left out (that
+    is the surface's edge), as are CV rows whose isoparm the trim cuts away."""
+    closed = store._periodic(surf)[0 if d == "U" else 1]
+    (u0, u1), (v0, v1) = surf.u_domain(), surf.v_domain()
+    H = net(surf)[0]
+    P = H[..., :3] / H[..., 3:4]
+    size = float(np.linalg.norm(P.reshape(-1, 3).max(axis=0) - P.reshape(-1, 3).min(axis=0))) or 1.0
+    foot = store._make_foot(surf)
+    spans = np.array(_dir_fracs(surf, d) + [0.0, 1.0], float)
+
+    def frac(f):
+        k = int(np.argmin(np.abs(spans - f)))
+        if abs(spans[k] - f) < 1e-9:             # on a span line (a knot already there): exactly on it
+            f = float(spans[k])
+        if closed:
+            f %= 1.0
+            return 0.0 if f > 1.0 - EPS else f
+        return f if EPS < f < 1.0 - EPS else None
+
+    out = []
+    if brep is None:
+        sides = [(lambda t, v=v: surf.evaluate(u0 + (u1 - u0) * t, v), 0.0, 1.0) for v in (v0, v1)] + \
+                [(lambda t, u=u: surf.evaluate(u, v0 + (v1 - v0) * t), 0.0, 1.0) for u in (u0, u1)]
+    else:
+        sides = [(e.point_at, *e.parameter_range()) for e in brep.edges()]
+    for fn, t0, t1 in sides:
+        M, L = _length_middle(fn, t0, t1)
+        if L < 1e-9 * size:                      # a pole
+            continue
+        u, v = foot(M)
+        f = frac((u - u0) / (u1 - u0) if d == "U" else (v - v0) / (v1 - v0))
+        if f is not None:
+            out.append((f, M, "mid"))
+    if cvs:
+        on = {}
+        for i, g in enumerate(_greville_fracs(surf, d)):
+            f = frac(g)
+            if f is None:
+                continue
+            if f not in on:
+                on[f] = face is None or bool(iso_runs(surf, face, d, f, 48))
+            if on[f]:
+                rows = P[i] if d == "U" else P[:, i]
+                out += [(f, p, "cv") for p in rows]
+    return out
+
+
 def _screen(context, P):
     """Region pixel coordinates (n, 2) of world points P (n, 3); NaN behind the eye."""
     M = np.array(context.region_data.perspective_matrix, float)
@@ -826,7 +900,8 @@ class NPROTO_OT_detach_iso(bpy.types.Operator):
     insertion). An untrimmed surface gives untrimmed pieces; a trimmed one
     gives each piece its share of the trim on the cut-down surface (one the
     trim does not cut into comes out untrimmed). Move over the surface to see
-    the isoparm, click to add a cut (it snaps to span lines; Shift: free), Tab
+    the isoparm, click to add a cut (it snaps to span lines, edge middles and
+    shown CVs; Shift: free), Tab
     switches U / V, Backspace takes the last cut back, Enter detaches. A
     closed direction opens at a single cut. With history each piece follows
     the source, which is kept hidden"""
@@ -885,7 +960,7 @@ class NPROTO_OT_detach_iso(bpy.types.Operator):
             return self.execute(context)
         self._obj, self._surf, self._foot = None, None, None
         self._cuts_l = []                 # [(dir, fraction, world polyline)]
-        self._hover = None                # (dir, fraction, snapped?)
+        self._hover = None                # (dir, fraction, snap kind or None, world snap point or None)
         self._snap_cache = {}
         a = context.active_object
         self._pre = a is not None and detachable(a) and a.select_get()
@@ -900,7 +975,8 @@ class NPROTO_OT_detach_iso(bpy.types.Operator):
     def _set_target(self, obj):
         self._obj = obj
         self._surf = store.get_surfaces(obj)[0]
-        self._face = None if store.is_natural(obj) else store.get_brep(obj).faces()[0]
+        self._brep = None if store.is_natural(obj) else store.get_brep(obj)
+        self._face = None if self._brep is None else self._brep.faces()[0]
         self._foot = store._make_foot(self._surf)
         self._M = np.array(geom.world_matrix(obj), float)
         self._snap_cache = {}
@@ -919,18 +995,44 @@ class NPROTO_OT_detach_iso(bpy.types.Operator):
             self._snap_cache[d] = lines
         return self._snap_cache[d]
 
+    def _snap_points(self, context, d):
+        """(fractions, world points, kinds) a cut in direction d snaps to: edge
+        middles, and the CVs while the net is shown (cached)."""
+        cvs = draw.cv_net_shown(context, self._obj)
+        key = ("P", d, cvs)
+        if key not in self._snap_cache:
+            pts = snap_points(self._surf, self._brep, self._face, d, cvs)
+            self._snap_cache[key] = (np.array([f for f, _, _ in pts], float),
+                                     self._world(np.array([p for _, p, _ in pts], float).reshape(-1, 3)),
+                                     [k for _, _, k in pts])
+        return self._snap_cache[key]
+
+    def _point_snap(self, context, event, d):
+        """(d, fraction, kind, world point) of the edge middle / CV nearest the
+        mouse within SNAP_PX, or None."""
+        F, W, K = self._snap_points(context, d)
+        if not len(F):
+            return None
+        S = _screen(context, W)
+        dist = np.linalg.norm(S - np.array([event.mouse_region_x, event.mouse_region_y], float), axis=1)
+        dist[~np.isfinite(dist)] = np.inf
+        i = int(np.argmin(dist))
+        return (d, float(F[i]), K[i], W[i]) if dist[i] < SNAP_PX else None
+
     def _pick(self, context, event):
-        """(dir, fraction, snapped) of the isoparm under the mouse, or None."""
+        """(dir, fraction, snap kind or None, world snap point or None) of the
+        isoparm under the mouse, or None. An edge middle or CV snaps even with
+        the mouse off the surface (a CV often is)."""
         from .ops_trim import _ray_nurbs
         obj, loc, _, _ = _ray_nurbs(context, event)
-        if obj is None:
+        if obj is None or (self._obj is not None and obj != self._obj):
+            if self._obj is not None and not event.shift:
+                return self._point_snap(context, event, self.iso_dir)
             return None
         if self._obj is None:
             if not detachable(obj):
                 return ("REFUSED", obj)
             self._set_target(obj)
-        if obj != self._obj:
-            return None
         q = np.linalg.solve(self._M, np.r_[np.array(loc, float), 1.0])[:3]
         u, v = self._foot(q)
         (u0, u1), (v0, v1) = self._surf.u_domain(), self._surf.v_domain()
@@ -938,7 +1040,10 @@ class NPROTO_OT_detach_iso(bpy.types.Operator):
         f = (u - u0) / (u1 - u0) if d == "U" else (v - v0) / (v1 - v0)
         f = min(max(f, 0.0), 1.0)
         if event.shift:
-            return (d, f, False)
+            return (d, f, None, None)
+        snap = self._point_snap(context, event, d)
+        if snap is not None:
+            return snap
         m = np.array([event.mouse_region_x, event.mouse_region_y], float)
         best = None
         for g, W in self._snap_lines(d):
@@ -947,8 +1052,8 @@ class NPROTO_OT_detach_iso(bpy.types.Operator):
             if dist < SNAP_PX and (best is None or dist < best[0]):
                 best = (dist, g)
         if best is not None:
-            return (d, best[1], True)
-        return (d, f, False)
+            return (d, best[1], "span", None)
+        return (d, f, None, None)
 
     def _polylines(self, d, f):
         """World polylines of the isoparm, where it runs on the (trimmed) face."""
@@ -960,6 +1065,9 @@ class NPROTO_OT_detach_iso(bpy.types.Operator):
         h = self._hover
         draw.pick_overlay["hover"] = (self._polylines(h[0], h[1]) or None) if h and h[0] in "UV" else None
         draw.pick_overlay["refused"] = None
+        snap = h[3] if h and h[0] in "UV" else None
+        draw.sketch_overlay["snap"] = Vector(tuple(snap)) if snap is not None else None
+        draw.sketch_overlay["snap_label"] = SNAP_LABELS.get(h[2]) if snap is not None else None
         if h and h[0] == "REFUSED":
             M = h[1].matrix_world
             pts = []
@@ -977,11 +1085,11 @@ class NPROTO_OT_detach_iso(bpy.types.Operator):
         state = [self._obj.name if self._obj is not None else "click a surface",
                  f"cuts U {nu} · V {nv}"]
         if h and h[0] in "UV":
-            state.append(f"{h[0]} {h[1]:.4f}" + (" (span line)" if h[2] else ""))
+            state.append(f"{h[0]} {h[1]:.4f}" + (f" ({SNAP_STATE[h[2]]})" if h[2] else ""))
         elif h and h[0] == "REFUSED":
             state.append(f"{h[1].name} has several faces: Unjoin first")
         rows = [("Cut", [hints.key("Click", "add a cut"), hints.cycle("Tab", ["U", "V"], self.iso_dir),
-                         hints.key("Shift", "no snapping to span lines"),
+                         hints.key("Shift", "no snapping"),
                          hints.key("Backspace", "take the last cut back", on=None if self._cuts_l else False)]),
                 ("Detach", [hints.key("Enter", "detach", on=None if self._cuts_l else False), hints.key("Esc", "cancel")])]
         hints.show(context, self.bl_label, state, rows,
@@ -991,6 +1099,7 @@ class NPROTO_OT_detach_iso(bpy.types.Operator):
     def _end(self, context):
         draw.pick_overlay["picked"], draw.pick_overlay["colors"] = [], []
         draw.pick_overlay["hover"] = draw.pick_overlay["refused"] = None
+        draw.sketch_overlay["snap"] = draw.sketch_overlay["snap_label"] = None
         hints.clear(context)
         if context.area is not None:
             context.area.header_text_set(None)
@@ -1012,7 +1121,7 @@ class NPROTO_OT_detach_iso(bpy.types.Operator):
         elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
             h = self._pick(context, event)
             if h and h[0] in "UV":
-                d, f, _ = h
+                d, f = h[0], h[1]
                 ends = not store._periodic(self._surf)[0 if d == "U" else 1]
                 if ends and not (EPS < f < 1.0 - EPS):
                     self.report({'WARNING'}, "That is the surface's edge: nothing to cut there")

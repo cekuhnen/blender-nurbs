@@ -42,7 +42,7 @@ FIELDS = {
     "rail_revolve": ["rr_axis", "pivot", "rr_height"],
     "network": ["nw_cont", "nw_degree", "nw_spans_u", "nw_spans_v"],
     "flange": ["fl_mode", "fl_length", "angle", "draft_angle", "pull_flip", "measure", "flip", "both_sides",
-               "tolerance"],
+               "fl_corner", "tolerance"],
     "sweep": ["samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height", "flip_normal"],
     "pipe": ["radius", "samples"],
     "patch": ["pt_cvs", "pt_cvs_v", "pt_auto_cvs", "pt_degree", "pt_fair", "pt_surface_fair", "pt_quad",
@@ -68,6 +68,9 @@ FIELDS = {
     "prim_torus": ["radius", "radius2", "degree", "spans_u", "spans_v"],
     "prim_disk": ["radius", "degree", "spans_u"],
 }
+
+# what a feature made before a setting existed was built with (shown when its history lacks it)
+MISSING = {"fl_corner": "OPEN"}
 LABELS = {"tan_a": "Tangent A", "tan_b": "Tangent B", "cur_a": "Curvature A", "cur_b": "Curvature B",
           "w_a": "Weight A", "w_b": "Weight B", "c_a": "Curvature A", "c_b": "Curvature B",
           "spans_u": "Spans U", "spans_v": "Spans V", "radius2": "Radius 2", "width": "Size X", "depth": "Size Y",
@@ -276,7 +279,8 @@ class NprotoFeature(bpy.types.PropertyGroup):
                               ("DRAPED", "Draped", "One even four-sided surface over the opening, trimmed "
                                                    "to the rim (no pole: easy to edit)")], **_F())
     dome_cvs: IntProperty(name="CVs", min=8, max=24, description="Draped: CVs in each direction", **_F())
-    dome_cont: EnumProperty(name="Continuity", items=[("G1", "G1", "Tangent to the surface"),
+    dome_cont: EnumProperty(name="Continuity", items=[("G0", "G0", "Meets the rim only: a round cap (Height 1: a hemisphere)"),
+                                                      ("G1", "G1", "Tangent to the surface"),
                                                       ("G2", "G2", "Tangent, with the surface's curvature carried on")],
                             **_F())
     dome_height: FloatProperty(name="Height", min=0.05, soft_max=3.0,
@@ -431,6 +435,9 @@ class NprotoFeature(bpy.types.PropertyGroup):
     os_corner: EnumProperty(name="Corners", items=[("SHARP", "Sharp", ""), ("ROUND", "Round", ""),
                                                    ("CHAMFER", "Chamfer", "")], **_F())
     fl_mode: EnumProperty(name="Mode", items=[("FLANGE", "Flange", ""), ("DRAFT", "Draft", "")], **_F())
+    fl_corner: EnumProperty(name="Corners", items=[("MITRE", "Mitre", "Far edges run on (or back) to where they meet"),
+                                                   ("BLEND", "Blend", "Round outside corners, inside ones mitred"),
+                                                   ("OPEN", "Open", "Corners left as they are")], **_F())
     fl_length: FloatProperty(name="Length", unit='LENGTH', **_F())
     draft_angle: FloatProperty(name="Draft °", min=-89.0, max=89.0, **_F())
     pull_flip: BoolProperty(name="Flip Pull", **_F())
@@ -496,9 +503,9 @@ def sync_from_history(obj):
             vals = {round(float(tens[i]), 9) if i < len(tens) else 1.0 for i in range(len(h["inputs"])) if i not in guides}
             pg.pt_tension_all = vals.pop() if len(vals) == 1 else 1.0
         for name in FIELDS.get(h["op"], []):
-            if name not in params:
+            if name not in params and name not in MISSING:
                 continue
-            v = params[name]
+            v = params.get(name, MISSING.get(name))
             try:
                 setattr(pg, name, str(v) if name in ("degree", "square_degree", "sq_degree_u", "sq_degree_v", "lr_degree",
                                                     "pt_quad_degree") else v)
@@ -669,7 +676,8 @@ def draw_feature(layout, context):
                     if op == "dome" and name == "dome_cvs" and pg.dome_layout != "DRAPED":
                         continue
                     if name in ("degree", "square_degree", "jc_mode", "bool_op", "lr_degree", "lr_mode", "pp_shape",
-                                "dome_cont", "dome_layout", "oc_mode", "oc_corner", "os_corner", "fl_mode", "measure",
+                                "dome_cont", "dome_layout", "oc_mode", "oc_corner", "os_corner", "fl_mode", "fl_corner",
+                                "measure",
                                 "nw_cont", "rr_height"):
                         col.row().prop(pg, name, expand=True)
                     elif name in ("jc_degree", "jc_cvs") and pg.jc_mode != "REBUILD":
@@ -832,6 +840,34 @@ def primitive_params(op, **values):
     return p
 
 
+# Exact / Smooth for the round shapes (as D in the drawing tools): a view of Degree,
+# so a script that passes degree= still works
+ROUND_KINDS = {"ARC", "CIRCLE", "ELLIPSE", "CYLINDER", "CONE", "SPHERE", "TORUS", "DISK"}
+ROUND_TYPE_ITEMS = [("EXACT", "Exact", "Rational: true circles, arcs, cylinders, spheres (degree 2)", 0),
+                    ("SMOOTH", "Smooth", "Not rational, degree 3 by default: even CVs to pull and blend "
+                                         "(a close approximation)", 1)]
+SMOOTH_DEGREE_ITEMS = [(str(d), str(d), f"Degree {d}", d) for d in range(1, 6)]
+
+
+def _get_round_type(self):
+    return 0 if self.degree == "0" else 1
+
+
+def _set_round_type(self, value):
+    if value == 0:
+        self.degree = "0"
+    elif self.degree == "0":
+        self.degree = "3"
+
+
+def _get_smooth_degree(self):
+    return 3 if self.degree == "0" else int(self.degree)
+
+
+def _set_smooth_degree(self, value):
+    self.degree = str(max(1, min(5, int(value))))
+
+
 class NPROTO_OT_add_primitive(bpy.types.Operator):
     """Add a NURBS curve or surface primitive at the 3D cursor (editable later in the Feature panel)"""
     bl_idname = "nproto.add_primitive"
@@ -855,6 +891,10 @@ class NPROTO_OT_add_primitive(bpy.types.Operator):
     sides: IntProperty(name="Sides", default=6, min=3, max=64)
     angle: FloatProperty(name="Angle", default=90.0, min=0.01, max=360.0)
     degree: EnumProperty(name="Degree", items=DEGREE_ITEMS, default="0")
+    ctype: EnumProperty(name="Type", items=ROUND_TYPE_ITEMS, get=_get_round_type, set=_set_round_type,
+                        options={'SKIP_SAVE'})
+    smooth_degree: EnumProperty(name="Degree", items=SMOOTH_DEGREE_ITEMS, get=_get_smooth_degree,
+                                set=_set_smooth_degree, options={'SKIP_SAVE'})
     spans_u: IntProperty(name="Spans U", default=8, min=1, max=64)
     spans_v: IntProperty(name="Spans V", default=4, min=1, max=64)
     pl_degree_u: IntProperty(name="Degree U", default=3, min=1, max=7, description="Degree along X")
@@ -921,8 +961,15 @@ class NPROTO_OT_add_primitive(bpy.types.Operator):
                 if not is_ellipse:          # the Ellipse kind is always elliptic
                     col.prop(self, n)
                 continue
-            if n == "degree":
+            if n == "degree" and self.kind in ROUND_KINDS:
+                col.row().prop(self, "ctype", expand=True)
+                if self.ctype == "SMOOTH":
+                    col.row().prop(self, "smooth_degree", expand=True)
+            elif n == "degree":
                 col.row().prop(self, "degree", expand=True)
+            elif self.kind in ROUND_KINDS and self.degree == "0" and (
+                    n == "spans_u" or (n == "spans_v" and self.kind in ("SPHERE", "TORUS"))):
+                continue                    # an exact circle has no spans to set
             elif n == "radius2" and op == "prim_circle":
                 row = col.row()
                 row.active = is_ellipse or self.elliptic   # Radius 2 only shapes an ellipse

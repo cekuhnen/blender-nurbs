@@ -2,6 +2,7 @@
 
 import bpy
 import gpu
+import numpy as np
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 
@@ -598,15 +599,31 @@ def _draw():
     gpu.state.blend_set('NONE')
 
 
+_tri_batch = [None, None]           # [the preview's triangles, their batch]: built once per preview
+
+
+def _preview_tri_batch(tris, sh):
+    """The fill's GPU batch, made from the array straight (a pattern's preview
+    can hold hundreds of thousands of triangles) and kept while it is the same."""
+    if _tri_batch[0] is not tris:
+        _tri_batch[1] = batch_for_shader(sh, 'TRIS', {"pos": np.ascontiguousarray(tris, np.float32).reshape(-1, 3)})
+        _tri_batch[0] = tris
+    return _tri_batch[1]
+
+
 def _draw_preview(pv):
     """The live value preview: a see-through fill (hidden where the model is in
     front), then its lines over everything, bright where they are seen and
     faint where the model hides them; the arrow's shaft and the draft guide."""
     tris = pv.get("tris")
     lines = _lines_from_polylines(pv.get("lines") or [], _IDENT)
-    if tris is not None and len(tris):
+    if tris is None or not len(tris):
+        _tri_batch[:] = [None, None]
+    else:
         gpu.state.depth_test_set('LESS_EQUAL')
-        _draw_tris([tuple(p) for p in tris], (*COL_PREVIEW, 0.16))
+        sh = gpu.shader.from_builtin('UNIFORM_COLOR')
+        sh.uniform_float("color", (*COL_PREVIEW, 0.16))
+        _preview_tri_batch(tris, sh).draw(sh)
         gpu.state.depth_test_set('NONE')
     _draw_lines(lines, (*COL_PREVIEW, 0.35), 1.5)
     gpu.state.depth_test_set('LESS_EQUAL')

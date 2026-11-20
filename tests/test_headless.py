@@ -1689,6 +1689,31 @@ r = bpy.ops.nproto.project_curve(direction="Z")
 pcs = geom.sample_curve(features.input_curve(ctx.active_object, "S0"), 64)
 check("project curve onto a surface", r == {'FINISHED'} and np.abs(pcs[:, 2]).max() < 1e-4
       and abs(np.linalg.norm(pcs[:, :2] - [0, Y0 + 45], axis=1).mean() - 1.0) < 1e-3)
+# a shallow view sends the circle's shadow past the plane (kernel SM_ERR 1001): a warning,
+# FINISHED with nothing made, so Adjust Last Operation stays open to change the direction
+bpy.ops.object.select_all(action='DESELECT'); pc.select_set(True); pl_.select_set(True); ctx.view_layer.objects.active = pl_
+_nobj = len(bpy.data.objects)
+_miss = [bpy.ops.nproto.project_curve(direction="VIEW", view_dir=(-0.79, 0.41, -0.45)),
+         bpy.ops.nproto.project_curve(direction="X")]
+check("project curve: a miss along the view or parallel to the plane makes nothing, keeps the redo panel",
+      _miss == [{'FINISHED'}] * 2 and len(bpy.data.objects) == _nobj)
+# the default direction is the active work plane's normal: World Z with the World active,
+# a tilted plane's normal (the circle's centre lands along it) when that plane is active
+from blender_nurbs import workplanes as _wpp
+_pjd = []
+for _tilt in (False, True):
+    if _tilt:
+        _wpP = _wpp.add_plane(ctx.scene, "ProjTilt", _wpp.frame_from_normal(np.zeros(3), np.array([0.3, 0.0, 1.0])))
+        _nP = _wpp.active_frame(ctx.scene)[3]
+    bpy.ops.object.select_all(action='DESELECT'); pc.select_set(True); pl_.select_set(True); ctx.view_layer.objects.active = pl_
+    _r = bpy.ops.nproto.project_curve()
+    _q = geom.sample_curve(features.input_curve(ctx.active_object, "S0"), 64)
+    _want = np.array([0.0, Y0 + 45, 0.0]) - (3.0 * _nP / _nP[2] if _tilt else 0.0)
+    _pjd.append((_r, float(np.abs(_q[:, 2]).max()), float(np.linalg.norm((_q[:, :2].min(0) + _q[:, :2].max(0)) / 2 - _want[:2]))))
+ctx.scene.nproto_workplanes.active = -1
+ctx.scene.nproto_workplanes.planes.remove(len(ctx.scene.nproto_workplanes.planes) - 1)
+check("project curve: defaults to the work plane normal (World Z, then a tilted plane's)",
+      all(r_ == {'FINISHED'} and z_ < 1e-4 and c_ < 1e-3 for r_, z_, c_ in _pjd), f"{_pjd}")
 bpy.ops.object.select_all(action='DESELECT'); sp_.select_set(True)
 ctx.scene.cursor.location = (0, Y0 + 40, 0.5)
 bpy.ops.nproto.add_primitive(kind="PLANE", width=4, depth=4, pl_degree_u=1, pl_degree_v=1, spans_u=1, spans_v=1); cutp = ctx.active_object
@@ -2177,10 +2202,10 @@ _sc_.location = (0, 0, -200)
 bpy.ops.object.select_all(action='DESELECT'); _sc_.select_set(True); lf.select_set(True)
 r = bpy.ops.nproto.export_step(filepath=_stp, use_selection=True, unit="MM")
 _txt = open(_stp).read()
-check("STEP export: valid Part 21 file, one solid + one sheet, rational surfaces, mm",
+check("STEP export: valid Part 21 file, one solid + one sheet, the exact cylinder a true cylinder, mm",
       r == {'FINISHED'} and _txt.startswith("ISO-10303-21;") and _txt.rstrip().endswith("END-ISO-10303-21;")
       and _txt.count("MANIFOLD_SOLID_BREP(") == 1 and _txt.count("SHELL_BASED_SURFACE_MODEL(") == 1
-      and "RATIONAL_B_SPLINE_SURFACE" in _txt and "SI_UNIT(.MILLI.,.METRE.)" in _txt
+      and "CYLINDRICAL_SURFACE(" in _txt and "SI_UNIT(.MILLI.,.METRE.)" in _txt
       and _txt.count("ADVANCED_FACE(") == 3 + store.get_brep(lf).face_count(),
       f"faces {_txt.count('ADVANCED_FACE(')}")
 # every #ref used is defined
@@ -5137,8 +5162,8 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cy
               "square"}     # Square: merged into Patch (Quad Sided); kept for older files, off the menus
 _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto)
               if n not in _not_tools and not n.startswith("workplane_")}   # the Work Planes panel's own
-_tool_ops = [o_ for o_ in _in_panels if o_ not in ("nproto.add_primitive", "nproto.boolean", "nproto.pattern")] + \
-    ["nproto.boolean", "nproto.pattern"]           # (one button per operation / mode)
+_tool_ops = [o_ for o_ in _in_panels if o_ not in ("nproto.add_primitive", "nproto.boolean")] + \
+    ["nproto.boolean"]                              # (one button per operation)
 _bool_ops = sorted(e["props"].get("operation") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r
                    if e.get("op") == "nproto.boolean")
 _kinds = [e["props"].get("kind") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r
@@ -6682,6 +6707,60 @@ _ke1, _ke2 = _apex_k(ctx.active_object), _apex_k(_el["obj"])
 check("G2 dome: as round at its top as the G1 one (no flat tip) -- round rim and ellipse",
       _ka2[0] > 0.9 * _ka1[0] and _ka2[0] > 0.5 and _ke2[0] > 0.85 * _ke1[0] and _ke2[0] > 0.3,
       f"round G1 {_ka1} G2 {_ka2}; ellipse G1 {_ke1} G2 {_ke2}")
+
+# Dome's live stage: the preview lies on the dome it makes, the arrow's tip is its top, the diamond is on it and
+# moves along its line as Fullness changes; both handles give their values back (round rim and ellipse)
+_dm_rep = []
+for _dbase, _dref in ((_g1["base"], _g1["ref"]), (_el["base"], _el["ref"])):
+    for _cont, _hh, _ff in (("G2", 1.0, 1.0), ("G1", 0.7, 1.4), ("G2", 1.6, 0.6)):
+        _x = _plain(_dome.NPROTO_OT_dome, inputs=ins((_dbase, _dref)), dome_cont=_cont, dome_height=_hh,
+                    dome_fullness=_ff, dome_layout="POLAR", dome_cvs=20)
+        _ok = _x.drag_setup(ctx, None)
+        _pv, _hs = _x.drag_preview(), _x.drag_handles()
+        _hf = _hs[1]
+        _x.dome_fullness = _hf["to_value"](1.1 * _hf["param"])
+        _lin = float(np.linalg.norm(_vd.ValueDrag._pos(_x.drag_handles()[1]) - (_hf["origin"] + 1.1 * _hf["param"] * _hf["dir"])))
+        _x.dome_fullness = _ff
+        r = bpy.ops.nproto.dome(inputs=ins((_dbase, _dref)), dome_cont=_cont, dome_height=_hh, dome_fullness=_ff)
+        _res = ctx.active_object; ctx.view_layer.update(); _t = _tree(_res)
+        _gap = max(_t.find_nearest(Vector(q_))[3] for q_ in np.vstack([_pv["tris"]] + list(_pv["lines"])))
+        _on = max(_t.find_nearest(Vector(_vd.ValueDrag._pos(h_)))[3] for h_ in _hs)
+        _dm_rep.append((_ok and r == {'FINISHED'}, round(_gap, 5), round(_on, 5), round(_lin, 5),
+                        round(_hs[0]["to_value"](_hs[0]["param"]) - _hh, 9), round(_hf["to_value"](_hf["param"]) - _ff, 9)))
+        bpy.data.objects.remove(_res)
+check("dome live stage: preview on the dome it makes, height arrow's tip its top, fullness diamond on it and moving "
+      "along its line, values back from the handles",
+      all(v[0] and v[1] < 2e-3 and v[2] < 2e-3 and v[3] < 0.01 and v[4] == 0 and v[5] == 0 for v in _dm_rep), str(_dm_rep))
+
+# Dome's continuity label (as Patch's): one on the rim, G0 / G1 / G2, the polar dome holds each; G0 ignores the wall
+# (a hemisphere-like cap: the drafted cone's 8 degrees show as a kink); a click steps it through the history
+from blender_nurbs import contlabels as _cl
+# (the ellipse without draft: Extrude's draft on its rational circle creases the wall 0.1 degrees at the double
+# knots, which the label rightly shows for any dome)
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0); _dc = ctx.active_object
+_h = json.loads(_dc[features.PROP_HIST]); _h["params"]["elliptic"] = True; _h["params"]["radius2"] = 0.6
+_dc[features.PROP_HIST] = json.dumps(_h); features.rebuild(_dc, ctx, force=True)
+_dc.location = (12.0, 2100, 0); ctx.view_layer.update()
+bpy.ops.nproto.extrude(inputs=ins((_dc, "S0")), distance=2.0, direction="Z"); _el0 = ctx.active_object
+_dl_rep, _dl_ok = [], True
+for _dbase, _dref in ((_g1["base"], _g1["ref"]), (_el0, _top_rim(_el0))):
+    for _cont in ("G0", "G1", "G2"):
+        r = bpy.ops.nproto.dome(inputs=ins((_dbase, _dref)), dome_cont=_cont, dome_height=1.0, dome_fullness=1.0,
+                                dome_layout="POLAR")
+        _do = ctx.active_object
+        _L = _cl.labels(_do)
+        _kink = _cl.measure(_do, _dbase, _dref, 1)["angle"]
+        _dl_rep.append((_cont, len(_L), _L and _L[0]["value"], _L and _L[0]["check"]["ok"], round(_kink, 3)))
+        _dl_ok &= (r == {'FINISHED'} and len(_L) == 1 and _L[0]["values"] == ["G0", "G1", "G2"] and _L[0]["value"] == _cont
+                   and _L[0]["check"]["ok"] and ((_kink > 5.0) if _cont == "G0" else (_kink < 0.1)))
+        if _cont == "G2" and _dbase is _g1["base"]:
+            bpy.ops.nproto.cycle_continuity('EXEC_DEFAULT', obj_name=_do.name, index=0, step=1)
+            _L2 = _cl.labels(_do)
+            _dl_ok &= features.history(_do)["params"]["dome_cont"] == "G0" and _L2[0]["value"] == "G0" and _L2[0]["check"]["ok"]
+            _dl_rep.append(("click", features.history(_do)["params"]["dome_cont"]))
+        bpy.data.objects.remove(_do)
+check("dome continuity label: one on the rim (G0 / G1 / G2), polar dome holds each on a round rim and an ellipse; "
+      "G0 meets the rim with the wall's kink; a click steps it G2 -> G0", _dl_ok, str(_dl_rep))
 
 # a loft of selected curves goes along them (a selection has no order: bottom, top, middle folded back)
 from blender_nurbs.ops import loft_selection_order as _lso
@@ -11304,6 +11383,61 @@ check("detach at isoparm (trimmed): a plane with a hole cut through the hole and
 _iso_hs, _iso_hf = store.get_surfaces(_iso_hp)[0], store.get_brep(_iso_hp).faces()[0]
 check("detach at isoparm (trimmed): the picked isoparm is drawn where it runs on the face (broken by the hole)",
       len(_iso.iso_runs(_iso_hs, _iso_hf, "U", 0.6)) == 2 and len(_iso.iso_runs(_iso_hs, _iso_hf, "U", 0.2)) == 1)
+
+
+def _iso_snap_on(s_, pts, d):
+    """Largest distance from a snap point to the surface along its isoparm (the
+    isoparm passes through the edge middle; for a CV, 0 by construction)."""
+    (u0, u1), (v0, v1) = s_.u_domain(), s_.v_domain()
+    foot = store._make_foot(s_)
+    off = 0.0
+    for f, p, k in pts:
+        if k != "mid":
+            continue
+        u, v = foot(p)
+        q = s_.evaluate(u0 + (u1 - u0) * f, v) if d == "U" else s_.evaluate(u, v0 + (v1 - v0) * f)
+        off = max(off, float(np.linalg.norm(np.array(q) - p)))
+    return off
+
+
+bpy.ops.nproto.add_primitive(kind="PLANE"); _iso_sp = ctx.active_object
+_iso_ss = store.get_surfaces(_iso_sp)[0]
+_iso_su = _iso.snap_points(_iso_ss, None, None, "U")
+_iso_sc = _iso._k()[1].surface_cvs(_iso_ss)
+_iso_gre = _iso._greville_fracs(_iso_ss, "U")
+check("detach at isoparm snaps: an untrimmed plane's U cuts snap to the middles of its two u sides (0.5) and to "
+      "every CV at its row's Greville fraction, the end rows left out (the surface's edge)",
+      sorted(round(f, 9) for f, _, k in _iso_su if k == "mid") == [0.5, 0.5]
+      and sum(k == "cv" for _, _, k in _iso_su) == (int(_iso_sc["count_u"]) - 2) * int(_iso_sc["count_v"])
+      and {round(f, 9) for f, _, k in _iso_su if k == "cv"} == {round(g, 9) for g in _iso_gre[1:-1]}
+      and not any(k == "cv" for _, _, k in _iso.snap_points(_iso_ss, None, None, "U", cvs=False)),
+      str(sorted({round(f, 4) for f, _, _ in _iso_su})))
+_iso_hb = store.get_brep(_iso_hp)
+_iso_hm = {d: _iso.snap_points(_iso_hs, _iso_hb, _iso_hf, d) for d in "UV"}
+check("detach at isoparm snaps: on a plane with a hole every edge middle (the hole's too) lies on the isoparm "
+      "it snaps to", all(_iso_snap_on(_iso_hs, _iso_hm[d], d) < 1e-9 for d in "UV")
+      and all(sum(k == "mid" for _, _, k in _iso_hm[d]) == 3 for d in "UV"),
+      str({d: [round(f, 4) for f, _, k in _iso_hm[d] if k == "mid"] for d in "UV"}))
+bpy.ops.nproto.add_primitive(kind="PLANE"); _iso_kp = ctx.active_object
+bpy.ops.curve.primitive_bezier_circle_add(radius=0.3, location=(0.2, 0.1, 1)); _c_ = ctx.active_object
+bpy.ops.nproto.trim(target=_iso_kp.name, cutters=ins((_c_, "S0")), ref_point=(0.2, 0.1, 0), normal=(0, 0, 1),
+                    view_dir=(0, 0, -1), action="KEEP")
+bpy.data.objects.remove(_c_)
+_iso_kb = store.get_brep(_iso_kp)
+_iso_kf = {round(f, 4) for f, _, k in _iso.snap_points(store.get_surfaces(_iso_kp)[0], _iso_kb, _iso_kb.faces()[0], "U")
+           if k == "cv"}
+check("detach at isoparm snaps: CV rows whose isoparm the trim cuts away (a small disc kept from a plane) do not "
+      "snap", bool(_iso_kf) and all(0.44 < f < 0.76 for f in _iso_kf), str(sorted(_iso_kf)))
+bpy.ops.nproto.add_primitive(kind="CYLINDER"); _iso_cy = ctx.active_object
+_iso_cs = store.get_surfaces(_iso_cy)[0]
+_iso_cu = _iso.snap_points(_iso_cs, None if store.is_natural(_iso_cy) else store.get_brep(_iso_cy),
+                           None if store.is_natural(_iso_cy) else store.get_brep(_iso_cy).faces()[0], "U")
+check("detach at isoparm snaps: on a closed direction (a cylinder's u) the seam's CV row snaps (a cut there "
+      "opens the seam) and every fraction is in [0, 1)",
+      any(f == 0.0 and k == "cv" for f, _, k in _iso_cu) and all(0.0 <= f < 1.0 for f, _, _ in _iso_cu),
+      str(sorted({round(f, 4) for f, _, _ in _iso_cu})))
+for _o in (_iso_sp, _iso_kp, _iso_cy):
+    bpy.data.objects.remove(_o)
 bpy.ops.nproto.add_primitive(kind="DISK"); _iso_disk = ctx.active_object
 _out = _iso.detach_trimmed(store.get_brep(_iso_disk), [0.5], [0.5])
 _ae, _off = _iso_trim_err(store.get_brep(_iso_disk), _out, [0.5], [0.5])

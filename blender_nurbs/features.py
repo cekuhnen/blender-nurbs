@@ -240,13 +240,14 @@ def _curve_ends(c):
     return np.array(c.evaluate(t0), float), np.array(c.evaluate(t1), float)
 
 
-def chain_side(side):
+def chain_side(side, mixed=False):
     """The pieces of a side in order along it: [(obj, ref, reversed)], each
-    piece's end on the next one's start. Raises when they do not touch."""
+    piece's end on the next one's start. Raises when they do not touch.
+    mixed: curves and surface edges may share the chain (Extrude's profile)."""
     if len(side) == 1:
         return [(side[0][0], side[0][1], False)]
     kinds = {is_surface_edge(r) and o.type != 'CURVE' for o, r in side}
-    if len(kinds) > 1:
+    if len(kinds) > 1 and not mixed:
         raise ValueError("a loft side is either surface edges or curves, not both")
     ends = [_curve_ends(input_curve(o, r)) for o, r in side]
     allp = np.vstack([e for pair in ends for e in pair])
@@ -277,10 +278,10 @@ def chain_side(side):
     return [(side[j][0], side[j][1], r) for j, r in order]
 
 
-def side_curve(side):
+def side_curve(side, mixed=False):
     """One exact kernel curve along a whole loft side (world space)."""
     sm, ext = _k()
-    chain = chain_side(side)
+    chain = chain_side(side, mixed)
     if len(chain) == 1:
         o, r, _ = chain[0]
         return input_curve(o, r)
@@ -1351,7 +1352,7 @@ def extrude_direction(obj, curve, p):
     preview uses it too, so the preview and the result always agree."""
     mode = p.get("direction", "NORMAL")
     if mode == "NORMAL":
-        d, _ = geom.curve_plane_normal(curve)
+        d = geom.profile_normal(curve, p.get("normal_hint"))
         if d.length < 0.5:
             d = Vector((0, 0, 1))
     elif mode == "VECTOR":
@@ -1363,18 +1364,70 @@ def extrude_direction(obj, curve, p):
     return geom.tilt_direction(d.normalized(), float(p.get("tilt", 0.0)), float(p.get("tilt_azimuth", 0.0)))
 
 
+def profile_groups(inputs):
+    """The inputs of one Extrude in groups that touch end to end (curves and
+    surface edges alike), each in the order given; a group that branches
+    (three ends at one point) comes apart into single inputs."""
+    if len(inputs) < 2:
+        return [list(inputs)]
+    ends = [_curve_ends(input_curve(o, r)) for o, r in inputs]
+    allp = np.vstack([e for pair in ends for e in pair])
+    tol = 1e-4 * (float(np.linalg.norm(np.ptp(allp, axis=0))) or 1.0)
+    parent = list(range(len(inputs)))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    for i in range(len(inputs)):
+        for j in range(i + 1, len(inputs)):
+            if min(np.linalg.norm(a - b) for a in ends[i] for b in ends[j]) <= tol:
+                parent[root(i)] = root(j)
+    groups = {}
+    for i in range(len(inputs)):
+        groups.setdefault(root(i), []).append(i)
+    out = []
+    for idx in sorted(groups.values()):
+        side = [inputs[i] for i in idx]
+        try:
+            chain_side(side, mixed=True)
+            out.append(side)
+        except ValueError:
+            out += [[x] for x in side]
+    return out
+
+
+def profile_curve(inputs):
+    """One exact kernel curve through inputs that touch end to end (a closed
+    chain ends exactly where it starts), or the single input's curve."""
+    if len(inputs) == 1:
+        return input_curve(*inputs[0])
+    _, ext = _k()
+    c = side_curve(inputs, mixed=True)
+    d = ext.curve_cvs(c)
+    P = np.array(d["points"], float)
+    size = float(np.linalg.norm(np.ptp(P, axis=0))) or 1.0
+    gap = float(np.linalg.norm(P[0] - P[-1]))
+    if 0.0 < gap <= 1e-4 * size:          # closed within the chaining tolerance: one point at the seam
+        P[-1] = P[0]
+        return ext.curve_from_cvs(int(d["degree"]), [tuple(map(float, x)) for x in P],
+                                  [float(k) for k in d["knots"]], d.get("weights") or None)
+    return c
+
+
 @builder("extrude")
 def build_extrude(inputs, p):
     sm, _ = _k()
     obj, ref = inputs[0]
-    curve = input_curve(obj, ref)
+    curve = profile_curve(inputs)
     d = extrude_direction(obj, curve, p)
     h = float(p.get("distance", 1.0))
     draft = float(p.get("draft", 0.0))
     if abs(draft) > 1e-9:
         # Multi-Draft: height h along d, the far edge moved outward by h tan(draft)
         return geom.draft_extrude(curve, d, h, draft, flip=bool(p.get("draft_flip")),
-                                  symmetric=bool(p.get("symmetric")))
+                                  symmetric=bool(p.get("symmetric")), centre=p.get("draft_centre"))
     vec = d * h
     if p.get("symmetric"):
         curve = geom.translate_curve(curve, tuple(-vec))

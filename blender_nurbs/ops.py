@@ -1029,7 +1029,7 @@ class _CurveTool(PickMixin):
         return _curve_inputs(context)
 
 
-def _smooth_draft_normals(P, d, closed, flip):
+def _smooth_draft_normals(P, d, closed, flip, centre=None):
     """Outward directions at samples of a smooth curve, from its tangents
     (second-order differences, also at open ends): a chord's normal at an
     end is off by half the turn of the last chord. Signed as _draft_normals."""
@@ -1039,13 +1039,13 @@ def _smooth_draft_normals(P, d, closed, flip):
         T = np.gradient(P, axis=0, edge_order=2)
     n = np.cross(T, d)
     n /= np.linalg.norm(n, axis=1, keepdims=True) + 1e-300
-    rel = P - P.mean(axis=0)
+    rel = P - geom.draft_reference(P, closed, centre)
     rel -= np.outer(rel @ d, d)
     sgn = 1.0 if np.sum(n * rel) >= 0 else -1.0
     return -sgn * n if flip else sgn * n
 
 
-def extrude_rows(P, d, h, draft=0.0, flip=False, symmetric=False, smooth=True):
+def extrude_rows(P, d, h, draft=0.0, flip=False, symmetric=False, smooth=True, centre=None):
     """Rows of points of the extrude of samples P (world): what build_extrude
     makes, for its live preview -- the far row moved by h along d and, with a
     draft, outward by h tan(draft) as draft_extrude does. smooth=False: P are
@@ -1056,7 +1056,7 @@ def extrude_rows(P, d, h, draft=0.0, flip=False, symmetric=False, smooth=True):
     if abs(draft) > 1e-9:
         closed = len(P) > 2 and np.linalg.norm(P[0] - P[-1]) < 1e-7 * (np.ptp(P, axis=0).max() or 1.0)
         normals = _smooth_draft_normals if smooth else geom._draft_normals
-        nrm = normals(P[:-1] if closed else P, d, closed, flip)
+        nrm = normals(P[:-1] if closed else P, d, closed, flip, centre)
         if closed:
             nrm = np.vstack([nrm, nrm[:1]])
         return geom._draft_rows(P, nrm, d, h, h * np.tan(np.radians(draft)), symmetric)
@@ -1073,6 +1073,7 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
     op_name = "extrude"
     start_value = 0.0      # the arrow stands on the curve: nothing is extruded until it is dragged
+    pick_max = 256         # a click takes one curve or edge; Shift+click keeps picking, Enter finishes
 
     distance: FloatProperty(name="Distance", default=1.0, unit='LENGTH',
                             description="Height along the direction (with draft: the far edge also moves outward)")
@@ -1088,11 +1089,62 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
     draft_flip: BoolProperty(name="Flip Draft", default=False, description="Draft towards the inside")
     symmetric: BoolProperty(name="Symmetric", default=False,
                             description="Both ways; with draft, both sides open away from the curve (parting line)")
+    chain: BoolProperty(name="Chain", default=True,
+                        description="Curves and edges that touch end to end make one surface (a draft mitres "
+                                    "their corners); off: one surface each")
+    normal_hint: FloatVectorProperty(subtype='XYZ', size=3, default=(0.0, 0.0, 1.0), options={'HIDDEN'},
+                                     description="Curve Normal of a straight curve, and the side a planar "
+                                                 "curve's normal points to: the work plane's normal")
 
     def params(self):
         return {"distance": self.distance, "direction": self.direction, "dir_vec": list(self.dir_vec),
                 "tilt": self.tilt, "tilt_azimuth": self.tilt_azimuth, "draft": self.draft,
-                "draft_flip": self.draft_flip, "symmetric": self.symmetric}
+                "draft_flip": self.draft_flip, "symmetric": self.symmetric,
+                "normal_hint": [float(x) for x in self.normal_hint]}
+
+    def invoke(self, context, event):
+        from . import workplanes
+        fr = workplanes.active_frame(context.scene)
+        self.normal_hint = [float(x) for x in fr[3]] if fr is not None else (0.0, 0.0, 1.0)
+        return super().invoke(context, event)
+
+    def _groups(self, ins):
+        """The surfaces to make: inputs that touch end to end together (Chain)."""
+        return features.profile_groups(ins) if self.chain else [[x] for x in ins]
+
+    @staticmethod
+    def _centre(curves):
+        """Where open pieces extruded together draft away from: the middle of all
+        of them (None for one profile: it uses its own centre)."""
+        if len(curves) < 2:
+            return None
+        P = np.vstack([geom.sample_curve(c, 33) for c in curves])
+        return [float(x) for x in 0.5 * (P.min(axis=0) + P.max(axis=0))]
+
+    def execute(self, context):
+        if not _kernel_ok(self):
+            return {'CANCELLED'}
+        try:
+            groups = self._groups(_decode_inputs(self.inputs))
+            centre = self._centre([features.profile_curve(g) for g in groups])
+        except Exception as exc:
+            self.report({'ERROR'}, f"{self.bl_label} failed: {exc}")
+            return {'CANCELLED'}
+        made, failed = [], []
+        for g in groups:           # one profile that fails doesn't take the others with it
+            p = self.params()
+            if centre is not None:
+                p["draft_centre"] = centre
+            try:
+                made.append(_make_result(context, self.bl_label, self.op_name, g, p))
+            except Exception as exc:
+                failed.append(f"{g[0][0].name}: {exc}")
+        if failed:
+            self.report({'ERROR'} if not made else {'WARNING'}, f"{self.bl_label} failed on " + "; ".join(failed))
+        if not made:
+            return {'CANCELLED'}
+        _select_only(context, made)
+        return {'FINISHED'}
 
     # -- the live value stage (valuedrag.py) ----------------------------------
     drag_fields = ("distance", "draft")
@@ -1103,8 +1155,8 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
         self._ex = []
         from .kernel import load
         ext = load().blender_ext
-        for obj, ref in _decode_inputs(self.inputs):
-            curve = features.input_curve(obj, ref)
+        for g in self._groups(_decode_inputs(self.inputs)):
+            obj, curve = g[0][0], features.profile_curve(g)
             cv = ext.curve_cvs(curve)
             if cv["degree"] == 1 and not cv.get("weights"):     # a polyline: its corners, exact
                 self._ex.append((obj, curve, np.array(cv["points"], float), False))
@@ -1112,6 +1164,7 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
                 self._ex.append((obj, curve, geom.sample_curve(curve, 97), True))
         if not self._ex:
             return False
+        self._ctr = self._centre([c for _, c, _, _ in self._ex])
         # the handles stand on the first curve: the arrow where it was clicked
         # (when it was picked by a click), else halfway along it
         obj, curve, P, smooth = self._ex[0]
@@ -1147,11 +1200,11 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
         obj, curve, P, smooth = self._ex[0]
         S, k, closed = self._S, self._kd, self._closed
         if smooth:
-            nrm = _smooth_draft_normals(S[:-1] if closed else S, d, closed, self.draft_flip)
+            nrm = _smooth_draft_normals(S[:-1] if closed else S, d, closed, self.draft_flip, self._ctr)
             return nrm[k % len(nrm)]
         # a polyline: the normal of the side the foot is on, signed as the corners' mitres
         cl = len(P) > 2 and np.linalg.norm(P[0] - P[-1]) < 1e-7 * (np.ptp(P, axis=0).max() or 1.0)
-        mit = geom._draft_normals(P[:-1] if cl else P, d, cl, self.draft_flip)
+        mit = geom._draft_normals(P[:-1] if cl else P, d, cl, self.draft_flip, self._ctr)
         if cl:
             mit = np.vstack([mit, mit[:1]])
         q = S[k]
@@ -1179,7 +1232,7 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
     def drag_preview(self):
         lines, tris = [], []
         for (obj, curve, P, smooth), d in zip(self._ex, self._dirs()):
-            rows = extrude_rows(P, d, self.distance, self.draft, self.draft_flip, self.symmetric, smooth)
+            rows = extrude_rows(P, d, self.distance, self.draft, self.draft_flip, self.symmetric, smooth, self._ctr)
             L, T = ruled_preview(rows, ribs=8 if smooth else len(P) - 1)
             lines += L
             tris.append(T)
@@ -1203,6 +1256,9 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
             self.symmetric = not self.symmetric
         elif ch == "d":
             self.draft_flip = not self.draft_flip
+        elif ch == "c" and len(_decode_inputs(self.inputs)) > 1:
+            self.chain = not self.chain
+            self.drag_setup(bpy.context, None)
         else:
             return False
         return True
@@ -1214,7 +1270,8 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
         cur = {"NORMAL": "normal"}.get(self.direction, self.direction.replace("LOCAL_", "").lower())
         return [("Direction", [hints.cycle("N X Y Z", ["normal", "x", "y", "z"], cur),
                                hints.key("F", "flip"), hints.toggle("S", "symmetric", self.symmetric)]),
-                ("Draft", [hints.toggle("D", "inward", self.draft_flip)])]
+                ("Draft", [hints.toggle("D", "inward", self.draft_flip)]
+                 + ([hints.toggle("C", "chain", self.chain)] if len(_decode_inputs(self.inputs)) > 1 else []))]
 
     def drag_state(self):
         names = {"NORMAL": "Curve Normal", "VECTOR": "Vector"}

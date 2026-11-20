@@ -9,7 +9,7 @@ import numpy as np
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
 from mathutils import Vector
 
-from . import draw, features, geom, store, sweeps
+from . import draw, features, geom, store, sweeps, workplanes
 from . import hints
 from .kernel import load as load_kernel
 from .ops import AskValue, PickMixin, _decode_inputs, _encode_inputs, _kernel_ok, _select_only
@@ -429,8 +429,10 @@ class NPROTO_OT_project_curve(bpy.types.Operator):
     bl_label = "Project Curve"
     bl_options = {'REGISTER', 'UNDO'}
 
-    direction: EnumProperty(name="Direction", items=[("VIEW", "View", ""), ("X", "World X", ""), ("Y", "World Y", ""),
-                                                     ("Z", "World Z", "")], default="VIEW")
+    direction: EnumProperty(name="Direction", items=[
+        ("WORKPLANE", "Work Plane", "Along the active work plane's normal (World Z when the World is active)"),
+        ("VIEW", "View", "Along the view direction"),
+        ("X", "World X", ""), ("Y", "World Y", ""), ("Z", "World Z", "")], default="WORKPLANE")
     view_dir: bpy.props.FloatVectorProperty(subtype='XYZ', options={'HIDDEN'}, default=(0, 0, -1))
 
     def invoke(self, context, event):
@@ -445,11 +447,25 @@ class NPROTO_OT_project_curve(bpy.types.Operator):
         if not (_kernel_ok(self) and store.is_nurbs(surf) and crv):
             self.report({'WARNING'}, "Select curves, then the surface (active)")
             return {'CANCELLED'}
-        d = Vector(self.view_dir) if self.direction == "VIEW" else Vector(
-            {"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}[self.direction])
+        if self.direction == "WORKPLANE":
+            fr = workplanes.active_frame(context.scene)
+            d = Vector((0, 0, -1)) if fr is None else -Vector(tuple(map(float, fr[3])))
+        elif self.direction == "VIEW":
+            d = Vector(self.view_dir)
+        else:
+            d = Vector({"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}[self.direction])
         try:
             c = _new_curves(context, "Projected", "project_curve",
                             [(o, "S0") for o in crv] + [(surf, "SURF")], {"dir": list(d.normalized())})
+        except sweeps.ProjectMiss:
+            # FINISHED with nothing made keeps Adjust Last Operation open, so
+            # the direction can be changed right there.
+            along = {"WORKPLANE": "the work plane normal", "VIEW": "the view"}.get(
+                self.direction, "World " + self.direction)
+            self.report({'WARNING'}, f"Project: the {'curve misses' if len(crv) == 1 else 'curves miss'} "
+                                     f"the surface along {along}; pick another Direction "
+                                     "in Adjust Last Operation")
+            return {'FINISHED'}
         except Exception as exc:
             self.report({'ERROR'}, f"Project failed: {exc}")
             return {'CANCELLED'}

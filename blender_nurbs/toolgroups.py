@@ -70,7 +70,8 @@ GROUPS = (
         )),
         ("From Surfaces", (
             (_t("nproto.offset", icon='MOD_OFFSET'), _t("nproto.thicken", icon='MOD_SOLIDIFY')),
-            (_t("nproto.flange", icon='MOD_SOLIDIFY'),),
+            (_t("nproto.flange", icon='MOD_SOLIDIFY'),
+             ("nproto.pattern", "Pattern", 'MOD_ARRAY', {"auto": True})),     # linear / circular / path: M
             (_t("nproto.from_blender_surface", icon='SURFACE_NSURFACE'),),
         )),
     )),
@@ -101,11 +102,6 @@ GROUPS = (
         )),
         ("Fillets", (
             (_t("nproto.fillet", "Surface Fillet", 'MOD_BEVEL'), _t("nproto.edge_fillet", icon='MOD_BEVEL')),
-        )),
-        ("Pattern", (
-            (("nproto.pattern", "Linear Pattern", 'MOD_ARRAY', {"mode": "LINEAR"}),
-             ("nproto.pattern", "Circular Pattern", 'DRIVER_ROTATIONAL_DIFFERENCE', {"mode": "CIRCULAR"})),
-            (("nproto.pattern", "Path Pattern", 'CURVE_PATH', {"mode": "PATH"}),),
         )),
         ("Boolean (solids)", (
             (("nproto.boolean", "Union", 'SELECT_EXTEND', {"operation": "UNION"}),

@@ -1,5 +1,5 @@
 """Clickable continuity labels (Free / G0 / G1 / G2) on the edges of selected
-history surfaces: Square, Loft, Loft Rails and Blend Curve.
+history surfaces: Square, Loft, Loft Rails, Blend Curve, Patch and Dome.
 
 Each label sits at the middle of the input it belongs to (Blend Curve: at the
 end it blends from). A click steps that edge's setting to the next value
@@ -20,7 +20,7 @@ from mathutils import Vector
 
 from . import features, store
 
-OPS = ("square", "loft", "loft_rails", "blend_curve", "patch")
+OPS = ("square", "loft", "loft_rails", "blend_curve", "patch", "dome")
 STACK_OPS = ("surface_align", "match_surface")   # history steps with a label per edge
 ORDER = ("FREE", "G0", "G1", "G2", "G3")
 SHORT = {"FREE": "Free", "G0": "G0", "G1": "G1", "G2": "G2", "G3": "G3"}
@@ -102,6 +102,12 @@ def _compute_base(obj):
             out.append({"pos": _mid(src, ref), "param": f"pc:{i}", "value": cur if cur in vals else vals[0],
                         "values": vals, "name": f"{src.name} {ref}" + (" (guide)" if g else ""), "src": (src, ref),
                         "guide": g, "tension": float(tens[i]) if i < len(tens) and not g else 1.0})
+    elif op == "dome":               # one label on the rim it closes
+        src, ref = ins[0]
+        vals = _edge_values(src, ref)
+        cur = p.get("dome_cont", "G2")
+        out.append({"pos": _mid(src, ref), "param": "dome_cont", "value": cur if cur in vals else vals[0],
+                    "values": vals, "name": f"{src.name} {ref}", "src": (src, ref)})
     elif op == "loft":
         groups = features.loft_sides(ins, p)
         nr = features.loft_rail_count(ins, p)

@@ -57,10 +57,6 @@ everything built from it rebuilds.
 
 - Join Curves, Unjoin Curves, Trim Curves, Split Curves
 - Rebuild Curve, Extend Curve, Align Curve
-- **Pattern:** Linear, Circular and Path Pattern of curves and NURBS objects: real copies with their exact
-  geometry (not Blender's mesh-only Array), on a snapping widget: a row, grid or block along its X / Y / Z (turned
-  to any angle), around its axis, or along a curve or edge; number keys set the count; with history the copies
-  follow their source and path
 
 ### Create Surfaces
 
@@ -72,6 +68,10 @@ everything built from it rebuilds.
 - **Fill a gap:** Boundary, Square, Patch, Dome
 - **From surfaces:** Offset, Thicken, Flange (from free edges or curves on a surface: at an angle to the surface,
   or a constant-draft surface to a pull direction; the base is the edge exactly), Convert Blender Surface
+- **Pattern:** one button for linear, circular and path patterns (**M** switches) of curves and NURBS objects: real copies with their exact
+  geometry (not Blender's mesh-only Array), on a snapping widget: a row, grid or block along its X / Y / Z (turned
+  to any angle), around its axis, or along a curve or edge; number keys set the count; with history the copies
+  follow their source and path
 
 ### Surface Edit
 
@@ -125,8 +125,9 @@ Exchange exact geometry with your CAD app: **File → Import / Export → NURBS 
 
 - **Import:** AP203, AP214 and AP242 solids and surface models, as exact trimmed NURBS,
   with units and assembly placements converted
-- **Export:** AP214 with exact B-spline surfaces and full B-rep topology; closed bodies
-  as solids; in mm, cm or m
+- **Export:** AP214 with exact B-spline surfaces and full B-rep topology; true cylinders,
+  cones, planes, circles and lines as STEP's own analytic entities; closed bodies as solids; in
+  mm, cm or m
 
 ## Learn more
 

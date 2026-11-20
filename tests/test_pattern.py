@@ -310,6 +310,39 @@ except RuntimeError:
     r = {'CANCELLED'}
 check("path: no path given is refused", r == {'CANCELLED'})
 
+# --- the live preview: one cache over a stage whose count and spacing change -----------
+from types import SimpleNamespace
+pth = (CIR, "S0")
+stage = {}
+base = dict(mode="PATH", count=5, distance=0.0, space="EXTENT", rotate=True)
+n5 = len(pattern.copy_transforms(base, PB, pth, stage))
+n6 = pattern.copy_transforms(dict(base, count=6), PB, pth, stage)
+fresh = pattern.copy_transforms(dict(base, count=6), PB, pth, {})
+check("path preview: a new count in the same stage gives its copies (number keys)",
+      n5 == 4 and len(n6) == 5 and max(np.abs(a[1] - b[1]).max() for a, b in zip(n6, fresh)) < 1e-12)
+o1 = pattern.copy_transforms(dict(base, count=4, space="SPACING", distance=1.0), PB, pth, stage)
+o2 = pattern.copy_transforms(dict(base, count=4, space="SPACING", distance=2.0), PB, pth, stage)
+check("path preview: a new spacing in the same stage moves the copies",
+      np.linalg.norm(o2[0][1][:3, 3] - o1[0][1][:3, 3]) > 0.1)
+
+def fake_op(p, src, path=None):
+    M = pattern.world_matrix(src)
+    return SimpleNamespace(params=lambda: p, _path=lambda: path, mode=p["mode"], _ptmp={},
+                           _pv=[(src, pattern._preview_lines(src, M), pattern._preview_tris(src, M),
+                                 pattern._box(src, M))])
+nt = len(pattern._preview_tris(PB, pattern.world_matrix(PB)))
+pv = pattern.NPROTO_OT_pattern.drag_preview(fake_op(
+    dict(mode="PATH", count=6, distance=0.0, space="EXTENT", rotate=True), PB, pth))
+check("path preview: count 6 draws 5 shaded copies", len(pv["tris"]) == 5 * nt, f"{len(pv['tris'])} {nt}")
+p3 = dict(v=2, mode="LINEAR", space="SPACING", count_x=3, distance_x=1.0, count_y=2, distance_y=1.0,
+          count_z=2, distance_z=1.0, frame_x=(1, 0, 0), frame_z=(0, 0, 1), turn=0.0)
+pv = pattern.NPROTO_OT_pattern.drag_preview(fake_op(p3, PB))
+check("linear preview: three directions (11 copies) stay shaded", len(pv["tris"]) == 11 * nt, f"{len(pv['tris'])}")
+big = dict(p3, count_x=40, count_y=40, count_z=10)
+pv = pattern.NPROTO_OT_pattern.drag_preview(fake_op(big, PB))
+check("linear preview: over the triangle budget each copy is shaded as its box (not wireframe)",
+      len(pv["tris"]) == 15999 * 36, f"{len(pv['tris'])}")
+
 
 # the original lists the patterns made from it (the Feature panel: Edit Pattern from there too)
 pf = pattern.patterns_from(BX, ctx.scene.objects)
@@ -386,8 +419,17 @@ check("too many copies are refused", r == {'CANCELLED'})
 # --- the tool table lists it ---------------------------------------------------
 from blender_nurbs import toolgroups
 ids = [(t[0], (t[3] or {}).get("mode")) for t in toolgroups.tools()]
-check("toolbar: Linear, Circular and Path Pattern",
-      all(("nproto.pattern", m) in ids for m in ("LINEAR", "CIRCULAR", "PATH")))
+pt = [t for t in toolgroups.tools() if t[0] == "nproto.pattern"]
+check("toolbar: one Pattern button, in Create Surfaces (it makes objects)",
+      len(pt) == 1 and pt[0][3] == {"auto": True} and pt[0] in list(toolgroups.tools("SURFACES")))
+select(RAIL)
+check("one button: one object selected starts in the mode used last",
+      pattern.selected_path(ctx) is None and pattern.start_mode(ctx, "CIRCULAR") == "CIRCULAR")
+select(RAIL, PB)
+check("one button: a curve active with something else selected starts a path pattern along it",
+      pattern.selected_path(ctx) is RAIL and pattern.start_mode(ctx, "LINEAR") == "PATH")
+select(PB, RAIL)
+check("one button: a surface active does not", pattern.start_mode(ctx, "LINEAR") == "LINEAR")
 icons = bpy.types.UILayout.bl_rna.functions["prop"].parameters["icon"].enum_items.keys()
 check("toolbar icons exist", all(t[2] in icons for t in toolgroups.tools() if t[0] == "nproto.pattern"))
 
