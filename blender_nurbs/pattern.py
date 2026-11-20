@@ -551,6 +551,53 @@ def circle_or_line(pts):
 # History: a copy follows its source
 # --------------------------------------------------------------------------
 
+# A pattern's copies rebuild one by one, each from the same source, path and
+# surfaces: the path's samples, the surface's faces and the frames along it
+# are worked out once and shared (a cache dict per geometry signature of the
+# inputs, as copy_transform keys it within; any change of the inputs'
+# geometry or placement is a new signature).
+_BUILD_CACHE = {}
+BUILD_CACHE_MAX = 8
+
+
+def _obj_sig(obj):
+    """What a copy's transform depends on of obj: its geometry and its placement."""
+    M = world_matrix(obj).tobytes()
+    if obj.type == 'CURVE':
+        parts = []
+        for sp in obj.data.splines:
+            parts.append((sp.type, sp.order_u, sp.use_cyclic_u, sp.use_endpoint_u, sp.use_bezier_u))
+            if sp.type == 'BEZIER':
+                n = len(sp.bezier_points)
+                for attr in ("co", "handle_left", "handle_right"):
+                    a = np.empty(3 * n)
+                    sp.bezier_points.foreach_get(attr, a)
+                    parts.append(a.tobytes())
+            else:
+                a = np.empty(4 * len(sp.points))
+                sp.points.foreach_get("co", a)
+                parts.append(a.tobytes())
+        return (obj.session_uid, obj.name, M, hash(tuple(parts)))
+    if store.PROP_REV in obj:
+        return (obj.session_uid, obj.name, M, obj[store.PROP_REV])
+    me = obj.data
+    a = np.empty(3 * len(me.vertices))
+    me.vertices.foreach_get("co", a)
+    return (obj.session_uid, obj.name, M, hash(a.tobytes()))
+
+
+def build_cache(inputs):
+    """The shared cache dict for a copy with these inputs."""
+    sig = tuple((_obj_sig(o), r) for o, r in inputs)
+    c = _BUILD_CACHE.pop(sig, None)
+    if c is None:
+        c = {}
+        while len(_BUILD_CACHE) >= BUILD_CACHE_MAX:
+            del _BUILD_CACHE[next(iter(_BUILD_CACHE))]      # the least recently used
+    _BUILD_CACHE[sig] = c
+    return c
+
+
 @features.builder(OP)
 def build_pattern(inputs, p):
     """The source's geometry at copy p["index"], in world space (the copy's
@@ -558,7 +605,7 @@ def build_pattern(inputs, p):
     src, _ = inputs[0]
     path = inputs[1] if len(inputs) > 1 else None
     surfs = [o for o, r in inputs[2:] if r == "SURF"] or None
-    T = copy_transform(p, src, int(p.get("index", 1)), path, None, surfs)
+    T = copy_transform(p, src, int(p.get("index", 1)), path, build_cache(inputs) if path else None, surfs)
     if T is None:
         raise RuntimeError("the pattern has no copy %s" % p.get("index"))
     W = T @ world_matrix(src)

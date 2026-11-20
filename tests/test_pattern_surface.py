@@ -143,6 +143,82 @@ ctx.view_layer.update()
 for c in cps:
     features.rebuild(c)
 
+# the build cache: a pattern's copies share one (frames worked out once), a change makes a new one
+def surf_pts(o, n=4):
+    """World points on each face's surface (a grid over its domain): the copy's geometry as rebuilt."""
+    out = []
+    M = W(o)
+    for sf in store.get_surfaces(o):
+        (u0, u1), (v0, v1) = sf.u_domain(), sf.v_domain()
+        for i in range(n):
+            for j in range(n):
+                q = np.array(sf.evaluate(u0 + (u1 - u0) * i / (n - 1), v0 + (v1 - v0) * j / (n - 1)), float)
+                out.append(M[:3, :3] @ q + M[:3, 3])
+    return np.array(out)
+
+def fresh_err(cps, src, path, surfs):
+    """Copies as rebuilt vs. worked out afresh (no cache): the cache gives the same."""
+    P = surf_pts(src)
+    err = 0.0
+    for c in cps:
+        p_ = pattern.pattern_of(c)[1]
+        T = pattern.copy_transform(p_, src, p_["index"], path, {}, surfs)
+        err = max(err, float(np.abs(surf_pts(c) - (P @ T[:3, :3].T + T[:3, 3])).max()))
+    return err
+
+made = [0]
+_init = pattern.SurfaceFrames.__init__
+def counting(self, *a, **k):
+    made[0] += 1
+    _init(self, *a, **k)
+pattern.SurfaceFrames.__init__ = counting
+pattern._BUILD_CACHE.clear()
+SPH.location = tuple(C + np.array([0.0, 0.0, 0.5]))
+SEAM.location = (0.0, 0.0, 0.5)
+ST.location = tuple(np.array(ST.location) + np.array([0.0, 0.0, 0.5]))
+ctx.view_layer.update()
+for c in cps:
+    features.rebuild(c, force=True)
+check("cache: 11 copies rebuilt, their surface frames made once", made[0] == 1 and len(pattern._BUILD_CACHE) == 1,
+      f"{made[0]} {len(pattern._BUILD_CACHE)}")
+ang, dh, _ = on_surface_errors(cps, surfoffset.target_of([SPH]), h)
+err = fresh_err(cps, ST, (SEAM, "S0"), [SPH])
+check("cache: all moved: copies on the moved surface, as without the cache", ang < 0.05 and dh < 1e-4 and err < 1e-5,
+      f"{ang:.4f} deg {dh:.2e} {err:.2e}")
+made[0] = 0
+for c in cps:
+    features.rebuild(c, force=True)
+check("cache: rebuilt again unchanged: no frames made", made[0] == 0, f"{made[0]}")
+SPH.location = tuple(C)
+SEAM.location = (0.0, 0.0, 0.0)
+ST.location = tuple(np.array(ST.location) - np.array([0.0, 0.0, 0.5]))
+ctx.view_layer.update()
+# the path's points change (turned 15 degrees about the sphere's axis: still on it), not its matrix
+for c in cps:
+    features.rebuild(c, force=True)
+before = np.array([surf_pts(c).mean(axis=0) for c in cps])
+Rz = pattern._rotation((0, 0, 1), 15.0)
+for q in SEAM.data.splines[0].points:
+    v = np.array(q.co[:3]) - C
+    q.co = (*(C + Rz @ v), 1.0)
+ctx.view_layer.update()
+made[0] = 0
+for c in cps:
+    features.rebuild(c, force=True)
+after = np.array([surf_pts(c).mean(axis=0) for c in cps])
+n_made = made[0]
+err = fresh_err(cps, ST, (SEAM, "S0"), [SPH])
+check("cache: an edited path is a new signature: copies follow it",
+      n_made == 1 and float(np.linalg.norm(after - before, axis=1).max()) > 0.1 and err < 1e-5,
+      f"frames {n_made} moved up to {np.linalg.norm(after - before, axis=1).max():.3f} {err:.2e}")
+for q in SEAM.data.splines[0].points:
+    v = np.array(q.co[:3]) - C
+    q.co = (*(C + Rz.T @ v), 1.0)
+ctx.view_layer.update()
+for c in cps:
+    features.rebuild(c, force=True)
+pattern.SurfaceFrames.__init__ = _init
+
 # Edit Pattern keeps the surface
 prm = pattern.pattern_of(cps[0])[1]
 check("params keep orient", prm.get("orient") == "SURFACE")
@@ -210,6 +286,20 @@ r = bpy.ops.nproto.pattern(mode="PATH", count=15, path_obj=LINE.name, path_ref="
 cl2 = [c for c in copies_of(ST3) if c not in cl]
 angp, _, _ = on_surface_errors(cl2, tgp, h)
 check("curve on a panel: the path frame tilts off it (what Surface fixes)", angp > 2.0, f"{angp:.2f} deg")
+# the panel's geometry changes (a new revision, the same matrix): the copies take the new surface
+store.set_geometry(PAN, pattern._moved_surface(srf, np.diag([1.0, 1.0, 1.6, 1.0])))
+ctx.view_layer.update()
+before = [surf_pts(c) for c in cl]
+for c in cl:
+    features.rebuild(c, force=True)
+err = fresh_err(cl, ST3, (LINE, "S0"), [PAN])
+turned = max(np.abs(surf_pts(c) - b).max() for c, b in zip(cl, before))
+check("cache: a reshaped surface is a new signature: copies take it", err < 1e-5 and turned > 1e-2,
+      f"{err:.2e} changed {turned:.3f}")
+store.set_geometry(PAN, srf)
+ctx.view_layer.update()
+for c in cl:
+    features.rebuild(c, force=True)
 
 # --- a seam: the edge between two joined panels (folded 60 degrees) -------------------------------
 def zA(x, y):
