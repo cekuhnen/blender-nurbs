@@ -1454,34 +1454,60 @@ def axis_vector(name, obj=None):
 
 
 # ---------------------------------------------------------------------------
-# Blend curve between two curve ends (G0 / G1 / G2 at each side)
+# Blend curve between two curve ends (G0 / G1 / G2 / G3 at each side)
 # ---------------------------------------------------------------------------
 
-def curve_end_frame(kcurve, end):
+def curve_end_frame(kcurve, end, third=False):
     """Point, outward 1st derivative and 2nd derivative at a curve end
-    (end 0 = start, 1 = end). 'Outward' = continuing the curve past that end."""
+    (end 0 = start, 1 = end). 'Outward' = continuing the curve past that end.
+    third: also the outward 3rd derivative (exact, from the CVs)."""
     sm, _ = _k()
     t0, t1 = kcurve.parameter_range()
     d = sm.evaluate_curve(kcurve, t1 if end else t0)
     P = np.array(d["point"], float)
     D = np.array(d["tangent"], float) * (1.0 if end else -1.0)
     DD = np.array(d["curvature"], float)
-    return P, D, DD
+    if not third:
+        return P, D, DD
+    return P, D, DD, curve_derivs(kcurve, t1 if end else t0, 3)[3] * (1.0 if end else -1.0)
+
+
+def curve_derivs(kcurve, t, nd=3):
+    """[C, C', ..., C^(nd)] at t, exact from the curve's CVs (rational: the
+    quotient rule)."""
+    from math import comb
+    from . import surfeval
+    _, ext = _k()
+    d = ext.curve_cvs(kcurve)
+    p, U = int(d["degree"]), np.asarray(d["knots"], float)
+    P = np.asarray(d["points"], float)
+    w = np.asarray(d["weights"], float) if d.get("weights") else np.ones(len(P))
+    span, N = surfeval.basis_ders(U, p, len(P), np.array([float(t)]), nd)
+    Pw = np.c_[P * w[:, None], w][int(span[0]) - p:int(span[0]) + 1]
+    A = [N[0, k] @ Pw for k in range(nd + 1)]
+    C = []
+    for k in range(nd + 1):
+        v = A[k][:3] - sum(comb(k, i) * A[i][3] * C[k - i] for i in range(1, k + 1))
+        C.append(v / A[0][3])
+    return C
 
 
 def blend_curve_cvs(frame_a, frame_b, cont_a="G1", cont_b="G1", w_a=1.0, w_b=1.0, c_a=0.0, c_b=0.0):
     """CVs of a single Bezier-span blend from end A to end B.
 
-    Same construction as the G1/G2 blend loft: P1 = P0 + w*L/n * T (G1),
+    Same construction as the G1/G2/G3 blend loft: P1 = P0 + w*L/n * T (G1),
     P2 = 2 P1 - P0 + (lam^2 C'' + c*L*T) / (n(n-1)) (G2) with lam = w*L/|C'|,
-    where L = distance between the ends and n = degree = 1 + kA + kB."""
-    PA, DA, DDA = frame_a
-    PB, DB, DDB = frame_b
+    P3 = 3 P2 - 3 P1 + P0 + (lam^3 C''' + 3 lam (c L / |C'|) C'') / (n(n-1)(n-2))
+    (G3: the curve reparameterised, f' = lam, f'' = c L / |C'|, f''' = 0),
+    where L = distance between the ends and n = degree = 1 + kA + kB. A
+    frame is (P, C', C'') or, for G3, (P, C', C'', C''')."""
+    PA, DA, DDA = frame_a[:3]
+    PB, DB, DDB = frame_b[:3]
     ka, kb = CONT_ORDER[cont_a], CONT_ORDER[cont_b]
     n = 1 + ka + kb
     L = float(np.linalg.norm(PB - PA)) or 1.0
 
-    def side(P, D, DD, k, w, c):
+    def side(P, D, DD, D3, k, w, c):
         rows = [P]
         if k == 0:
             return rows
@@ -1489,14 +1515,19 @@ def blend_curve_cvs(frame_a, frame_b, cont_a="G1", cont_b="G1", w_a=1.0, w_b=1.0
         T = D / dn
         P1 = P + (w * L / n) * T
         rows.append(P1)
+        lam = w * L / dn
         if k >= 2:
-            lam = w * L / dn
             P2 = 2 * P1 - P + (lam * lam * DD + c * L * T) / (n * (n - 1))
             rows.append(P2)
+        if k >= 3:
+            if D3 is None:
+                raise ValueError("G3 needs the curve's third derivative")
+            S3 = lam ** 3 * D3 + 3.0 * lam * (c * L / dn) * DD
+            rows.append(3 * P2 - 3 * P1 + P + S3 / (n * (n - 1) * (n - 2)))
         return rows
 
-    a = side(PA, DA, DDA, ka, w_a, c_a)
-    b = side(PB, DB, DDB, kb, w_b, c_b)
+    a = side(PA, DA, DDA, frame_a[3] if len(frame_a) > 3 else None, ka, w_a, c_a)
+    b = side(PB, DB, DDB, frame_b[3] if len(frame_b) > 3 else None, kb, w_b, c_b)
     return n, [tuple(map(float, p)) for p in a + b[::-1]]
 
 

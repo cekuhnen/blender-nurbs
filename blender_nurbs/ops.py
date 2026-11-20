@@ -32,6 +32,11 @@ LOFT_CONT_ITEMS = CONT_ITEMS + [
     ("G3", "G3 Curvature Rate", "Curvature continuous, and the curvature changes across the edge at the source "
                                 "surface's rate (a source with a CV net; up to G2 with rails)"),
 ]
+# Blend Curve's ends: G3 too (the curve's own curvature rate carried on)
+BLEND_CONT_ITEMS = CONT_ITEMS + [
+    ("G3", "G3 Curvature Rate", "Curvature continuous, and the curvature changes at the curve's rate there "
+                                "(torsion too: the curve's third derivative is carried on)"),
+]
 AXIS_ITEMS = [
     ("X", "World X", ""), ("Y", "World Y", ""), ("Z", "World Z", ""),
     ("LOCAL_X", "Local X", ""), ("LOCAL_Y", "Local Y", ""), ("LOCAL_Z", "Local Z", ""),
@@ -652,13 +657,154 @@ CHAIN_ITEMS = [("TANGENT", "Tangent Chain", "A click picks the edge and every ed
                ("SINGLE", "Single Edge", "A click picks just that edge (Shift+click more edges that touch it)")]
 
 
-class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
+BODY_ITEMS = [("SURFACE", "Surface", "The walls only: an open surface"),
+              ("NEW", "New Solid", "A closed solid: the walls with flat caps on the open ends "
+                                   "(a profile inside another is its hole)"),
+              ("JOIN", "Join", "The solid added to the body it touches"),
+              ("CUT", "Cut", "The solid cut out of the body it overlaps"),
+              ("INTERSECT", "Intersect", "Only what the solid and the body share")]
+BODY_CYCLE = [k for k, _, _ in BODY_ITEMS]
+BODY_BOOL = {"JOIN": "UNION", "CUT": "DIFFERENCE", "INTERSECT": "INTERSECTION"}
+
+
+def _is_solid(obj):
+    try:
+        return bool(store.get_brep(obj).is_manifold_solid())
+    except Exception:
+        return False
+
+
+def _world_box(obj):
+    lo, hi = store.get_brep(obj).bounding_box()
+    M = geom.world_matrix(obj)
+    P = np.array([M @ Vector((x, y, z)) for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
+    return P.min(axis=0), P.max(axis=0)
+
+
+class SolidBody:
+    """Body option of Extrude, Revolve, Sweep, Pipe and Loft: the surface as before, or a closed
+    solid (walls and flat caps) kept as a new body or joined to, cut from or
+    intersected with a target body (the existing Boolean, history kept)."""
+    body: EnumProperty(name="Body", items=BODY_ITEMS, default="SURFACE",
+                       description="Surface, or a closed solid: new, or joined to / cut from / "
+                                   "intersected with a body")
+    target: StringProperty(name="Target", default="", options={'SKIP_SAVE'},
+                           description="The body to join to, cut or intersect (a closed NURBS solid). "
+                                       "Empty: the selected solid, else the one the new solid overlaps most")
+
+    def body_prefer(self, context):
+        """A closed solid selected with the profiles: the target the user means."""
+        self._prefer = [o.name for o in context.selected_objects if store.is_nurbs(o) and _is_solid(o)]
+
+    def find_target(self, context, tools):
+        if self.target:
+            o = bpy.data.objects.get(self.target)
+            if o is not None and o not in tools and store.is_nurbs(o) and _is_solid(o):
+                return o
+        from .cvs import is_cage
+        cands = [o for o in context.visible_objects
+                 if o not in tools and store.is_nurbs(o) and not is_cage(o) and _is_solid(o)]
+        if not cands:
+            return None
+        boxes = [_world_box(t) for t in tools]
+        lo, hi = np.min([b[0] for b in boxes], axis=0), np.max([b[1] for b in boxes], axis=0)
+        pad = 1e-3 * (float(np.linalg.norm(hi - lo)) or 1.0)
+        best = None
+        for o in cands:
+            a, b = _world_box(o)
+            ext_ = np.minimum(hi, b) - np.maximum(lo, a) + pad     # > 0 on every axis: the boxes meet
+            if (ext_ <= 0).any():
+                continue
+            score = (o.name in getattr(self, "_prefer", []), float(np.prod(ext_)))
+            if best is None or score > best[0]:
+                best = (score, o)
+        return best[1] if best else None
+
+    def solid_groups(self, ins):
+        """The inputs of each solid to make: Extrude / Revolve one per outline
+        (with its holes); Sweep and Loft all inputs together, Pipe one per curve."""
+        return features.solid_regions(ins)
+
+    def make_solids(self, context, ins, params):
+        """(objects made, failure texts): a solid per group of inputs,
+        then Join / Cut / Intersect with the target."""
+        from . import jobs
+        made, failed = [], []
+        groups = self.solid_groups(ins)
+        for reg in groups:
+            try:
+                made.append(_make_result(context, self.bl_label, self.op_name, reg, dict(params, caps=True)))
+            except Exception as exc:
+                failed.append(f"{reg[0][0].name}: {exc}" if len(groups) > 1 else str(exc))
+        if not made or self.body == "NEW":
+            return made, failed
+        word = {"JOIN": "join to", "CUT": "cut", "INTERSECT": "intersect with"}[self.body]
+        target = self.find_target(context, made)
+        if target is None:
+            self.report({'WARNING'}, f"No closed solid to {word} (none overlaps the new solid): "
+                                     "kept as a new solid")
+            return made, failed
+        self.target = target.name
+        from .ops_trim import combine_solids
+        name = target.name
+        hist = features.history_enabled(context)
+        if hist:                       # the result keeps the body's name; the hidden input is the base
+            target.name = name + "_base"
+        try:
+            res, _ = combine_solids(context, [target] + made, BODY_BOOL[self.body], self, name=name)
+        except (jobs.JobError, RuntimeError) as exc:
+            if hist:
+                target.name = name
+            failed.append(f"{self.body.title()} with {name} failed ({exc}); the solid is kept as a new body")
+            return made, failed
+        if hist:
+            res.name = name
+        return [res], failed
+
+    def execute_solid(self, context, ins=None, params=None):
+        try:
+            if ins is None:
+                ins = self.usable_inputs(_decode_inputs(self.inputs))
+            made, failed = self.make_solids(context, ins, self.params() if params is None else params)
+        except Exception as exc:
+            self.report({'ERROR'}, f"{self.bl_label} failed: {exc}")
+            return {'CANCELLED'}
+        if failed:
+            self.report({'ERROR'} if not made else {'WARNING'}, f"{self.bl_label} failed: " + "; ".join(failed))
+        if not made:
+            return {'CANCELLED'}
+        _select_only(context, made)
+        return {'FINISHED'}
+
+    def draw_body(self, layout):
+        row = layout.row(align=True)
+        row.prop(self, "body", text="Body")
+        if self.body in BODY_BOOL:
+            layout.prop(self, "target", icon='MESH_CUBE')
+
+    # -- the live value stage: B cycles the body --------------------------------
+    def body_key(self, ch):
+        if ch != "b":
+            return False
+        self.body = BODY_CYCLE[(BODY_CYCLE.index(self.body) + 1) % len(BODY_CYCLE)]
+        return True
+
+    def body_row(self):
+        names = ["surface", "solid", "join", "cut", "intersect"]
+        return ("Body", [hints.cycle("B", names, names[BODY_CYCLE.index(self.body)])])
+
+    def body_state(self):
+        return [] if self.body == "SURFACE" else [dict((k, n) for k, n, _ in BODY_ITEMS)[self.body]]
+
+
+class NPROTO_OT_loft(SolidBody, PickMixin, bpy.types.Operator):
     """Loft a surface between curves or surface edges (G0 / G1 / G2 / G3). A side
     can be several edges end to end: picked edges that touch form one side
     (Tangent Chain picks a smooth run of edges with one click)"""
     bl_idname = "nproto.loft"
     bl_label = "Loft"
     bl_options = {'REGISTER', 'UNDO'}
+    op_name = "loft"
 
     accepts_picks = True
     pick_min = 2
@@ -724,6 +870,7 @@ class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
     def invoke(self, context, event):
         if not _kernel_ok(self):
             return {'CANCELLED'}
+        self.body_prefer(context)
         sel = [o for o in context.selected_objects if o.type == 'CURVE']
         if self.use_selection or (len(sel) >= 2 and not event.alt):
             sel = loft_selection_order(sel, context.active_object, self.closed)
@@ -871,6 +1018,17 @@ class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
     def execute(self, context):
         if not _kernel_ok(self):
             return {'CANCELLED'}
+        if self.body != "SURFACE":
+            try:
+                inputs = _decode_inputs(self.inputs)
+            except ValueError as exc:
+                self.report({'ERROR'}, f"Loft failed: {exc}")
+                return {'CANCELLED'}
+            features.LOFT_NOTES.clear()
+            r = self.execute_solid(context, inputs, self._params())
+            for note in features.LOFT_NOTES:
+                self.report({'WARNING'}, note)
+            return r
         try:
             inputs = _decode_inputs(self.inputs)
             features.LOFT_NOTES.clear()
@@ -883,8 +1041,12 @@ class NPROTO_OT_loft(PickMixin, bpy.types.Operator):
         _select_only(context, [obj])
         return {'FINISHED'}
 
+    def solid_groups(self, ins):
+        return [ins]                  # one solid through all the sections
+
     def draw(self, context):
         lay = self.layout
+        self.draw_body(lay)
         try:
             refs = [r for _, r in json.loads(self.inputs or "[]")]
         except ValueError:
@@ -1014,7 +1176,7 @@ class _CurveTool(PickMixin):
             except Exception as exc:
                 failed.append(f"{inp[0].name}: {exc}")
         if failed:
-            self.report({'ERROR'} if not made else {'WARNING'}, f"{self.bl_label} failed on " + "; ".join(failed))
+            self.report({'ERROR'} if not made else {'WARNING'}, f"{self.bl_label} failed: " + "; ".join(failed))
         if not made:
             return {'CANCELLED'}
         _select_only(context, made)
@@ -1065,7 +1227,7 @@ def extrude_rows(P, d, h, draft=0.0, flip=False, symmetric=False, smooth=True, c
     return [P, P + h * d]
 
 
-class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
+class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
     """Extrude curves (or surface edges) into surfaces. From the UI the distance
     follows the mouse with a preview; type a value, Tab for the draft, LMB to apply"""
     bl_idname = "nproto.extrude"
@@ -1106,11 +1268,12 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
         from . import workplanes
         fr = workplanes.active_frame(context.scene)
         self.normal_hint = [float(x) for x in fr[3]] if fr is not None else (0.0, 0.0, 1.0)
+        self.body_prefer(context)
         return super().invoke(context, event)
 
     def _groups(self, ins):
         """The surfaces to make: inputs that touch end to end together (Chain)."""
-        return features.profile_groups(ins) if self.chain else [[x] for x in ins]
+        return features.profile_groups(ins) if self.chain or self.body != "SURFACE" else [[x] for x in ins]
 
     @staticmethod
     def _centre(curves):
@@ -1124,6 +1287,8 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
     def execute(self, context):
         if not _kernel_ok(self):
             return {'CANCELLED'}
+        if self.body != "SURFACE":
+            return self.execute_solid(context)
         try:
             groups = self._groups(_decode_inputs(self.inputs))
             centre = self._centre([features.profile_curve(g) for g in groups])
@@ -1140,7 +1305,7 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
             except Exception as exc:
                 failed.append(f"{g[0][0].name}: {exc}")
         if failed:
-            self.report({'ERROR'} if not made else {'WARNING'}, f"{self.bl_label} failed on " + "; ".join(failed))
+            self.report({'ERROR'} if not made else {'WARNING'}, f"{self.bl_label} failed: " + "; ".join(failed))
         if not made:
             return {'CANCELLED'}
         _select_only(context, made)
@@ -1242,6 +1407,8 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
         size = max(float(np.ptp(np.vstack([P for _, _, P, _ in self._ex]), axis=0).max()), 1e-9)
         if abs(self.distance) <= 1e-6 * size:
             return "Distance 0: drag the arrow out, or type a distance"
+        if self.body != "SURFACE" and not all(features.is_closed_curve(c) for _, c, _, _ in self._ex):
+            return "A solid needs closed profiles (B: Body Surface for an open one)"
         return ""
 
     def drag_key(self, context, event, ch):
@@ -1259,7 +1426,7 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
         elif ch == "c" and len(_decode_inputs(self.inputs)) > 1:
             self.chain = not self.chain
             self.drag_setup(bpy.context, None)
-        else:
+        elif not self.body_key(ch):
             return False
         return True
 
@@ -1271,17 +1438,18 @@ class NPROTO_OT_extrude(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
         return [("Direction", [hints.cycle("N X Y Z", ["normal", "x", "y", "z"], cur),
                                hints.key("F", "flip"), hints.toggle("S", "symmetric", self.symmetric)]),
                 ("Draft", [hints.toggle("D", "inward", self.draft_flip)]
-                 + ([hints.toggle("C", "chain", self.chain)] if len(_decode_inputs(self.inputs)) > 1 else []))]
+                 + ([hints.toggle("C", "chain", self.chain)] if len(_decode_inputs(self.inputs)) > 1 else [])),
+                self.body_row()]
 
     def drag_state(self):
         names = {"NORMAL": "Curve Normal", "VECTOR": "Vector"}
         d = names.get(self.direction, self.direction.replace("LOCAL_", "Local ").replace("_", " "))
         if d in ("X", "Y", "Z"):
             d = "World " + d
-        return [d] + (["Symmetric"] if self.symmetric else [])
+        return [d] + (["Symmetric"] if self.symmetric else []) + self.body_state()
 
 
-class NPROTO_OT_revolve(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
+class NPROTO_OT_revolve(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
     """Revolve curves around an axis. From the UI the angle has a handle to drag
     around the axis on a live preview; type a value, click away or Enter to make it"""
     bl_idname = "nproto.revolve"
@@ -1304,6 +1472,17 @@ class NPROTO_OT_revolve(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
     def params(self):
         return {"angle": self.angle, "axis": self.axis, "pivot": self.pivot, "seam_angle": self.seam_angle,
                 "axis_point": list(self.axis_point), "axis_dir": list(self.axis_dir)}
+
+    def invoke(self, context, event):
+        self.body_prefer(context)
+        return super().invoke(context, event)
+
+    def execute(self, context):
+        if self.body == "SURFACE":
+            return super().execute(context)
+        if not _kernel_ok(self):
+            return {'CANCELLED'}
+        return self.execute_solid(context)
 
     # -- the live value stage (valuedrag.py) ----------------------------------
     drag_fields = ("angle",)
@@ -1464,6 +1643,8 @@ class NPROTO_OT_revolve(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
             self.pivot = "WORLD" if self.pivot == "OBJECT" else "OBJECT"
         elif ch == "f":
             self.angle = -self.angle
+        elif self.body_key(ch):
+            return True
         else:
             return False
         self._drop_on_axis()
@@ -1479,13 +1660,14 @@ class NPROTO_OT_revolve(ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
         return [("Axis", [hints.cycle("X Y Z", ["x", "y", "z"], cur),
                           hints.key("A", "pick a line / edge", on=True if picked else None),
                           hints.cycle("O", ["object", "world"], None if picked else self.pivot.lower(), "pivot"),
-                          hints.key("F", "other way"), hints.key("Ctrl", "5° steps")])]
+                          hints.key("F", "other way"), hints.key("Ctrl", "5° steps")]),
+                self.body_row()]
 
     def drag_state(self):
         if self.axis == "PICKED":
-            return ["Axis: picked line"]
+            return ["Axis: picked line"] + self.body_state()
         ax = self.axis.replace("LOCAL_", "Local ") if self.axis.startswith("LOCAL_") else "World " + self.axis
-        return [f"Axis {ax}", "Pivot " + ("Object Origin" if self.pivot == "OBJECT" else "World Origin")]
+        return [f"Axis {ax}", "Pivot " + ("Object Origin" if self.pivot == "OBJECT" else "World Origin")] + self.body_state()
 
     # -- A: pick the axis (a line, an open curve, a straight edge) ------------
     def _start_axis_pick(self, context):
@@ -2226,7 +2408,7 @@ class NPROTO_OT_align_curve(PickMixin, bpy.types.Operator):
 
 
 class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
-    """Blend curve between two curve ends with G0 / G1 / G2 and a weight per side.
+    """Blend curve between two curve ends with G0 / G1 / G2 / G3 and a weight per side.
     Click each curve near the end to blend from"""
     bl_idname = "nproto.blend_curve"
     bl_label = "Blend Curve"
@@ -2238,13 +2420,13 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
     inputs: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     end_a: IntProperty(name="End A", default=1, min=0, max=1, options={'HIDDEN'})
     end_b: IntProperty(name="End B", default=0, min=0, max=1, options={'HIDDEN'})
-    cont_a: EnumProperty(name="Continuity A", items=CONT_ITEMS, default="G2")
-    cont_b: EnumProperty(name="Continuity B", items=CONT_ITEMS, default="G2")
+    cont_a: EnumProperty(name="Continuity A", items=BLEND_CONT_ITEMS, default="G2")
+    cont_b: EnumProperty(name="Continuity B", items=BLEND_CONT_ITEMS, default="G2")
     w_a: FloatProperty(name="Weight A", default=1.0, min=0.0, soft_max=3.0,
                        description="Tangent weight at A (how far the blend follows curve A's direction)")
     w_b: FloatProperty(name="Weight B", default=1.0, min=0.0, soft_max=3.0)
     c_a: FloatProperty(name="Curvature A", default=0.0, soft_min=-2.0, soft_max=2.0,
-                       description="G2 shape at A (moves the 3rd CV along the tangent)")
+                       description="G2 / G3 shape at A (moves the 3rd CV along the tangent)")
     c_b: FloatProperty(name="Curvature B", default=0.0, soft_min=-2.0, soft_max=2.0)
     flip_a: BoolProperty(name="Flip A", default=False, description="Reverse the tangent direction at A")
     flip_b: BoolProperty(name="Flip B", default=False)
@@ -2325,7 +2507,7 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
             col = box.column(align=True)
             col.prop(self, f"w_{side}", text="Weight")
             sub = col.row()
-            sub.enabled = getattr(self, f"cont_{side}") == "G2"
+            sub.enabled = getattr(self, f"cont_{side}") in ("G2", "G3")
             sub.prop(self, f"c_{side}", text="Curvature")
             box.prop(self, f"flip_{side}")
 

@@ -3,8 +3,8 @@
 Exact geometry: every face's surface is written as a B-spline surface (rational
 when it has weights), every edge as a B-spline curve cut exactly to the edge's
 range -- or, with analytic on (the default), as what it truly is when it is one
-within 1e-7 of the body's size: a CYLINDRICAL_SURFACE, CONICAL_SURFACE or
-PLANE, a CIRCLE or LINE, as CAD programs write them (an exact cylinder is then
+within 1e-7 of the body's size: a PLANE, CYLINDRICAL_, CONICAL_, SPHERICAL_
+or TOROIDAL_SURFACE, a SURFACE_OF_REVOLUTION or _LINEAR_EXTRUSION, a CIRCLE, ELLIPSE or LINE, as CAD programs write them (an exact cylinder is then
 a true cylinder in the file, its holes and bosses recognised by the reader) -- with full B-rep topology (vertices, edge curves shared by their two
 faces, oriented edges, outer / inner face bounds, face sense). Closed bodies
 become MANIFOLD_SOLID_BREPs, open ones SHELL_BASED_SURFACE_MODELs. Each object
@@ -56,7 +56,8 @@ def _knots(U):
 
 
 # --------------------------------------------------------------------------
-# Analytic recognition: is this B-spline a line, circle, plane, cylinder or cone?
+# Analytic recognition: is this B-spline a line, circle, plane, cylinder, cone,
+# sphere or torus?
 # Measured on samples, within tol (absolute, export units); None if not.
 # --------------------------------------------------------------------------
 
@@ -124,6 +125,61 @@ def fit_circle(S, tol, size):
     if float(turn @ n) < 0:
         n = -n
     return C, n, r
+
+
+def fit_ellipse(S, tol, size):
+    """(centre, unit normal, major axis direction, major radius, minor radius)
+    of points on an ellipse or elliptic arc, the normal so that the points run
+    counter-clockwise round it; else None. Lines and circles are not ellipses
+    (check fit_line and fit_circle first)."""
+    S = np.asarray(S, float)
+    if len(S) < 6:
+        return None
+    pl = fit_plane(S, tol)
+    if pl is None:
+        return None
+    c, n = pl
+    x = S[0] - c
+    x -= (x @ n) * n
+    if np.linalg.norm(x) < 1e-12:
+        x = np.cross(n, [1.0, 0, 0]) if abs(n[0]) < 0.9 else np.cross(n, [0, 1.0, 0])
+    x /= np.linalg.norm(x)
+    y = np.cross(n, x)
+    Q = np.column_stack([(S - c) @ x, (S - c) @ y])
+    s = float(np.abs(Q).max())
+    if s <= tol:
+        return None
+    q = Q / s
+    # the conic A x² + B xy + C y² + D x + E y + F = 0 through the points
+    Dm = np.column_stack([q[:, 0] ** 2, q[:, 0] * q[:, 1], q[:, 1] ** 2, q[:, 0], q[:, 1], np.ones(len(q))])
+    A, B, C, D, E, F = np.linalg.svd(Dm)[2][-1]
+    if B * B - 4 * A * C >= 0:            # a parabola or hyperbola
+        return None
+    c2 = np.linalg.solve([[2 * A, B], [B, 2 * C]], [-D, -E])
+    Fc = F + 0.5 * (D * c2[0] + E * c2[1])
+    lam, vec = np.linalg.eigh([[A, B / 2], [B / 2, C]])
+    ax2 = -Fc / lam
+    if not (ax2 > 0).all():
+        return None
+    k = int(np.argmax(ax2))               # the major axis first
+    r = np.sqrt(ax2[[k, 1 - k]]) * s
+    if not (tol < r[1] and r[0] < 1e3 * size):
+        return None
+    u = vec[:, k]
+    C2 = c2 * s
+    # every point on it: the point at its own eccentric angle is no nearer than the foot
+    d = Q - C2
+    e1, e2 = d @ u, d @ np.array([-u[1], u[0]])
+    t = np.arctan2(e2 / r[1], e1 / r[0])
+    off = np.hypot(e1 - r[0] * np.cos(t), e2 - r[1] * np.sin(t))
+    if float(off.max()) > tol:
+        return None
+    Cw = c + C2[0] * x + C2[1] * y
+    U = u[0] * x + u[1] * y
+    turn = sum(np.cross(S[i] - Cw, S[i + 1] - Cw) for i in range(len(S) - 1))
+    if float(turn @ n) < 0:
+        n = -n
+    return Cw, n, U, float(r[0]), float(r[1])
 
 
 def fit_cylinder(G, tol, size):
@@ -210,6 +266,149 @@ def fit_cone(G, tol, size):
     return None
 
 
+def revolution_axis(G, tol, size):
+    """(point, unit axis) of a grid of surface points G (mu, mv, 3) whose rows
+    along u or v are circles round one axis (the parallels of a surface of
+    revolution), else None. Rows shrunk to a point (a pole) are skipped."""
+    rv = fit_revolution(G, tol, size)
+    return None if rv is None else rv[:2]
+
+
+def fit_revolution(G, tol, size):
+    """(point, unit axis, k) of a surface of revolution: its parallels run along
+    grid axis k (0: u, 1: v), counter-clockwise round the axis; else None."""
+    G = np.asarray(G, float)
+    for k, rows in ((0, G.transpose(1, 0, 2)), (1, G)):   # parallels along u, then along v
+        circles = []
+        ok = True
+        for R in rows:
+            if float(np.linalg.norm(R - R[0], axis=1).max()) <= tol:
+                continue                              # a pole
+            ci = fit_circle(R, tol, size)
+            if ci is None:
+                ok = False
+                break
+            circles.append(ci)
+        if not ok or len(circles) < 2:
+            continue
+        C0, a, _ = circles[0]
+        for C, n, r in circles[1:]:
+            d = C - C0
+            if (np.linalg.norm(np.cross(n, a)) * r > tol or
+                    np.linalg.norm(d - (d @ a) * a) > tol):
+                ok = False
+                break
+        if ok:
+            return C0, a, k
+    return None
+
+
+def fit_sphere(G, tol, size):
+    """(centre, radius) of surface points on a sphere, else None. Planes are
+    not spheres (check fit_plane first)."""
+    P = np.asarray(G, float).reshape(-1, 3)
+    m = P.mean(axis=0)
+    q = P - m
+    A = np.column_stack([2 * q, np.ones(len(q))])
+    sol, *_ = np.linalg.lstsq(A, (q * q).sum(axis=1), rcond=None)
+    c = sol[:3]
+    r = float(np.sqrt(max(sol[3] + c @ c, 0.0)))
+    if not (tol < r < 1e3 * size):
+        return None
+    if float(np.abs(np.linalg.norm(q - c, axis=1) - r).max()) > tol:
+        return None
+    return c + m, r
+
+
+def fit_torus(G, tol, size):
+    """(centre, unit axis, major radius, minor radius) of a grid of surface
+    points G (mu, mv, 3) on a ring torus (major radius larger than the
+    minor), its parallels along u or v, else None. Planes, cylinders, cones
+    and spheres are surfaces of revolution too: check them first."""
+    ax = revolution_axis(G, tol, size)
+    if ax is None:
+        return None
+    p, a = ax
+    r = np.asarray(G, float).reshape(-1, 3) - p
+    z = r @ a
+    rho = np.linalg.norm(r - np.outer(z, a), axis=1)
+    (R, z0), rm = _circle_2d(np.column_stack([rho, z]))
+    if not (tol < rm < 1e3 * size and R > rm + tol):
+        return None
+    if float(np.abs(np.hypot(rho - R, z - z0) - rm).max()) > tol:
+        return None
+    return p + z0 * a, a, float(R), rm
+
+
+def fit_extrusion(G, tol, size):
+    """(axis, unit direction) of a surface of linear extrusion: every row of the
+    samples along `axis` (1: along v, 0: along u) the same straight run, only
+    moved along the profile; else None. Planes and cylinders are extrusions
+    too (check them first)."""
+    G = np.asarray(G, float)
+    for ax in (1, 0):
+        H = G if ax == 1 else G.transpose(1, 0, 2)
+        T = H - H[:, :1]                       # each row's run from its start
+        if float(np.abs(T - T[:1]).max()) > tol:
+            continue
+        ln = fit_line(H[0], tol)               # row 0 straight, so every row is
+        if ln is None:
+            continue
+        P = H[:, 0]
+        if float(np.linalg.norm(P - P[0], axis=1).max()) <= tol:
+            continue                           # no profile: a single line
+        return ax, ln[1]
+    return None
+
+
+def _iso_start(d, ax):
+    """(degree, points, knots, weights) of the surface's boundary iso-curve at
+    the start of the extrusion direction (ax 1: v, 0: u), read off the CV net;
+    None when that direction's knots are not clamped there."""
+    du, dv, nu, nv = d["degree_u"], d["degree_v"], d["count_u"], d["count_v"]
+    Uu, Uv = list(d["knots_u"]), list(d["knots_v"])
+    if len(Uu) != nu + du + 1 or len(Uv) != nv + dv + 1:
+        return None
+    dg, U = (dv, Uv) if ax == 1 else (du, Uu)
+    if max(U[:dg + 1]) - min(U[:dg + 1]) > 1e-12 * (1 + abs(U[0])):
+        return None
+    W = list(d["weights"]) if d.get("weights") else None
+    idx = [i * nv for i in range(nu)] if ax == 1 else list(range(nv))
+    if ax == 1:
+        return du, [d["points"][k] for k in idx], Uu, ([W[k] for k in idx] if W else None)
+    return dv, [d["points"][k] for k in idx], Uv, ([W[k] for k in idx] if W else None)
+
+
+def _regular(su, sv, rel):
+    """Do su, sv span a tangent plane (not a pole: one of them ~0, or parallel)?"""
+    m = max(float(np.linalg.norm(su)), float(np.linalg.norm(sv)))
+    return m > 0 and float(np.linalg.norm(np.cross(su, sv))) > rel * m * m
+
+
+def _off_degenerate(surf, uv, rel=1e-6):
+    """uv, or (where su x sv vanishes there, e.g. a sphere's pole) a point
+    stepped from it towards the middle of the surface's domain, where the
+    normal is defined; its direction is the pole's by continuity."""
+    u, v = float(uv[0]), float(uv[1])
+    _, su, sv = surf.derivatives(u, v)
+    su, sv = np.asarray(su, float), np.asarray(sv, float)
+    if _regular(su, sv, rel):
+        return u, v
+    try:
+        (u0, u1), (v0, v1) = surf.u_domain(), surf.v_domain()
+    except Exception:
+        from .surfeval import Surf
+        E = Surf(surf)
+        (u0, u1), (v0, v1) = E.u_domain, E.v_domain
+    for s in (1e-4, 1e-3, 1e-2):
+        uu, vv = u + s * (0.5 * (u0 + u1) - u), v + s * (0.5 * (v0 + v1) - v)
+        _, a, b = surf.derivatives(uu, vv)
+        a, b = np.asarray(a, float), np.asarray(b, float)
+        if _regular(a, b, rel):
+            return uu, vv
+    return u, v
+
+
 def _perp(n, hint=None):
     """A unit vector square to n (hint's part square to n, when it has one)."""
     if hint is not None:
@@ -240,8 +439,9 @@ class StepExporter:
         self.scale = scale * unit_factor
         self.analytic = analytic
         self.stats = {"bodies": 0, "faces": 0, "edges": 0, "solids": 0, "sheets": 0,
-                      "analytic": {"CYLINDRICAL_SURFACE": 0, "CONICAL_SURFACE": 0, "PLANE": 0, "CIRCLE": 0,
-                                   "LINE": 0}}
+                      "analytic": {"CYLINDRICAL_SURFACE": 0, "CONICAL_SURFACE": 0, "SPHERICAL_SURFACE": 0,
+                                   "TOROIDAL_SURFACE": 0, "SURFACE_OF_REVOLUTION": 0,
+                                   "SURFACE_OF_LINEAR_EXTRUSION": 0, "PLANE": 0, "CIRCLE": 0, "ELLIPSE": 0, "LINE": 0}}
         self._dir_cache = {}
 
     # -- small geometry ----------------------------------------------------
@@ -262,7 +462,7 @@ class StepExporter:
 
     # -- analytic ----------------------------------------------------------
     def analytic_curve(self, S, tol, size):
-        """LINE or CIRCLE through the edge's samples S (in its direction), else None."""
+        """LINE, CIRCLE or ELLIPSE through the edge's samples S (in its direction), else None."""
         ln = fit_line(S, tol)
         if ln is not None:
             o, d = ln
@@ -274,19 +474,27 @@ class StepExporter:
             C, n, r = ci
             self.stats["analytic"]["CIRCLE"] += 1
             return self.w.add(f"CIRCLE('',{self.placement(C, n, _perp(n, S[0] - C))},{_f(r)})")
+        el = fit_ellipse(S, tol, size)
+        if el is not None:
+            C, n, U, ra, rb = el
+            self.stats["analytic"]["ELLIPSE"] += 1
+            return self.w.add(f"ELLIPSE('',{self.placement(C, n, _perp(n, U))},{_f(ra)},{_f(rb)})")
         return None
 
-    def analytic_surface(self, G, tol, size):
-        """(entity, normal at a point: P -> unit normal) of a PLANE,
-        CYLINDRICAL_SURFACE or CONICAL_SURFACE through the surface samples G,
-        else None."""
+    def analytic_surface(self, G, tol, size, cvs=None, X=None):
+        """(entity, normal at a point: P -> unit normal, entity type) of a PLANE,
+        CYLINDRICAL_, CONICAL_, SPHERICAL_ or TOROIDAL_SURFACE or a
+        SURFACE_OF_REVOLUTION or _LINEAR_EXTRUSION through the surface samples G, else None.
+        cvs (the surface's CV net) and X (its point transform) give an
+        revolution's meridian, and an extrusion's profile when it is no circle
+        or ellipse."""
         pl = fit_plane(G, tol)
         if pl is not None:
             c, n = pl
             self.stats["analytic"]["PLANE"] += 1
             G2 = np.asarray(G, float)
             ent = self.w.add(f"PLANE('',{self.placement(c, n, _perp(n, G2[-1, 0] - G2[0, 0]))})")
-            return ent, (lambda P: n)
+            return ent, (lambda P: n), "PLANE"
         cy = fit_cylinder(G, tol, size)
         if cy is not None:
             o, a, r = cy
@@ -297,7 +505,7 @@ class StepExporter:
                 d = np.asarray(P, float) - o
                 d -= (d @ a) * a
                 return d / (np.linalg.norm(d) or 1.0)
-            return ent, normal
+            return ent, normal, "CYLINDRICAL_SURFACE"
         co = fit_cone(G, tol, size)
         if co is not None:
             apex, a, al = co
@@ -313,7 +521,81 @@ class StepExporter:
                 e = d - (d @ a) * a
                 e /= (np.linalg.norm(e) or 1.0)
                 return e * np.cos(al) - a * np.sin(al)
-            return ent, normal
+            return ent, normal, "CONICAL_SURFACE"
+        G2 = np.asarray(G, float).reshape(-1, 3)
+        sp = fit_sphere(G, tol, size)
+        if sp is not None:
+            c, r = sp
+            ax = revolution_axis(G, tol, size)            # its poles on the surface's own axis, when it has one
+            z = ax[1] if ax is not None else np.array([0.0, 0.0, 1.0])
+            self.stats["analytic"]["SPHERICAL_SURFACE"] += 1
+            ent = self.w.add(f"SPHERICAL_SURFACE('',{self.placement(c, z, _perp(z, G2[0] - c))},{_f(r)})")
+            return ent, (lambda P: (np.asarray(P, float) - c) / r), "SPHERICAL_SURFACE"
+        to = fit_torus(G, tol, size)
+        if to is not None:
+            c, a, R, rm = to
+            self.stats["analytic"]["TOROIDAL_SURFACE"] += 1
+            ent = self.w.add(f"TOROIDAL_SURFACE('',{self.placement(c, a, _perp(a, G2[0] - c))},{_f(R)},{_f(rm)})")
+
+            def normal(P):           # STEP's: away from the tube's centre circle
+                d = np.asarray(P, float) - c
+                e = d - (d @ a) * a
+                e = c + R * e / (np.linalg.norm(e) or 1.0)
+                n = np.asarray(P, float) - e
+                return n / (np.linalg.norm(n) or 1.0)
+            return ent, normal, "TOROIDAL_SURFACE"
+        rv = fit_revolution(G, tol, size)
+        if rv is not None:
+            C0, a, k = rv
+            H = np.asarray(G, float) if k == 0 else np.asarray(G, float).transpose(1, 0, 2)
+            # the meridian: the surface's own boundary across the parallels, exact and bounded (a CIRCLE
+            # or ELLIPSE would run round both sides of the axis and sweep the surface twice)
+            cur = None
+            iso = _iso_start(cvs, k) if cvs is not None else None
+            if iso is not None:
+                dg, P, U, W = iso
+                cur = self.bspline_curve(dg, [X(p) for p in P], U, W)
+            if cur is not None:
+                self.stats["analytic"]["SURFACE_OF_REVOLUTION"] += 1
+                ax1 = self.w.add(f"AXIS1_PLACEMENT('',{self.point(C0)},{self.direction(a)})")
+                ent = self.w.add(f"SURFACE_OF_REVOLUTION('',{cur},{ax1})")
+                # STEP's normal: d/d(angle) x d/d(meridian), the angle turning right-handed round the axis
+                # (the parallels' own way round); sampled on the grid, poles left out
+                Nn = np.cross(np.gradient(H, axis=0), np.gradient(H, axis=1)).reshape(-1, 3)
+                ln = np.linalg.norm(Nn, axis=1)
+                keep = ln > 1e-9 * max(float(ln.max()), 1e-300)
+                flat, Nn = H.reshape(-1, 3)[keep], Nn[keep] / ln[keep, None]
+
+                def normal(P):
+                    return Nn[int(np.argmin(np.linalg.norm(flat - np.asarray(P, float), axis=1)))]
+                return ent, normal, "SURFACE_OF_REVOLUTION"
+        ex = fit_extrusion(G, tol, size)
+        if ex is not None:
+            ax, dvec = ex
+            H = np.asarray(G, float) if ax == 1 else np.asarray(G, float).transpose(1, 0, 2)
+            prof = H[:, 0]
+            cur = None
+            if fit_circle(prof, tol, size) is not None or fit_ellipse(prof, tol, size) is not None:
+                cur = self.analytic_curve(prof, tol, size)        # a true circle or ellipse, run along prof
+            if cur is None and cvs is not None:
+                iso = _iso_start(cvs, ax)
+                if iso is not None:
+                    dg, P, U, W = iso
+                    cur = self.bspline_curve(dg, [X(p) for p in P], U, W)
+            if cur is None:
+                return None
+            self.stats["analytic"]["SURFACE_OF_LINEAR_EXTRUSION"] += 1
+            vec = self.w.add(f"VECTOR('',{self.direction(dvec)},1.)")
+            ent = self.w.add(f"SURFACE_OF_LINEAR_EXTRUSION('',{cur},{vec})")
+            # STEP's normal: the profile's tangent (as it runs) x the extrusion direction
+            tng = np.gradient(prof, axis=0)
+            flat = H.reshape(-1, 3)
+
+            def normal(P):
+                k = int(np.argmin(np.linalg.norm(flat - np.asarray(P, float), axis=1))) // H.shape[1]
+                n = np.cross(tng[k], dvec)
+                return n / (np.linalg.norm(n) or 1.0)
+            return ent, normal, "SURFACE_OF_LINEAR_EXTRUSION"
         return None
 
     # -- curves / surfaces -------------------------------------------------
@@ -446,9 +728,10 @@ class StepExporter:
                 nu, nv = (min(4 * (n - 1) + 1, 61) for n in (E.nu, E.nv))
                 us, vs = np.linspace(*E.u_domain, max(nu, 9)), np.linspace(*E.v_domain, max(nv, 9))
                 G = E.grid(us, vs, 0)[0, 0] @ A.T + t
-                an = self.analytic_surface(G, tol, xsize)
+                an = self.analytic_surface(G, tol, xsize, d, X)
+            an_kind = None
             if an is not None:
-                srf, an_normal = an
+                srf, an_normal, an_kind = an
             else:
                 P = [X(p) for p in d["points"]]
                 W = list(d["weights"]) if d.get("weights") else None
@@ -462,6 +745,7 @@ class StepExporter:
             try:
                 uv = _foot(surf, np.array(f.interior_point(), float))
                 n_out = np.array(f.outward_normal_at_uv(*uv), float)
+                uv = _off_degenerate(surf, uv)        # a pole has no su x sv: probe beside it
                 _, su, sv = surf.derivatives(*uv)
                 sense = ".T." if float(np.cross(su, sv) @ n_out) >= 0 else ".F."
             except Exception:
@@ -484,7 +768,22 @@ class StepExporter:
             outer = f.boundary_outer_loop()
             outer_ids = {edge_key(e) for e, _ in outer}
             bounds = []
-            for loop in f.boundary_loops():
+            loops = list(f.boundary_loops())
+            if an_kind == "SPHERICAL_SURFACE":
+                # a whole sphere: bounded only by its seam (run there and back) and collapsed pole edges.
+                # Written as CAD programs do, with no seam: one VERTEX_LOOP at a pole
+                used = {}
+                for loop in loops:
+                    for e, _ in loop:
+                        if e.length() > 1e-9 * size:
+                            used.setdefault(edge_key(e), []).append(e)
+                if used and all(len(v) == 2 for v in used.values()):
+                    e = next(iter(used.values()))[0]
+                    t0, _ = e.parameter_range()
+                    vl = self.w.add(f"VERTEX_LOOP('',{vertex(end_vertices(e)[0], e.point_at(t0))})")
+                    bounds.append(self.w.add(f"FACE_BOUND('',{vl},.T.)"))
+                    loops = []
+            for loop in loops:
                 oes = []
                 for e, fwd in loop:
                     if e.length() <= 1e-9 * size:       # degenerate (collapsed) edge: readers re-create it
@@ -614,7 +913,7 @@ from bpy_extras.io_utils import ExportHelper  # noqa: E402
 
 class NPROTO_OT_export_step(bpy.types.Operator, ExportHelper):
     """Export NURBS objects as STEP (AP214): exact B-spline surfaces and curves
-    (true cylinders, planes, circles and lines as STEP's own) with full B-rep
+    (true cylinders, planes, revolutions, extrusions, circles, ellipses and lines as STEP's own) with full B-rep
     topology; closed bodies as solids"""
     bl_idname = "nproto.export_step"
     bl_label = "Export STEP"
@@ -628,10 +927,9 @@ class NPROTO_OT_export_step(bpy.types.Operator, ExportHelper):
                        description="Length unit of the file; Blender units are taken as metres")
     global_scale: FloatProperty(name="Scale", default=1.0, min=1e-6, soft_max=1000.0)
     analytic: BoolProperty(name="Analytic Surfaces", default=True,
-                           description="Write true cylinders, cones, planes, circles and lines as STEP's own "
-                                       "CYLINDRICAL_SURFACE, CONICAL_SURFACE, PLANE, CIRCLE and LINE, as CAD programs "
-                                       "do (holes, bosses and countersinks are then recognised); off: everything as "
-                                       "B-splines")
+                           description="Write true planes, cylinders, cones, spheres, tori, revolutions, extrusions, circles, ellipses and lines as "
+                                       "STEP's own analytic entities, as CAD programs do (holes, bosses, countersinks "
+                                       "and fillets are then recognised); off: everything as B-splines")
 
     def execute(self, context):
         sc = context.scene.unit_settings.scale_length or 1.0      # Blender units -> metres
@@ -645,11 +943,17 @@ class NPROTO_OT_export_step(bpy.types.Operator, ExportHelper):
         msg = (f"STEP: {stats['bodies']} bodies ({stats['solids']} solid, {stats['sheets']} sheet), "
                f"{stats['faces']} faces, {stats['edges']} edges")
         an = stats["analytic"]
-        if self.analytic and (an["CYLINDRICAL_SURFACE"] or an["CONICAL_SURFACE"] or an["CIRCLE"]):
-            msg += f"; {an['CYLINDRICAL_SURFACE']} true cylinder faces"
-            if an["CONICAL_SURFACE"]:
-                msg += f", {an['CONICAL_SURFACE']} cone faces"
-            msg += f", {an['CIRCLE']} circles"
+        parts = [f"{an[k]} {w}" for k, w in (("CYLINDRICAL_SURFACE", "cylinder"), ("CONICAL_SURFACE", "cone"),
+                                              ("SPHERICAL_SURFACE", "sphere"), ("TOROIDAL_SURFACE", "torus"),
+                                              ("SURFACE_OF_REVOLUTION", "revolution"),
+                                              ("SURFACE_OF_LINEAR_EXTRUSION", "extrusion"))
+                 if an[k]]
+        if self.analytic and parts:
+            msg += f"; true {', '.join(parts)} faces"
+        if self.analytic and an["CIRCLE"]:
+            msg += f"; {an['CIRCLE']} circles"
+        if self.analytic and an["ELLIPSE"]:
+            msg += f"; {an['ELLIPSE']} ellipses"
         if stats.get("open_loops"):
             msg += f"; {len(stats['open_loops'])} edge loop(s) don't close -- other programs may drop those faces"
         if stats.get("failed"):

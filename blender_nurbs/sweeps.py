@@ -586,21 +586,128 @@ class ProjectMiss(RuntimeError):
 _PROJECT_MISS = "SM_ERR (1001)"
 
 
+def _brep_planes(brep):
+    """(point, unit normal, face) of every planar face of a brep (CVs coplanar)."""
+    _, ext = _k()
+    out = []
+    for f in brep.faces():
+        P = np.array(ext.surface_cvs(f.surface())["points"], float)
+        c = P.mean(axis=0)
+        size = float(np.ptp(P, axis=0).max()) or 1.0
+        n = np.linalg.svd(P - c)[2][-1]
+        if np.abs((P - c) @ n).max() <= 1e-9 * size:
+            out.append((c, n, f))
+    return out
+
+
+def _closest_g(spans, x, per=64):
+    """Global span parameter of the point of a span list closest to x."""
+    from .curvejoin import eval_span
+    from .curvetrim import sample_spans
+    Q, G = sample_spans(spans, per)
+    g = float(G[int(np.argmin(np.linalg.norm(Q - x, axis=1)))])
+    n, h = len(spans), 1.0 / per
+    lo, hi = max(0.0, g - h), min(float(n), g + h)
+
+    def dist(g_):
+        i = min(int(g_), n - 1)
+        return float(np.linalg.norm(eval_span(spans[i], [g_ - i])[0] - x))
+    r = (math.sqrt(5) - 1) / 2                 # golden section on the bracket
+    a, b = hi - r * (hi - lo), lo + r * (hi - lo)
+    for _ in range(60):
+        if dist(a) < dist(b):
+            hi, b = b, a
+            a = hi - r * (hi - lo)
+        else:
+            lo, a = a, b
+            b = lo + r * (hi - lo)
+    return 0.5 * (lo + hi)
+
+
+def _exact_planar_piece(kc, poly, planes, d):
+    """The projection of curve kc onto a plane is an affine image of it: the
+    same degree, knots and weights, its CVs moved onto the plane along d. The
+    kernel's projected piece `poly` (sampled) says which plane and which part
+    of the curve lands on the face; returns that part as an exact spline spec,
+    or None when the piece is not on a planar face or the exact part does not
+    follow it."""
+    from .curvejoin import kernel_curve_spans, transform_spans, spans_to_spec, _size
+    from .curvetrim import clean_cuts, is_closed, piece_at, split_spans, sample_spans
+    P = np.asarray(poly, float)
+    size = float(np.linalg.norm(np.ptp(P, axis=0))) or 1.0
+    d = np.asarray(d, float)
+    plane = next(((c, n, f) for c, n, f in planes if np.abs((P - c) @ n).max() <= 1e-6 * size
+                  and abs(d @ n) > 1e-6 * np.linalg.norm(d)), None)
+    if plane is None:
+        return None
+    c, n, face = plane
+    M = np.eye(4)                              # x -> x - d (n.(x - c)) / (d.n)
+    M[:3, :3] -= np.outer(d, n) / (d @ n)
+    M[:3, 3] = d * (n @ c) / (d @ n)
+    try:
+        spans = transform_spans(kernel_curve_spans(kc), M)
+    except ValueError:
+        return None
+    closed = is_closed(spans)
+    tol = 1e-6 * _size(spans)
+    a, b = P[0], P[-1]
+    ends = [spans[0][0, :3] / spans[0][0, 3], spans[-1][-1, :3] / spans[-1][-1, 3]]
+    whole = (np.linalg.norm(a - b) <= tol) if closed else (
+        min(np.linalg.norm(a - ends[0]) + np.linalg.norm(b - ends[1]),
+            np.linalg.norm(a - ends[1]) + np.linalg.norm(b - ends[0])) <= 2 * tol)
+    if whole:
+        part = spans
+    else:
+        # the kernel's piece ends are only near the face's edges (about 1e-3 of
+        # the size): cut where the exact curve crosses an edge, nearest each end
+        from .curvetrim import intersect
+        from .square import _edge_curve
+        hits = []
+        for e in face.edges():
+            try:
+                hits += [(g, X) for g, _, X in intersect(spans, kernel_curve_spans(_edge_curve(e)), 1e-7 * size)]
+            except Exception:
+                pass
+
+        def cut_at(x):
+            if hits:
+                g, X = min(hits, key=lambda h: np.linalg.norm(h[1] - x))
+                if np.linalg.norm(X - x) <= 1e-2 * size:
+                    return g, X
+            return _closest_g(spans, x), x
+        cuts = clean_cuts(spans, [cut_at(x) for x in (a, b)], closed)
+        pieces = split_spans(spans, cuts, closed)
+        part = pieces[piece_at(pieces, _closest_g(spans, P[len(P) // 2]), len(spans))][0]
+    spec = spans_to_spec(part, simplify=True)
+    if whole and closed:
+        spec = _cyclic_if_closed(spec)
+    Q = sample_spans(part, max(32, 400 // len(part)))[0]   # it must lie where the kernel's piece does
+    dd = np.linalg.norm(Q[:, None] - P[None], axis=2)
+    if max(dd.min(axis=1).max(), dd.min(axis=0).max()) > 5e-3 * size:
+        return None
+    return spec
+
+
 @features.builder("project_curve")
 def build_project_curve(inputs, p):
     sm, _ = _k()
     *curves, (surf_obj, _) = inputs
     d = p.get("dir", [0, 0, -1])
     brep_w = _world_brep(surf_obj)
+    planes = _brep_planes(brep_w)
     out = []
     for o, r in curves:
+        kc = features.input_curve(o, r)
         try:
-            pcs = sm.project_curve(brep_w, features.input_curve(o, r), tuple(d))
+            pcs = sm.project_curve(brep_w, kc, tuple(d))
         except RuntimeError as exc:
             if _PROJECT_MISS not in str(exc):
                 raise
             continue                    # this curve misses; keep the others
-        out.extend(_poly_to_spec(_kcurve_poly(pc)) for pc in pcs)
+        for pc in pcs:
+            poly = _kcurve_poly(pc, 400)
+            # onto a plane: exact (the curve's own CVs moved); else a fit
+            out.append((planes and _exact_planar_piece(kc, poly, planes, d)) or _poly_to_spec(poly))
     if not out:
         raise ProjectMiss("the curve misses the surface in that direction")
     return ("splines", out)

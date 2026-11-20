@@ -107,7 +107,8 @@ GROUPS = (
             (("nproto.boolean", "Union", 'SELECT_EXTEND', {"operation": "UNION"}),
              ("nproto.boolean", "Difference", 'SELECT_SUBTRACT', {"operation": "DIFFERENCE"}),
              ("nproto.boolean", "Intersection", 'SELECT_INTERSECT', {"operation": "INTERSECTION"})),
-            (_t("nproto.boundary_fill", icon='MESH_CUBE'),),
+            (_t("nproto.boundary_fill", icon='MESH_CUBE'), _t("nproto.push_pull", icon='FACESEL'),
+             _t("nproto.replace_face", icon='FACE_MAPS')),
         )),
     )),
     ("CONVERT", "Convert", (

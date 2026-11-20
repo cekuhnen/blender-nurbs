@@ -23,13 +23,14 @@ STEP_FIELDS = {
                     "class_a", "ca_tolerance", "ca_angle", "ca_degree", "ca_continuity"],
     "rebuild_surface": ["degree_u", "degree_v", "spans_u", "spans_v"],
     "extend_surface": ["distance"],
+    "push_pull": ["distance"],
     "refit_trim": ["refit_degree", "refit_spans_u", "refit_spans_v"],
     "merge_patches": ["merge_mode", "merge_tolerance", "merge_degree", "merge_spans_u", "merge_spans_v",
                       "merge_cont_u0", "merge_cont_u1", "merge_cont_v0", "merge_cont_v1", "merge_edge_tolerance",
                       "merge_knots", "merge_seams", "merge_reduce_degree"],
 }
 CA_DEFAULTS = {"ca_tolerance": 1e-4, "ca_angle": 0.1, "ca_degree": 7}
-ROLE = {"trim": "trim cutter", "fillet_trim": "fillet partner"}
+ROLE = {"replace_face": "replacing surface", "trim": "trim cutter", "fillet_trim": "fillet partner"}
 STEP_NOTE = {"fillet_trim": "Follows its Surface Fillet (edit the fillet object)"}
 
 
@@ -417,7 +418,7 @@ def draw_steps(box, obj, only=None, bare=False):
                 inner.label(text=pg.error, icon='ERROR')
 
 
-STEP_ICON = {"untrim_region": 'SELECT_SUBTRACT', "untrim": 'LOOP_BACK', "edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
+STEP_ICON = {"replace_face": 'FACE_MAPS', "push_pull": 'FACESEL', "untrim_region": 'SELECT_SUBTRACT', "untrim": 'LOOP_BACK', "edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
              "flip_normal": 'NORMALS_FACE', "surface_align": 'SNAP_EDGE', "match_surface": 'SNAP_FACE', "extend_surface": 'FULLSCREEN_ENTER',
              "rebuild_surface": 'MOD_REMESH', "refit_trim": 'MOD_LATTICE', "merge_patches": 'MESH_GRID'}
 

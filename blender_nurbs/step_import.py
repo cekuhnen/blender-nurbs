@@ -583,21 +583,76 @@ class Importer:
             o = sf.point(ax[1]) * self.f
             z = sf.direction(ax[2])
             cs = self.curve_spans(a[1], pts)
-            # profile in the (radial, axial) frame of its own first point
-            P0 = _cart(cs[0][0])[0] - o
-            xr = P0 - (P0 @ z) * z
-            if np.linalg.norm(xr) < 1e-12:
-                Pm = curvejoin.eval_span(cs[len(cs) // 2][0], [0.5])[0] - o
-                xr = Pm - (Pm @ z) * z
-            x = xr / np.linalg.norm(xr)
+            # the angles of the face's points (and seam) turned round from the profile: each against the
+            # profile's point at its own height and radius (a skew profile, e.g. a hyperboloid's line,
+            # runs round the axis itself; one starting on the axis has no direction there)
+            M = np.vstack([curvejoin.eval_span(s, np.linspace(0, 1, 33)) for s, _, _ in cs]) - o
+            Mh = M @ z
+            Mr = M - np.outer(Mh, z)
+            Mrho = np.linalg.norm(Mr, axis=1)
+            x = Mr[int(np.argmax(Mrho))] / Mrho.max()
             y = np.cross(z, x)
+            Mphi = np.arctan2(Mr @ y, Mr @ x)
+            scale = float(max(np.ptp(Mh), Mrho.max())) or 1.0
+
+            def turned(P):
+                P = np.asarray(P, float).reshape(-1, 3) - o
+                h = P @ z
+                r = P - np.outer(h, z)
+                rho = np.linalg.norm(r, axis=1)
+                d2 = ((h[:, None] - Mh[None]) ** 2 + (rho[:, None] - Mrho[None]) ** 2) / scale ** 2
+                return np.arctan2(r @ y, r @ x) - Mphi[np.argmin(d2, axis=1)]
             spans = [s for s, _, _ in cs]
-            th0, th1 = self._angle_range(pts, o, x, y, seam_pts, from_zero=True)
+            seam = None
+            if seam_pts is not None and len(seam_pts):
+                # the seam sets where the surface starts: match it to the profile exactly, not to a sample
+                def hr(k, t):
+                    q = curvejoin.eval_span(spans[k], [t])[0] - o
+                    h = float(q @ z)
+                    r = q - h * z
+                    return h, r
+                ts = []
+                for S in np.asarray(seam_pts, float).reshape(-1, 3) - o:
+                    hs = float(S @ z)
+                    rs = S - hs * z
+                    i = int(np.argmin(((Mh - hs) ** 2 + (Mrho - np.linalg.norm(rs)) ** 2)))
+                    k, j = divmod(i, 33)
+                    lo, hi = max(j - 1, 0) / 32, min(j + 1, 32) / 32
+                    for _ in range(60):                     # the profile's nearest (height, radius)
+                        m1, m2 = lo + (hi - lo) / 3, hi - (hi - lo) / 3
+                        f1, f2 = ((hs - h) ** 2 + (np.linalg.norm(rs) - np.linalg.norm(r)) ** 2
+                                  for h, r in (hr(k, m1), hr(k, m2)))
+                        lo, hi = (lo, m2) if f1 < f2 else (m1, hi)
+                    _, rm_ = hr(k, 0.5 * (lo + hi))
+                    ts.append(math.atan2(float(np.cross(rm_, rs) @ z), float(rm_ @ rs)))
+                seam = float(np.arctan2(np.mean(np.sin(ts)), np.mean(np.cos(ts))))
+            th0, th1 = _cover(turned(pts), seam)
             return self._revolve_3d(spans, o, x, y, z, th0, th1)
         if t == "SURFACE_OF_LINEAR_EXTRUSION":
-            cs = self.curve_spans(a[1], pts)
             va = sf.args(a[2])
             d = sf.direction(va[1])
+            g = a[1]
+            while sf.type(g) in ("SURFACE_CURVE", "SEAM_CURVE", "INTERSECTION_CURVE", "TRIMMED_CURVE"):
+                g = sf.args(g)[1]
+            if sf.type(g) in ("CIRCLE", "ELLIPSE") and abs(float(d @ placement(sf, sf.args(g)[1], self.f)[3])) > 1e-9:
+                # a circle or ellipse swept: only the face's angles, from its seam (as on a cylinder), the
+                # points slid along the sweep into the curve's plane
+                ga = sf.args(g)
+                o, x, y, z = placement(sf, ga[1], self.f)
+                r1 = float(ga[2]) * self.f
+                r2 = float(ga[3]) * self.f if sf.type(g) == "ELLIPSE" else r1
+
+                def angles(P):
+                    P = np.asarray(P, float).reshape(-1, 3)
+                    q = P - o - np.outer(((P - o) @ z) / float(d @ z), d)
+                    return np.arctan2((q @ y) / r2, (q @ x) / r1)
+                seam = float(angles(seam_pts).mean()) if seam_pts is not None and len(seam_pts) else None
+                th0, th1 = _cover(angles(pts), seam)
+                sp = arc_spans(o, x, y, r1, r2, th0, th1)
+                cs = [(s, th0 + (th1 - th0) * k / len(sp), th0 + (th1 - th0) * (k + 1) / len(sp))
+                      for k, s in enumerate(sp)]
+            else:
+                cs = self.curve_spans(a[1], pts)
             C = np.vstack([curvejoin.eval_span(s, np.linspace(0, 1, 9)) for s, _, _ in cs])
             s_lo = float((pts @ d).min() - (C @ d).max())
             s_hi = float((pts @ d).max() - (C @ d).min())
@@ -689,6 +744,9 @@ class Importer:
         cs = arc_spans(np.zeros(3), np.array([1.0, 0, 0]), np.array([0, 1.0, 0]), 1.0, 1.0, th0, th1)
         crow, Uu = self._spans_rows(cs, cart3=True)
         G = np.zeros((len(crow), len(rows), 4))
+        P3 = rows[:, :3] / rows[:, 3:4] - o
+        R3 = P3 - np.outer(P3 @ z, z)
+        snap = 1e-6 * float(np.linalg.norm(R3, axis=1).max())   # a pole a hair off the axis: on it, closed
         for i, c in enumerate(crow):
             wc = c[3]
             cx, cy = c[0] / wc, c[1] / wc
@@ -697,6 +755,8 @@ class Importer:
                 P = r[:3] / wp - o
                 h = float(P @ z)
                 rho = P - h * z
+                if float(np.linalg.norm(rho)) < snap:
+                    rho = np.zeros(3)
                 Q = o + h * z + cx * rho + cy * np.cross(z, rho)
                 w = wc * wp
                 G[i, j] = [*(Q * w), w]
@@ -727,6 +787,9 @@ class Importer:
         a = sf.args(face_ref)
         loops, seams = self.face_loops(face_ref)
         if not loops:
+            whole = self._whole_surface(a[2], a[3] != "F")
+            if whole is not None:
+                return whole
             raise ValueError("face without edge loops")
         pts = np.vstack([curvejoin.eval_span(s, np.linspace(0, 1, 9)) for _, L in loops for e in L for s in e])
         seam_pts = None
@@ -734,6 +797,11 @@ class Importer:
             seam_pts = np.vstack([curvejoin.eval_span(s, [0.5]) for ec in seams for s in self.edge_spans(ec)])
         data = self.surface(a[2], pts, seam_pts)
         same_sense = a[3] != "F"
+        if (len(loops) == 1 and seams and len(loops[0][1]) == 2 * len(seams)
+                and sf.type(a[2]) in ("SURFACE_OF_REVOLUTION", "SPHERICAL_SURFACE", "TOROIDAL_SURFACE")):
+            # bounded only by its seam, run there and back (and collapsed poles): the whole surface,
+            # built from that seam round
+            return self.ext.brep_from_surface(self.make_surface(data, not same_sense))
         surf = self.make_surface(data, not same_sense)
         counts, curves = [], []
         for _, L in loops:
@@ -754,6 +822,29 @@ class Importer:
         probe = self.make_surface(data, not same_sense)
         curves = [self._projected_curve(probe, e) for _, L in loops for e in L]
         return self.sm.trim_surface_with_3d_curves(surf, counts, curves)
+
+    def _whole_surface(self, ref, same_sense):
+        """A face with no edge loops (only a VERTEX_LOOP, as CAD programs write a
+        whole sphere, or none) on a closed surface: the whole surface, else None."""
+        sf = self.sf
+        st = sf.type(ref)
+        if st not in ("SPHERICAL_SURFACE", "TOROIDAL_SURFACE"):
+            return None
+        o, x, y, z = placement(sf, sf.args(ref)[1], self.f)
+        th = np.linspace(0, 2 * math.pi, 25)[:-1]
+        if st == "SPHERICAL_SURFACE":
+            R = float(sf.args(ref)[2]) * self.f
+            ph = np.linspace(-math.pi / 2, math.pi / 2, 9)
+            pts = np.array([o + R * (math.cos(p) * (math.cos(t) * x + math.sin(t) * y) + math.sin(p) * z)
+                            for p in ph for t in th])
+            seam_pts = np.array([o + R * (math.cos(p) * x + math.sin(p) * z) for p in ph[1:-1]])
+        else:
+            Rm, rm = (float(v) * self.f for v in sf.args(ref)[2:4])
+            pts = np.array([o + (Rm + rm * math.cos(p)) * (math.cos(t) * x + math.sin(t) * y) + rm * math.sin(p) * z
+                            for p in th for t in th])
+            seam_pts = np.array([o + (Rm + rm * math.cos(p)) * x + rm * math.sin(p) * z for p in th])
+        data = self.surface(ref, pts, seam_pts)
+        return self.ext.brep_from_surface(self.make_surface(data, not same_sense))
 
     def _projected_curve(self, surf, spans):
         from .drawtools import interpolate

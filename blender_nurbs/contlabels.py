@@ -150,7 +150,7 @@ def _compute_base(obj):
             [M @ b.co for b in sp.bezier_points]
         if len(pts) >= 2:
             for (src, ref), param, P in ((ins[0], "cont_a", pts[0]), (ins[1], "cont_b", pts[-1])):
-                vals = ["G0", "G1", "G2"]
+                vals = ["G0", "G1", "G2", "G3"]
                 cur = p.get(param, "G1")
                 out.append({"pos": P, "param": param, "value": cur if cur in vals else "G1", "values": vals,
                             "name": f"{src.name} end"})
