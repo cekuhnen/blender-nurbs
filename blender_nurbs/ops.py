@@ -32,6 +32,11 @@ LOFT_CONT_ITEMS = CONT_ITEMS + [
     ("G3", "G3 Curvature Rate", "Curvature continuous, and the curvature changes across the edge at the source "
                                 "surface's rate (a source with a CV net; up to G2 with rails)"),
 ]
+# Blend Curve's ends: G3 too (the curve's own curvature rate carried on)
+BLEND_CONT_ITEMS = CONT_ITEMS + [
+    ("G3", "G3 Curvature Rate", "Curvature continuous, and the curvature changes at the curve's rate there "
+                                "(torsion too: the curve's third derivative is carried on)"),
+]
 AXIS_ITEMS = [
     ("X", "World X", ""), ("Y", "World Y", ""), ("Z", "World Z", ""),
     ("LOCAL_X", "Local X", ""), ("LOCAL_Y", "Local Y", ""), ("LOCAL_Z", "Local Z", ""),
@@ -2403,7 +2408,7 @@ class NPROTO_OT_align_curve(PickMixin, bpy.types.Operator):
 
 
 class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
-    """Blend curve between two curve ends with G0 / G1 / G2 and a weight per side.
+    """Blend curve between two curve ends with G0 / G1 / G2 / G3 and a weight per side.
     Click each curve near the end to blend from"""
     bl_idname = "nproto.blend_curve"
     bl_label = "Blend Curve"
@@ -2415,13 +2420,13 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
     inputs: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     end_a: IntProperty(name="End A", default=1, min=0, max=1, options={'HIDDEN'})
     end_b: IntProperty(name="End B", default=0, min=0, max=1, options={'HIDDEN'})
-    cont_a: EnumProperty(name="Continuity A", items=CONT_ITEMS, default="G2")
-    cont_b: EnumProperty(name="Continuity B", items=CONT_ITEMS, default="G2")
+    cont_a: EnumProperty(name="Continuity A", items=BLEND_CONT_ITEMS, default="G2")
+    cont_b: EnumProperty(name="Continuity B", items=BLEND_CONT_ITEMS, default="G2")
     w_a: FloatProperty(name="Weight A", default=1.0, min=0.0, soft_max=3.0,
                        description="Tangent weight at A (how far the blend follows curve A's direction)")
     w_b: FloatProperty(name="Weight B", default=1.0, min=0.0, soft_max=3.0)
     c_a: FloatProperty(name="Curvature A", default=0.0, soft_min=-2.0, soft_max=2.0,
-                       description="G2 shape at A (moves the 3rd CV along the tangent)")
+                       description="G2 / G3 shape at A (moves the 3rd CV along the tangent)")
     c_b: FloatProperty(name="Curvature B", default=0.0, soft_min=-2.0, soft_max=2.0)
     flip_a: BoolProperty(name="Flip A", default=False, description="Reverse the tangent direction at A")
     flip_b: BoolProperty(name="Flip B", default=False)
@@ -2502,7 +2507,7 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
             col = box.column(align=True)
             col.prop(self, f"w_{side}", text="Weight")
             sub = col.row()
-            sub.enabled = getattr(self, f"cont_{side}") == "G2"
+            sub.enabled = getattr(self, f"cont_{side}") in ("G2", "G3")
             sub.prop(self, f"c_{side}", text="Curvature")
             box.prop(self, f"flip_{side}")
 

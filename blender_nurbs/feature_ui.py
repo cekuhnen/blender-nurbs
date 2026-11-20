@@ -114,10 +114,10 @@ _LOFT_CONT_N = [(*it, i) for i, it in enumerate(LOFT_CONT_ITEMS)]
 
 
 def _side_cont_items(self, context):
-    """Continuity A / B: a Loft's sides go to G3, a Blend Curve's to G2."""
+    """Continuity A / B: a Loft's sides and a Blend Curve's ends go to G3."""
     try:
         h = features.history(self.id_data)
-        if h is not None and h.get("op") == "loft":
+        if h is not None and h.get("op") in ("loft", "blend_curve"):
             return _LOFT_CONT_N
     except Exception:
         pass

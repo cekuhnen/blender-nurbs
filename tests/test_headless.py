@@ -1447,6 +1447,45 @@ check("feature edit: blend weight rebuilds curve and its dependents",
       [tuple(p.co) for p in bcf.data.splines[0].points] != pts0 and dep.get("nproto_rev") != rev0)
 bcf.nproto_feature.cont_b = "G1"
 check("feature edit: blend continuity G2 -> G1 (degree 5 -> 4)", bcf.data.splines[0].order_u == 5)
+# Blend Curve G3: the curves' third derivatives carried on -- curvature, its rate along the curve and the
+# torsion match at both ends (also with Curvature moved, and to a rational curve); labels and panel offer G3
+def _bc_inv(c_, t_, s_=1.0):
+    D_ = geom.curve_derivs(c_, t_, 3)
+    a_, b_, d3_ = s_ * D_[1], D_[2], s_ * D_[3]
+    ab_ = np.cross(a_, b_)
+    k_ = np.linalg.norm(ab_) / np.linalg.norm(a_) ** 3
+    dk_ = ((ab_ @ np.cross(a_, d3_)) / np.linalg.norm(ab_) / np.linalg.norm(a_) ** 3
+           - 3 * k_ * (a_ @ b_) / (a_ @ a_)) / np.linalg.norm(a_)
+    return np.array([k_, dk_, (ab_ @ d3_) / (ab_ @ ab_)])
+_g3A = nurbs("BC3_A", [(0, 30, 0), (1, 30.3, 0.1), (2, 29.8, 0.4), (3, 30.5, 0.2), (4, 30.1, 0.9)], order=5)
+_g3B = nurbs("BC3_B", [(6, 31, 1), (7, 31.5, 0.3), (8, 30.6, -0.4), (9, 31.2, 0.1)])
+for _i_, _w_ in enumerate((1, 1.3, 0.8, 1)):
+    _g3B.data.splines[0].points[_i_].co[3] = _w_
+_ca3, _cb3 = features.input_curve(_g3A, "S0"), features.input_curve(_g3B, "S0")
+_bc3 = []
+for _cc in ((0.0, 0.0), (0.7, -0.4)):
+    _, _dg, _pt = features.run("blend_curve", [(_g3A, "S0"), (_g3B, "S0")],
+                               {"end_a": 1, "end_b": 0, "cont_a": "G3", "cont_b": "G3", "c_a": _cc[0], "c_b": _cc[1]})
+    _bl = ext.curve_from_cvs(_dg, [tuple(q_) for q_ in _pt], [0.0] * (_dg + 1) + [1.0] * (_dg + 1), None)
+    _ia, _ib = _bc_inv(_ca3, _ca3.parameter_range()[1]), _bc_inv(_cb3, _cb3.parameter_range()[0])
+    _bc3.append((_dg, float(np.max(np.abs(_bc_inv(_bl, 0.0) - _ia) / np.abs(_ia))),
+                 float(np.max(np.abs(_bc_inv(_bl, 1.0) - _ib) / np.abs(_ib)))))
+_, _dg2, _pt2 = features.run("blend_curve", [(_g3A, "S0"), (_g3B, "S0")], {"end_a": 1, "end_b": 0, "cont_a": "G2", "cont_b": "G3"})
+_bl2 = ext.curve_from_cvs(_dg2, [tuple(q_) for q_ in _pt2], [0.0] * (_dg2 + 1) + [1.0] * (_dg2 + 1), None)
+_g2open = float(np.max(np.abs(_bc_inv(_bl2, 0.0) - _bc_inv(_ca3, _ca3.parameter_range()[1]))[1:]))
+r = bpy.ops.nproto.blend_curve(inputs=ins((_g3A, "S0"), (_g3B, "S0")), end_a=1, end_b=0, cont_a="G3", cont_b="G3")
+_bco = ctx.active_object
+from blender_nurbs import contlabels as _clbc, feature_ui as _fuibc
+_clbc._cache.clear()
+_fuibc.sync_from_history(_bco)
+check("blend curve G3: degree 7; curvature, its rate and the torsion match at both ends (Curvature moved, rational "
+      "B too); a G2 end leaves them open; labels and Feature panel offer G3",
+      all(d_ == 7 and ea_ < 1e-8 and eb_ < 1e-8 for d_, ea_, eb_ in _bc3) and _dg2 == 6 and _g2open > 1e-3
+      and r == {'FINISHED'} and _bco.data.splines[0].order_u == 8
+      and [L_["values"] for L_ in _clbc.labels(_bco)] == [["G0", "G1", "G2", "G3"]] * 2
+      and _bco.nproto_feature.cont_a == "G3"
+      and [i_[0] for i_ in _fuibc._side_cont_items(_bco.nproto_feature, ctx)] == ["G0", "G1", "G2", "G3"],
+      f"{_bc3} G2 end {_g2open:.3g}")
 
 # --- History chains: Trim / Split / Surface Fillet / Join / Edge Fillet ---
 def settle():
@@ -4483,10 +4522,10 @@ bpy.ops.nproto.blend_curve(inputs=ins((_lbc[0], "S0"), (_lbc[1], "S0")), end_a=1
 bcf = ctx.active_object
 _li = [it[0] for it in _fui._side_cont_items(_lo.nproto_feature, ctx)]
 _bi = [it[0] for it in _fui._side_cont_items(bcf.nproto_feature, ctx)]
-check("loft labels offer G0 - G3 and a click steps G2 -> G3 (rebuilt G3); the Feature panel offers G3 for a loft, "
-      "not for a blend curve",
+check("loft labels offer G0 - G3 and a click steps G2 -> G3 (rebuilt G3); the Feature panel offers G3 for a loft "
+      "and a blend curve",
       _vals == [["G0", "G1", "G2", "G3"]] * 2 and r1 == {'FINISHED'} and _c1 == "G3" and _g3after[2] < 1e-7
-      and _li == ["G0", "G1", "G2", "G3"] and _bi == ["G0", "G1", "G2"] and _lo.nproto_feature.cont_a == "G3",
+      and _li == ["G0", "G1", "G2", "G3"] and _bi == ["G0", "G1", "G2", "G3"] and _lo.nproto_feature.cont_a == "G3",
       f"{_vals} {_c1} {_g3after} {_li} {_bi} {_lo.nproto_feature.cont_a}")
 
 # --- Boundary: exact Coons edges, degree / spans ------------------------------

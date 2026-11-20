@@ -1723,12 +1723,13 @@ def build_planar(inputs, p):
 def build_blend_curve(inputs, p):
     """Returns ('curve', degree, world CVs): written into a Blender curve object."""
     (oa, ra), (ob, rb) = inputs[0], inputs[1]
-    fa = geom.curve_end_frame(input_curve(oa, ra), int(p.get("end_a", 1)))
-    fb = geom.curve_end_frame(input_curve(ob, rb), int(p.get("end_b", 0)))
+    fa = geom.curve_end_frame(input_curve(oa, ra), int(p.get("end_a", 1)), p.get("cont_a") == "G3")
+    fb = geom.curve_end_frame(input_curve(ob, rb), int(p.get("end_b", 0)), p.get("cont_b") == "G3")
+    flip = lambda f: (f[0], -f[1], f[2]) + tuple(-x for x in f[3:])      # odd derivatives turn round
     if p.get("flip_a"):
-        fa = (fa[0], -fa[1], fa[2])
+        fa = flip(fa)
     if p.get("flip_b"):
-        fb = (fb[0], -fb[1], fb[2])
+        fb = flip(fb)
     deg, pts = geom.blend_curve_cvs(fa, fb, p.get("cont_a", "G1"), p.get("cont_b", "G1"),
                                     p.get("w_a", 1.0), p.get("w_b", 1.0), p.get("c_a", 0.0), p.get("c_b", 0.0))
     return ("curve", deg, pts)
