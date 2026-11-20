@@ -1618,28 +1618,119 @@ def _exact_draft(cv, d, h, off, flip, symmetric):
         sgn = -sgn
     heights = [h] + ([-h] if symmetric else [])          # far rows: top (and bottom)
 
-    def fit_piece(Pw_, U_):
-        """The far rows of one smooth piece on its own basis (ends exact)."""
+    def unit(v):
+        return v / (np.linalg.norm(v) or 1.0)
+
+    def tangent_at(Q, i0, i1, i2):
+        """The profile's unit tangent at its CV i1 where the curve passes
+        through it (a knot of full multiplicity, or a clamped end): exactly
+        the directions to and from its neighbours i0, i2 (positive weights),
+        averaged (they agree: no corner there)."""
+        return unit(unit(Q[i1] - Q[i0]) + unit(Q[i2] - Q[i1]))
+
+    # a closed profile smooth through its seam: the far row's two seam ends
+    # must leave along one tangent too
+    seam_t = None
+    if closed and not seam_corner:
+        seam_t = unit(unit(P[-1] - P[-2]) + unit(P[1] - P[0]))
+
+    def fit_piece(Pw_, U_, t_start=None, t_end=None):
+        """The far rows of one smooth piece on its own basis (ends exact). At
+        a knot of full multiplicity the basis is only C0, so a free fit would
+        put a small tangent crease there (and in the wall): the far row's CV
+        at such a knot is held on the target and its two neighbours on the
+        profile's tangent line through it -- the row and the ruled wall are
+        then G1 there, as the profile is. t_start / t_end: the same at the
+        piece's ends (a smooth seam)."""
         n0 = len(Pw_)
         for _ in range(16):
             w_ = Pw_[:, 3]
+            n_cv = len(Pw_)
             br_ = sorted(set(U_))
+            fixed = {0: U_[0], n_cv - 1: U_[-1]}              # CV -> parameter (on the target)
+            Q = Pw_[:, :3] / w_[:, None]
+            anchors = []
+            for k in br_[1:-1]:
+                if U_.count(k) >= p:
+                    j = U_.index(k) - 1
+                    fixed[j] = k
+                    anchors.append((j, tangent_at(Q, j - 1, j, j + 1)))
+            if t_start is not None:
+                anchors.append((0, t_start))
+            if t_end is not None:
+                anchors.append((n_cv - 1, t_end))
+            ties = {}                                         # CV -> [(anchor CV, unit tangent)]
+            for j, T in anchors:
+                for i in (j - 1, j + 1):
+                    if 0 <= i < n_cv and i not in fixed:
+                        ties.setdefault(i, []).append((j, T))
             ts_ = np.concatenate([np.linspace(a, b, 16, endpoint=False) for a, b in zip(br_[:-1], br_[1:])]
                                  + [[br_[-1]]])
+            at = {k: 16 * i for i, k in enumerate(br_)}       # the sample index of each knot
+            at[br_[-1]] = len(ts_) - 1
             C_, T_ = frame(Pw_, U_, ts_)
             n_ = unit_n(T_)
             if n_ is None:
                 return None
             B = basis(U_, p, ts_)
             R = B * w_[None, :] / (B @ w_)[:, None]           # the rational basis
+            tgs = [C_ + hh * d + off * sgn * n_ for hh in heights]
+            # one CV between two anchors (degree 2: every span between double
+            # knots) lies on both tangent lines: where they meet (one line
+            # when they are the same: a straight span); else split the span
+            meet, split = {}, None
+            for i, tl in ties.items():
+                if len(tl) < 2:
+                    continue
+                (j1, T1), (j2, T2) = tl
+                pts = []
+                for tg in tgs:
+                    A1, A2 = tg[at[fixed[j1]]], tg[at[fixed[j2]]]
+                    c = T1 @ T2
+                    if 1.0 - abs(c) < 1e-12:                  # parallel: the same line, or no meeting
+                        if np.linalg.norm(np.cross(A2 - A1, T1)) > 1e-3 * tol:
+                            break
+                        continue
+                    s1, s2 = np.linalg.solve(np.array([[1.0, -c], [c, -1.0]]), [(A2 - A1) @ T1, (A2 - A1) @ T2])
+                    q1, q2 = A1 + s1 * T1, A2 + s2 * T2
+                    if np.linalg.norm(q1 - q2) > 1e-3 * tol or s1 * (A2 - A1) @ T1 < 0:
+                        break                                 # skew lines, or a meeting behind
+                    pts.append(0.5 * (q1 + q2))
+                else:
+                    if pts:
+                        meet[i] = pts
+                    else:
+                        ties[i] = tl[:1]
+                    continue
+                split = 0.5 * (fixed[j1] + fixed[j2])
+                break
+            if split is not None:
+                Pw_, U_ = insert_knot(Pw_, U_, p, split)
+                Pw_ = np.asarray(Pw_, float)
+                continue
+            # X = X0 + M z: fixed and met CVs in X0, a tied CV = its anchor + s * tangent
+            cols = []
+            for i in range(n_cv):
+                if i in meet or i in fixed:
+                    continue
+                cols.append((i, [ties[i][0][1]] if i in ties else list(np.eye(3))))
+            M = np.zeros((3 * n_cv, sum(len(c) for _, c in cols)))
+            c0 = 0
+            for i, vs in cols:
+                for v in vs:
+                    M[3 * i:3 * i + 3, c0] = v
+                    c0 += 1
+            RR = np.kron(R, np.eye(3))
             rows, worst = [], np.zeros(len(ts_))
-            for hh in heights:
-                tg = C_ + hh * d + off * sgn * n_
-                X = np.zeros((len(Pw_), 3))
-                X[0], X[-1] = tg[0], tg[-1]
-                if len(Pw_) > 2:
-                    rhs = tg - np.outer(R[:, 0], X[0]) - np.outer(R[:, -1], X[-1])
-                    X[1:-1] = np.linalg.lstsq(R[:, 1:-1], rhs, rcond=None)[0]
+            for r_, tg in enumerate(tgs):
+                X = np.zeros((n_cv, 3))
+                for i, k in fixed.items():
+                    X[i] = tg[at[k]]
+                for i, tl in ties.items():
+                    X[i] = meet[i][r_] if i in meet else X[tl[0][0]]
+                if M.shape[1]:
+                    z = np.linalg.lstsq(RR @ M, (tg - R @ X).ravel(), rcond=None)[0]
+                    X = X + (M @ z).reshape(n_cv, 3)
                 rows.append(X)
                 worst = np.maximum(worst, np.linalg.norm(R @ X - tg, axis=1))
             if worst.max() <= tol:
@@ -1658,7 +1749,8 @@ def _exact_draft(cv, d, h, off, flip, symmetric):
     for a, b in zip(cuts[:-1], cuts[1:]):
         ka = 0 if a == U[0] else U.index(a) - 1
         kb = len(P) - 1 if b == U[-1] else U.index(b) - 1
-        res = fit_piece(Pw[ka:kb + 1], [a] * (p + 1) + [u for u in U if a < u < b] + [b] * (p + 1))
+        res = fit_piece(Pw[ka:kb + 1], [a] * (p + 1) + [u for u in U if a < u < b] + [b] * (p + 1),
+                        seam_t if a == U[0] else None, seam_t if b == U[-1] else None)
         if res is None:
             return None
         pieces.append(res)

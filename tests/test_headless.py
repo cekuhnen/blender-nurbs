@@ -2276,6 +2276,43 @@ for _sym in (False, True):
           and abs(_rr[0].mean() - (1 + _t if _sym else 1.0)) < 1e-6 and abs(_rr[1].mean() - (1 + _t)) < 1e-6,
           f"cvs {_cd['count_u']}x{_cd['count_v']} rational {bool(_cd['weights'])} radii "
           f"{[(round(float(_x.mean()), 7), float(np.ptp(_x))) for _x in _rr]}")
+# a drafted rational profile with double knots (C0 basis there) stays G1 at them: the far row's CVs either
+# side of such a knot lie on the profile's tangent line (a free fit creased an ellipse's rim and wall by 0.1 deg)
+def _kink(_a, _b):
+    return math.degrees(math.acos(max(-1.0, min(1.0, _a @ _b / (np.linalg.norm(_a) * np.linalg.norm(_b))))))
+_dk = {}
+for _i, (_shape, _dr) in enumerate((("circle", -8.0), ("circle", 5.0), ("ellipse", -8.0), ("ellipse", 5.0),
+                                    ("rounded rect", -8.0), ("rounded rect", 5.0))):
+    if _shape == "rounded rect":
+        bpy.ops.nproto.add_primitive(kind="RECTANGLE", width=2.0, depth=1.2, corner=0.3)
+    else:
+        bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0)
+    _ep = ctx.active_object
+    if _shape == "ellipse":
+        _h = json.loads(_ep[features.PROP_HIST]); _h["params"]["elliptic"] = True; _h["params"]["radius2"] = 0.6
+        _ep[features.PROP_HIST] = json.dumps(_h); features.rebuild(_ep, ctx, force=True)
+    _ep.location = (50 + 4 * _i, 0, -190); ctx.view_layer.update()
+    r = bpy.ops.nproto.extrude(inputs=ins((_ep, "S0")), distance=2.0, direction="Z", draft=_dr)
+    _eo = ctx.active_object
+    _es = store.get_surfaces(_eo)[0]
+    _kv = ext.surface_cvs(_es)["knots_v"]
+    _side = max(("U0", "U1", "V0", "V1"), key=lambda w: np.mean([q[2] for q in geom.boundary_points(_es, w, 8)]))
+    _kc = features.input_curve(_eo, _side)
+    _E = lambda t: np.array(_kc.evaluate(t), float)
+    _t0, _t1 = _kc.parameter_range()
+    _ks = [(_k - _kv[0]) / (_kv[-1] - _kv[0]) for _k in sorted(set(_kv)) if _kv[0] < _k < _kv[-1]]
+    _rim = [_kink(_E(_t0 + (_t1 - _t0) * _s) - _E(_t0 + (_t1 - _t0) * _s - 1e-7),
+                  _E(_t0 + (_t1 - _t0) * _s + 1e-7) - _E(_t0 + (_t1 - _t0) * _s)) for _s in _ks]
+    _rim.append(_kink(_E(_t1) - _E(_t1 - 1e-7), _E(_t0 + 1e-7) - _E(_t0)))          # the seam
+    (_u0, _u1), (_v0, _v1) = _es.u_domain(), _es.v_domain()
+    def _nrm(_u, _v):
+        _S = lambda a, b: np.array(_es.evaluate(a, b), float)
+        return np.cross(_S(min(_u + 1e-6, _u1), _v) - _S(max(_u - 1e-6, _u0), _v), _S(_u, _v + 1e-8) - _S(_u, _v - 1e-8))
+    _wall = [_kink(_nrm(_u, _v0 + (_v1 - _v0) * _s - 2e-7), _nrm(_u, _v0 + (_v1 - _v0) * _s + 2e-7))
+             for _s in _ks for _u in np.linspace(_u0, _u1, 5)]
+    _dk[f"{_shape} {_dr:+g}"] = (r == {'FINISHED'}, round(max(_rim), 5), round(max(_wall), 5))
+check("drafted circle, ellipse and rounded rectangle (-8 and +5 deg): top rim and wall G1 at every knot and the "
+      "seam (< 0.001 deg)", all(_v[0] and _v[1] < 1e-3 and _v[2] < 1e-3 for _v in _dk.values()), str(_dk))
 # a smooth profile with a sharp corner still drafts (sampled, mitred path)
 _bzc = bezier("EX_bz", [(40, 0), (42, 0), (42, 2), (40, 2)], -190.0)
 _bzc.data.splines[0].use_cyclic_u = True
