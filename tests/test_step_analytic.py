@@ -49,6 +49,23 @@ Gcone = np.array([3, 4, 5]) + (0.25 + 0.1 * vv)[..., None] * (np.cos(uu)[..., No
 check("a cone is no cylinder", se.fit_cylinder(Gcone, 1e-9, 10) is None)
 P = np.array([1, 2, 3]) + uu[..., None] * e1 + vv[..., None] * ax
 check("plane: found; a cylinder is no plane", se.fit_plane(P, 1e-9) is not None and se.fit_plane(G, 1e-9) is None)
+# a cone, apex (3,4,5) - 2.5 ax, radius 0.25 + 0.1 v: semi-angle atan(0.1)
+co = se.fit_cone(Gcone, 1e-9, 10)
+check("cone: apex, axis into the face, semi-angle", co is not None
+      and np.linalg.norm(co[0] - (np.array([3, 4, 5]) - 2.5 * ax)) < 1e-9 and abs(co[1] @ ax - 1) < 1e-12
+      and abs(co[2] - math.atan(0.1)) < 1e-12, f"{co}")
+co = se.fit_cone(Gcone[:, ::-1].transpose(1, 0, 2), 1e-9, 10)
+check("cone, rulings along u and running to the apex", co is not None and abs(co[1] @ ax - 1) < 1e-12)
+uu2, ww = np.meshgrid(np.linspace(0.2, 1.4, 9), np.linspace(0, 1, 7), indexing="ij")     # a partial, pointed one
+Gtip = (ww * 0.7)[..., None] * (np.cos(uu2)[..., None] * e1 + np.sin(uu2)[..., None] * e2) + (ww * 1.2)[..., None] * ax
+co = se.fit_cone(Gtip, 1e-9, 10)
+check("partial cone with its tip in the face", co is not None and np.linalg.norm(co[0]) < 1e-9
+      and abs(co[2] - math.atan2(0.7, 1.2)) < 1e-12, f"{co}")
+check("a cylinder is no cone; a bent cone is no cone", se.fit_cone(G, 1e-9, 10) is None
+      and se.fit_cone(Gcone + 1e-6 * np.sin(np.pi * (vv + 1) / 3)[..., None] * e1, 1e-9, 10) is None)
+Gboth = np.array([3, 4, 5]) + (0.1 * vv)[..., None] * (np.cos(uu)[..., None] * e1 + np.sin(uu)[..., None] * e2) \
+    + vv[..., None] * ax                                    # v from -1 to 2: through the apex, both nappes
+check("a double cone (both nappes) is not written as one", se.fit_cone(Gboth, 1e-9, 10) is None)
 
 # --- export: what each shape is written as ------------------------------------------------
 def add(kind, **kw):
@@ -56,7 +73,8 @@ def add(kind, **kw):
     return ctx.active_object
 
 def kinds(txt):
-    return {k: len(re.findall(r"=%s\(" % k, txt)) for k in ("CYLINDRICAL_SURFACE", "PLANE", "CIRCLE", "LINE")} | {
+    return {k: len(re.findall(r"=%s\(" % k, txt)) for k in ("CYLINDRICAL_SURFACE", "CONICAL_SURFACE", "PLANE",
+                                                             "CIRCLE", "LINE")} | {
         "BSPLINE_SURF": txt.count("B_SPLINE_SURFACE"), "BSPLINE_CURVE": txt.count("B_SPLINE_CURVE")}
 
 def export(o, name, **kw):
@@ -76,7 +94,7 @@ ctx.view_layer.update()
 st, txt, res, rep = export(cyl, "cyl")
 k = kinds(txt)
 check("exact solid cylinder: a CYLINDRICAL_SURFACE, two PLANEs, two CIRCLEs, the seam a LINE; no B-splines",
-      k == {"CYLINDRICAL_SURFACE": 1, "PLANE": 2, "CIRCLE": 2, "LINE": 1, "BSPLINE_SURF": 0, "BSPLINE_CURVE": 0}, str(k))
+      k == {"CYLINDRICAL_SURFACE": 1, "CONICAL_SURFACE": 0, "PLANE": 2, "CIRCLE": 2, "LINE": 1, "BSPLINE_SURF": 0, "BSPLINE_CURVE": 0}, str(k))
 r_ = float(re.search(r"=CYLINDRICAL_SURFACE\('',#\d+,([^)]+)\)", txt).group(1))
 # (within Blender's single-precision object matrix: rotated, it is a hair from rigid)
 check("its radius in millimetres", abs(r_ - 500) < 1e-4, f"{r_}")
@@ -90,7 +108,7 @@ check("every referenced entity is defined", set(re.findall(r"#(\d+)", txt)) <= _
 
 st, txt, res, rep = export(cyl, "cyl_bspline", analytic=False)
 k = kinds(txt)
-check("analytic off: B-splines only, as before", k["CYLINDRICAL_SURFACE"] == k["PLANE"] == k["CIRCLE"] == k["LINE"] == 0
+check("analytic off: B-splines only, as before", k["CYLINDRICAL_SURFACE"] == k["CONICAL_SURFACE"] == k["PLANE"] == k["CIRCLE"] == k["LINE"] == 0
       and k["BSPLINE_SURF"] and rep["solids"] == 1, str(k))
 
 smooth = add("CYLINDER", radius=0.5, height=1.2, caps=True, degree="3")
@@ -116,6 +134,50 @@ check("box with a hole: the hole a CYLINDRICAL_SURFACE, its rims CIRCLEs, the bo
       and k["BSPLINE_SURF"] == 0, str(k))
 check("box with a hole reads back: one solid, every face, the volume", rep["solids"] == 1 and rep["failed"] == 0
       and res and res[0][1].face_count() == 7 and abs(vol(res[0][1]) / (4.0 - math.pi * 0.16) - 1) < 1e-4,
+      f"{rep} {vol(res[0][1]) if res else None}")
+
+# cones: a frustum, a pointed one, a smooth one, a countersink
+fr = add("CONE", radius=0.6, radius2=0.25, height=0.9, caps=True, degree="0")
+fr.location, fr.rotation_euler = (-2, 1, 0.5), (0.3, -0.5, 0.8)
+ctx.view_layer.update()
+st, txt, res, rep = export(fr, "frustum")
+k = kinds(txt)
+check("exact frustum: a CONICAL_SURFACE, two PLANEs, two CIRCLEs, the seam a LINE; no B-splines",
+      k == {"CYLINDRICAL_SURFACE": 0, "CONICAL_SURFACE": 1, "PLANE": 2, "CIRCLE": 2, "LINE": 1, "BSPLINE_SURF": 0,
+            "BSPLINE_CURVE": 0}, str(k))
+m = re.search(r"=CONICAL_SURFACE\('',(#\d+),([^,]+),([^)]+)\)", txt)
+check("its semi-angle atan(0.35 / 0.9)", m and abs(float(m.group(3)) - math.atan(0.35 / 0.9)) < 1e-6, m and m.group(3))
+check("frustum reads back: one solid, three faces, the volume", rep["solids"] == 1 and rep["failed"] == 0 and res
+      and res[0][1].face_count() == 3
+      and abs(vol(res[0][1]) / (math.pi * 0.9 / 3 * (0.36 + 0.15 + 0.0625)) - 1) < 1e-4,
+      f"{rep} {vol(res[0][1]) if res else None}")
+check("frustum: every referenced entity is defined",
+      set(re.findall(r"#(\d+)", txt)) <= set(re.findall(r"^#(\d+)=", txt, re.M)))
+tip = add("CONE", radius=0.5, radius2=0.0, height=1.0, caps=True, degree="0")
+st, txt, res, rep = export(tip, "pointed")
+k = kinds(txt)
+check("exact pointed cone: a CONICAL_SURFACE and its base a PLANE", k["CONICAL_SURFACE"] == 1 and k["PLANE"] == 1
+      and k["BSPLINE_SURF"] == 0, str(k))
+check("pointed cone reads back: one solid, the volume", rep["solids"] == 1 and rep["failed"] == 0 and res
+      and abs(vol(res[0][1]) / (math.pi * 0.25 / 3) - 1) < 1e-4, f"{rep} {vol(res[0][1]) if res else None}")
+sc_ = add("CONE", radius=0.6, radius2=0.25, height=0.9, caps=True, degree="3")
+st, txt, res, rep = export(sc_, "smooth_cone")
+k = kinds(txt)
+check("smooth cone: stays a B-spline", k["CONICAL_SURFACE"] == 0 and k["BSPLINE_SURF"] == 1 and rep["solids"] == 1,
+      str(k))
+bx = add("BOX", width=2, depth=2, height=1)
+cs = add("CONE", radius=0.1, radius2=0.7, height=1.2, caps=True, degree="0")
+cs.location = (0, 0, -0.6)          # a tapered hole through the box (z -0.5..0.5): radius 0.15 at the bottom, 0.65 at the top
+ctx.view_layer.update()
+r = bpy.ops.nproto.boolean(operation="DIFFERENCE", names=json.dumps([bx.name, cs.name]))
+sink = ctx.active_object
+st, txt, res, rep = export(sink, "countersink")
+k = kinds(txt)
+check("box with a tapered hole: the sink a CONICAL_SURFACE, its rims CIRCLEs, no B-spline surfaces",
+      r == {'FINISHED'} and k["CONICAL_SURFACE"] == 1 and k["CIRCLE"] == 2 and k["BSPLINE_SURF"] == 0, str(k))
+check("tapered hole reads back: one solid, every face", rep["solids"] == 1 and rep["failed"] == 0 and res
+      and res[0][1].face_count() == store.get_brep(sink).face_count()
+      and abs(vol(res[0][1]) / (4 - math.pi / 3 * (0.65 ** 2 + 0.65 * 0.15 + 0.15 ** 2)) - 1) < 1e-4,
       f"{rep} {vol(res[0][1]) if res else None}")
 
 # an extruded exact circle and an extruded smooth one

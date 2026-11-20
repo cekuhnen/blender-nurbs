@@ -3,9 +3,9 @@
 Exact geometry: every face's surface is written as a B-spline surface (rational
 when it has weights), every edge as a B-spline curve cut exactly to the edge's
 range -- or, with analytic on (the default), as what it truly is when it is one
-within 1e-7 of the body's size: a CYLINDRICAL_SURFACE or PLANE, a CIRCLE or
-LINE, as CAD programs write them (an exact cylinder is then a true cylinder in
-the file, its holes and bosses recognised by the reader) -- with full B-rep topology (vertices, edge curves shared by their two
+within 1e-7 of the body's size: a CYLINDRICAL_SURFACE, CONICAL_SURFACE or
+PLANE, a CIRCLE or LINE, as CAD programs write them (an exact cylinder is then
+a true cylinder in the file, its holes and bosses recognised by the reader) -- with full B-rep topology (vertices, edge curves shared by their two
 faces, oriented edges, outer / inner face bounds, face sense). Closed bodies
 become MANIFOLD_SOLID_BREPs, open ones SHELL_BASED_SURFACE_MODELs. Each object
 is one body, in world space, written in the chosen length unit.
@@ -56,7 +56,7 @@ def _knots(U):
 
 
 # --------------------------------------------------------------------------
-# Analytic recognition: is this B-spline a line, circle, plane or cylinder?
+# Analytic recognition: is this B-spline a line, circle, plane, cylinder or cone?
 # Measured on samples, within tol (absolute, export units); None if not.
 # --------------------------------------------------------------------------
 
@@ -161,6 +161,55 @@ def fit_cylinder(G, tol, size):
     return None
 
 
+def fit_cone(G, tol, size):
+    """(apex, unit axis pointing from the apex into the face, semi-angle) of a
+    grid of surface points G (mu, mv, 3) on one nappe of a circular cone, its
+    rulings along u or v, else None. Planes and cylinders are not cones (check
+    fit_plane and fit_cylinder first)."""
+    G = np.asarray(G, float)
+    P = G.reshape(-1, 3)
+    for rows in (G, G.transpose(1, 0, 2)):          # rulings along v, then along u
+        lines = [fit_line(R, tol) for R in rows]
+        if any(ln is None for ln in lines):
+            continue
+        D = np.array([d for _, d in lines])          # all in parameter order, so all one way
+        if float(np.linalg.norm(np.cross(D, D[0]), axis=1).max()) < 1e-9:
+            continue                                  # parallel rulings: a cylinder
+        # the apex: nearest to all the rulings
+        M = np.zeros((3, 3))
+        b = np.zeros(3)
+        for (o, d) in lines:
+            Q = np.eye(3) - np.outer(d, d)
+            M += Q
+            b += Q @ o
+        if np.linalg.svd(M, compute_uv=False)[-1] < 1e-9 * len(lines):
+            continue
+        apex = np.linalg.solve(M, b)
+        if float(np.linalg.norm(apex - P.mean(axis=0))) > 1e3 * size:
+            continue
+        # the axis: the ruling directions' tips lie on a circle round it
+        c = D.mean(axis=0)
+        _, sv, Vt = np.linalg.svd(D - c, full_matrices=False)
+        if sv[1] < 1e-9:                              # too few distinct rulings to tell
+            continue
+        a = Vt[2]
+        r = P - apex
+        if float((r @ a).mean()) < 0:
+            a = -a
+        h = r @ a
+        rho = np.linalg.norm(r - np.outer(h, a), axis=1)
+        if float(h.min()) < -tol:                     # both nappes
+            continue
+        far = rho + h > 1e-3 * (float(np.ptp(h)) + float(rho.max()))
+        al = float(np.arctan2(rho[far], h[far]).mean())
+        if not (1e-6 < al < 0.5 * np.pi - 1e-6):
+            continue
+        if float(np.abs(rho * np.cos(al) - h * np.sin(al)).max()) > tol:
+            continue
+        return apex, a, al
+    return None
+
+
 def _perp(n, hint=None):
     """A unit vector square to n (hint's part square to n, when it has one)."""
     if hint is not None:
@@ -191,7 +240,8 @@ class StepExporter:
         self.scale = scale * unit_factor
         self.analytic = analytic
         self.stats = {"bodies": 0, "faces": 0, "edges": 0, "solids": 0, "sheets": 0,
-                      "analytic": {"CYLINDRICAL_SURFACE": 0, "PLANE": 0, "CIRCLE": 0, "LINE": 0}}
+                      "analytic": {"CYLINDRICAL_SURFACE": 0, "CONICAL_SURFACE": 0, "PLANE": 0, "CIRCLE": 0,
+                                   "LINE": 0}}
         self._dir_cache = {}
 
     # -- small geometry ----------------------------------------------------
@@ -227,8 +277,9 @@ class StepExporter:
         return None
 
     def analytic_surface(self, G, tol, size):
-        """(entity, normal at a point: P -> unit normal) of a PLANE or
-        CYLINDRICAL_SURFACE through the surface samples G, else None."""
+        """(entity, normal at a point: P -> unit normal) of a PLANE,
+        CYLINDRICAL_SURFACE or CONICAL_SURFACE through the surface samples G,
+        else None."""
         pl = fit_plane(G, tol)
         if pl is not None:
             c, n = pl
@@ -246,6 +297,22 @@ class StepExporter:
                 d = np.asarray(P, float) - o
                 d -= (d @ a) * a
                 return d / (np.linalg.norm(d) or 1.0)
+            return ent, normal
+        co = fit_cone(G, tol, size)
+        if co is not None:
+            apex, a, al = co
+            G2 = np.asarray(G, float).reshape(-1, 3)
+            hm = float(((G2 - apex) @ a).mean())           # placed at the face's mean height
+            o = apex + hm * a
+            self.stats["analytic"]["CONICAL_SURFACE"] += 1
+            ent = self.w.add(f"CONICAL_SURFACE('',{self.placement(o, a, _perp(a, G2[0] - o))},"
+                             f"{_f(hm * np.tan(al))},{_f(al)})")
+
+            def normal(P):           # STEP's: away from the axis, tilted back towards the apex
+                d = np.asarray(P, float) - apex
+                e = d - (d @ a) * a
+                e /= (np.linalg.norm(e) or 1.0)
+                return e * np.cos(al) - a * np.sin(al)
             return ent, normal
         return None
 
@@ -561,9 +628,10 @@ class NPROTO_OT_export_step(bpy.types.Operator, ExportHelper):
                        description="Length unit of the file; Blender units are taken as metres")
     global_scale: FloatProperty(name="Scale", default=1.0, min=1e-6, soft_max=1000.0)
     analytic: BoolProperty(name="Analytic Surfaces", default=True,
-                           description="Write true cylinders, planes, circles and lines as STEP's own "
-                                       "CYLINDRICAL_SURFACE, PLANE, CIRCLE and LINE, as CAD programs do (holes and "
-                                       "bosses are then recognised); off: everything as B-splines")
+                           description="Write true cylinders, cones, planes, circles and lines as STEP's own "
+                                       "CYLINDRICAL_SURFACE, CONICAL_SURFACE, PLANE, CIRCLE and LINE, as CAD programs "
+                                       "do (holes, bosses and countersinks are then recognised); off: everything as "
+                                       "B-splines")
 
     def execute(self, context):
         sc = context.scene.unit_settings.scale_length or 1.0      # Blender units -> metres
@@ -577,8 +645,11 @@ class NPROTO_OT_export_step(bpy.types.Operator, ExportHelper):
         msg = (f"STEP: {stats['bodies']} bodies ({stats['solids']} solid, {stats['sheets']} sheet), "
                f"{stats['faces']} faces, {stats['edges']} edges")
         an = stats["analytic"]
-        if self.analytic and (an["CYLINDRICAL_SURFACE"] or an["CIRCLE"]):
-            msg += f"; {an['CYLINDRICAL_SURFACE']} true cylinder faces, {an['CIRCLE']} circles"
+        if self.analytic and (an["CYLINDRICAL_SURFACE"] or an["CONICAL_SURFACE"] or an["CIRCLE"]):
+            msg += f"; {an['CYLINDRICAL_SURFACE']} true cylinder faces"
+            if an["CONICAL_SURFACE"]:
+                msg += f", {an['CONICAL_SURFACE']} cone faces"
+            msg += f", {an['CIRCLE']} circles"
         if stats.get("open_loops"):
             msg += f"; {len(stats['open_loops'])} edge loop(s) don't close -- other programs may drop those faces"
         if stats.get("failed"):
