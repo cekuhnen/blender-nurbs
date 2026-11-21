@@ -696,6 +696,12 @@ def draw_feature(layout, context):
                          ("Chamfer" if prm.get("xsect") == 0 else "Circular"))
                 box.label(text=f"Shape: {shape} · Rail: {'Chord' if prm.get('chord') else 'Rolling Ball'}",
                           icon='MOD_BEVEL')
+                from .steps import fillet_radii
+                var = fillet_radii(prm).get("radii")     # as history replays it (scaled with Radius A)
+                if var:
+                    from .valuedrag import fmt_length
+                    box.label(text=f"Variable Radius: {fmt_length(context, var[0])} → "
+                                   f"{fmt_length(context, var[1])} (Radius A scales both)", icon='DRIVER_DISTANCE')
             from .ui import draw_pause
             draw_pause(box, context)
             if obj.get("nproto_feature_synced") != obj.get(features.PROP_HIST):
