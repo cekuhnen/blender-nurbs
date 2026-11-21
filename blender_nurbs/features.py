@@ -1430,6 +1430,8 @@ def _extrude_side(obj, curve, p):
     d = extrude_direction(obj, curve, p)
     h = float(p.get("distance", 1.0))
     draft = float(p.get("draft", 0.0))
+    if p.get("start"):                       # Extrude Face: the walls start a hair behind the face
+        curve = geom.translate_curve(curve, tuple(d * float(p["start"])))
     if abs(draft) > 1e-9:
         # Multi-Draft: height h along d, the far edge moved outward by h tan(draft)
         return geom.draft_extrude(curve, d, h, draft, flip=bool(p.get("draft_flip")),
@@ -1439,6 +1441,103 @@ def _extrude_side(obj, curve, p):
         curve = geom.translate_curve(curve, tuple(-vec))
         vec = vec * 2.0
     return sm.create_extrude_surface(curve, tuple(vec))
+
+
+def is_face_ref(ref):
+    """A face of a NURBS object as an input: F<index> (Extrude Face)."""
+    return isinstance(ref, str) and len(ref) > 1 and ref[0] == "F" and ref[1:].isdigit()
+
+
+def face_at(obj, p, ref=None):
+    """The index of the face an Extrude Face means: the one at its point
+    (face_local, the object's local space), else the one its ref names."""
+    faces = store.get_brep(obj).faces()
+    q = p.get("face_local")
+    if q is not None:
+        return min(range(len(faces)), key=lambda k: faces[k].closest_point(tuple(map(float, q)))[1])
+    i = int(ref[1:]) if ref else 0
+    if not 0 <= i < len(faces):
+        raise RuntimeError(f"{obj.name} has no face {i}")
+    return i
+
+
+def face_direction(obj, i, p):
+    """Unit direction (world) an Extrude Face goes before the distance's sign:
+    Face Normal is the face's outward normal (a flat face's plane normal, a
+    curved face's averaged over it), the other Directions as Extrude's."""
+    if p.get("direction", "NORMAL") != "NORMAL":
+        return extrude_direction(obj, None, p)
+    return geom.tilt_direction(Vector(face_normal(obj, i)), float(p.get("tilt", 0.0)),
+                               float(p.get("tilt_azimuth", 0.0)))
+
+
+def face_normal(obj, i):
+    """World unit outward normal of face i: a flat face's, or a curved face's
+    averaged over its tessellation points (a bump's comes out straight up)."""
+    from .pushpull import face_frame, normals_at
+    _, _, n, flat = face_frame(obj, i)
+    if not flat:
+        from . import subsel
+        pts = subsel.face_tris(obj, i)[0]
+        if len(pts):
+            m = normals_at(obj, i, pts[::max(1, len(pts) // 200)]).mean(axis=0)
+            if np.linalg.norm(m) > 1e-6:
+                n = m / np.linalg.norm(m)
+    return np.asarray(n, float)
+
+
+def face_loop_inputs(obj, i):
+    """The edges round face i as inputs ((obj, ref), each once: seams and
+    zero-length pole edges left out) -- an untrimmed surface's sides U0 / U1 /
+    V0 / V1, else its B-rep edges E<k>."""
+    if store.is_natural(obj):
+        surf = store.get_surfaces(obj)[0]
+        out = []
+        for which in ("U0", "U1", "V0", "V1"):
+            P = geom.boundary_points(surf, which, 9, corners=True)
+            if np.linalg.norm(np.ptp(np.asarray(P, float), axis=0)) > 1e-9:
+                out.append((obj, which))
+        return out
+    b = store.get_brep(obj)
+    F = b.faces()[i]
+    uses = {}
+    for loop in F.boundary_loops():
+        for e, _ in loop:
+            uses[e] = uses.get(e, 0) + 1
+    edges = b.edges()
+    return [(obj, f"E{k}") for k, e in enumerate(edges) if uses.get(e) == 1 and e.length() > 1e-9]
+
+
+@builder("extrude_face")
+def build_extrude_face(inputs, p):
+    """A closed solid from a face swept along a direction (Fusion's Extrude
+    of a face): the face, its copy moved by Distance and walls from its loops.
+    Draft (a flat face only) leans the walls as Extrude's Multi-Draft, holes
+    the other way. reach: the solid starts that far behind the face, so a Join
+    or Cut with the face's own body never meets the face exactly."""
+    from . import jobs
+    obj, ref = inputs[0]
+    i = face_at(obj, p, ref)
+    from .pushpull import face_frame
+    _, pw, _, flat = face_frame(obj, i)
+    d = np.array(face_direction(obj, i, p), float)
+    h = float(p.get("distance", 1.0))
+    if abs(h) <= 0.0:
+        raise RuntimeError("the distance is 0")
+    reach = float(p.get("reach", 0.0))
+    sym = bool(p.get("symmetric"))
+    a, b = (-abs(h), abs(h)) if sym else (-reach if h > 0 else reach, h)
+    if abs(float(p.get("draft", 0.0))) > 1e-9:
+        if not flat:
+            raise RuntimeError("Draft needs a flat face: a curved face extrudes straight (Draft 0)")
+        q = dict(p, direction="VECTOR", dir_vec=[float(x) for x in d], tilt=0.0, tilt_azimuth=0.0)
+        q.pop("draft_centre", None)
+        if not sym:
+            q["start"], q["distance"] = a, b - a
+        return _solid(face_loop_inputs(obj, i), q, _extrude_side)
+    info, breps = jobs.run("extrude_face", {"target": obj}, ["result"], face_pt=[float(x) for x in pw],
+                           dir=[float(x) for x in d], start=a, distance=b, into="_world_")
+    return ("brep_text", breps["result"])
 
 
 def revolve_exact(curve, origin, axis, angle_deg, start_deg=0.0):
@@ -1824,7 +1923,8 @@ def record(obj, op, inputs, params):
 
 HISTORY_COLL = "NURBS History"
 PROP_HOME = "nproto_home"      # JSON list: the collections an input was in before it was kept
-KEEP_OPS = ("join", "join_curves", "boolean", "thicken", "boundary_fill", "split_region", "iso_detach")   # results that keep their inputs
+KEEP_OPS = ("join", "join_curves", "boolean", "thicken", "boundary_fill", "split_region", "iso_detach",
+            "extrude_face")   # results that keep their inputs
 
 
 def history_collection(context, create=True):

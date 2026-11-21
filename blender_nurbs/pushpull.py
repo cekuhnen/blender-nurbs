@@ -123,6 +123,22 @@ def _faces_json(items):
     return json.dumps([[o.name, [float(x) for x in p]] for o, p in items])
 
 
+def face_highlight(o, i, max_fill=3000):
+    """The overlay preview lighting face i of o: its outlines and fill (world),
+    lifted a hair off the face so they don't z-fight with it. A curved face
+    with more tessellation points than max_fill: outlines only."""
+    fr = face_frame(o, i)
+    pts, tris, polys = subsel.face_tris(o, i)
+    M = np.array(geom.world_matrix(o))
+    lift = 2e-3 * float(np.linalg.norm(np.ptp(np.vstack(polys), axis=0)) or 1.0)
+    if fr[3]:
+        W = lambda P: _world(M, P) + lift * fr[2]
+    else:
+        W = lambda P: _world(M, P) + lift * normals_at(o, i, P)
+    return {"lines": [W(P) for P in polys],
+            "tris": W(pts)[tris].reshape(-1, 3) if len(tris) and len(pts) <= max_fill else np.zeros((0, 3))}
+
+
 class _FacePicking:
     """Clicking faces in the view (Push / Pull, Replace Face): what is under
     the mouse, lit up."""
@@ -153,17 +169,7 @@ class _FacePicking:
             o, i = hit
             try:
                 if _is_solid(o) == solids:
-                    fr = face_frame(o, i)
-                    pts, tris, polys = subsel.face_tris(o, i)
-                    M = np.array(geom.world_matrix(o))
-                    lift = 2e-3 * float(np.linalg.norm(np.ptp(np.vstack(polys), axis=0)) or 1.0)
-                    if fr[3]:                   # off the face: no z-fight
-                        W = lambda P: _world(M, P) + lift * fr[2]
-                    else:
-                        W = lambda P: _world(M, P) + lift * normals_at(o, i, P)
-                    pv = {"lines": [W(P) for P in polys],
-                          "tris": W(pts)[tris].reshape(-1, 3) if len(tris) and len(pts) <= self.MAX_FILL else
-                          np.zeros((0, 3))}
+                    pv = face_highlight(o, i, self.MAX_FILL)
             except Exception as exc:
                 print("NURBS push/pull hover:", exc)
         draw.pick_overlay["preview"] = pv

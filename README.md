@@ -63,11 +63,12 @@ everything built from it rebuilds.
 - **Draw:** Plane, Box (corner to corner, centre to corner or 3 points, then the height; or diagonal, two corners in 3D), Cylinder (centre, radius, height, or around a circle or hole; exact or smooth, solid or
   open)
 - **Primitives:** Plane, Disk, Box, Cylinder, Cone, Sphere, Torus
-- **From curves:** Loft (G0 to G3 to surface edges), Loft Rails, Curve Network (a grid of crossing curves, G0 / G1 /
-  G2 to surface edges around it), Sweep, Pipe, Extrude, Revolve, Rail Revolve (exact), Planar
-- **Fill a gap:** Boundary, Square, Patch, Dome
-- **From surfaces:** Offset, Thicken, Flange (from free edges or curves on a surface: at an angle to the surface,
-  or a constant-draft surface to a pull direction; the base is the edge exactly), Convert Blender Surface
+- **Through curves or edges:** Loft (G0 to G3 to surface edges), Loft Rails, Curve Network (a grid of crossing
+  curves or edges, G0 / G1 / G2 to surface edges around it), Revolve, Rail Revolve (exact), Sweep, Pipe
+- **Extrude and fill:** Extrude (curves or edges into walls; a face into a solid joined to its body, cut from it
+  or new, with draft on flat faces), Flange (from free edges or curves on a surface: at an angle to the surface, or a
+  constant-draft surface to a pull direction; the base is the edge exactly), Planar, Dome, Boundary, Patch
+- **From surfaces:** Offset, Thicken, Pattern, Unroll, Flow, Convert Blender Surface
 - **Unroll and Flow:** Unroll Surface lays developable surfaces flat (sheet-metal patterns: cones, cylinders,
   bent and folded sheets, joined parts with their bend lines; trims and curves on them come along); Flow Along
   Surface bends curves and surfaces from a base surface onto a target, and folds what is drawn on an unrolled

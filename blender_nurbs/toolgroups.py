@@ -8,17 +8,25 @@ tools. Panels draw the rows (sections separated by a gap, a Dropdown as one menu
 button), menus draw the sections with their labels and every tool.
 
 `needs` are the kinds of object a section's tools work on (CURVE, NURBS, MESH,
-SUBD, SURFACE: see kinds()). When objects are selected and none is of those
-kinds, the panel draws the section dimmed. Dimmed buttons still run: with nothing
-fitting selected a tool asks for its inputs, like Alt+click."""
+SUBD, SURFACE: see kinds()); a tool takes other kinds as its own fifth item
+(_t(..., needs=)). A tool works on a NURBS object when it takes its edges, as
+Loft or Extrude do, not only when it takes the surface. When objects are
+selected and none is of a tool's kinds, the panel draws it dimmed. Dimmed buttons
+still run: with nothing fitting selected a tool asks for its inputs, like
+Alt+click."""
 
 import bpy
 
 from .kernel import load as load_kernel
 
 
-def _t(op, text=None, icon='NONE'):
-    return (op, text, icon, None)
+def _t(op, text=None, icon='NONE', needs=None):
+    return (op, text, icon, None) if needs is None else (op, text, icon, None, frozenset(needs))
+
+
+def tool_needs(tool, default=()):
+    """The kinds a tool works on: its own, else its section's."""
+    return tool[4] if not isinstance(tool, Dropdown) and len(tool) > 4 else default
 
 
 class MenuOnly(tuple):
@@ -38,6 +46,7 @@ class Dropdown(tuple):
 
 
 CURVE, NURBS, MESH, SUBD, SURFACE = "CURVE", "NURBS", "MESH", "SUBD", "SURFACE"
+EDGES = {CURVE, NURBS}                                       # curves, or a surface's edges
 
 
 GROUPS = (
@@ -52,10 +61,12 @@ GROUPS = (
             (_t("nproto.draw_profile", "Profile", 'MESH_CIRCLE'),),
         )),
         ("Between Curves", (
-            (_t("nproto.blend_curve", icon='IPO_EASE_IN_OUT'), _t("nproto.fillet_curves", "Fillet", 'SPHERECURVE')),
+            (_t("nproto.blend_curve", icon='IPO_EASE_IN_OUT', needs=EDGES),
+             _t("nproto.fillet_curves", "Fillet", 'SPHERECURVE')),
         ), {CURVE}),
         ("From Curves", (
-            (_t("nproto.offset_curve", icon='MOD_OFFSET'), _t("nproto.offset_on_surface", icon='MOD_SHRINKWRAP')),
+            (_t("nproto.offset_curve", icon='MOD_OFFSET'),
+             _t("nproto.offset_on_surface", icon='MOD_SHRINKWRAP', needs=EDGES)),
         ), {CURVE}),
         ("Shapes", (                                         # at the 3D cursor: the menus only (the panel
             MenuOnly((_p("LINE"), _p("ARC"), _p("CIRCLE"), _p("ELLIPSE"), _p("RECTANGLE"), _p("POLYGON"),
@@ -74,24 +85,23 @@ GROUPS = (
                        (_p("PLANE"), _p("DISK"), _p("BOX"), _p("CYLINDER"), _p("CONE"), _p("SPHERE"),
                         _p("TORUS")))),),
         )),
-        ("From Curves", (
-            (_t("nproto.loft", icon='MOD_SIMPLEDEFORM'), _t("nproto.loft_rails", icon='MOD_SIMPLEDEFORM')),
-            (_t("nproto.network", icon='MESH_GRID'), _t("nproto.rail_revolve", icon='MOD_SCREW')),
+        ("Through Curves", (
+            (_t("nproto.loft", icon='MOD_SIMPLEDEFORM'), _t("nproto.loft_rails", icon='MOD_SIMPLEDEFORM'),
+             _t("nproto.network", "Network", 'MESH_GRID')),
+            (_t("nproto.revolve", icon='MOD_SCREW'), _t("nproto.rail_revolve", icon='MOD_SCREW')),
             (_t("nproto.sweep", icon='MOD_CURVE'), _t("nproto.pipe", icon='META_CAPSULE')),
-            (_t("nproto.extrude", icon='MOD_SOLIDIFY'), _t("nproto.revolve", icon='MOD_SCREW'),
-             _t("nproto.planar", icon='MESH_PLANE')),
-        ), {CURVE}),
-        ("Fill a Gap", (
+        ), EDGES),
+        ("Extrude and Fill", (
+            (_t("nproto.extrude", icon='MOD_SOLIDIFY'), _t("nproto.flange", icon='MOD_SOLIDIFY')),
+            (_t("nproto.planar", icon='MESH_PLANE'), _t("nproto.dome", icon='MESH_UVSPHERE')),
             (_t("nproto.boundary", icon='MESH_GRID'), _t("nproto.patch", icon='MOD_TRIANGULATE')),
-            (_t("nproto.dome", icon='MESH_UVSPHERE'),),
-        ), {CURVE, NURBS}),
+        ), EDGES),
         ("From Surfaces", (
             (_t("nproto.offset", icon='MOD_OFFSET'), _t("nproto.thicken", icon='MOD_SOLIDIFY')),
-            (_t("nproto.flange", icon='MOD_SOLIDIFY'),
-             ("nproto.pattern", "Pattern", 'MOD_ARRAY', {"auto": True})),     # linear / circular / path: M
-            (_t("nproto.unroll", "Unroll", 'UV'), _t("nproto.flow", "Flow", 'MOD_SIMPLEDEFORM')),
-            (_t("nproto.from_blender_surface", icon='SURFACE_NSURFACE'),),
-        ), {NURBS, SURFACE}),
+            (("nproto.pattern", "Pattern", 'MOD_ARRAY', {"auto": True}, frozenset(EDGES)),),  # linear / circular / path: M
+            (_t("nproto.unroll", "Unroll", 'UV'), _t("nproto.flow", "Flow", 'MOD_SIMPLEDEFORM', needs=EDGES)),
+            (_t("nproto.from_blender_surface", icon='SURFACE_NSURFACE', needs={SURFACE}),),
+        ), {NURBS}),
     )),
     ("CURVE_EDIT", "Curve Edit", (
         ("Join and Trim", (
@@ -229,7 +239,7 @@ def _button(lay, tool):
     if isinstance(tool, Dropdown):
         lay.menu(tool.menu, text=tool.text, icon=tool.icon)
         return
-    op, text, icon, props = tool
+    op, text, icon, props = tool[:4]
     kw = {"icon": icon}
     if text is not None:
         kw["text"] = text
@@ -249,14 +259,21 @@ def draw_panel(lay, key, context=None):
         if not first and label:
             col.separator(factor=0.6)
         first = False
-        on = fits(sec[2] if len(sec) > 2 else (), have)
+        needs = sec[2] if len(sec) > 2 else ()
         for row in rows:
             if isinstance(row, MenuOnly):
                 continue
             r = col.row(align=True)
-            r.active = on                                  # dimmed, not disabled: it still runs
-            for tool in row:
-                _button(r, tool)
+            on = [fits(tool_needs(t, needs), have) for t in row]
+            if len(set(on)) == 1:
+                r.active = on[0]                           # dimmed, not disabled: it still runs
+                for tool in row:
+                    _button(r, tool)
+            else:                                          # a lit and a dimmed tool side by side
+                for tool, lit in zip(row, on):
+                    sub = r.row(align=True)
+                    sub.active = lit
+                    _button(sub, tool)
 
 
 def draw_menu(lay, key):

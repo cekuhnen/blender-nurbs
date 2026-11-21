@@ -286,6 +286,15 @@ class PickMixin:
     def pick_candidates(self, context):
         return _pick_candidates(context, self.allow_edges)
 
+    def pick_miss(self, context, event):
+        """A candidate (obj, ref, points) for a click that hit no curve or
+        edge (Extrude: the face under the mouse), or None."""
+        return None
+
+    def hover_miss(self, context, event, cur):
+        """Called on every hover with the candidate under the mouse (None: no
+        curve or edge there; Extrude lights the face under it)."""
+
     def closes_loop(self):
         return False
 
@@ -344,6 +353,7 @@ class PickMixin:
             self._tie_key, self._ties, self._cycle = key, ties, 0
         cur = self._ties[self._cycle % len(self._ties)] if self._ties else None
         draw.pick_overlay["hover"] = cur[2] if cur else None
+        self.hover_miss(context, event, cur)
         self._status(context)
         context.area.tag_redraw()
         return cur
@@ -433,6 +443,8 @@ class PickMixin:
         elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
             hit = self._update_hover(context, event)
             self._last_mouse = Vector((event.mouse_region_x, event.mouse_region_y))
+            if not hit:
+                hit = self.pick_miss(context, event)
             if hit:
                 self._tie_key = None
                 have = {(o.name, r) for o, r in self._picks}
@@ -738,6 +750,15 @@ class SolidBody:
                 failed.append(f"{reg[0][0].name}: {exc}" if len(groups) > 1 else str(exc))
         if not made or self.body == "NEW":
             return made, failed
+        made, more = self.combine_made(context, made)
+        return made, failed + more
+
+    def combine_made(self, context, made):
+        """(objects, failure texts): the new solids joined to, cut from or
+        intersected with the target body (Body), or kept as they are when
+        there is none."""
+        from . import jobs
+        failed = []
         word = {"JOIN": "join to", "CUT": "cut", "INTERSECT": "intersect with"}[self.body]
         target = self.find_target(context, made)
         if target is None:
@@ -1141,6 +1162,31 @@ def _curve_inputs(context):
     return out
 
 
+def _face_flat(obj, i):
+    try:
+        return bool(store.get_brep(obj).faces()[i].surface().is_planar())
+    except Exception:
+        return False
+
+
+def _face_inputs(context):
+    """Extrude Face inputs a selection gives: the faces picked in Face mode on
+    the selected NURBS objects, else every face of the selected open surfaces
+    (not solids: a solid's face is picked). None in Edge mode or with edges
+    picked: those are the inputs then."""
+    from . import subsel
+    try:
+        if "EDGE" in subsel.kinds(context) or subsel.selected_edges(context):
+            return []
+    except Exception:
+        pass
+    objs = [o for o in context.selected_objects if store.is_nurbs(o)]
+    out = [(o, f"F{i}") for o in objs for i in subsel.picks(o, "FACE")]
+    if out:
+        return out
+    return [(o, f"F{i}") for o in objs if not _is_solid(o) for i in range(store.get_brep(o).face_count())]
+
+
 class _CurveTool(PickMixin):
     accepts_picks = True
     pick_min = 1
@@ -1228,7 +1274,8 @@ def extrude_rows(P, d, h, draft=0.0, flip=False, symmetric=False, smooth=True, c
 
 
 class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
-    """Extrude curves (or surface edges) into surfaces. From the UI the distance
+    """Extrude curves or surface edges into surfaces, or a surface face into a
+    solid (joined to its own body, or cut from it). From the UI the distance
     follows the mouse with a preview; type a value, Tab for the draft, LMB to apply"""
     bl_idname = "nproto.extrude"
     bl_label = "Extrude"
@@ -1236,6 +1283,7 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
     op_name = "extrude"
     start_value = 0.0      # the arrow stands on the curve: nothing is extruded until it is dragged
     pick_max = 256         # a click takes one curve or edge; Shift+click keeps picking, Enter finishes
+    extra_help = "click inside a face (away from its edges) to extrude the face into a solid"
 
     distance: FloatProperty(name="Distance", default=1.0, unit='LENGTH',
                             description="Height along the direction (with draft: the far edge also moves outward)")
@@ -1273,7 +1321,114 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
 
     def _groups(self, ins):
         """The surfaces to make: inputs that touch end to end together (Chain)."""
+        ins = [x for x in ins if not features.is_face_ref(x[1])]
+        if not ins:
+            return []
         return features.profile_groups(ins) if self.chain or self.body != "SURFACE" else [[x] for x in ins]
+
+    # -- faces: Extrude Face (features.build_extrude_face) -----------------------
+    @staticmethod
+    def _faces(ins):
+        return [x for x in ins if features.is_face_ref(x[1])]
+
+    def selection_inputs(self, context):
+        return _curve_inputs(context) or _face_inputs(context)
+
+    def pick_miss(self, context, event):
+        """A click inside a face (no edge near it) picks the face."""
+        from . import subsel
+        try:
+            hit = subsel.face_under(context, (event.mouse_region_x, event.mouse_region_y))
+        except Exception:
+            return None
+        if hit is None:
+            return None
+        o, i = hit
+        M = np.array(geom.world_matrix(o))
+        polys = subsel.face_tris(o, i)[2]
+        P = max(polys, key=len) if polys else np.zeros((0, 3))
+        return (o, f"F{i}", [Vector(q) for q in (np.c_[P, np.ones(len(P))] @ M.T)[:, :3]])
+
+    def hover_miss(self, context, event, cur):
+        """No edge near the mouse: light the face under it (a click picks it)."""
+        from . import subsel
+        hit = None
+        if cur is None:
+            try:
+                hit = subsel.face_under(context, (event.mouse_region_x, event.mouse_region_y))
+            except Exception:
+                hit = None
+        key = (hit[0].name, hit[1]) if hit else None
+        if key == getattr(self, "_face_hover", None):
+            return
+        self._face_hover = key
+        pv = None
+        if hit is not None:
+            from .pushpull import face_highlight
+            try:
+                pv = face_highlight(*hit)
+            except Exception as exc:
+                print("NURBS extrude face hover:", exc)
+        draw.pick_overlay["preview"] = pv
+
+    def _end(self, context):
+        super()._end(context)
+        if getattr(self, "_face_hover", None) is not None:
+            draw.pick_overlay["preview"] = None
+            self._face_hover = None
+
+    def _face_body(self, faces):
+        """A face always makes a solid: Body Surface becomes Join for a solid's
+        face (joined to its body) and New Solid for an open surface's."""
+        if faces and self.body == "SURFACE":
+            self.body = "JOIN" if all(_is_solid(o) for o, _ in faces) else "NEW"
+        if faces and self.body in BODY_BOOL and not self.target:
+            own = [o for o, _ in faces if _is_solid(o)]
+            if own:
+                self.target = own[0].name
+
+    def body_key(self, ch):
+        if not super().body_key(ch):
+            return False
+        if self.body == "SURFACE" and self._faces(_decode_inputs(self.inputs)):
+            super().body_key(ch)                 # a face makes a solid: no Surface
+        return True
+
+    def execute_faces(self, context, faces):
+        self._face_body(faces)
+        made, failed = [], []
+        reach = 0.0
+        if self.body in BODY_BOOL:              # a hair behind the face: the boolean never meets it exactly
+            size = max(float(np.linalg.norm(_world_box(o)[1] - _world_box(o)[0])) for o, _ in faces)
+            reach = 1e-5 * (size or 1.0)
+        for o, ref in faces:
+            p = self.params()
+            p.pop("normal_hint", None)
+            from .pushpull import face_frame
+            p["face_local"] = [float(x) for x in face_frame(o, int(ref[1:]))[0]]
+            p["reach"] = reach
+            try:
+                made.append(_make_result(context, self.bl_label, "extrude_face", [(o, ref)], p))
+            except Exception as exc:
+                failed.append(f"{o.name} face {ref[1:]}: {exc}")
+        # an open surface extruded whole: the solid replaces it (kept for Restore Inputs with history)
+        whole = [o for o in {o for o, _ in faces} if not _is_solid(o)
+                 and {r for x, r in faces if x is o} == {f"F{i}" for i in range(store.get_brep(o).face_count())}]
+        if made and self.body != "NEW":
+            made, more = self.combine_made(context, made)
+            failed += more
+        if made and whole:
+            if features.history_enabled(context):
+                features.keep_inputs(context, whole)
+            else:
+                for o in whole:
+                    bpy.data.objects.remove(o)
+        if failed:
+            self.report({'ERROR'} if not made else {'WARNING'}, f"{self.bl_label} failed: " + "; ".join(failed))
+        if not made:
+            return {'CANCELLED'}
+        _select_only(context, made)
+        return {'FINISHED'}
 
     @staticmethod
     def _centre(curves):
@@ -1287,6 +1442,15 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
     def execute(self, context):
         if not _kernel_ok(self):
             return {'CANCELLED'}
+        try:
+            faces = self._faces(_decode_inputs(self.inputs))
+        except Exception as exc:
+            self.report({'ERROR'}, f"{self.bl_label} failed: {exc}")
+            return {'CANCELLED'}
+        if faces:
+            if len(faces) < len(_decode_inputs(self.inputs)):
+                self.report({'WARNING'}, "Extrude: faces and curves together -- only the faces were extruded")
+            return self.execute_faces(context, faces)
         if self.body != "SURFACE":
             return self.execute_solid(context)
         try:
@@ -1317,19 +1481,31 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
     AXES = {"x": "X", "y": "Y", "z": "Z"}
 
     def drag_setup(self, context, mouse):
-        self._ex = []
+        self._ex, self._exf = [], []         # (obj, curve, points, smooth); the face index of each (or None)
         from .kernel import load
+        from . import subsel
         ext = load().blender_ext
-        for g in self._groups(_decode_inputs(self.inputs)):
+        ins = _decode_inputs(self.inputs)
+        faces = self._faces(ins)
+        self._face_body(faces)
+        for o, ref in faces:                   # a face: its outlines (curve None), moved along its direction
+            i = features.face_at(o, {}, ref)
+            M = np.array(geom.world_matrix(o))
+            for P in subsel.face_tris(o, i)[2]:
+                if len(P) > 1:
+                    self._ex.append((o, None, (np.c_[P, np.ones(len(P))] @ M.T)[:, :3], True))
+                    self._exf.append(i)
+        for g in self._groups(ins) if not faces else []:
             obj, curve = g[0][0], features.profile_curve(g)
             cv = ext.curve_cvs(curve)
             if cv["degree"] == 1 and not cv.get("weights"):     # a polyline: its corners, exact
                 self._ex.append((obj, curve, np.array(cv["points"], float), False))
             else:
                 self._ex.append((obj, curve, geom.sample_curve(curve, 97), True))
+            self._exf.append(None)
         if not self._ex:
             return False
-        self._ctr = self._centre([c for _, c, _, _ in self._ex])
+        self._ctr = None if faces else self._centre([c for _, c, _, _ in self._ex])
         # the handles stand on the first curve: the arrow where it was clicked
         # (when it was picked by a click), else halfway along it
         obj, curve, P, smooth = self._ex[0]
@@ -1357,7 +1533,16 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
 
     def _dirs(self):
         p = self.params()
-        return [np.array(features.extrude_direction(obj, curve, p)) for obj, curve, _, _ in self._ex]
+        memo = {}
+        out = []
+        for (obj, curve, _, _), f in zip(self._ex, self._exf):
+            if f is None:
+                out.append(np.array(features.extrude_direction(obj, curve, p)))
+            else:
+                if (obj.name, f) not in memo:
+                    memo[(obj.name, f)] = np.array(features.face_direction(obj, f, p))
+                out.append(memo[(obj.name, f)])
+        return out
 
     def _draft_normal(self, d):
         """Outward direction of the draft at the diamond's foot (sample kd),
@@ -1407,8 +1592,11 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
         size = max(float(np.ptp(np.vstack([P for _, _, P, _ in self._ex]), axis=0).max()), 1e-9)
         if abs(self.distance) <= 1e-6 * size:
             return "Distance 0: drag the arrow out, or type a distance"
-        if self.body != "SURFACE" and not all(features.is_closed_curve(c) for _, c, _, _ in self._ex):
+        if self.body != "SURFACE" and not all(features.is_closed_curve(c) for _, c, _, _ in self._ex if c is not None):
             return "A solid needs closed profiles (B: Body Surface for an open one)"
+        if abs(self.draft) > 1e-9 and any(f is not None and not _face_flat(o, f)
+                                          for (o, _, _, _), f in zip(self._ex, self._exf)):
+            return "Draft needs a flat face: a curved face extrudes straight (Draft 0)"
         return ""
 
     def drag_key(self, context, event, ch):
@@ -1442,7 +1630,8 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
                 self.body_row()]
 
     def drag_state(self):
-        names = {"NORMAL": "Curve Normal", "VECTOR": "Vector"}
+        names = {"NORMAL": "Face Normal" if any(f is not None for f in getattr(self, "_exf", ())) else "Curve Normal",
+                 "VECTOR": "Vector"}
         d = names.get(self.direction, self.direction.replace("LOCAL_", "Local ").replace("_", " "))
         if d in ("X", "Y", "Z"):
             d = "World " + d

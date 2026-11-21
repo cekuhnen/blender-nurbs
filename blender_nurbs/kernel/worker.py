@@ -1879,6 +1879,41 @@ def _curve_piece(c, t0, t1):
     if t0 > t1:
         t0, t1 = t1, t0
     d = ext.curve_cvs(c)
+def job_extrude_face(job):
+    """Extrude Face: the face of the body at face_pt (world) swept along dir,
+    from start to distance (signed world lengths along dir): the face there,
+    its copy moved and walls from its loops, stitched into a closed solid
+    (world). A start a hair behind the face (Join / Cut) keeps the boolean
+    from meeting the face exactly."""
+    np = _np()
+    body = world_brep(job, "target")
+    lo, hi = (np.array(v, float) for v in body.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    tol = 1e-6 * size
+    p = np.asarray(job["face_pt"], float)
+    F = _face_at(body, p)
+    if F.closest_point(tuple(float(x) for x in p))[1] > 1e-3 * size:
+        raise RuntimeError("the face is no longer on the body")
+    d = np.asarray(job["dir"], float)
+    d /= np.linalg.norm(d) or 1.0
+    a, b = float(job.get("start", 0.0)), float(job["distance"])
+    if abs(b - a) <= 1e-9 * size:
+        raise RuntimeError("the distance is 0")
+    sheet = _face_sheet(body, p)
+    why = ("the face swept along the direction does not close into a solid (the direction runs along the "
+           "face somewhere, or the face wraps round, like a tube's side)")
+    try:
+        solid, _kept = _swept_solid(sheet, a * d, (b - a) * d, tol)
+    except RuntimeError:
+        raise RuntimeError(why)
+    v = _volume(solid, 1e-4)
+    area = float(sheet.area()) if hasattr(sheet, "area") else 0.0
+    if v <= 1e-6 * max(area, size * size) * abs(b - a):
+        raise RuntimeError(why)
+    save(to_local(solid, job.get("xforms", {}).get(job.get("into"))), job["out"]["result"])
+    return {"faces": solid.face_count(), "volume": v}
+
+
     p, U = int(d["degree"]), [float(k) for k in d["knots"]]
     P = np.array(d["points"], float)
     w = np.array(d["weights"], float) if d.get("weights") else np.ones(len(P))
@@ -3961,7 +3996,7 @@ def job_mesh_to_brep(job):
             "filleted": done, "failed": failed}
 
 
-JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "untrim_region": job_untrim_region, "untrim_preview": job_untrim_preview, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean, "push_pull": job_push_pull, "replace_face": job_replace_face,
+JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "untrim_region": job_untrim_region, "untrim_preview": job_untrim_preview, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean, "push_pull": job_push_pull, "replace_face": job_replace_face, "extrude_face": job_extrude_face,
         "flip": job_flip, "cap_solid": job_cap_solid, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken,
         "mesh_to_brep": job_mesh_to_brep}
 
