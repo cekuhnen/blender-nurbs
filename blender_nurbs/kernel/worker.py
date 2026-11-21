@@ -916,11 +916,13 @@ def job_fillet(job):
     """Surface fillet. A rolling-ball circle or chamfer: the kernel's fillet.
     With job['chord'] (the rails that far apart, the ball radius changing
     with the angle between the surfaces) or job['blend'] (1 / 2 / 3: a G1 / G2 /
-    G3 blend between the rolling ball's rails): built from exact sections
-    (secfillet.py). Either way the bases are trimmed back to its rails.
-    job['ends'] EXTEND: where one surface ends along the crossing before the
-    other, it is grown to the other's end first (filletends.py); NOTCH
-    (default): the longer one is cut back only along the fillet."""
+    G3 blend between the rolling ball's rails) or job['soft'] (the smoothing
+    of a soft fillet, softfillet.py: radius_a is its minimum radius, blend its
+    continuity 2 / 3): built from exact sections (secfillet.py). Either way the
+    bases are trimmed back to its rails. job['ends'] EXTEND: where one surface
+    ends along the crossing before the other, it is grown to the other's end
+    first (filletends.py); NOTCH (default): the longer one is cut back only
+    along the fillet."""
     grown = []
     if job.get("ends") == "EXTEND":
         job, grown = _grow_shorter(job)
@@ -966,6 +968,27 @@ def _grow_shorter(job):
 def _job_fillet(job, A, B):
     chord = job.get("chord")
     blend = int(job.get("blend") or 0)
+    soft = job.get("soft")
+    if soft is not None:
+        import secfillet
+        sa = 1.0 if float(job["radius_a"]) >= 0 else -1.0
+        sb = 1.0 if float(job["radius_b"]) >= 0 else -1.0
+        shape = "SOFT3" if blend >= 3 else "SOFT2"
+        R = abs(float(job["radius_a"]))
+        f, info = secfillet.build(sm, A, B, sa, sb, R, R, shape=shape, smoothing=float(soft),
+                                  tolerance=float(job.get("tolerance", 1e-4)))
+        f = _orient_fillet(f, (A, B))
+        job = dict(job, radius_a=sa * info["radius"][2], radius_b=sb * info["radius"][2])   # (trim sheet size)
+        res = _fillet_finish(job, f, A, B)
+        res["radius"] = info["radius"][1]
+        res["radius_range"] = info["radius"]
+        res["chord"] = info["chord"]
+        res["sections"] = info["sections"]
+        res["min_radius"] = info["min_radius"]
+        res["smoothing"] = info["smoothing"]
+        if info.get("note"):
+            res["note"] = info["note"]
+        return res
     if chord or blend:
         # our own sections (secfillet.py): the kernel's fillet has one ball
         # radius, a chord needs one per section; a blend is built between the
@@ -3195,9 +3218,12 @@ def _section_groups(b, sel, tol):
     return list(groups.values())
 
 
-def _section_edge_fillet(b, sel, chord, shape):
+def _section_edge_fillet(b, sel, chord, shape, soft=None):
     """(body, info) with the picked edges filleted from exact sections at a
-    constant chord, or None when the kernel has to do it (see _section_groups)."""
+    constant chord, or None when the kernel has to do it (see _section_groups).
+    soft = (R, smoothing): a soft fillet (shape SOFT2 / SOFT3) of minimum
+    radius R instead (chord is then only the reach: how far to carry the
+    faces on and to stand the trim sheets)."""
     np = _np()
     import os
     import tempfile
@@ -3207,15 +3233,20 @@ def _section_edge_fillet(b, sel, chord, shape):
     groups = _section_groups(b, sel, 1e-5 * size)
     if groups is None:
         return None
-    fillets, radii, chords, sections = [], [], [], 0
+    fillets, radii, chords, sections, peaks = [], [], [], 0, []
     for fp, fq, es in groups:
         # the faces' surfaces carried on past their edges: a face that ends at
         # the filleted edge has no foot for the ball there otherwise (nor a
         # twisted one at the sheet's ends, where the section leans past it)
         A = ext.brep_from_surface(_surface_extended(fp.surface(), 2.0 * chord))
         B = ext.brep_from_surface(_surface_extended(fq.surface(), 2.0 * chord))
-        f, info = secfillet.build(sm, A, B, None, None, chord, chord, chord=chord, shape=shape,
-                                  curves=[_EdgeCurve(e) for e in es], on_faces=(fp, fq))
+        if soft:
+            f, info = secfillet.build(sm, A, B, None, None, soft[0], soft[0], shape=shape, smoothing=soft[1],
+                                      curves=[_EdgeCurve(e) for e in es], on_faces=(fp, fq))
+            peaks += list(info["min_radius"])
+        else:
+            f, info = secfillet.build(sm, A, B, None, None, chord, chord, chord=chord, shape=shape,
+                                      curves=[_EdgeCurve(e) for e in es], on_faces=(fp, fq))
         fillets.append((f, A, B, fp, fq))
         radii += list(info["radius"])
         chords += list(info["chord"])
@@ -3280,8 +3311,11 @@ def _section_edge_fillet(b, sel, chord, shape):
                 os.remove(path)
             except OSError:
                 pass
-    return r, {"radius": (min(radii), float(np.mean(radii)), max(radii)),
-               "chord": (min(chords), float(np.mean(chords)), max(chords)), "sections": sections}
+    out = {"radius": (min(radii), float(np.mean(radii)), max(radii)),
+           "chord": (min(chords), float(np.mean(chords)), max(chords)), "sections": sections}
+    if peaks:
+        out["min_radius"] = (min(peaks), max(peaks))
+    return r, out
 
 
 def _measured_chords(before, r):
@@ -3343,6 +3377,8 @@ def job_edge_fillet(job):
         if i not in picked:
             picked.append(i)
     sel = [edges[i] for i in picked]
+    if job.get("shape") == "SOFT":
+        return _soft_edge_fillet(job, b, b_ring, sel)
     xsect = {"CHAMFER": 0, "CIRCULAR": 1, "BLEND": 2}[job.get("shape", "CIRCULAR")]
     r0 = float(job["radius"])
     r1 = job.get("end_radius")
@@ -3446,6 +3482,111 @@ def job_edge_fillet(job):
     if class_a is not None:
         out["class_a"] = class_a
     return out
+
+
+def _new_face_points(before, r):
+    """A point inside each face of r that is not one of before's (world)."""
+    out = []
+    try:
+        on_in = _input_test(before)
+        for f in r.faces():
+            if not on_in(f):
+                q = f.interior_point()
+                out.append([float(q.x), float(q.y), float(q.z)] if hasattr(q, "x") else [float(x) for x in q])
+    except Exception:
+        return []
+    return out
+
+
+def _soft_edge_fillet(job, b, b_ring, sel):
+    """Soft fillet (softfillet.py) of the picked edges, minimum radius
+    job['radius'], job['smoothing'], G2 / G3 (job['continuity']). Edges whose
+    fillets end at the sheet's boundary or close on themselves are built from
+    exact sections, each sized from its own angle (secfillet). Otherwise the
+    kernel's circular fillet, its ball sized from the mean angle, gives the
+    rails, and every fillet strip is rebuilt with soft sections between them
+    (classa); the corner patches where fillets meet are removed, and the
+    openings left for Square (G2, Match Neighbours)."""
+    np = _np()
+    import math
+    import softfillet
+    cont = 3 if int(job.get("continuity", 2)) >= 3 else 2
+    R = float(job["radius"])
+    smooth = softfillet.clamp_smoothing(float(job.get("smoothing", 0.6)), cont)
+    shape = "SOFT3" if cont == 3 else "SOFT2"
+    xf = job.get("xforms", {}).get("target")
+    note = None
+    try:
+        sec = _section_edge_fillet(b, sel, 2.0 * softfillet.ball_radius(R, 0.5 * math.pi, smooth, cont), shape,
+                                   soft=(R, smooth))
+    except Exception as exc:
+        sec, note = None, f"exact sections failed ({exc}): kernel rails"
+    if sec is not None:
+        r, info = sec
+        try:
+            solid = bool(r.is_manifold_solid())
+        except Exception:
+            solid = False
+        new_faces = _new_face_points(b_ring, r)
+        save(to_local(r, xf), job["out"]["result"])
+        return {"edges": len(sel), "faces": r.face_count(), "solid": solid, "new_faces": new_faces, "rings": [],
+                "rims_only": False, "radius": R, "ball_radius": info["radius"], "min_radius": info["min_radius"],
+                "smoothing": smooth, "sections": info["sections"], "soft": "sections"}
+    # the kernel's rails: one ball for all the edges, from their mean angle
+    th = []
+    for e in sel:
+        t0, t1 = e.parameter_range()
+        for t in np.linspace(t0, t1, 9)[1:-1]:
+            p = np.array(e.point_at(t), float)
+            n0, n1 = (_face_normal(fc, p) for fc in e.faces()[:2])
+            th.append(float(np.arccos(np.clip(n0 @ n1, -1.0, 1.0))))
+    turn = max(float(np.mean(th)), math.radians(2.0))
+    rho = softfillet.ball_radius(R, turn, smooth, cont)
+    r = sm.fillet_edges(b, sel, radius=rho, xsect_type=1, continuity=1, thumbweight=1.0)
+    if r is None or r.face_count() == 0:
+        raise RuntimeError("the kernel returned no result (radius too large for the neighbouring faces?)")
+    r = _fix_ring_faces(b_ring, r)
+    import classa
+    on_in = _input_test(b_ring)
+    fil = [i for i, f in enumerate(r.faces()) if not on_in(f)]
+    keep = r.copy()
+    try:
+        out, rep = classa.rebuild_body(r, sm, fil, kind="SOFT", cont=cont,
+                                       tol=float(job.get("ca_tolerance", 1e-4)),
+                                       ang_tol=float(job.get("ca_angle", 0.1)),
+                                       max_degree=max(int(job.get("ca_degree", 7)), softfillet.degree_of(cont)),
+                                       max_spans=int(job.get("ca_spans", 8)), radius=rho, soft=(smooth, cont))
+    except Exception as exc:
+        raise RuntimeError(f"the soft sections failed ({exc})")
+    if isinstance(rep, list) or not rep.get("patches"):
+        raise RuntimeError("no fillet strip could be rebuilt with soft sections")
+    lo, hi = (np.array(v) for v in out.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    sl = [f for f in out.faces() if f.area() < 1e-10 * size * size]
+    if sl:
+        ext.delete_faces(out, sl)
+        out = sm.stitch_advanced(out, rep["stitch_tol"], squeeze_small_edges=False, making_manifold_solid=False)[0]
+    lamina = sum(1 for e in out.edges() if len(e.faces()) == 1)
+    nonman = sum(1 for e in out.edges() if len(e.faces()) > 2)
+    if lamina > rep["lamina_before"] + rep["opening_edges"] or nonman:
+        raise RuntimeError(f"the soft strips did not stitch back ({lamina - rep['lamina_before']} open, "
+                           f"{nonman} non-manifold edges)")
+    try:
+        solid = bool(out.is_manifold_solid())
+    except Exception:
+        solid = False
+    peaks = [x["min_radius"] for x in rep["faces"] if "min_radius" in x]
+    res = {"edges": len(sel), "faces": out.face_count(), "solid": solid, "new_faces": _new_face_points(b_ring, out),
+           "rings": [], "rims_only": False, "radius": R, "ball_radius": (rho, rho, rho), "smoothing": smooth,
+           "soft": "kernel rails", "openings": rep["openings"], "patches": rep["patches"],
+           "class_a": {k: v for k, v in rep.items() if k in ("faces", "patches", "openings")}}
+    if peaks:
+        res["min_radius"] = (min(p[0] for p in peaks), max(p[1] for p in peaks))
+    if note:
+        res["note"] = note
+    del keep
+    save(to_local(out, xf), job["out"]["result"])
+    return res
 
 
 def _open_edge_count(b):

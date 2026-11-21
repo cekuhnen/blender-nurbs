@@ -741,7 +741,11 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         ("CIRCULAR", "Circular", "Exact circular cross-section"),
         ("CHAMFER", "Chamfer", "Straight (linear) cross-section"),
         ("BLEND", "Blend", "Free-form blend, G1, G2 or G3 to both surfaces"),
+        ("SOFT", "Soft", "Soft (curvature-ramped) corner: the curvature rises from the faces' own to a peak of exactly 1 / Radius in the middle. G2 (degree 5) or G3 (degree 7) to both faces"),
     ], default="CIRCULAR")
+    smoothing: FloatProperty(name="Smoothing", default=0.6, min=0.1, max=1.0, subtype='FACTOR',
+                             description="Soft: the share of the turn taken by the curvature ramps. Low is close "
+                                         "to a circle, 1 has no constant-radius part left. G3 needs 0.5 or more")
     continuity: EnumProperty(name="Continuity", items=[("1", "G1", "Tangent to both surfaces"),
                                                        ("2", "G2", "Curvature continuous to both surfaces"),
                                                        ("3", "G3", "Curvature continuous, and changing at the "
@@ -866,13 +870,19 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
     # -- the live value stage (valuedrag.py) ----------------------------------
     fit_view = "shrink"         # the radius fit_radius found for the part: only ever made smaller
     start_value = 0.0           # the arrow at the crossing: no fillet until it is dragged (L: the last radius)
-    SHAPES = ("CIRCULAR", "CHAMFER", "BLEND")
+    SHAPES = ("CIRCULAR", "CHAMFER", "BLEND", "SOFT")
 
     @property
     def drag_fields(self):
-        return ("radius",) if (self.same_radius or self.rail_type == "CHORD") else ("radius", "radius_b")
+        return ("radius",) if (self.same_radius or self.rail_type == "CHORD" or self.shape == "SOFT") \
+            else ("radius", "radius_b")
+
+    def _soft_cont(self):
+        return 3 if self.continuity == "3" else 2
 
     def _label(self, name):
+        if self.shape == "SOFT":
+            return "Min Radius"
         word = "Distance" if self.shape == "CHAMFER" else "Radius"
         if name == "radius" and self.rail_type == "CHORD":
             return "Chord"
@@ -935,7 +945,12 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         lines, tris = [], []
         for P, NA, NB in self._sf:
             ra, rb = self._radii(P, NA, NB)
-            X = surface_fillet_sections(P, NA, NB, ra, rb, sa, sb, self.shape, continuity=self.continuity)
+            if self.shape == "SOFT":
+                ca, cb, A, B = surface_fillet_rails(P, NA, NB, sa, sb)
+                X = soft_sections(P, _unit(ca - A + cb), _unit(ca + cb - B), self.radius, self.smoothing,
+                                  self._soft_cont())
+            else:
+                X = surface_fillet_sections(P, NA, NB, ra, rb, sa, sb, self.shape, continuity=self.continuity)
             L, T = ruled_preview(list(X), ribs=2)
             lines += L
             tris.append(T)
@@ -951,6 +966,11 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
             D = ca - A + cb
             D /= np.linalg.norm(D) or 1.0
             al, be = float((ca - A) @ D), float(cb @ D)
+            if self.shape == "SOFT":    # the rail at the soft section's setback g R
+                D2 = _unit(ca + cb - B)
+                g = soft_setback_factor(float(D @ D2), self.smoothing, self._soft_cont())
+                return {"field": field, "kind": "arrow", "origin": P[j], "dir": D, "base": P[j],
+                        "param": g * self.radius, "to_value": lambda t: t / g}
             if self.rail_type == "CHORD":
                 k = float(self._chord_k(P[j:j + 1], NA[j:j + 1], NB[j:j + 1])[0])
                 to_value, param = (lambda t: t * k / (al + be)), ra * (al + be)
@@ -984,6 +1004,8 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
             self._field = 0
         elif ch == "g" and self.shape == "BLEND":
             self.continuity = {"1": "2", "2": "3"}.get(self.continuity, "1")
+        elif ch == "g" and self.shape == "SOFT":
+            self.continuity = "2" if self.continuity == "3" else "3"
         elif ch == "t":
             self.trim_bases = not self.trim_bases
         elif ch == "e" and getattr(self, "_uneven", False):
@@ -1004,11 +1026,13 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         return [hints.key("LMB drag", "arrow: chord" if self.rail_type == "CHORD" else "arrow: radius")]
 
     def drag_rows(self):
-        rows = [("Shape", [hints.cycle("C", ["circular", "chamfer", "blend"], self.shape.lower()),
-                           hints.cycle("R", ["rolling ball", "chord"],
-                                       "rolling ball" if self.rail_type == "RADIUS" else "chord", "size"),
-                           hints.toggle("S", "same radius", self.same_radius)]
-                 + ([hints.cycle("G", ["G1", "G2", "G3"], "G" + self.continuity)] if self.shape == "BLEND" else [])),
+        rows = [("Shape", [hints.cycle("C", ["circular", "chamfer", "blend", "soft"], self.shape.lower())]
+                 + ([] if self.shape == "SOFT" else
+                    [hints.cycle("R", ["rolling ball", "chord"],
+                                 "rolling ball" if self.rail_type == "RADIUS" else "chord", "size"),
+                     hints.toggle("S", "same radius", self.same_radius)])
+                 + ([hints.cycle("G", ["G1", "G2", "G3"], "G" + self.continuity)] if self.shape == "BLEND" else [])
+                 + ([hints.cycle("G", ["G2", "G3"], "G%d" % self._soft_cont())] if self.shape == "SOFT" else [])),
                 ("Side", [hints.key("A", "other side of A"), hints.key("B", "other side of B"),
                           hints.toggle("T", "trim the surfaces", self.trim_bases)]
                  + ([hints.cycle("E", ["notch", "extend"], self.ends.lower(), "ends")]
@@ -1026,9 +1050,18 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
             fit_radius(self, [a, b], ["radius", "radius_b"])     # a size that fits, shown in the dialog
 
     def _chord(self):
-        return self.radius if self.rail_type == "CHORD" else None
+        return self.radius if (self.rail_type == "CHORD" and self.shape != "SOFT") else None
 
     def _try(self, a, b, fa, fb):
+        if self.shape == "SOFT":
+            r = self.radius
+            self._used = {"radius_a": -r if fa else r, "radius_b": -r if fb else r, "xsect": 2, "chord": None,
+                          "blend": self._soft_cont(), "soft": float(self.smoothing), "ends": self.ends,
+                          "trim": self.trim_bases}
+            return jobs.run("fillet", {"a": a, "b": b}, ["fillet", "a", "b"],
+                            radius_a=self._used["radius_a"], radius_b=self._used["radius_b"], xsect=2,
+                            blend=self._used["blend"], soft=self._used["soft"], tolerance=1e-4,
+                            trim_bases=self.trim_bases, ends=self.ends)
         chord = self._chord()
         rb = self.radius if (self.same_radius or chord) else self.radius_b
         self._used = {"radius_a": -self.radius if fa else self.radius, "radius_b": -rb if fb else rb,
@@ -1094,6 +1127,8 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
             self.report({'WARNING'}, res["note"])
         if keep_history:
             features.record(fil, "surface_fillet", [(a, "SURF"), (b, "SURF")], dict(u))
+        if u.get("soft") is not None and res.get("min_radius"):
+            self.report({'INFO'}, soft_summary(res))
         if u["chord"] and res.get("radius_range"):
             lo, mean, hi = res["radius_range"]
             spread = (f"{lo:.4g}..{hi:.4g}" if hi - lo > 1e-3 * mean else f"{mean:.4g}")
@@ -1108,9 +1143,14 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         lay.prop(self, "shape", expand=True)
         if self.shape == "BLEND":
             lay.row(align=True).prop(self, "continuity", expand=True)
-        lay.row(align=True).prop(self, "rail_type", expand=True)
+        if self.shape == "SOFT":
+            _draw_soft(lay, self)
+        else:
+            lay.row(align=True).prop(self, "rail_type", expand=True)
         col = lay.column(align=True)
-        if self.rail_type == "CHORD":
+        if self.shape == "SOFT":
+            col.prop(self, "radius", text="Min Radius")
+        elif self.rail_type == "CHORD":
             col.prop(self, "radius", text="Chord")
         else:
             col.prop(self, "radius", text="Distance A" if self.shape == "CHAMFER" else "Radius A")
@@ -2194,6 +2234,66 @@ def surface_fillet_sections(P, NA, NB, ra, rb, sa, sb, shape="CIRCULAR", k=9, co
     return C[:, None] + rr[..., None] * (wa[..., None] * a[:, None] + wb[..., None] * b[:, None])
 
 
+def _unit(X):
+    return X / (np.linalg.norm(X, axis=-1, keepdims=True) + 1e-300)
+
+
+def soft_setback_factor(cosa, smoothing, cont):
+    """g: rail distance from the corner per unit minimum radius, for faces
+    leaving the corner at cos(angle between them) cosa."""
+    from .kernel import softfillet
+    turn = np.pi - np.arccos(np.clip(cosa, -0.9999, 0.9999))
+    return softfillet.setback(1.0, float(turn), softfillet.clamp_smoothing(smoothing, cont), cont)
+
+
+def soft_sections(P, D1, D2, R, smoothing, cont, k=9):
+    """Cross-sections (n, k, 3) of a soft fillet (softfillet.py) of minimum
+    radius R at corner points P, the faces leaving them along the unit
+    directions D1, D2 (the faces taken as flat across, as the other
+    previews)."""
+    from .kernel import softfillet
+    sm_ = softfillet.clamp_smoothing(smoothing, cont)
+    out = []
+    w = np.linspace(0.0, 1.0, k)
+    for p, d1, d2 in zip(P, D1, D2):
+        cosa = float(np.clip(d1 @ d2, -0.9999, 0.9999))
+        turn = float(np.pi - np.arccos(cosa))
+        sh = softfillet.shape(turn, sm_, cont)
+        L = sh["g"] * R
+        n1 = d2 - (d2 @ d1) * d1
+        n2 = d1 - (d1 @ d2) * d2
+        n1 /= np.linalg.norm(n1) or 1.0
+        n2 /= np.linalg.norm(n2) or 1.0
+        cv = softfillet.section_cvs(p + L * d1, -d1, n1, 0.0, p + L * d2, -d2, n2, 0.0, L, sh["spacing"],
+                                    sh["degree"])
+        out.append(softfillet._bern(sh["degree"], w) @ cv)
+    return np.array(out)
+
+
+def soft_summary(info):
+    """One line on a soft fillet's result: its measured minimum radius."""
+    lo, hi = info["min_radius"][0], info["min_radius"][-1]
+    rr = f"{lo:.4g}" if hi - lo <= 1e-4 * max(hi, 1e-12) else f"{lo:.4g}..{hi:.4g}"
+    msg = f"soft fillet: min radius {rr} m, smoothing {info.get('smoothing', 0):.2f}"
+    if info.get("corners_filled"):
+        n = info["corners_filled"]
+        msg += f" · {n} corner{'s' if n != 1 else ''} filled (Square, G2)"
+    if info.get("openings"):
+        n = info["openings"]
+        msg += (f" · {n} corner{'s' if n != 1 else ''} left open where fillets meet: fill "
+                f"{'them' if n != 1 else 'it'} with Square (G2, Match Neighbours)")
+    return msg
+
+
+def _draw_soft(lay, op):
+    row = lay.row(align=True)
+    for v, t in (("2", "G2"), ("3", "G3")):
+        row.prop_enum(op, "continuity", v, text=t)
+    lay.prop(op, "smoothing", slider=True)
+    if op.continuity == "3" and op.smoothing < 0.5:
+        lay.label(text="G3 uses Smoothing 0.5 (lower bumps its curvature)", icon='INFO')
+
+
 class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
     """Fillet, chamfer or blend shared edges of joined surfaces and solids.
     Click the edges to fillet (click again to un-pick, A = all), Enter to finish.
@@ -2217,11 +2317,18 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
         ("CIRCULAR", "Circular", "Circular cross-section"),
         ("CHAMFER", "Chamfer", "Straight cross-section"),
         ("BLEND", "Blend", "Free-form blend with G1/G2/G3 continuity to both faces"),
+        ("SOFT", "Soft", "Soft (curvature-ramped) corner: the curvature rises from the faces' own to a peak of exactly 1 / Radius in the middle. G2 (degree 5) or G3 (degree 7) to both faces"),
     ], default="CIRCULAR")
+    smoothing: FloatProperty(name="Smoothing", default=0.6, min=0.1, max=1.0, subtype='FACTOR',
+                             description="Soft: the share of the turn taken by the curvature ramps. Low is close "
+                                         "to a circle, 1 has no constant-radius part left. G3 needs 0.5 or more")
     rail_type: EnumProperty(name="Rail", items=[
         ("RADIUS", "Rolling Ball", "The size is the radius of a ball rolling between the faces"),
         ("CHORD", "Chord", "The size is the distance between the two rails (where the fillet meets the faces)"),
     ], default="RADIUS")
+    fill_corners: BoolProperty(name="Fill Corners", default=True,
+                               description="Soft: where three or four fillets meet (a box corner), fill the opening "
+                                           "with a Square, G2 to the fillets around it")
     radius: FloatProperty(name="Radius", default=0.1, min=1e-4, soft_max=5.0, unit='LENGTH')
     variable: BoolProperty(name="Variable Radius", default=False)
     end_radius: FloatProperty(name="End Radius", default=0.2, min=1e-4, soft_max=5.0, unit='LENGTH')
@@ -2315,11 +2422,20 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
     angle_fields = ()
     fit_view = "shrink"         # the radius fit_radius found for the part: only ever made smaller
     start_value = 0.0           # the radius handle on the edges: no fillet until it is dragged (L: the last radius)
-    SHAPES = ("CIRCULAR", "CHAMFER", "BLEND")
+    SHAPES = ("CIRCULAR", "CHAMFER", "BLEND", "SOFT")
 
     @property
     def drag_fields(self):
-        return ("radius", "end_radius") if self.variable and self.rail_type == "RADIUS" else ("radius",)
+        return ("radius", "end_radius") if (self.variable and self.rail_type == "RADIUS"
+                                            and self.shape != "SOFT") else ("radius",)
+
+    def _soft_cont(self):
+        return 3 if self.continuity == "3" else 2
+
+    def _label(self, name):
+        if self.shape == "SOFT":
+            return "Min Radius"
+        return super()._label(name)
 
     def drag_setup(self, context, mouse):
         self._ef = []
@@ -2361,7 +2477,10 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
         lines, tris = [], []
         for i in range(len(self._ef)):
             P, D1, D2 = self._ef[i]
-            X = fillet_sections(P, D1, D2, self._radii(i), self.shape, fullness=self.thumbweight)
+            if self.shape == "SOFT":
+                X = soft_sections(P, D1, D2, self.radius, self.smoothing, self._soft_cont())
+            else:
+                X = fillet_sections(P, D1, D2, self._radii(i), self.shape, fullness=self.thumbweight)
             L, T = ruled_preview(list(X), ribs=2)
             lines += L
             tris.append(T)
@@ -2372,6 +2491,10 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
         cosa = float(D1[j] @ D2[j])
         tan_half = np.tan(0.5 * np.arccos(np.clip(cosa, -0.9999, 0.9999)))
         value = getattr(self, field)
+        if self.shape == "SOFT":          # the rail at the soft section's setback g R
+            g = soft_setback_factor(cosa, self.smoothing, self._soft_cont())
+            return {"field": field, "kind": "arrow", "origin": P[j], "dir": D1[j], "base": P[j],
+                    "param": g * value, "to_value": lambda t: t / g}
         if self.rail_type == "CHORD":     # chord -> rail distance and back
             th = np.pi - np.arccos(np.clip(cosa, -0.9999, 0.9999))
             k = 2.0 * np.sin(0.5 * max(th, np.radians(1.0)))
@@ -2397,18 +2520,25 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
         elif ch == "r":
             self.rail_type = "CHORD" if self.rail_type == "RADIUS" else "RADIUS"
             self._field = 0
+        elif ch == "g" and self.shape == "SOFT":
+            self.continuity = "2" if self.continuity == "3" else "3"
         else:
             return False
         return True
 
     def drag_handle_hints(self):
+        if self.shape == "SOFT":
+            return [hints.key("LMB drag", "arrow: min radius")]
         hs = [hints.key("LMB drag", "arrow: radius" if self.rail_type == "RADIUS" else "arrow: chord")]
         if "end_radius" in self.drag_fields:
             hs.append(hints.key("LMB drag", "2nd arrow: end radius"))
         return hs
 
     def drag_rows(self):
-        return [("Shape", [hints.cycle("C", ["circular", "chamfer", "blend"], self.shape.lower()),
+        if self.shape == "SOFT":
+            return [("Shape", [hints.cycle("C", ["circular", "chamfer", "blend", "soft"], "soft"),
+                               hints.cycle("G", ["G2", "G3"], "G%d" % self._soft_cont())])]
+        return [("Shape", [hints.cycle("C", ["circular", "chamfer", "blend", "soft"], self.shape.lower()),
                            hints.cycle("R", ["rolling ball", "chord"],
                                        "rolling ball" if self.rail_type == "RADIUS" else "chord", "size"),
                            hints.toggle("V", "variable", self.variable)])]
@@ -2450,7 +2580,10 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
             self.report({'WARNING'}, "Pick shared edges of a joined surface")
             return {'CANCELLED'}
         fit_radius(self, [bpy.data.objects[n] for n in by_obj], ["radius", "end_radius"])
-        chord = self.radius if self.rail_type == "CHORD" else None
+        soft = self.shape == "SOFT"
+        chord = self.radius if (self.rail_type == "CHORD" and not soft) else None
+        variable = self.variable and not chord and not soft
+        cont = self._soft_cont() if soft else int(self.continuity)
         done = []
         for name, idxs in by_obj.items():
             obj = bpy.data.objects[name]
@@ -2458,10 +2591,12 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
                 mids = [_edge_mid_world(obj, i) for i in idxs]
                 info, breps = jobs.run("edge_fillet", {"target": obj}, ["result"], edge_mids=mids,
                                        shape=self.shape, radius=self.radius,
-                                       end_radius=self.end_radius if self.variable and not chord else None,
-                                       chord=chord,
-                                       continuity=int(self.continuity), thumbweight=self.thumbweight,
+                                       end_radius=self.end_radius if variable else None,
+                                       chord=chord, smoothing=float(self.smoothing),
+                                       continuity=cont, thumbweight=self.thumbweight,
                                        **steps.class_a_params(self._ca_params()))
+                breps["result"] = steps.soft_corners(obj, breps["result"], info,
+                                                     {"shape": self.shape, "fill_corners": self.fill_corners})
             except (jobs.JobError, IndexError) as exc:
                 why = seam_crossings(obj, idxs)
                 if why:
@@ -2479,8 +2614,9 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
                 steps.store_rims(obj, [list(Mi @ Vector(m)) for m in mids], info, Mi, breps["result"])
                 features.push_step(obj, "edge_fillet", [], {
                     "mids_local": [list(Mi @ Vector(m)) for m in mids], "shape": self.shape, "radius": self.radius,
-                    "end_radius": self.end_radius if self.variable and not chord else None, "chord": chord,
-                    "continuity": int(self.continuity), "thumbweight": self.thumbweight,
+                    "end_radius": self.end_radius if variable else None, "chord": chord,
+                    "continuity": cont, "thumbweight": self.thumbweight, "smoothing": float(self.smoothing),
+                    "fill_corners": bool(self.fill_corners),
                     **self._ca_params()}, base_text=pre)
             done.append(obj)
             from . import subsel
@@ -2493,12 +2629,16 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
                 msg += (f" · chord {lo:.4g}..{hi:.4g} m" if hi - lo > 1e-3 * mean else f" · chord {mean:.4g} m") \
                     + f" (ball radius {ball} m)"
             level = 'INFO'
+            if info.get("min_radius"):
+                msg += " · " + soft_summary(info)
+                if info.get("openings"):
+                    level = 'WARNING'
             if info.get("chord_note"):
                 msg += " · " + info["chord_note"]
                 level = 'WARNING'
             if info.get("rings") and "class_a" not in info:
                 msg += " · " + ring_summary(info["rings"])
-            if "class_a" in info:
+            if "class_a" in info and not soft:
                 ca_msg, ok = class_a_summary(info["class_a"])
                 msg += " · " + ca_msg
                 level = 'INFO' if ok else 'WARNING'
@@ -2518,6 +2658,11 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
     def draw(self, context):
         lay = self.layout
         lay.prop(self, "shape", expand=True)
+        if self.shape == "SOFT":
+            lay.prop(self, "radius", text="Min Radius")
+            _draw_soft(lay, self)
+            lay.prop(self, "fill_corners")
+            return
         lay.row(align=True).prop(self, "rail_type", expand=True)
         col = lay.column(align=True)
         if self.rail_type == "CHORD":

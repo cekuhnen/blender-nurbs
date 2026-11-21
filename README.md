@@ -90,7 +90,7 @@ everything built from it rebuilds.
   Gap, angle and curvature checks show in the panel; trimmed patches fall back to a projected grid (G0 edges)
 - **Trim and split:** Trim, Split, Untrim, Untrim Region, Detach at Isoparm
 - **Join:** Join, Unjoin
-- **Fillets:** Surface Fillet, Edge Fillet (circular, chamfer, or blends G1 to G3)
+- **Fillets:** Surface Fillet, Edge Fillet (circular, chamfer, blends G1 to G3, or soft: curvature-ramped G2 / G3 with an exact minimum radius, box corners filled G2)
 - **Solids:** Union, Difference, Intersection, Push / Pull, Replace Face, Boundary Fill
 
 ### Analyze

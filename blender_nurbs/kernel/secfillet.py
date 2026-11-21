@@ -11,7 +11,10 @@ section is a circular arc (exact, rational), a straight chamfer, or a G1
 cubic / G2 quintic / G3 degree-7 blend: tangent to each surface square
 across the rail and, G2, with its normal curvature in that direction; G3
 also with the rate that curvature changes at (the surface's third-order
-form, from the exact third derivatives of its CV net).
+form, from the exact third derivatives of its CV net). SOFT2 / SOFT3: the
+soft fillet (softfillet.py), a G2 quintic / G3 degree-7 span whose curvature
+peaks at exactly 1 / R in the middle; each section's ball is sized from its
+own angle so the rails sit where that span needs them.
 
 The sections are skinned through, in homogeneous coordinates (rational arcs
 stay exact), periodic round a closed crossing; a section is added halfway
@@ -24,7 +27,7 @@ import math
 
 import numpy as np
 
-SHAPES = ("CIRCULAR", "LINEAR", "G1", "G2", "G3")
+SHAPES = ("CIRCULAR", "LINEAR", "G1", "G2", "G3", "SOFT2", "SOFT3")
 MAX_SECTIONS = 400
 ANGLE_TOL = math.radians(0.02)       # surface normal vs a surface's along a rail (labels: 0.1 deg)
 
@@ -380,7 +383,7 @@ def chains(curves, tol):
 # ---------------------------------------------------------------------------
 
 class Section:
-    __slots__ = ("s", "P0", "C", "pa", "pb", "na", "nb", "wa", "wb", "ra", "rb")
+    __slots__ = ("s", "P0", "C", "pa", "pb", "na", "nb", "wa", "wb", "ra", "rb", "turn")
 
 
 def _plane(T):
@@ -391,10 +394,11 @@ def _plane(T):
 
 
 class Solver:
-    def __init__(self, A, B, ra, rb, chord=None, scale=1.0):
+    def __init__(self, A, B, ra, rb, chord=None, scale=1.0, soft=None):
         self.A, self.B = A, B
         self.ra, self.rb, self.chord = ra, rb, chord
         self.scale = scale
+        self.soft = soft            # (R, smoothing, cont): each section's ball from its own angle
 
     def ball(self, P0, T, ra, rb, C):
         """Centre in the plane (P0, T) at signed distances ra from A, rb from B."""
@@ -459,12 +463,49 @@ class Solver:
                 C = P0 + (C - P0) * (r_new / r)
                 r_prev, ch_prev, r = r, ch, r_new
             ra = rb = r
+        elif self.soft:
+            import softfillet
+            R, smooth, cont = self.soft
+            C0, na0, nb0 = self.start(P0, 1.0, 1.0)
+            turn = math.acos(max(-1.0, min(1.0, float(na0 @ nb0))))
+            r = guess if guess else softfillet.ball_radius(R, turn, smooth, cont)
+            C = P0 + r * (C0 - P0)
+            for _ in range(40):
+                C, pa, na, wa, pb, nb, wb = self.ball(P0, T, r, r, C)
+                turn = math.acos(max(-1.0, min(1.0, float(na @ nb))))
+                r_new = softfillet.ball_radius(R, turn, smooth, cont)
+                if abs(r_new - r) <= 1e-12 * r:
+                    break
+                C = P0 + (C - P0) * (r_new / r)
+                r = r_new
+            # on curved faces the faces' curvature bends the span: size the ball
+            # so this section's own sharpest point has radius R exactly (secant)
+            shape = "SOFT3" if cont >= 3 else "SOFT2"
+            r_prev = e_prev = None
+            for _ in range(12):
+                x = Section()
+                x.s, x.P0, x.C, x.pa, x.pb, x.na, x.nb, x.wa, x.wb, x.ra, x.rb = s, P0, C, pa, pb, na, nb, wa, wb, r, r
+                x.turn = math.acos(max(-1.0, min(1.0, float(na @ nb))))
+                _, rows = section_rows(x, shape, self.A, self.B, self.soft)
+                err = softfillet.peak_radius(rows[:, :3] / rows[:, 3:]) - R
+                if abs(err) <= 1e-10 * R:
+                    break
+                if r_prev is not None and abs(err - e_prev) > 1e-300:
+                    r_new = r - err * (r - r_prev) / (err - e_prev)
+                else:
+                    r_new = r * R / (err + R)
+                r_new = min(max(r_new, 0.5 * r), 2.0 * r)
+                C = P0 + (C - P0) * (r_new / r)
+                r_prev, e_prev, r = r, err, r_new
+                C, pa, na, wa, pb, nb, wb = self.ball(P0, T, r, r, C)
+            ra = rb = r
         else:
             ra, rb = self.ra, self.rb
             C = guess if guess is not None else self.start(P0, ra, rb)[0]
             C, pa, na, wa, pb, nb, wb = self.ball(P0, T, ra, rb, C)
         x = Section()
         x.s, x.P0, x.C, x.pa, x.pb, x.na, x.nb, x.wa, x.wb, x.ra, x.rb = s, P0, C, pa, pb, na, nb, wa, wb, ra, rb
+        x.turn = math.acos(max(-1.0, min(1.0, float(na @ nb))))
         return x
 
 
@@ -479,10 +520,25 @@ def _across(x, base, p, n, other):
     return d / (np.linalg.norm(d) or 1.0)
 
 
-def section_rows(x, shape, A, B):
+def section_rows(x, shape, A, B, soft=None):
     """(degree, rows (deg+1, 4) homogeneous) of the section's curve, rail A first."""
     pa, pb = x.pa, x.pb
     h1 = lambda p, w=1.0: np.append(np.asarray(p, float) * w, w)
+    if shape in ("SOFT2", "SOFT3"):
+        import softfillet
+        _, smooth, cont = soft
+        sh = softfillet.shape(x.turn, smooth, cont)
+        ta = _across(x, A, pa, x.na, pb)
+        tb = _across(x, B, pb, x.nb, pa)
+        L = 0.5 * (x.ra + x.rb) * math.tan(0.5 * x.turn)
+        if cont >= 3:
+            ka, ka3 = A.curvature_rate(x.wa, x.na, ta)
+            kb, kb3 = B.curvature_rate(x.wb, x.nb, tb)
+        else:
+            ka, kb = A.normal_curvature(x.wa, x.na, ta), B.normal_curvature(x.wb, x.nb, tb)
+            ka3 = kb3 = 0.0
+        P = softfillet.section_cvs(pa, ta, x.na, ka, pb, tb, x.nb, kb, L, sh["spacing"], sh["degree"], ka3, kb3)
+        return sh["degree"], np.array([h1(q) for q in P])
     if shape == "LINEAR":
         return 1, np.array([h1(pa), h1(pb)])
     if shape == "CIRCULAR":
@@ -581,13 +637,13 @@ def _bern(n, t):
 # ---------------------------------------------------------------------------
 
 
-def _sides_on(sm, brep_a, brep_b, cr, ra, rb, chord, size, faces):
+def _sides_on(sm, brep_a, brep_b, cr, ra, rb, chord, size, faces, soft=None):
     """(side_a, side_b) whose ball's rails lie on the given faces (sampled at
     three places along the crossing)."""
     best = None
     for sa in (-1.0, 1.0):
         for sb in (-1.0, 1.0):
-            solver = Solver(Base(sm, brep_a, sa), Base(sm, brep_b, sb), ra, rb, chord, size)
+            solver = Solver(Base(sm, brep_a, sa), Base(sm, brep_b, sb), ra, rb, chord, size, soft)
             worst = 0.0
             try:
                 for s in (0.25, 0.5, 0.75):
@@ -602,16 +658,25 @@ def _sides_on(sm, brep_a, brep_b, cr, ra, rb, chord, size, faces):
     return best[1], best[2]
 
 def build(sm, brep_a, brep_b, side_a, side_b, ra, rb, chord=None, shape="CIRCULAR", tolerance=1e-4,
-          curves=None, on_faces=None):
+          curves=None, on_faces=None, smoothing=0.6):
     """(fillet brep, info) between two world-space breps. side_a / side_b: +1
     for the fillet on that surface's outward-normal side, -1 the other.
     curves: the crossing to follow (an edge fillet's edges) instead of the
     breps' intersection. on_faces = (face on A, face on B) with side_a /
     side_b None: the sides are the ones whose rails land on those faces
-    (an edge fillet: the one corner between the two faces that both have)."""
+    (an edge fillet: the one corner between the two faces that both have).
+    SOFT2 / SOFT3: ra is the soft fillet's minimum radius R (rb is not used),
+    smoothing its share of the turn in the ramps."""
     ext = sm.blender_ext
     if shape not in SHAPES:
         raise ValueError(f"unknown section {shape}")
+    soft = None
+    if shape in ("SOFT2", "SOFT3"):
+        import softfillet
+        cont = 3 if shape == "SOFT3" else 2
+        soft = (float(ra), softfillet.clamp_smoothing(smoothing, cont), cont)
+        chord = None
+        ra = rb = softfillet.ball_radius(ra, 0.5 * math.pi, soft[1], cont)     # a first guess, for the sides
     if curves is None:
         try:
             curves, _ = sm.intersect_breps(brep_a, brep_b)
@@ -625,9 +690,9 @@ def build(sm, brep_a, brep_b, side_a, side_b, ra, rb, chord=None, shape="CIRCULA
         raise RuntimeError("the surfaces do not cross")
     cr = max(crossings, key=lambda c: c.length)
     if side_a is None or side_b is None:
-        side_a, side_b = _sides_on(sm, brep_a, brep_b, cr, ra, rb, chord, size, on_faces)
+        side_a, side_b = _sides_on(sm, brep_a, brep_b, cr, ra, rb, chord, size, on_faces, soft)
     A, B = Base(sm, brep_a, side_a), Base(sm, brep_b, side_b)
-    solver = Solver(A, B, ra, rb, chord, size)
+    solver = Solver(A, B, ra, rb, chord, size, soft)
     polys = []
     for br in (brep_a, brep_b):
         for e in br.edges():
@@ -637,19 +702,19 @@ def build(sm, brep_a, brep_b, side_a, side_b, ra, rb, chord=None, shape="CIRCULA
     n0 = 12 if cr.closed else 9
     secs = []
     for s in np.linspace(0.0, 1.0, n0, endpoint=not cr.closed):
-        secs.append(solver.section(cr, float(s), secs[-1].ra if (chord and secs) else None))
+        secs.append(solver.section(cr, float(s), secs[-1].ra if ((chord or soft) and secs) else None))
     gap_tol = max(min(tolerance, 1e-5 * max(cr.length, 1e-9)), 1e-9 * size)
     surf = None
     for _round in range(8):
-        rows = [section_rows(x, shape, A, B) for x in secs]
+        rows = [section_rows(x, shape, A, B, soft) for x in secs]
         deg = rows[0][0]
         surf = skin(ext, secs, [r for _, r in rows], deg, cr.closed)
         add = []
         n = len(secs)
         for i in range(n if cr.closed else n - 1):
             s0, s1 = secs[i].s, (secs[i + 1].s if i + 1 < n else 1.0)
-            x = solver.section(cr, 0.5 * (s0 + s1), secs[i].ra if chord else None)
-            dg, xr = section_rows(x, shape, A, B)
+            x = solver.section(cr, 0.5 * (s0 + s1), secs[i].ra if (chord or soft) else None)
+            dg, xr = section_rows(x, shape, A, B, soft)
             if not _check(sm, surf, x, xr, dg, gap_tol, shape != "LINEAR"):
                 add.append((i + 1, x))
         if not add or len(secs) + len(add) > MAX_SECTIONS:
@@ -662,6 +727,11 @@ def build(sm, brep_a, brep_b, side_a, side_b, ra, rb, chord=None, shape="CIRCULA
     info = {"radius": (float(min(radii)), float(np.mean(radii)), float(max(radii))),
             "chord": (float(min(chords)), float(np.mean(chords)), float(max(chords))),
             "sections": len(secs)}
+    if soft:
+        import softfillet
+        pk = [softfillet.peak_radius(np.asarray(r)[:, :3] / np.asarray(r)[:, 3:]) for _, r in rows]
+        info["min_radius"] = (float(min(pk)), float(np.mean(pk)), float(max(pk)))
+        info["smoothing"] = soft[1]
     if len(crossings) > 1:
         info["note"] = f"the surfaces cross {len(crossings)} times: filleted the longest crossing"
     return f, info

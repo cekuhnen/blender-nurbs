@@ -212,15 +212,140 @@ def rims_of(obj, mids_local):
         return None
 
 
+def _corner_loops(b, new_faces, tol):
+    """Edge index lists of the openings a soft fillet left where its strips
+    meet: closed loops of 3 or 4 open edges, each on a fillet face."""
+    import numpy as np
+    edges = b.edges()
+    on_new = lambda f: any(f.closest_point(tuple(q))[1] < tol for q in new_faces)
+    cand = []
+    for i, e in enumerate(edges):
+        fs = e.faces()
+        if len(fs) == 1 and on_new(fs[0]):
+            t0, t1 = e.parameter_range()
+            cand.append((i, np.array(e.point_at(t0), float), np.array(e.point_at(t1), float)))
+    loops, left = [], list(cand)
+    while left:
+        g = [left.pop(0)]
+        grown = True
+        while grown:
+            grown = False
+            for q in list(left):
+                if any(min(np.linalg.norm(q[a] - x[c]) for a in (1, 2) for c in (1, 2)) < tol for x in g):
+                    g.append(q)
+                    left.remove(q)
+                    grown = True
+        ends = [x[k] for x in g for k in (1, 2)]
+        closed = all(sum(np.linalg.norm(p - q) < tol for q in ends) == 2 for p in ends)
+        if closed and len(g) in (3, 4):
+            loops.append([x[0] for x in g])
+    return loops
+
+
+def _folded(surf, n=25):
+    """True when the patch's normal turns over inside it (away from its
+    boundary, where a three-sided patch's collapsed side has none)."""
+    import numpy as np
+    (u0, u1), (v0, v1) = surf.u_domain(), surf.v_domain()
+    N = []
+    for u in np.linspace(u0, u1, n)[1:-1]:
+        for v in np.linspace(v0, v1, n)[1:-1]:
+            _, su, sv = (np.array(x, float) for x in surf.derivatives(u, v))
+            nn = np.cross(su, sv)
+            ln = float(np.linalg.norm(nn))
+            if ln > 0:
+                N.append(nn / ln)
+    if not N:
+        return True
+    N = np.array(N)
+    avg = N.sum(axis=0)
+    avg /= np.linalg.norm(avg) or 1.0
+    return bool((N @ avg < 0).any())
+
+
+def fill_soft_corners(text, info):
+    """A soft edge fillet leaves an opening where three or four strips meet
+    (a box corner): each is filled with a Square, G2 to the strips around it
+    (Match Neighbours), and stitched in. Works in the object's own space
+    (info["new_faces_local"]: a point inside each fillet face). Returns
+    (text, filled, left open)."""
+    import numpy as np
+    from . import square
+    if not info.get("openings"):
+        return text, 0, 0
+    b = store.brep_from_text(text)
+    lo, hi = (np.array(v, float) for v in b.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    loops = _corner_loops(b, info.get("new_faces_local") or [], 1e-5 * size)
+    patches = []
+    _, ext = store._k()
+    for lp in loops:
+        try:
+            surf = None
+            # Match Neighbours first (the strips' own layout: a light patch). Next
+            # to degree-7 (G3) strips that one folds near its collapsed side: a
+            # degree-7 patch of 2 x 2 spans on its own knots holds them exactly
+            # (box corner: gap 3e-15, 0.002 deg, 0.2 %); the Square's own Auto
+            # (degree 5) would leave a 2e-5 gap at their edges
+            for extra in ({"sq_match": True},
+                          {"sq_match": False, "sq_degree_u": 7, "sq_degree_v": 7, "sq_spans_u": 2, "sq_spans_v": 2},
+                          {"sq_match": False}):
+                raw = [square.sample_side(None, f"E{i}", 48, brep=b, M=Matrix.Identity(4)) for i in lp]
+                p = {f"e{k}": "G2" for k in range(4)}
+                p.update(extra)
+                surf, _ = square.surface_from_sides(raw, p)
+                if not _folded(surf):
+                    break
+            patches.append(store.brep_to_text(ext.brep_from_surface(surf)))
+        except Exception as exc:
+            print("NURBS soft corner:", exc)
+    left_open = int(info["openings"]) - len(patches)
+    if not patches:
+        return text, 0, left_open
+    objs = {"s0": (text, IDENT)}
+    objs.update({f"c{k}": (t, IDENT) for k, t in enumerate(patches)})
+    for tol in (1e-6 * size, 1e-5 * size, 1e-4 * size):
+        try:
+            _, breps = jobs.run("join", objs, ["joined"], order=list(objs), into="s0", tolerance=tol)
+        except jobs.JobError as exc:
+            print("NURBS soft corner stitch:", exc)
+            continue
+        out = store.brep_from_text(breps["joined"])
+        opened = sum(1 for e in out.edges() if len(e.faces()) == 1)
+        if opened <= sum(1 for e in b.edges() if len(e.faces()) == 1) - sum(len(lp) for lp in loops):
+            return breps["joined"], len(patches), left_open
+    return text, 0, int(info["openings"])
+
+
+def soft_corners(obj, text, info, p):
+    """fill_soft_corners when the step asks for it (Fill Corners), with the
+    fillet faces' points in the object's own space; updates info."""
+    if p.get("shape") != "SOFT" or not p.get("fill_corners", True) or not info.get("openings"):
+        return text
+    Mi = _world(obj).inverted()
+    info["new_faces_local"] = [list(Mi @ Vector(q)) for q in info.get("new_faces", [])]
+    text, filled, left = fill_soft_corners(text, info)
+    info["corners_filled"], info["openings"] = filled, left
+    if filled:
+        b = store.brep_from_text(text)
+        try:
+            info["solid"] = bool(b.is_manifold_solid())
+        except Exception:
+            pass
+    return text
+
+
 def apply_edge_fillet(obj, text, inputs, p):
     M = _world(obj)
     mids = [list(M @ Vector(m)) for m in p["mids_local"]]
     info, breps = jobs.run("edge_fillet", {"target": (text, jobs.xform(obj))}, ["result"], edge_mids=mids,
                         shape=p.get("shape", "CIRCULAR"), radius=p["radius"], end_radius=p.get("end_radius"),
-                        chord=p["radius"] if p.get("chord") else None,
+                        chord=p["radius"] if (p.get("chord") and p.get("shape") != "SOFT") else None,
                         continuity=int(p.get("continuity", 1)), thumbweight=p.get("thumbweight", 1.0), loose=True,
+                        smoothing=float(p.get("smoothing", 0.6)),
                         shrink_planes=bool(p.get("shrink_planes")),
                         **class_a_params(p))
+    breps["result"] = soft_corners(obj, breps["result"], info, p)
     if "class_a" in info:
         obj["nproto_class_a"] = json.dumps(info["class_a"])
     elif "nproto_class_a" in obj:
@@ -255,7 +380,8 @@ def apply_fillet_trim(obj, text, inputs, p):
     trim = p.get("trim", True)
     res, breps = jobs.run("fillet", objs, ["fillet", "a", "b"], radius_a=p["radius_a"], radius_b=p["radius_b"],
                           xsect=p["xsect"], chord=abs(p["radius_a"]) if p.get("chord") else None,
-                          blend=p.get("blend", 0), tolerance=1e-4, trim_bases=trim, ends=p.get("ends", "NOTCH"))
+                          blend=p.get("blend", 0), soft=p.get("soft"), tolerance=1e-4, trim_bases=trim,
+                          ends=p.get("ends", "NOTCH"))
     if role not in breps and not trim:
         return text                 # Extend without trimming: this side was not the one grown
     if role not in breps:
@@ -547,7 +673,7 @@ def _register():
         _, breps = jobs.run("fillet", objs, ["fillet"], radius_a=p["radius_a"],
                             radius_b=p["radius_b"], xsect=p["xsect"],
                             chord=abs(p["radius_a"]) if p.get("chord") else None, blend=p.get("blend", 0),
-                            tolerance=1e-4, trim_bases=False, ends=p.get("ends", "NOTCH"))
+                            soft=p.get("soft"), tolerance=1e-4, trim_bases=False, ends=p.get("ends", "NOTCH"))
         return ("brep_text", breps["fillet"])
 
 

@@ -628,8 +628,10 @@ def draw_feature(layout, context):
                 box.label(text=ff, icon='LINKED')
             if op == "surface_fillet":       # how it was built (set in the Fillet's redo panel)
                 prm = h["params"]
-                shape = ("Blend G%d" % prm["blend"]) if prm.get("blend") else \
-                    ("Chamfer" if prm.get("xsect") == 0 else "Circular")
+                shape = ("Soft G%d, Smoothing %.2f" % (prm.get("blend") or 2, prm["soft"])
+                         if prm.get("soft") is not None else
+                         ("Blend G%d" % prm["blend"]) if prm.get("blend") else
+                         ("Chamfer" if prm.get("xsect") == 0 else "Circular"))
                 box.label(text=f"Shape: {shape} · Rail: {'Chord' if prm.get('chord') else 'Rolling Ball'}",
                           icon='MOD_BEVEL')
             from .ui import draw_pause

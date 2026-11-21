@@ -163,16 +163,20 @@ def _second(surf, u, v):
     return su, sv, suu, 0.5 * (suv + svu), svv
 
 
-def sample_side(obj, ref, m):
-    """Side data for a curve (G0 only) or a NURBS surface edge."""
+def sample_side(obj, ref, m, brep=None, M=None):
+    """Side data for a curve (G0 only) or a NURBS surface edge. brep / M: an
+    edge of this brep, in the space M maps it to (default: the object's own
+    brep and world matrix)."""
     sm, _ = _k()
-    M = geom.world_matrix(obj)
+    if M is None:
+        M = geom.world_matrix(obj)
     if not features.is_edge_ref(ref) and not features.is_brep_edge_ref(ref):
         kc = features.input_curve(obj, ref)
         t0, t1 = kc.parameter_range()
         tt = _by_arclength(kc.evaluate, t0, t1, m)
         return Side([kc.evaluate(t) for t in tt], t=(tt - tt[0]) / ((tt[-1] - tt[0]) or 1.0))
-    brep = store.get_brep(obj)
+    if brep is None:
+        brep = store.get_brep(obj)
     R = np.array(M.to_3x3(), dtype=float)
     if features.is_brep_edge_ref(ref):
         edge = brep.edges()[int(ref[1:])]
@@ -1306,6 +1310,16 @@ def build_square(inputs, p):
     raw = [sample_side(o, r, m) for o, r in inputs]
     for sd, (o, r) in zip(raw, inputs):
         sd.src = (o.name, r)
+    surf, info = surface_from_sides(raw, p)
+    LAST_INFO.clear()
+    LAST_INFO.update(info)
+    return surf
+
+
+def surface_from_sides(raw, p):
+    """(surface, info): the Square through 3 or 4 sampled sides (any order and
+    direction), settings p as the feature's."""
+    m = len(raw[0].P)
     if len(raw) == 3:
         # chain the three, then a degenerate 4th side (a point) closes the loop
         chain, idx3 = [raw[0]], [0]
@@ -1334,9 +1348,7 @@ def build_square(inputs, p):
                                 max_move=float(p.get("sq_move", 5.0)) / 100.0)
     surf = _orient_like_neighbours(surf, sides)
     info["corner_notes"] = list(LAST_NOTES)
-    LAST_INFO.clear()
-    LAST_INFO.update(info)
-    return surf
+    return surf, info
 
 
 def _orient_like_neighbours(surf, sides):

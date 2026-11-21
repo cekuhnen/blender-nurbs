@@ -351,6 +351,33 @@ def blend_section(lay, sm, t, radius, A, B, tA, m, k):
     return np.array([np.r_[q, 1.0] for q in cvs])
 
 
+def soft_section(lay, sm, t, radius, A, B, tA, soft):
+    """Soft section (softfillet.py) between the rolling-ball contact points:
+    the span's spacings for this section's own turn, on its own setback
+    L = radius x tan(turn / 2); the faces' normal curvature on CV 2 (G2;
+    G3 takes it as constant across the rail, as Blend's G3 does)."""
+    import softfillet
+    exact = ball(lay, sm, t, radius, A, B, tA)
+    if exact is None:
+        return None
+    A, B, C = exact
+    smooth, cont = soft
+    ua, ub = A - C, B - C
+    th = float(np.arccos(np.clip(ua @ ub / (np.linalg.norm(ua) * np.linalg.norm(ub)), -1.0, 1.0)))
+    sh = softfillet.shape(th, smooth, cont)
+    bis = ua + ub
+    P1 = C + radius / np.cos(0.5 * th) * bis / np.linalg.norm(bis)
+    L = radius * np.tan(0.5 * th)
+    frame = []
+    for X, face in ((A, lay["rails"][0][1]), (B, lay["rails"][1][1])):
+        tX = (P1 - X) / (np.linalg.norm(P1 - X) or 1.0)
+        nX = (C - X) / radius
+        frame.append((X, tX, nX, _normal_curvature(face.surface(), sm, X, tX, nX, L)))
+    (pa, ta, na, ka), (pb, tb, nb, kb) = frame
+    P = softfillet.section_cvs(pa, ta, na, ka, pb, tb, nb, kb, L, sh["spacing"], sh["degree"])
+    return np.array([np.r_[q, 1.0] for q in P])
+
+
 def blend_fullness(lay, sm, m, n=9):
     """The kernel Blend's tangent spacing: |CV1 - contact| / tangent length,
     read from its own sections (both ends of each)."""
@@ -375,11 +402,17 @@ def blend_fullness(lay, sm, m, n=9):
 
 
 def section(lay, t, kind, m=3, sm=None, radius=None, blend_k=None):
-    """Homogeneous section CVs (rows x 4) at along-param t."""
+    """Homogeneous section CVs (rows x 4) at along-param t. blend_k: Blend's
+    fullness, or Soft's (smoothing, continuity)."""
     a0, a1 = lay["dom_a"]
     A, tA = _eval(lay, a0, t)
     B, tB = _eval(lay, a1, t)
     tB = -tB
+    if kind == "SOFT":
+        Q = soft_section(lay, sm, t, radius, A, B, tA, blend_k) if (radius and sm is not None) else None
+        if Q is None:
+            raise ValueError("no rolling ball of this size here: the soft section needs one")
+        return Q
     if kind == "BLEND" and radius and sm is not None and blend_k:
         Q = blend_section(lay, sm, t, radius, A, B, tA, m, blend_k)
         if Q is not None:
@@ -715,6 +748,9 @@ def rebuild_face(face, sm, is_fillet, kind="CIRCULAR", cont=2, tol=1e-4, ang_tol
     if isinstance(lay, str):
         return lay
     m = 3
+    if kind == "SOFT":
+        import softfillet
+        m = softfillet.degree_of(blend_k[1])
     if kind == "BLEND":
         d = sm.blender_ext.surface_cvs(lay["surf"])
         m = int(np.clip(d["degree_u"] if lay["across"] == "u" else d["degree_v"], 3, 9))
@@ -774,7 +810,7 @@ def rebuild_face(face, sm, is_fillet, kind="CIRCULAR", cont=2, tol=1e-4, ang_tol
     rail_edges = [lay["rails"][0][0], lay["rails"][1][0]]
 
     sym = is_symmetric(secs, ends)
-    exact = bool(radius and (kind == "CIRCULAR" or (kind == "BLEND" and blend_k)))
+    exact = bool(radius and (kind in ("CIRCULAR", "SOFT") or (kind == "BLEND" and blend_k)))
 
     # starting parameters: the candidate a plain single-span fit likes best
     p0 = min(7, max_degree)
@@ -862,6 +898,10 @@ def rebuild_face(face, sm, is_fillet, kind="CIRCULAR", cont=2, tol=1e-4, ang_tol
     rep["within"] = not best[0][0]
     rep["kernel_cvs"] = list(_kernel_counts(lay, sm))
     rep["exact_sections"] = exact
+    if kind == "SOFT":
+        import softfillet
+        pk = [softfillet.peak_radius(q[:, :3] / q[:, 3:]) for q in secs]
+        rep["min_radius"] = (float(min(pk)), float(max(pk)))
     return {"pieces": [P.reshape(p + 1, nrows, 4) for P in pieces], "degree_u": nrows - 1,
             "degree_v": p, "report": rep, "spline": (C, U, p, nrows)}
 
@@ -953,9 +993,12 @@ def patch_surface(P, ext):
 
 
 def rebuild_body(b, sm, fillet_ids, kind="CIRCULAR", cont=2, tol=1e-4, ang_tol=0.1,
-                 max_degree=7, max_spans=6, radius=None):
+                 max_degree=7, max_spans=6, radius=None, soft=None):
     """Replace the dense fillet faces (indices fillet_ids into b.faces()) of
-    brep b by Bezier patches. Returns (new brep, report)."""
+    brep b by Bezier patches. Returns (new brep, report). kind SOFT (soft =
+    (smoothing, continuity)): every fillet strip is rebuilt with soft sections
+    between the kernel's circular rails; the faces that are no strip (the
+    corner patches where fillets meet) are removed, their openings reported."""
     ext = sm.blender_ext
     faces = b.faces()
     fil = [faces[i] for i in fillet_ids]
@@ -984,7 +1027,9 @@ def rebuild_body(b, sm, fillet_ids, kind="CIRCULAR", cont=2, tol=1e-4, ang_tol=0
                 if 3 <= m <= 9 and m % 2 == 1:
                     ratios += blend_fullness(lay, sm, m)
         blend_k = float(np.median(ratios)) if ratios else None
-    todo = [i for i, f in enumerate(fil) if not (is_light(f.surface(), ext) and kind != "BLEND")]
+    if kind == "SOFT":
+        blend_k = (float(soft[0]), int(soft[1]))
+    todo = [i for i, f in enumerate(fil) if not (is_light(f.surface(), ext) and kind not in ("BLEND", "SOFT"))]
     # simplest faces first (e.g. straight runs before the bend): later faces
     # take their G1 / G2 from the patches already built
     todo.sort(key=lambda i: (int(np.prod(_kernel_counts(layout_of(fil[i]), sm)))
@@ -997,7 +1042,7 @@ def rebuild_body(b, sm, fillet_ids, kind="CIRCULAR", cont=2, tol=1e-4, ang_tol=0
             return built[k]
         return "pending" if k in todo else None
 
-    results, report = [], []
+    results, report, corners = [], [], []
     for i in todo:
         f = fil[i]
         res = rebuild_face(f, sm, is_fillet, kind, cont, tol, ang_tol, max_degree, max_spans, layout_of, radius,
@@ -1005,6 +1050,8 @@ def rebuild_body(b, sm, fillet_ids, kind="CIRCULAR", cont=2, tol=1e-4, ang_tol=0
         if isinstance(res, str):
             report.append({"skipped": res})
             built[i] = None
+            if kind == "SOFT":
+                corners.append(f)
             continue
         built[i] = res["spline"]
         results.append((f, res))
@@ -1013,7 +1060,8 @@ def rebuild_body(b, sm, fillet_ids, kind="CIRCULAR", cont=2, tol=1e-4, ang_tol=0
         return b, report
     gap = max(r["report"]["edge_gap"] for _, r in results)
     before_lamina = sum(1 for e in b.edges() if len(e.faces()) == 1)
-    ext.delete_faces(b, [f for f, _ in results])
+    opening_edges = sum(len(lp) for f in corners for lp in f.boundary_loops())
+    ext.delete_faces(b, [f for f, _ in results] + corners)
     patches = [ext.brep_from_surface(patch_surface(P, ext)) for _, r in results for P in r["pieces"]]
     if hasattr(ext, "append_brep"):       # plain copy: no imprint where a patch touches a face
         merged = b
@@ -1031,4 +1079,5 @@ def rebuild_body(b, sm, fillet_ids, kind="CIRCULAR", cont=2, tol=1e-4, ang_tol=0
     except Exception:
         pass
     return out, {"faces": report, "lamina_before": before_lamina, "lamina_after": lamina,
-                 "stitch_tol": st_tol, "patches": len(patches)}
+                 "stitch_tol": st_tol, "patches": len(patches), "openings": len(corners),
+                 "opening_edges": opening_edges}
