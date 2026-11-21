@@ -68,7 +68,7 @@ GROUPS = (
     )),
     ("SURFACES", "Create Surfaces", (
         ("Draw", (
-            (_t("nproto.draw_plane", "Draw Plane", 'MESH_PLANE'), _t("nproto.draw_box", "Box", 'MESH_CUBE'),
+            (_t("nproto.draw_plane", "Plane", 'MESH_PLANE'), _t("nproto.draw_box", "Box", 'MESH_CUBE'),
              _t("nproto.draw_cylinder", "Cylinder", 'MESH_CYLINDER')),
             (Dropdown(("Primitive", 'MESH_UVSPHERE', "VIEW3D_MT_nproto_primitives",
                        (_p("PLANE"), _p("DISK"), _p("BOX"), _p("CYLINDER"), _p("CONE"), _p("SPHERE"),

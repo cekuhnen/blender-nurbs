@@ -16,7 +16,7 @@ Tools that don't fit the selection are dimmed: select a curve and the tools that
 |---|---|
 | **Active Object** | Shown only when the active object has something to show: CV editing (Done / Cancel), its feature settings and history, its face and edge count |
 | **Create Curves** | CV Curve, Draw Line, Arc, Circle, Ellipse, Rectangle, Polygon, Slot, Profile · between curves: Blend Curve, Fillet · from curves: Offset Curve, Offset on Surface · Helix (the other shapes, placed at the 3D cursor: Shift+A) · from surfaces: Iso Curve, Duplicate Edge, Project Curve, Intersect |
-| **Create Surfaces** | Draw Plane, Box, Cylinder, **Primitive** ▾ (Plane, Disk, Box, Cylinder, Cone, Sphere, Torus) · from curves: Loft, Loft Rails, Curve Network, Sweep, Pipe, Extrude, Revolve, Rail Revolve, Planar · filling a gap: Boundary, Square, Patch, Dome · from surfaces: Offset, Thicken, Flange (and draft surface), Convert Blender Surface |
+| **Create Surfaces** | Plane, Box, Cylinder, **Primitive** ▾ (Plane, Disk, Box, Cylinder, Cone, Sphere, Torus) · from curves: Loft, Loft Rails, Curve Network, Sweep, Pipe, Extrude, Revolve, Rail Revolve, Planar · filling a gap: Boundary, Square, Patch, Dome · from surfaces: Offset, Thicken, Flange (and draft surface), Convert Blender Surface |
 | **Curve Edit** | Join / Unjoin Curves, Trim / Split Curves, Rebuild / Extend Curve, Align Curve |
 | **Surface Edit** | Edit CVs, Flip Normal, Rebuild Surface, Extend Surface, Surface Align, Match Surface, Refit to Trim, Merge Patches · Trim, Split, Untrim, Join, Unjoin, Detach at Isoparm · Surface Fillet, Edge Fillet · solids: Union, Difference, Intersection, Boundary Fill |
 | **Convert** (closed at first) | BREP to Mesh, Mesh to BREP, SubD to BREP (all also in Object › Convert) |
@@ -405,7 +405,7 @@ Sidebar **Create Curves** / **Create Surfaces** panels, the **NURBS Proto** head
 
 ### Cylinder (Draw)
 
-Under Create Surfaces, next to Draw Plane: a cylinder drawn in place, with Helix's steps and snapping.
+Under Create Surfaces, next to Plane and Box: a cylinder drawn in place, with Helix's steps and snapping.
 
 * **Centre:** click the centre (on the grid, a face or a curve, like the other drawing tools), then the radius (or type
   it), then the height: move along the axis (it stands square to the plane you started on) or type it; Ctrl snaps the
@@ -420,7 +420,7 @@ Under Create Surfaces, next to Draw Plane: a cylinder drawn in place, with Helix
 
 ### Box (Draw)
 
-Under Create Surfaces, between Draw Plane and Cylinder: a box drawn in place -- its base as a rectangle, then its
+Under Create Surfaces, between Plane and Cylinder: a box drawn in place -- its base as a rectangle, then its
 height -- with the drawing tools' snapping and guides.
 
 * **Corner to Corner** (default): click a corner of the base, then the opposite corner. **Centre to Corner** (**M**):
@@ -434,7 +434,7 @@ height -- with the drawing tools' snapping and guides.
 * It is a Box primitive (a closed solid of six faces) placed where you drew it: width, depth, height, degree and spans
   stay editable in the redo panel and the Feature panel.
 
-### Draw Plane
+### Plane (Draw)
 
 Under Create Surfaces. Like Draw Line, but it makes a flat NURBS surface.
 
@@ -552,7 +552,7 @@ How it works: the flat map is built from the surface's own geometry (the length 
 **Flow Along Surface** bends curves and NURBS objects from a **base** surface onto a **target** surface. Select the geometry and the base, then the target last (active); the F9 panel shows **Base** and **Target** to change them.
 
 * **Fold back:** when the base is a pattern made by Unroll from the target, every flat face goes to the face it was unrolled from at the very same (u, v): a circle drawn on a cone's pattern lands on the cone with the same length, a disk with the same area, a line drawn across a box's cross folds over the box with corners at the bends. **Fold Back** (on) is used whenever it applies.
-* **General:** otherwise a point's place on the base, as a share of the base's (u, v) domain, is the same share of the target's (both untrimmed): usually the base is a flat rectangle the pattern was drawn on (Draw Plane, a Plane primitive). **Flip U**, **Flip V** and **Swap UV** turn the target's directions round when they run the other way. Note that the (u, v) of a target need not run evenly (an exact circle's does not), so a straight line can come out a little uneven.
+* **General:** otherwise a point's place on the base, as a share of the base's (u, v) domain, is the same share of the target's (both untrimmed): usually the base is a flat rectangle the pattern was drawn on (drawn with Plane, or a Plane primitive). **Flip U**, **Flip V** and **Swap UV** turn the target's directions round when they run the other way. Note that the (u, v) of a target need not run evenly (an exact circle's does not), so a straight line can come out a little uneven.
 * The height above the base (along its normal) is kept above the target. Curves are refitted within 1e-5 of the size (their corners kept); surfaces are refitted over their own (u, v) with their trims, so a flowed solid is still one body.
 * **Rigid** moves and turns each object as a whole instead of bending it (rivets, bosses, logos that must not deform).
 * The originals stay; the results are new objects, selected. With history they follow the geometry, the base and the target.

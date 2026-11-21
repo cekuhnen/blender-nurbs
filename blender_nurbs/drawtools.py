@@ -2500,7 +2500,7 @@ class NPROTO_OT_draw_plane(SketchMixin, bpy.types.Operator):
     it square, Ctrl snaps to the grid. Degree and spans per direction in the
     Adjust Last Operation panel, later in the Feature panel"""
     bl_idname = "nproto.draw_plane"
-    bl_label = "Draw Plane"
+    bl_label = "Plane"
     bl_options = {'REGISTER', 'UNDO'}
 
     size_x: FloatProperty(name="Size X", default=2.0, min=1e-6, unit='LENGTH')
@@ -2695,7 +2695,7 @@ class NPROTO_OT_draw_plane(SketchMixin, bpy.types.Operator):
         except ValueError:
             d = {}
         if not d.get("anchor"):
-            self.report({'WARNING'}, "Draw Plane is interactive: start it from the panel or menu")
+            self.report({'WARNING'}, "Plane is interactive: start it from the panel or menu")
             return {'CANCELLED'}
         A, u, v = (np.array(d[k], float) for k in ("anchor", "u", "v"))
         X, Y = float(self.size_x), float(self.size_y)

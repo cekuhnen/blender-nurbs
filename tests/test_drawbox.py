@@ -119,9 +119,9 @@ E = surfeval.Surf(store.get_brep(ctx.active_object).faces()[0].surface())
 check("redo panel: degree 3, 2 spans", r == {'FINISHED'} and (E.p, E.q) == (3, 3) and (E.nu, E.nv) == (5, 5),
       f"degree ({E.p}, {E.q}), CVs {E.nu} x {E.nv}")
 
-# --- in the palette, next to Draw Plane and Cylinder ------------------------------------
+# --- in the palette, next to Plane and Cylinder ------------------------------------
 row = [t[0] for t in toolgroups.GROUPS[1][2][0][1][0]]
-check("palette: Draw Plane, Box, Cylinder", row == ["nproto.draw_plane", "nproto.draw_box", "nproto.draw_cylinder"], row)
+check("palette: Plane, Box, Cylinder", row == ["nproto.draw_plane", "nproto.draw_box", "nproto.draw_cylinder"], row)
 
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)
