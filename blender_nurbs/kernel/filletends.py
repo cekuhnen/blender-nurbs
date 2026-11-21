@@ -23,6 +23,8 @@ follow, all handled here:
   exactly where the longer surface ends along the crossing (a parameter, not
   an averaged distance: trimext.extended_surface_to). The fillet then runs
   the whole edge and both surfaces trim edge to edge.
+- Set Back (Ends: Set Back) is built in Blender (filletsetback.py): both
+  surfaces cut back along their whole edges, a Loft edge blend between.
 
 Kernel and numpy only: the worker imports it top-level, Blender as
 blender_nurbs.kernel.filletends (the Surface Fillet preview)."""
@@ -205,3 +207,4 @@ def notch_sheet(sm, X, q, ends, size, reach):
     Q = [c + s * L * d1 + w * H * d2 for s in (-0.5, 1.5) for w in (-1.0, 1.0)]
     srf = ext.surface_from_cvs(1, 1, [tuple(map(float, x)) for x in Q], [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0])
     return ext.brep_from_surface(srf)
+
