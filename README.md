@@ -60,7 +60,7 @@ everything built from it rebuilds.
 
 ### Create Surfaces
 
-- **Draw:** Plane, Box (corner to corner, centre to corner or 3 points, then the height), Cylinder (centre, radius, height, or around a circle or hole; exact or smooth, solid or
+- **Draw:** Plane, Box (corner to corner, centre to corner or 3 points, then the height; or diagonal, two corners in 3D), Cylinder (centre, radius, height, or around a circle or hole; exact or smooth, solid or
   open)
 - **Primitives:** Plane, Disk, Box, Cylinder, Cone, Sphere, Torus
 - **From curves:** Loft (G0 to G3 to surface edges), Loft Rails, Curve Network (a grid of crossing curves, G0 / G1 /

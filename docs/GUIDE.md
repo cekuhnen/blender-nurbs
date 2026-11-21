@@ -426,6 +426,10 @@ height -- with the drawing tools' snapping and guides.
 * **Corner to Corner** (default): click a corner of the base, then the opposite corner. **Centre to Corner** (**M**):
   the base's centre, then a corner. **3 Points** (**M**): two corners along one side (it sets the box's direction, so
   it can stand rotated), then the other side's length.
+* **Diagonal** (**M**): two opposite corners of the box in 3D. Snap the second to geometry off the plane (a vertex, an
+  edge's end, a point on a face) and the box closes at once, its sides square to the plane you started on; or type the
+  width, **Tab** depth, **Tab** height and **Enter**. A second corner on the plane works like Corner to Corner: the
+  height comes next.
 * Type the width, **Tab** the depth (3 Points: the side's length, then the other side's) and **Enter**; Shift holds
   the second corner to 15° steps (45°: a square base).
 * Then the height: move along the base's normal (it stands square to the plane you started on: the grid, a work

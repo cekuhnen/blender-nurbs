@@ -57,8 +57,8 @@ def tool(mode):
     f._finish = lambda context, sh: setattr(f, "done", sh) or {'FINISHED'}
     return f
 
-def click(f, P, typed=None):
-    f._point = lambda context, event: (np.asarray(P, float), None)
+def click(f, P, typed=None, snap=None):
+    f._point = lambda context, event: (np.asarray(P, float), snap)
     f._vals = dict(typed or {})
     return f._click(ctx, Ev())
 
@@ -85,6 +85,33 @@ click(f, A + [2.0, 1.0, 0])
 f._h_sign = -1.0
 click(f, A, {"H": -0.6})
 check("negative height: below the base", f.done is not None and np.allclose(f.done["T"][:3, 3], A + [1.0, 0.5, -0.3]))
+
+# Diagonal: a snapped corner off the plane closes the box; on the plane, the height comes next
+VERT = ("vertex", None, None, "vertex")
+f = tool("DIAGONAL")
+click(f, A)
+out = click(f, A + [2.0, -1.0, 0.8], snap=VERT)
+sh = f.done
+check("diagonal: a corner in 3D closes the box", out == {'FINISHED'} and sh is not None
+      and np.allclose([sh["params"][k] for k in ("width", "depth", "height")], [2, 1, 0.8])
+      and np.allclose(sh["T"][:3, 3], A + [1.0, -0.5, 0.4]), f"{sh and sh['params']}")
+f = tool("DIAGONAL")
+click(f, A)
+click(f, A + [-2.0, 1.0, -0.6], snap=VERT)
+check("diagonal: below the plane", f.done is not None and abs(f.done["params"]["height"] - 0.6) < 1e-12
+      and np.allclose(f.done["T"][:3, 3], A + [-1.0, 0.5, -0.3]))
+f = tool("DIAGONAL")
+click(f, A)
+out = click(f, A + [2.0, 1.0, 0.0])
+check("diagonal, corner on the plane: on to the height", out is None and f.done is None and f._height_step())
+click(f, A, {"H": 0.5})
+check("diagonal: then the height", f.done is not None and np.allclose(f.done["T"][:3, 3], A + [1.0, 0.5, 0.25]))
+f = tool("DIAGONAL")
+click(f, A)
+check("diagonal: width, depth and height typed", f._fields() == ["X", "Y", "H"])
+click(f, A + [1.0, 1.0, 0.0], {"X": 3.0, "Y": 2.0, "H": 1.0})
+check("diagonal: typed sizes close it", f.done is not None
+      and np.allclose([f.done["params"][k] for k in ("width", "depth", "height")], [3, 2, 1]))
 
 f = tool("THREE")
 for P in (A, A + [2.0, 0, 0], A + [1.0, 1.0, 0]):

@@ -1662,7 +1662,9 @@ class NPROTO_OT_draw_cylinder(NPROTO_OT_draw_helix):
 BOX_MODES = [("CORNERS", "Corner to Corner", "Two opposite corners of the base, then the height"),
              ("CENTER", "Centre to Corner", "The base's centre, then a corner, then the height"),
              ("THREE", "3 Points", "Two corners along one side (its direction), the other side's length, "
-                                   "then the height")]
+                                   "then the height"),
+             ("DIAGONAL", "Diagonal", "Two opposite corners of the box in 3D: snap the second to geometry off the "
+                                      "plane (or type width, depth and height); on the plane, the height is next")]
 
 
 def box_outline(T, X, Y, Z):
@@ -1698,9 +1700,9 @@ def base_rect(mode, pts, P, n, u, typed):
     else:
         w = _flat((P if P is not None else A + u + v) - A, n)
         dx, dy = float(w @ u), float(w @ v)
-        k = 1.0 if mode == "CORNERS" else 2.0
+        k = 2.0 if mode == "CENTER" else 1.0
         X, Y = typed.get("X", k * abs(dx)), typed.get("Y", k * abs(dy))
-        C = A + 0.5 * (math.copysign(X, dx or 1.0) * u + math.copysign(Y, dy or 1.0) * v) if mode == "CORNERS" else A
+        C = A if mode == "CENTER" else A + 0.5 * (math.copysign(X, dx or 1.0) * u + math.copysign(Y, dy or 1.0) * v)
         xdir = u
     if X < 1e-12 or Y < 1e-12:
         return None
@@ -1710,8 +1712,9 @@ def base_rect(mode, pts, P, n, u, typed):
 class NPROTO_OT_draw_box(_TwoStep, bpy.types.Operator):
     """Draw a box: its base as a rectangle -- two corners, the centre and a
     corner, or three points (rotated; M switches) -- then its height along
-    the base's normal. Type the width and depth (Tab), then the height. It
-    stays editable in the Feature panel"""
+    the base's normal; or Diagonal: two opposite corners in 3D. Type the
+    width and depth (Tab), then the height. It stays editable in the
+    Feature panel"""
     bl_idname = "nproto.draw_box"
     bl_label = "Box"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1758,6 +1761,8 @@ class NPROTO_OT_draw_box(_TwoStep, bpy.types.Operator):
             return ["H"]
         if self.mode == "THREE":
             return ["X"] if len(self._pts) == 1 else (["Y"] if len(self._pts) == 2 else [])
+        if self.mode == "DIAGONAL":
+            return ["X", "Y", "H"] if len(self._pts) == 1 else []
         return ["X", "Y"] if len(self._pts) == 1 else []
 
     def _step(self):
@@ -1766,6 +1771,9 @@ class NPROTO_OT_draw_box(_TwoStep, bpy.types.Operator):
         if self.mode == "THREE":
             return ["click a corner", "click the next corner (the side's direction)", "click the other side"][
                 min(len(self._pts), 2)]
+        if self.mode == "DIAGONAL":
+            return ["click a corner", "click the opposite corner in 3D (snap to geometry off the plane)"][
+                min(len(self._pts), 1)]
         return ["click a corner" if self.mode == "CORNERS" else "click the centre",
                 "click the opposite corner" if self.mode == "CORNERS" else "click a corner"][min(len(self._pts), 1)]
 
@@ -1796,12 +1804,21 @@ class NPROTO_OT_draw_box(_TwoStep, bpy.types.Operator):
             if isinstance(b[0], str):            # 3 Points: the first side
                 return {"kind": "box", "poly": [self._pts[0], b[1]], "next": b[1], "ok": False, "vals": {"X": b[2]}}
             C, X, Y, xdir = b
+            if self.mode == "DIAGONAL":                  # the second corner off the plane (or a typed height): done
+                dz = float((P - self._pts[0]) @ _unit(n)) if P is not None and snap is not None else 0.0
+                h = typed["H"] if "H" in typed else dz
+                if abs(h) > 1e-9 * max(X, Y, 1.0):
+                    return self._box(C, X, Y, xdir, _unit(n), h)
             T = frame(C, xdir, n)
             return {"kind": "box", "poly": to_world(T, rounded_outline(0.5 * X, 0.5 * Y, 0.0)), "base": b,
                     "ok": False, "vals": {"X": X, "Y": Y}}
         C, X, Y, xdir = self._base
         a = _unit(n)
         h, _ = self._axis_h(context, event, typed, P, snap, C, a)
+        return self._box(C, X, Y, xdir, a, h)
+
+    def _box(self, C, X, Y, xdir, a, h):
+        """The box on the base (centre C, sizes X Y, x direction) rising h along a (negative: below)."""
         H = abs(h)
         if H < 1e-12:
             return None
@@ -1822,7 +1839,7 @@ class NPROTO_OT_draw_box(_TwoStep, bpy.types.Operator):
         sh = self._shape(context, event, final=True)
         if sh is None:
             return None
-        if self._height_step():
+        if self._height_step() or "op" in sh:            # Diagonal: a corner in 3D closes the box at once
             return self._finish(context, sh)
         if sh.get("base") is None:                       # 3 Points: the first side
             self._pts.append(np.asarray(sh["next"], float))
