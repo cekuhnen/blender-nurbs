@@ -183,6 +183,9 @@ cq = bpy.data.objects.new("CQ", bz); ctx.collection.objects.link(cq)
 up = poly("UP", [(42, 1, 0), (42, 1, 2)])
 r, made = pipes([(cq, "S0"), (up, "S0")], radius=0.1, cap_style="FLAT")
 check("curve into a corner: mitred solid", r == {'FINISHED'} and len(made) == 1 and solid(made[0]), str(r)[:150])
+if made:   # no fold along the circle's quarter lines (it would split the curved tube in two)
+    check("  the curved tube has no fold: 2 tubes, 2 caps", store.get_brep(made[0]).face_count() == 4,
+          f"{store.get_brep(made[0]).face_count()} faces")
 if made:
     rail = features.profile_curve([(cq, "S0"), (up, "S0")])
     t0_, t1_ = rail.parameter_range()
@@ -277,6 +280,103 @@ r, made = pipes([(s1, e1), (s2, e2)], radius=0.1, cap_style="FLAT")
 want = math.pi * 0.01 * (math.pi / 2 + 3)
 check("two touching surface edges: one pipe", e1 and e2 and r == {'FINISHED'} and len(made) == 1
       and solid(made[0]) and abs(vol(made[0]) - want) < 1e-3, f"{e1} {e2} {r} {[round(vol(o), 5) for o in made]}")
+
+# --- round elbow corners ----------------------------------------------------------
+clear()
+e1 = poly("E1", [(0, 0, 0), (2, 0, 0)]); e2 = poly("E2", [(2, 0, 0), (2, 2, 0)])
+r0, k = 0.2, 2.0
+Rb = k * r0
+d = Rb * math.tan(math.pi / 4)
+centre = 4 - 2 * d + Rb * math.pi / 2
+r, made = pipes([(e1, "S0"), (e2, "S0")], radius=r0, cap_style="FLAT", corner_style="ROUND", bend=k)
+check("90 degree elbow: closed body, Pappus volume", r == {'FINISHED'} and len(made) == 1 and solid(made[0])
+      and abs(vol(made[0]) - rod(r0, centre)) < 1e-4,
+      f"{r} {[round(vol(o), 5) for o in made]} want {rod(r0, centre):.5f}")
+if made:
+    b = store.get_brep(made[0])
+    check("  two tubes, an elbow, two caps", b.face_count() == 5, f"{b.face_count()} faces")
+    # G1 where the tubes meet the elbow: normals agree across every tube / elbow edge
+    worst = 0.0
+    for e in b.edges():
+        fs = e.faces()
+        if len(fs) != 2 or any(f.surface().is_planar() for f in fs):
+            continue
+        for f0 in (0.2, 0.5, 0.8):
+            ns = []
+            for f in fs:
+                sf = f.surface()
+                pt = None
+                (u0_, u1_), (v0_, v1_) = sf.u_domain(), sf.v_domain()
+                ns.append(sf)
+            # sample the shared circle through one face's boundary rows
+        # compare normals of the two faces at points of the edge
+        t0e, t1e = (0.0, 1.0)
+        poly_pts = None
+    # direct check: the elbow's end rows against the tubes' end rows
+    tubes = [f.surface() for f in b.faces() if not f.surface().is_planar()]
+    def nrm(sf, u, v):
+        _, su, sv = sf.derivatives(u, v); n_ = np.cross(su, sv); return n_ / np.linalg.norm(n_)
+    for A in tubes:
+        for Bs in tubes:
+            if A is Bs:
+                continue
+            (au0, au1), (av0, av1) = A.u_domain(), A.v_domain()
+            (bu0, bu1), (bv0, bv1) = Bs.u_domain(), Bs.v_domain()
+            for ua in (au0, au1):
+                for ub in (bu0, bu1):
+                    pa = np.array(A.evaluate(ua, (av0 + av1) / 3)); pb = np.array(Bs.evaluate(ub, (bv0 + bv1) / 3))
+                    if np.linalg.norm(pa - pb) < 1e-6:
+                        for v in np.linspace(av0, av1, 13)[:-1]:
+                            c_ = abs(float(nrm(A, ua, v) @ nrm(Bs, ub, v)))
+                            worst = max(worst, math.degrees(math.acos(min(1.0, c_))))
+    check("  G1 between tubes and elbow", worst < 1e-3, f"{worst:.6f} deg")
+r, made = pipes([(e1, "S0"), (e2, "S0")], radius=r0, corner_style="ROUND", bend=k)
+check("elbow, cap none: one open piece", r == {'FINISHED'} and len(made) == 1 and not solid(made[0])
+      and store.get_brep(made[0]).face_count() == 3)
+r, made = pipes([(e1, "S0"), (e2, "S0")], radius=r0, corner_style="ROUND", bend=k, cap_style="ROUND", body="NEW")
+want = rod(r0, centre) + 4 / 3 * math.pi * r0 ** 3
+check("elbow with round caps, new solid", r == {'FINISHED'} and len(made) == 1 and solid(made[0])
+      and abs(vol(made[0]) - want) < 1e-4, f"{[round(vol(o), 5) for o in made]} want {want:.5f}")
+z = poly("Z", [(10, 0, 0), (12, 0, 0), (13, 1.5, 0.5), (13, 3, 0)])
+pts = [np.array(p_) for p_ in [(10, 0, 0), (12, 0, 0), (13, 1.5, 0.5), (13, 3, 0)]]
+Ls = [np.linalg.norm(pts[i + 1] - pts[i]) for i in range(3)]
+cl = sum(Ls)
+for i in (1, 2):
+    a_, b_ = pts[i] - pts[i - 1], pts[i + 1] - pts[i]
+    th = math.acos(float(a_ @ b_) / (np.linalg.norm(a_) * np.linalg.norm(b_)))
+    Rz = 1.5 * 0.15
+    cl += Rz * th - 2 * Rz * math.tan(th / 2)
+r, made = pipes([(z, "S0")], radius=0.15, cap_style="FLAT", corner_style="ROUND", bend=1.5)
+check("3D zigzag, two elbows", r == {'FINISHED'} and len(made) == 1 and solid(made[0])
+      and abs(vol(made[0]) - rod(0.15, cl)) < 1e-4, f"{[round(vol(o), 5) for o in made]} want {rod(0.15, cl):.5f}")
+sq2 = poly("Sq2", [(20, 0, 0), (22, 0, 0), (22, 2, 0), (20, 2, 0)], cyclic=True)
+r, made = pipes([(sq2, "S0")], radius=0.2, body="NEW", corner_style="ROUND", bend=2.0)
+cl = 8 - 8 * 0.4 + 2 * math.pi * 0.4
+check("closed square, round corners: a solid frame", r == {'FINISHED'} and len(made) == 1 and solid(made[0])
+      and abs(vol(made[0]) - rod(0.2, cl)) < 1e-4, f"{r} {[round(vol(o), 5) for o in made]} want {rod(0.2, cl):.5f}")
+r, made = pipes([(sq2, "S0")], radius=0.2, body="NEW", corner_style="ROUND", bend=5.0)
+torus = rod(0.2, 2 * math.pi * 1.0)
+check("square with elbows that meet: a torus", r == {'FINISHED'} and len(made) == 1 and solid(made[0])
+      and abs(vol(made[0]) - torus) < 1e-4, f"{r} {[round(vol(o), 5) for o in made]} want {torus:.5f}")
+r, made = pipes([(sq2, "S0")], radius=0.2, corner_style="ROUND", bend=6.0)
+check("elbows that don't fit are refused", "don't fit" in str(r) and not made, str(r)[:140])
+cq2 = bpy.data.curves.new("CQ2", 'CURVE'); cq2.dimensions = '3D'
+sp = cq2.splines.new('BEZIER'); sp.bezier_points.add(1)
+p0, p1 = sp.bezier_points
+p0.co = (30, 0, 0); p0.handle_right = (31, 0, 0); p0.handle_left = (29, 0, 0)
+p1.co = (32, 1, 0); p1.handle_left = (32, 0, 0); p1.handle_right = (32, 2, 0)
+cq2o = bpy.data.objects.new("CQ2", cq2); ctx.collection.objects.link(cq2o)
+up2 = poly("UP2", [(32, 1, 0), (32, 1, 2)])
+r, made = pipes([(cq2o, "S0"), (up2, "S0")], radius=0.1, cap_style="FLAT", corner_style="ROUND", bend=2.0)
+check("curve into a round corner: solid", r == {'FINISHED'} and len(made) == 1 and solid(made[0]), str(r)[:140])
+if made:
+    h = features.history(made[0])["params"]
+    check("history keeps the corners", h.get("corner_style") == "ROUND" and h.get("bend") == 2.0)
+    o = made[0]
+    hh = json.loads(o[features.PROP_HIST]); hh["params"]["corner_style"] = "MITRE"; o[features.PROP_HIST] = json.dumps(hh)
+    features.rebuild(o, ctx)
+    check("history edit round -> mitre", solid(o) and store.get_brep(o).face_count() == 4,
+          f"{store.get_brep(o).face_count()} faces")
 
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)

@@ -47,7 +47,7 @@ FIELDS = {
     "flange": ["fl_mode", "fl_length", "angle", "draft_angle", "pull_flip", "measure", "flip", "both_sides",
                "fl_corner", "tolerance"],
     "sweep": ["samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height", "flip_normal", "caps"],
-    "pipe": ["radius", "cap_style", "samples", "caps"],
+    "pipe": ["radius", "cap_style", "corner_style", "bend", "samples", "caps"],
     "patch": ["pt_cvs", "pt_cvs_v", "pt_auto_cvs", "pt_degree", "pt_fair", "pt_surface_fair", "pt_quad",
               "pt_quad_ease", "pt_even", "pt_quad_degree", "pt_quad_spans_u", "pt_quad_spans_v"],
     "dome": ["dome_layout", "dome_cont", "dome_height", "dome_fullness", "dome_cvs"],
@@ -327,6 +327,9 @@ class NprotoFeature(bpy.types.PropertyGroup):
     ruled: BoolProperty(name="Ruled", **_F())
     symmetric: BoolProperty(name="Symmetric", **_F())
     caps: BoolProperty(name="Caps (solid)", **_F())
+    corner_style: EnumProperty(name="Corners", items=[("MITRE", "Mitre", "The tubes cut on the plane halving the turn"),
+                                                      ("ROUND", "Round", "An exact torus elbow")], **_F())
+    bend: FloatProperty(name="Bend ×", min=1.0, soft_max=10.0, **_F())
     cap_style: EnumProperty(name="Cap", items=[("NONE", "None", "Open ends (a solid gets flat caps)"),
                                                ("FLAT", "Flat", "Flat discs close the ends"),
                                                ("ROUND", "Round", "Half spheres close the ends")], **_F())
@@ -490,6 +493,8 @@ def sync_from_history(obj):
             params.setdefault("caps", False)
         if h["op"] == "pipe":                    # older pipes: open ends (flat ones as a solid)
             params.setdefault("cap_style", "NONE")
+            params.setdefault("corner_style", "MITRE")         # older pipes: mitred corners
+            params.setdefault("bend", 2.0)
         if h["op"] == "loft":                    # older lofts: square to the side, or the Match Edges switch
             old = "EDGES" if params.get("match_edges") else "FREE"
             params.setdefault("edges_a", old)

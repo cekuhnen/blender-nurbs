@@ -129,6 +129,9 @@ def sweep_profile(crv, act):
     return min(crv, key=lambda c: sum(gap(c, o) for o in crv if o != c))
 
 
+PIPE_CORNER_ITEMS = [("MITRE", "Mitre", "Sharp corners of the rail: the tubes cut on the plane halving the turn"),
+                     ("ROUND", "Round", "Sharp corners of the rail: an exact torus elbow, G1 to straight legs")]
+
 PIPE_CAP_ITEMS = [("NONE", "None", "Open ends (a solid gets flat caps)"),
                   ("FLAT", "Flat", "Flat discs close the ends: a closed body"),
                   ("ROUND", "Round", "Half spheres close the ends, tangent to the tube: a closed body")]
@@ -168,6 +171,11 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
                         description="What one click on an edge picks")
     chain_angle: FloatProperty(name="Chain Angle", default=2.0, min=0.01, max=sweeps.PIPE_CORNER_DEG,
                                description="Tangent Chain: edges meeting within this angle (degrees) are one run")
+    corner_style: EnumProperty(name="Corners", items=PIPE_CORNER_ITEMS, default="MITRE",
+                               description="How the pipe turns a sharp corner of its rail")
+    bend: FloatProperty(name="Bend", default=2.0, min=1.0, soft_max=10.0,
+                        description="Round corners: the elbow's centreline radius, as a multiple of the pipe's "
+                                    "radius (1: the inside of the bend comes to a point)")
 
     def invoke(self, context, event):
         if not _kernel_ok(self):
@@ -210,7 +218,8 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
         return 0.5 * self.diameter if self.use_diameter else self.radius
 
     def params(self):
-        return {"radius": self._radius(), "samples": self.samples, "cap_style": self.cap_style}
+        return {"radius": self._radius(), "samples": self.samples, "cap_style": self.cap_style,
+                "corner_style": self.corner_style, "bend": self.bend}
 
     def execute(self, context):
         if not _kernel_ok(self):
@@ -260,6 +269,11 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
         lay.prop(self, "cap_style", expand=True)
         if self.body != "SURFACE" and self.cap_style == "NONE":
             lay.label(text="A solid gets flat caps", icon='INFO')
+        row = lay.row(align=True)
+        row.prop(self, "corner_style", expand=True)
+        sub = row.row(align=True)
+        sub.active = self.corner_style == "ROUND"
+        sub.prop(self, "bend", text="Bend ×")
         lay.prop(self, "samples")
         row = lay.row(align=True)
         row.prop(self, "chain", text="")
@@ -270,7 +284,10 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
     # -- the live value stage (valuedrag.py) ----------------------------------
     @property
     def drag_fields(self):
-        return ("diameter",) if self.use_diameter else ("radius",)
+        size = "diameter" if self.use_diameter else "radius"
+        return (size, "bend") if self.corner_style == "ROUND" and getattr(self, "_corner", None) else (size,)
+
+    ratio_fields = ("bend",)
 
     PREVIEW_ROWS = 48           # circles along the rail
     PREVIEW_RING = 33           # points round a circle (closed)
@@ -284,7 +301,7 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
             rail = sweeps.pipe_rail(g)
             closed = features.is_closed_curve(rail)
             try:
-                tracks = sweeps.pipe_tracks(rail, closed)
+                tracks = sweeps.pipe_tracks(rail, closed, self.corner_style)
             except RuntimeError as exc:         # a rail turning back on itself
                 self._bad.append((str(exc), [c["point"] for c in sweeps.rail_corners(rail) if c["deg"] > 175.0]))
                 tracks = None
@@ -297,7 +314,8 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
                 for tr in tracks:
                     T, N = tr["T"], tr["N"]
                     spans.append({"P": tr["P"], "T": T, "N": N, "B": tr["h"] * np.cross(T, N), "track": tr})
-                limit = sweeps.mitre_limit(tracks)
+                # Mitre: the largest radius; Round: the largest elbow centreline radius
+                limit = sweeps.elbow_limit(tracks) if self.corner_style == "ROUND" else sweeps.mitre_limit(tracks)
             ends = []
             if not closed:
                 a_, b_ = spans[0], spans[-1]
@@ -306,6 +324,9 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
             self._pp.append({"spans": spans, "ends": ends, "limit": limit, "inputs": g})
         if not self._pp:
             return False
+        # the corner the Bend handle stands at: the first one of the first rail
+        self._corner = next((sp["track"]["end"] for pp in self._pp for sp in pp["spans"]
+                             if sp["track"] is not None and sp["track"]["end"] is not None), None)
         spans = self._pp[0]["spans"]
         mid = spans[len(spans) // 2]
         kb, self._base_at_mouse = (len(spans) // 2, len(mid["P"]) // 2), False
@@ -346,9 +367,19 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
     def drag_handles(self):
         B0 = self._foot()[0]
         k = 2.0 if self.use_diameter else 1.0
-        return [{"field": self.drag_fields[0], "kind": "arrow", "origin": B0, "dir": self._dir,
-                 "param": self._radius(), "base": B0,
-                 "to_value": lambda t, k=k: max(1e-4 * k, abs(t) * k)}]
+        out = [{"field": self.drag_fields[0], "kind": "arrow", "origin": B0, "dir": self._dir,
+                "param": self._radius(), "base": B0,
+                "to_value": lambda t, k=k: max(1e-4 * k, abs(t) * k)}]
+        c = getattr(self, "_corner", None)
+        if c is not None and self.corner_style == "ROUND":
+            # a diamond where the elbow meets the leg after the corner, slid along that leg
+            tn = math.tan(math.radians(c["deg"]) / 2.0)
+            r = self._radius()
+            out.append({"field": "bend", "kind": "draft", "origin": c["C"], "dir": c["t_out"],
+                        "param": sweeps.elbow_reach(c, self.bend * r),
+                        "to_value": lambda t, tn=tn, r=r: max(1.0, abs(t) / tn / r) if tn > 1e-9 else None,
+                        "snap": (0.1, 0.01)})
+        return out
 
     def drag_preview(self):
         r = self._radius()
@@ -357,20 +388,36 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
         ca, sa = np.cos(a), np.sin(a)
         ring = r * np.stack([ca, sa], axis=1)
         lines, tris, guides = [], [], []
+        rnd = self.corner_style == "ROUND"
+        bend = self.bend * r
         for pp in self._pp:
-            too_big = r > pp["limit"] * (1.0 + 1e-9)
+            too_big = (bend if rnd else r) > pp["limit"] * (1.0 + (1e-6 if rnd else 1e-9))
             for sp in pp["spans"]:
-                if sp["track"] is None:
+                tr = sp["track"]
+                pieces = []
+                if tr is None:
                     P, N, B = sp["P"], sp["N"], sp["B"]
-                    rows = [P[k] + np.outer(ring[:, 0], N[k]) + np.outer(ring[:, 1], B[k]) for k in range(len(P))]
-                else:           # a stretch between corners: its columns cut off on the mitres
-                    rows = list(sweeps.mitred_rows(sp["track"], ring, 25))
-                L, Tr = ruled_preview(rows, ribs=8, row_every=6 if sp["track"] is None else 4)
-                if too_big:                     # the mitres overlap: shown in red, not made
-                    guides += [(ln, (1.0, 0.25, 0.2, 1.0)) for ln in L]
-                    continue
-                lines += L
-                tris.append(Tr)
+                    pieces.append(([P[k] + np.outer(ring[:, 0], N[k]) + np.outer(ring[:, 1], B[k])
+                                    for k in range(len(P))], 6))
+                else:           # a stretch between corners: its columns cut off on the mitres / where the elbows start
+                    L_ = float(tr["s"][-1])
+                    used = sum(sweeps.elbow_reach(tr[k], bend) for k in ("start", "end")
+                               if rnd and tr[k] is not None)
+                    if too_big or L_ - used > 1e-7 * L_:
+                        pieces.append((list(sweeps.mitred_rows(tr, ring, 25, bend)), 4))
+                    if rnd and tr["end"] is not None and not too_big:
+                        c = tr["end"]
+                        Pk, Tk, Nk, Bk = sweeps._frame_end(tr, -1)
+                        p0, O, ax, th = sweeps.elbow_geometry(c, bend)
+                        X = p0 + np.outer(ring[:, 0], Nk) + np.outer(ring[:, 1], Bk)
+                        pieces.append(([O + sweeps._rot_rows(X - O, ax, f) for f in np.linspace(0.0, th, 13)], 3))
+                for rows, every in pieces:
+                    L, Tr = ruled_preview(rows, ribs=8, row_every=every)
+                    if too_big:                     # the mitres / elbows don't fit: shown in red, not made
+                        guides += [(ln, (1.0, 0.25, 0.2, 1.0)) for ln in L]
+                        continue
+                    lines += L
+                    tris.append(Tr)
             if style == "NONE" or too_big:
                 continue
             for C, out, N, B in pp["ends"]:
@@ -403,10 +450,12 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
             return self._bad[0][0] + (" · J: a pipe each" if self.join and self._n_in > 1 else "")
         r = self._radius()
         for pp in self._pp:
-            if r > pp["limit"] * (1.0 + 1e-9):
+            sep = " · J: a pipe each" if self.join and len(pp["inputs"]) > 1 else ""
+            if self.corner_style == "ROUND" and self.bend * r > pp["limit"] * (1.0 + 1e-6):
+                return f"the elbows don't fit: Bend at most ×{pp['limit'] / r:.2f} at this radius" + sep
+            if self.corner_style != "ROUND" and r > pp["limit"] * (1.0 + 1e-9):
                 lim = pp["limit"] * (2.0 if self.use_diameter else 1.0)
-                return (f"too large for the mitred corners: at most {fmt_length(bpy.context, lim)}"
-                        + (" · J: a pipe each" if self.join and len(pp["inputs"]) > 1 else ""))
+                return f"too large for the mitred corners: at most {fmt_length(bpy.context, lim)}" + sep
         return "" if r > 1e-4 else "Radius 0: drag the arrow out, or type a radius"
 
     def drag_key(self, context, event, ch):
@@ -420,17 +469,25 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
         elif ch == "j" and self._n_in > 1:
             self.join = not self.join
             self.drag_setup(context, None)
+        elif ch == "m" and getattr(self, "_corner", None) is not None:
+            self.corner_style = "ROUND" if self.corner_style == "MITRE" else "MITRE"
+            self.drag_setup(context, None)
         elif not self.body_key(ch):
             return False
         return True
 
     def drag_handle_hints(self):
-        return [hints.key("LMB drag", "arrow: " + ("diameter" if self.use_diameter else "radius"))]
+        out = [hints.key("LMB drag", "arrow: " + ("diameter" if self.use_diameter else "radius"))]
+        if self.corner_style == "ROUND" and getattr(self, "_corner", None) is not None:
+            out.append(hints.key("LMB drag", "diamond: bend"))
+        return out
 
     def drag_rows(self):
         names = {"NONE": "none", "FLAT": "flat", "ROUND": "round"}
         rows = [("Size", [hints.toggle("D", "diameter", self.use_diameter)]),
                 ("Caps", [hints.cycle("C", list(names.values()), names[self.cap_style])])]
+        if getattr(self, "_corner", None) is not None:
+            rows.append(("Corners", [hints.cycle("M", ["mitre", "round"], self.corner_style.lower())]))
         if self._n_in > 1:
             rows.append(("Rails", [hints.toggle("J", "join touching", self.join)]))
         return rows + [self.body_row()]
@@ -441,7 +498,8 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
         n = len(self._pp)
         mitres = sum(len(pp["spans"]) - (1 if pp["ends"] else 0)        # a closed rail: one more joint
                      for pp in self._pp if pp["spans"][0]["track"] is not None)
-        return (([f"{n} pipes"] if n > 1 else []) + ([f"{mitres} mitre{'s' if mitres > 1 else ''}"] if mitres else [])
+        word = "elbow" if self.corner_style == "ROUND" else "mitre"
+        return (([f"{n} pipes"] if n > 1 else []) + ([f"{mitres} {word}{'s' if mitres > 1 else ''}"] if mitres else [])
                 + [caps] + self.body_state())
 
 
