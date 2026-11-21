@@ -281,6 +281,40 @@ class NprotoPatchEdge(bpy.types.PropertyGroup):
                            update=_on_patch_edge, description=TENSION_DESC)
 
 
+def _pipe_obj(pg):
+    """The Pipe object a radius point row belongs to (None for the Pipe
+    operator's own copy of the points: its redo rebuilds)."""
+    obj = pg.id_data
+    if _syncing[0] or not isinstance(obj, bpy.types.Object):
+        return None
+    h = features.history(obj)
+    return obj if h is not None and h["op"] == "pipe" else None
+
+
+def pipe_points_param(points):
+    """The points of a collection as the history's radius_points: [[at, radius]] along the rail."""
+    return sorted([[float(p.at), float(p.radius)] for p in points], key=lambda x: x[0])
+
+
+def _on_pipe_point(self, context):
+    """A radius point changed in the Feature panel: into the feature's list."""
+    obj = _pipe_obj(self)
+    if obj is None:
+        return
+    raw = json.loads(obj[features.PROP_HIST])
+    raw["params"]["radius_points"] = pipe_points_param(obj.nproto_feature.pipe_points)
+    raw["params"]["variable"] = True
+    _patch_write(obj, raw, context)
+
+
+class NprotoPipePoint(bpy.types.PropertyGroup):
+    """A radius point along a Pipe's rail (Feature panel, and the Pipe operator)."""
+    at: FloatProperty(name="At", min=0.0, max=1.0, subtype='FACTOR', default=0.5, update=_on_pipe_point,
+                      description="Where along the rail (share of its length from the start)")
+    radius: FloatProperty(name="Radius", min=1e-4, unit='LENGTH', default=0.1, update=_on_pipe_point,
+                          description="The pipe's radius there")
+
+
 class NprotoFeature(bpy.types.PropertyGroup):
     dome_layout: EnumProperty(name="Layout", items=[("POLAR", "Polar", "Rows from the rim to one top point (a round rim: an exact revolution)"),
                               ("DRAPED", "Draped", "One even four-sided surface over the opening, trimmed "
@@ -420,6 +454,7 @@ class NprotoFeature(bpy.types.PropertyGroup):
     pt_auto_cvs: BoolProperty(name="Lightest", description="The fewest CVs (per direction, up to CVs U / V) at which "
                               "every edge still holds its continuity", **_F())
     pt_edges: CollectionProperty(type=NprotoPatchEdge)
+    pipe_points: CollectionProperty(type=NprotoPipePoint)
     pt_cont_all: EnumProperty(name="All Edges", items=PATCH_ALL, default="MIXED", update=_on_patch_all,
                               description="Continuity of every edge at once")
     pt_tension_all: FloatProperty(name="Tension", min=0.25, max=4.0, soft_min=0.5, soft_max=2.0, default=1.0,
@@ -518,6 +553,10 @@ def sync_from_history(obj):
             params.setdefault("variable", False)               # older pipes: one radius
             params.setdefault("radius_end", params.get("radius", 0.1))
             params.setdefault("taper", "LINEAR")
+            pg.pipe_points.clear()
+            for at_, r_ in params.get("radius_points", []):
+                it = pg.pipe_points.add()
+                it.at, it.radius = float(at_), float(r_)
         if h["op"] == "loft":                    # older lofts: square to the side, or the Match Edges switch
             old = "EDGES" if params.get("match_edges") else "FREE"
             params.setdefault("edges_a", old)
@@ -669,6 +708,8 @@ def draw_feature(layout, context):
                 elif op == "pattern":
                     from .pattern import draw_feature as _draw_pattern
                     _draw_pattern(box, context, obj, h)
+                elif op == "pipe" and h["params"].get("variable"):
+                    _draw_pipe_points(box, obj, pg, h)
                 for name in FIELDS.get(op, []) if op != "patch" else []:
                     if op == "square" and name[0] in "ew" and name[1:].isdigit():
                         if name[0] == "e":
@@ -804,6 +845,78 @@ def _defer_sync(name):
                     area.tag_redraw()
         return None
     bpy.app.timers.register(run, first_interval=0.0)
+
+
+def _draw_pipe_points(box, obj, pg, h):
+    """A row per radius point along the rail (where, its radius, remove), and Add."""
+    pts = h["params"].get("radius_points", [])
+    if len(pg.pipe_points) != len(pts):
+        _defer_sync(obj.name)
+    col = box.column(align=True)
+    col.label(text="Radius Points" if len(pg.pipe_points) else "Radius Points: none (start and end only)",
+              icon='DRIVER_DISTANCE')
+    order = sorted(range(len(pg.pipe_points)), key=lambda i: pg.pipe_points[i].at)
+    for n, i in enumerate(order):
+        it = pg.pipe_points[i]
+        row = col.row(align=True)
+        row.prop(it, "at", text=f"{n + 1}  At", slider=True)
+        row.prop(it, "radius", text="R")
+        op = row.operator("nproto.pipe_point_remove", text="", icon='X')
+        op.name, op.index = obj.name, i
+    box.operator("nproto.pipe_point_add", icon='ADD').name = obj.name
+
+
+class NPROTO_OT_pipe_point_add(bpy.types.Operator):
+    """Add a radius point to this Pipe, in the middle of the longest stretch
+    between its points (the radius it has there now): set where and how big"""
+    bl_idname = "nproto.pipe_point_add"
+    bl_label = "Add Radius Point"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    name: StringProperty(options={'HIDDEN'})
+
+    def execute(self, context):
+        obj = bpy.data.objects.get(self.name)
+        h = features.history(obj) if obj is not None else None
+        if h is None or h["op"] != "pipe":
+            return {'CANCELLED'}
+        from . import sweeps
+        raw = json.loads(obj[features.PROP_HIST])
+        p = raw["params"]
+        pts = sorted(p.get("radius_points", []))
+        fs = [0.0] + [a for a, _ in pts] + [1.0]
+        k = max(range(len(fs) - 1), key=lambda i: fs[i + 1] - fs[i])
+        at = 0.5 * (fs[k] + fs[k + 1])
+        law = sweeps.pipe_radius_law(dict(p, variable=True), 1.0)
+        p["radius_points"] = sorted(pts + [[at, float(law(at))]])
+        p["variable"] = True
+        _patch_write(obj, raw, context)
+        sync_from_history(obj)
+        return {'FINISHED'}
+
+
+class NPROTO_OT_pipe_point_remove(bpy.types.Operator):
+    """Remove this radius point from the Pipe"""
+    bl_idname = "nproto.pipe_point_remove"
+    bl_label = "Remove Radius Point"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    name: StringProperty(options={'HIDDEN'})
+    index: IntProperty(options={'HIDDEN'})
+
+    def execute(self, context):
+        obj = bpy.data.objects.get(self.name)
+        if obj is None or features.history(obj) is None:
+            return {'CANCELLED'}
+        pg = obj.nproto_feature
+        if not 0 <= self.index < len(pg.pipe_points):
+            return {'CANCELLED'}
+        raw = json.loads(obj[features.PROP_HIST])
+        keep = [x for i, x in enumerate(pg.pipe_points) if i != self.index]
+        raw["params"]["radius_points"] = pipe_points_param(keep)
+        _patch_write(obj, raw, context)
+        sync_from_history(obj)
+        return {'FINISHED'}
 
 
 def _draw_patch(box, obj, pg, h):
@@ -1051,7 +1164,7 @@ class NPROTO_OT_add_primitive(bpy.types.Operator):
                 col.prop(self, n)
 
 
-classes = (NprotoPatchEdge, NprotoFeature, NPROTO_OT_sync_feature, NPROTO_OT_remove_step, NPROTO_OT_add_primitive)
+classes = (NprotoPatchEdge, NprotoPipePoint, NprotoFeature, NPROTO_OT_pipe_point_add, NPROTO_OT_pipe_point_remove, NPROTO_OT_sync_feature, NPROTO_OT_remove_step, NPROTO_OT_add_primitive)
 
 
 def register():

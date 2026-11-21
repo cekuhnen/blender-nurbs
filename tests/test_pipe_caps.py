@@ -446,5 +446,62 @@ vsq = poly("VSQ", [(20, 0, 0), (22, 0, 0), (22, 2, 0), (20, 2, 0)], cyclic=True)
 r, made = pipes([(vsq, "S0")], radius=0.2, use_variable=True, radius_end=0.1)
 check("closed rail with a varying radius is refused", "closed rail" in str(r) and not made, str(r)[:120])
 
+# --- radius points along the rail --------------------------------------------------
+clear()
+pl = poly("PL", [(0, 0, 0), (0, 0, 3)])
+fr = lambda a, b, L: math.pi * L * (a * a + a * b + b * b) / 3
+want = 2 * fr(0.3, 0.6, 1.5)
+r, made = pipes([(pl, "S0")], radius=0.3, use_variable=True, radius_end=0.3, taper="LINEAR",
+                points=[{"name": "", "at": 0.5, "radius": 0.6}], cap_style="FLAT")
+check("a radius point (linear): two frustums", r == {'FINISHED'} and len(made) == 1 and solid(made[0])
+      and abs(vol(made[0]) - want) < 1e-4, f"{[round(vol(o), 5) for o in made]} want {want:.5f}")
+if made:
+    lo, hi = store.get_brep(made[0]).bounding_box()
+    check("  the bulge has the point's radius", abs(hi[0] - 0.6) < 1e-4, f"{hi}")
+    hp = features.history(made[0])["params"]
+    check("  history keeps the point", hp.get("radius_points") == [[0.5, pytest_approx(0.6)]] if False else
+          (len(hp.get("radius_points", [])) == 1 and abs(hp["radius_points"][0][1] - 0.6) < 1e-6))
+    # Feature panel: Add (middle of the longest stretch, its current radius) and Remove
+    o = made[0]
+    ctx.view_layer.objects.active = o
+    from blender_nurbs import feature_ui
+    feature_ui.sync_from_history(o)
+    bpy.ops.nproto.pipe_point_add(name=o.name)
+    hp = features.history(o)["params"]
+    ats = sorted(a for a, _ in hp["radius_points"])
+    check("Feature panel: Add Radius Point", len(ats) == 2 and abs(ats[1] - 0.75) < 1e-9 or abs(ats[0] - 0.25) < 1e-9,
+          f"{hp['radius_points']}")
+    v_before = vol(o)
+    feature_ui.sync_from_history(o)
+    bpy.ops.nproto.pipe_point_remove(name=o.name, index=0)
+    hp = features.history(o)["params"]
+    check("Feature panel: Remove Radius Point", len(hp["radius_points"]) == 1, f"{hp['radius_points']}")
+from blender_nurbs import sweeps as _sw
+law = _sw.RadiusLaw(0.3, 0.2, "SMOOTH", 3.0, [(0.4, 0.5), (0.7, 0.35)])
+gs = np.linspace(0, 3.0, 30001)
+rr = law(gs)
+trap = getattr(np, "trapezoid", None) or np.trapz
+want = math.pi * float(trap(rr * rr, gs))
+r, made = pipes([(pl, "S0")], radius=0.3, use_variable=True, radius_end=0.2, taper="SMOOTH",
+                points=[{"name": "", "at": 0.4, "radius": 0.5}, {"name": "", "at": 0.7, "radius": 0.35}], cap_style="FLAT")
+check("two points, smooth: volume", r == {'FINISHED'} and len(made) == 1 and abs(vol(made[0]) - want) < 2e-4,
+      f"{[round(vol(o), 5) for o in made]} want {want:.5f}")
+check("  smooth law: through the points, level at the top, no overshoot",
+      abs(law(1.2) - 0.5) < 1e-12 and abs(law.slope(1.2)) < 1e-12 and abs(law(2.1) - 0.35) < 1e-12
+      and float(rr.max()) <= 0.5 + 1e-12 and float(rr.min()) >= 0.2 - 1e-12)
+pb1 = poly("PB1", [(10, 0, 0), (13, 0, 0)]); pb2 = poly("PB2", [(13, 0, 0), (13, 3, 0)])
+r, made = pipes([(pb1, "S0"), (pb2, "S0")], radius=0.2, use_variable=True, radius_end=0.2,
+                points=[{"name": "", "at": 0.25, "radius": 0.35}, {"name": "", "at": 0.75, "radius": 0.1}], cap_style="ROUND", body="NEW")
+check("points on a mitred L (linear: a crease at each point), round caps: 4 cones + 2 caps, closed", r == {'FINISHED'}
+      and len(made) == 1 and solid(made[0]) and store.get_brep(made[0]).face_count() == 6,
+      f"{r} {[store.get_brep(o).face_count() for o in made]}")
+r, made = pipes([(pb1, "S0"), (pb2, "S0")], radius=0.2, use_variable=True, radius_end=0.2, taper="SMOOTH",
+                points=[{"name": "", "at": 0.25, "radius": 0.35}, {"name": "", "at": 0.75, "radius": 0.1}],
+                cap_style="ROUND", body="NEW")
+check("  smooth: no creases, 2 tubes + 2 caps", r == {'FINISHED'} and len(made) == 1 and solid(made[0])
+      and store.get_brep(made[0]).face_count() == 4, f"{r} {[store.get_brep(o).face_count() for o in made]}")
+r, made = pipes([(pl, "S0")], radius=0.3, use_variable=True, radius_end=0.3, points=[{"name": "", "at": 0.5, "radius": 0.0001}])
+check("a point at the smallest radius still builds", r == {'FINISHED'} and len(made) == 1, str(r)[:100])
+
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)

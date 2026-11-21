@@ -472,7 +472,8 @@ def elbow_limit(tracks):
     best = math.inf
     for tr in tracks:
         L = float(tr["s"][-1])
-        k = sum(math.tan(math.radians(tr[key]["deg"]) / 2.0) for key in ("start", "end") if tr[key] is not None)
+        k = sum(math.tan(math.radians(tr[key]["deg"]) / 2.0) for key in ("start", "end")
+                if tr[key] is not None and tr[key].get("kind") != "split")
         if k > 0:
             best = min(best, L / k)
     return best
@@ -547,45 +548,78 @@ PIPE_TAPERS = ("LINEAR", "SMOOTH")
 
 class RadiusLaw:
     """The pipe's radius along its rail (g: rail length from its start, of
-    total L): constant, or from r0 to r1 -- Linear, or Smooth (a smoothstep:
-    the radius levels off at both ends, so a round cap there is a half
-    sphere)."""
+    total L): constant, or through radius points (f, r) -- f the share of the
+    rail's length, 0 and 1 its ends -- Linear (straight between the points),
+    or Smooth: a monotone cubic (PCHIP) through them, level at both ends, at
+    every highest and lowest point and nowhere overshooting the points, so a
+    round cap on an end is a half sphere. Two points, Smooth: the smoothstep."""
 
-    def __init__(self, r0, r1=None, taper="LINEAR", L=1.0):
-        self.r0, self.r1 = float(r0), float(r0 if r1 is None else r1)
+    def __init__(self, r0, r1=None, taper="LINEAR", L=1.0, points=()):
+        r1 = float(r0 if r1 is None else r1)
+        pts = sorted((min(1.0, max(0.0, float(f))), float(r)) for f, r in points if 0.0 < float(f) < 1.0)
+        self.f = np.array([0.0] + [f for f, _ in pts] + [1.0])
+        self.r = np.array([float(r0)] + [r for _, r in pts] + [r1])
+        keep = np.concatenate([[True], np.diff(self.f) > 1e-9])      # two points at one place: the later one
+        self.f, self.r = self.f[keep], self.r[keep]
+        self.f[-1] = 1.0
+        self.r0, self.r1 = float(self.r[0]), float(self.r[-1])
         self.taper = taper if taper in PIPE_TAPERS else "LINEAR"
         self.L = float(L) or 1.0
+        h = np.diff(self.f)
+        d = np.diff(self.r) / h
+        m = np.zeros(len(self.f))                 # slopes dr/df at the points: level at both ends
+        for k in range(1, len(self.f) - 1):
+            if d[k - 1] * d[k] > 0.0:             # Fritsch-Carlson: weighted harmonic mean; 0 at an extreme
+                w1, w2 = 2.0 * h[k] + h[k - 1], h[k] + 2.0 * h[k - 1]
+                m[k] = (w1 + w2) / (w1 / d[k - 1] + w2 / d[k])
+        self._m = m
 
     @property
     def constant(self):
-        return abs(self.r1 - self.r0) <= 1e-12 * max(abs(self.r0), 1e-12)
+        return float(np.ptp(self.r)) <= 1e-12 * max(abs(self.r0), 1e-12)
 
     @property
     def rmax(self):
-        return max(self.r0, self.r1)
+        return float(self.r.max())
+
+    @property
+    def rmin(self):
+        return float(self.r.min())
+
+    def _eval(self, f, deriv=False):
+        f = np.clip(np.asarray(f, float), 0.0, 1.0)
+        k = np.clip(np.searchsorted(self.f, f, side="right") - 1, 0, len(self.f) - 2)
+        f0, h = self.f[k], self.f[k + 1] - self.f[k]
+        t = (f - f0) / h
+        ra, rb = self.r[k], self.r[k + 1]
+        if self.taper == "LINEAR":
+            return (rb - ra) / h if deriv else ra + (rb - ra) * t
+        ma, mb = self._m[k], self._m[k + 1]
+        if deriv:
+            return ((6 * t * t - 6 * t) * ra + (-6 * t * t + 6 * t) * rb) / h + \
+                (3 * t * t - 4 * t + 1) * ma + (3 * t * t - 2 * t) * mb
+        t2, t3 = t * t, t * t * t
+        return (2 * t3 - 3 * t2 + 1) * ra + (t3 - 2 * t2 + t) * h * ma + (-2 * t3 + 3 * t2) * rb + (t3 - t2) * h * mb
 
     def __call__(self, g):
         if self.constant:
             return np.full(np.shape(g), self.r0) if np.ndim(g) else self.r0
-        f = np.clip(np.asarray(g, float) / self.L, 0.0, 1.0)
-        w = f if self.taper == "LINEAR" else f * f * (3.0 - 2.0 * f)
-        out = self.r0 + (self.r1 - self.r0) * w
+        out = self._eval(np.asarray(g, float) / self.L)
         return out if np.ndim(g) else float(out)
 
     def slope(self, g):
         """dr / dg."""
         if self.constant:
             return 0.0
-        f = min(1.0, max(0.0, float(g) / self.L))
-        dw = 1.0 if self.taper == "LINEAR" else 6.0 * f * (1.0 - f)
-        return (self.r1 - self.r0) * dw / self.L
+        return float(self._eval(float(g) / self.L, deriv=True)) / self.L
 
 
 def pipe_radius_law(p, L):
     r0 = float(p.get("radius", 0.2))
     if not p.get("variable"):
         return RadiusLaw(r0, r0, "LINEAR", L)
-    return RadiusLaw(r0, float(p.get("radius_end", r0)), str(p.get("taper", "LINEAR")).upper(), L)
+    return RadiusLaw(r0, float(p.get("radius_end", r0)), str(p.get("taper", "LINEAR")).upper(), L,
+                     p.get("radius_points", ()))
 
 
 def mitre_reach(tr, q, bend=None, scale=(1.0, 1.0)):
@@ -598,6 +632,9 @@ def mitre_reach(tr, q, bend=None, scale=(1.0, 1.0)):
     for (k, key, sgn), sc in zip(((0, "start", 1.0), (-1, "end", -1.0)), scale):
         m = tr[key]
         if m is None:
+            out.append(np.zeros(len(q)))
+            continue
+        if m["kind"] == "split":                  # a Linear radius point: the tube just ends there, square
             out.append(np.zeros(len(q)))
             continue
         if m["kind"] == "elbow":
@@ -791,6 +828,10 @@ def build_pipe(inputs, p):
     style = pipe_cap_style(p)
     corner = "ROUND" if str(p.get("corner_style", "MITRE")).upper() == "ROUND" else "MITRE"
     tracks = pipe_tracks(rail_k, closed, corner)
+    creased = bool(p.get("variable")) and str(p.get("taper", "LINEAR")).upper() == "LINEAR" and \
+        any(0.0 < float(f) < 1.0 for f, _ in p.get("radius_points", ()))
+    if tracks is None and creased:
+        tracks = [_whole_track(rail_k)]         # built in pieces between the radius points
     if tracks is None:
         n = min(600, samples * len(inputs))      # samples per curve / edge of the rail
         P, T, N, B = pipe_frames(rail_k, n, closed)
@@ -814,6 +855,8 @@ def build_pipe(inputs, p):
     total = sum(float(tr["s"][-1]) for tr in tracks)
     law = pipe_radius_law(p, total)
     _check_law(law, closed)
+    if creased:
+        tracks = _split_tracks(tracks, law)
     rmax = law.rmax
     bend = float(p.get("bend", 2.0)) * rmax
     if corner == "MITRE" and rmax > mitre_limit(tracks) * (1.0 + 1e-9):
@@ -861,10 +904,56 @@ def build_pipe(inputs, p):
     return features.cap_walls(walls)
 
 
+def _whole_track(rail_k):
+    """The rail as one stretch (no corners), sampled densely: for building it
+    in pieces (Linear radius points)."""
+    t0, t1 = rail_k.parameter_range()
+    s, P, T = _track(rail_k, [(t0, t1)], 401)
+    N = _rmf(P, T, _perp(T[0], np.array([0, 0, 1.0])))
+    return {"s": s, "P": P, "T": T, "N": N, "h": 1.0, "start": None, "end": None}
+
+
+def _split_tracks(tracks, law):
+    """The stretches cut at the law's inner points (Linear: the radius turns
+    there, a crease between two cones, which one fit along the rail would round
+    off): the pieces share the point's sample, so their end circles are the same
+    CVs. Ends made by a cut are kind "split" (no cap, no mitre)."""
+    cuts = [float(f) * law.L for f in law.f[1:-1]]
+    out, s0 = [], 0.0
+    for tr in tracks:
+        L = float(tr["s"][-1])
+        pieces, cur, a = [], tr, s0
+        for g in cuts:
+            Lc = float(cur["s"][-1])
+            x = g - a
+            if not 1e-9 * L < x < Lc - 1e-9 * L:
+                continue
+            s, P, T, N = cur["s"], cur["P"], cur["T"], cur["N"]
+            j = int(np.searchsorted(s, x))
+            f = (x - s[j - 1]) / (s[j] - s[j - 1])
+            Px = P[j - 1] + f * (P[j] - P[j - 1])
+            Tx = T[j - 1] + f * (T[j] - T[j - 1])
+            Tx /= np.linalg.norm(Tx)
+            Nx = N[j - 1] + f * (N[j] - N[j - 1])
+            Nx -= float(Nx @ Tx) * Tx
+            Nx /= np.linalg.norm(Nx)
+            left = {"s": np.append(s[:j], x), "P": np.vstack([P[:j], Px]), "T": np.vstack([T[:j], Tx]),
+                    "N": np.vstack([N[:j], Nx]), "h": cur["h"], "start": cur["start"], "end": {"kind": "split"}}
+            right = {"s": np.concatenate([[0.0], s[j:] - x]), "P": np.vstack([Px, P[j:]]),
+                     "T": np.vstack([Tx, T[j:]]), "N": np.vstack([Nx, N[j:]]), "h": cur["h"],
+                     "start": {"kind": "split"}, "end": cur["end"]}
+            pieces.append(left)
+            cur, a = right, a + x
+        pieces.append(cur)
+        out += pieces
+        s0 += L
+    return out
+
+
 def _check_law(law, closed):
     if closed and not law.constant:
         raise RuntimeError("a closed rail has no start and end for a varying radius: use one radius")
-    if min(law.r0, law.r1) <= 0.0:
+    if law.rmin <= 0.0:
         raise RuntimeError("the radius must stay above 0")
 
 
