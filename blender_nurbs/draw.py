@@ -765,6 +765,11 @@ def _draw_px():
         contcheck.draw_px(ctx, region, rv3d, _box)
     except Exception as exc:
         print("NURBS continuity labels:", exc)
+    from . import loftslide
+    try:
+        loftslide.draw_dots(ctx, region, rv3d, _disc)         # a Loft's slide handles (From / To)
+    except Exception as exc:
+        print("NURBS loft slide handles:", exc)
     font = 0
     blf.size(font, 11)
     cols = {"FREE": (0.62, 0.62, 0.62, 1), "G0": (0.9, 0.9, 0.9, 1), "G1": (0.35, 0.8, 1.0, 1),

@@ -147,9 +147,13 @@ def _normal_near(surf, q):
 # Surface from cross-section rows
 # --------------------------------------------------------------------------
 
-def _surface_from_rows(rows, prof, tol_rel=1e-4):
+def _surface_from_rows(rows, prof, tol_rel=1e-4, end_dirs=None):
     """rows: K arrays (nv,3) of profile CVs at each rail sample. Fit along the
-    rail per CV (shared knots), keep the profile's v knots / weights."""
+    rail per CV (shared knots), keep the profile's v knots / weights.
+    end_dirs: (d0, d1) unit directions the surface leaves its first / last row
+    along (the second CV of every column moved onto that line): what a fit
+    alone only comes close to, so a part tangent to them there is G1. Either
+    may be None (that end as fitted), or (nv, 3): a direction per column."""
     _, ext = _k()
     rows = np.array(rows)                 # (K, nv, 3)
     K, nv, _ = rows.shape
@@ -157,6 +161,17 @@ def _surface_from_rows(rows, prof, tol_rel=1e-4):
     size = float(np.linalg.norm(np.ptp(rows.reshape(-1, 3), axis=0))) or 1.0
     cv_cols, U, deg_u = geom.fit_rows(cols, 3, tol=tol_rel * size)
     nu = len(cv_cols[0])
+    if end_dirs is not None and nu >= 4:
+        for jc, c in enumerate(cv_cols):
+            j_col = [jc]
+            for a, b, d in ((0, 1, end_dirs[0]), (nu - 1, nu - 2, end_dirs[1])):
+                if d is None:
+                    continue
+                d = np.asarray(d, float)
+                if d.ndim == 2:                  # one direction per column (a tapering tube's end)
+                    d = d[j_col[0]]
+                    d = d / (np.linalg.norm(d) or 1.0)
+                c[b] = c[a] + float((c[b] - c[a]) @ d) * d
     pts, wts = [], []
     w = prof["weights"] or [1.0] * nv
     for iu in range(nu):
@@ -273,20 +288,725 @@ def _sweep_two_rails(inputs, p, prof, n):
     return _surface_from_rows(rows, prof)
 
 
-@features.builder("pipe")
-def build_pipe(inputs, p):
-    from .primitives import exact_circle_spec, spec_to_kernel_curve
-    sm, ext = _k()
-    rail_k = features.input_curve(*inputs[0])
-    n = int(p.get("samples", 32))
+PIPE_CAPS = ("NONE", "FLAT", "ROUND")
+
+
+def pipe_cap_style(p):
+    """The ends a Pipe gets: NONE (an open tube), FLAT or ROUND. A solid
+    (caps=True, Body: Solid / Join / Cut / Intersect) always has caps: flat
+    unless round ones are asked for."""
+    style = str(p.get("cap_style", "NONE")).upper()
+    style = style if style in PIPE_CAPS else "NONE"
+    if p.get("caps") and style == "NONE":
+        return "FLAT"
+    return style
+
+
+PIPE_CORNER_DEG = 5.0     # a rail turning more than this at one point has a corner: the pipe mitres it
+PIPE_MITRE_SHARE = 0.25   # a mitre may reach back at most this share of the stretch it ends
+
+
+def pipe_frames(rail_k, n, closed=False):
+    """(P, T, N, B): the rail's samples and the pipe's rotation-minimising
+    frames there (what build_pipe moves the circle along). closed: the frames
+    are turned a little more along the way so the last one is the first
+    again (rotation-minimising frames round a loop that is not flat come back
+    turned), so a closed rail's tube meets itself at its seam."""
     P, T = _arc_samples(rail_k, n)
     N = _rmf(P, T, _perp(T[0], np.array([0, 0, 1.0])))
+    if closed and len(P) > 2:
+        t = T[0]
+        a = N[-1] - (N[-1] @ t) * t
+        phi = math.atan2(float(np.cross(a, N[0]) @ t), float(a @ N[0]))   # N[-1] turned by phi about t is N[0]
+        s = np.linspace(0.0, 1.0, len(P))
+        for k in range(1, len(P)):
+            c, si = math.cos(phi * s[k]), math.sin(phi * s[k])
+            N[k] = c * N[k] + si * np.cross(T[k], N[k])
+        N[-1] = N[0]
     B = np.cross(T, N)
-    r = float(p.get("radius", 0.2))
-    prof = _profile(spec_to_kernel_curve(exact_circle_spec(r)))
-    q = prof["points"]                       # circle in its local XY plane, centre origin
-    rows = [P[k] + np.outer(q[:, 0], N[k]) + np.outer(q[:, 1], B[k]) for k in range(n)]
-    return _surface_from_rows(rows, prof)
+    return P, T, N, B
+
+
+def rail_corners(kc, max_deg=PIPE_CORNER_DEG):
+    """Where the curve turns sharper than max_deg at one point -- the joints
+    of a chain of edges, a polyline's corners, a vector handle; a closed
+    curve's seam too -- as dicts: u (parameter), point, deg, t_in / t_out
+    (unit tangents arriving / leaving), in parameter order."""
+    sm, ext = _k()
+    d = ext.curve_cvs(kc)
+    p, U = int(d["degree"]), [float(u) for u in d["knots"]]
+    t0, t1 = kc.parameter_range()
+    eps = 1e-7 * ((t1 - t0) or 1.0)
+
+    def tan(t):
+        v = np.array(sm.evaluate_curve(kc, float(min(t1, max(t0, t))))["tangent"], float)
+        return v / (np.linalg.norm(v) or 1.0)
+    knots = sorted({round(u, 12) for u in U[p + 1:len(U) - p - 1] if t0 + eps < u < t1 - eps})
+    tests = [(u, tan(u - 4 * eps), tan(u + 4 * eps)) for u in knots if sum(abs(x - u) < 1e-12 for x in U) >= p]
+    if features.is_closed_curve(kc):
+        tests.insert(0, (t0, tan(t1 - 4 * eps), tan(t0 + 4 * eps)))
+    out = []
+    for u, a, b in tests:
+        deg = math.degrees(math.acos(max(-1.0, min(1.0, float(a @ b)))))
+        if deg > max_deg:
+            out.append({"u": float(u), "point": np.array(kc.evaluate(float(u)), float), "deg": deg,
+                        "t_in": a, "t_out": b})
+    return out
+
+
+def pipe_rail(inputs):
+    """The rail of one pipe: inputs that touch end to end make one exact curve."""
+    return features.profile_curve(inputs)
+
+
+def _track(kc, ranges, m):
+    """A stretch of the rail between corners, resampled evenly by arc length:
+    (s, P, T) with m samples. ranges: [(ta, tb)] run in order (a closed
+    rail's stretch over its seam takes two). Tangents one-sided at the ends."""
+    sm, _ = _k()
+    t0, t1 = kc.parameter_range()
+    eps = 1e-9 * ((t1 - t0) or 1.0)
+    ts, rid = [], []
+    for i, (ta, tb) in enumerate(ranges):
+        x = np.linspace(ta, tb, 300)
+        x[0], x[-1] = ta + eps, tb - eps
+        ts += list(x)
+        rid += [i] * len(x)
+    ts, rid = np.array(ts), np.array(rid)
+    Q = np.array([kc.evaluate(float(t)) for t in ts], float)
+    L = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(Q, axis=0), axis=1))])
+    s = np.linspace(0.0, L[-1], m)
+    idx = np.clip(np.searchsorted(L, s, side="right") - 1, 0, len(L) - 2)
+    tt = []
+    for k, i in enumerate(idx):
+        if rid[i] != rid[i + 1] or L[i + 1] <= L[i]:
+            tt.append(ts[i + 1] if s[k] > L[i] else ts[i])
+        else:
+            f = (s[k] - L[i]) / (L[i + 1] - L[i])
+            tt.append(ts[i] + f * (ts[i + 1] - ts[i]))
+    P, T = [], []
+    for t in tt:
+        dd = sm.evaluate_curve(kc, float(t))
+        P.append(dd["point"])
+        v = np.array(dd["tangent"], float)
+        T.append(v / (np.linalg.norm(v) or 1.0))
+    P, T = np.array(P, float), np.array(T, float)
+    P[0], P[-1] = Q[0], Q[-1]
+    return s, P, T
+
+
+def _mirror(v, nrm):
+    return v - 2.0 * float(v @ nrm) * nrm
+
+
+def _corner_info(c):
+    return {"C": c["point"], "n": c["n"], "deg": c["deg"], "t_in": c["t_in"], "t_out": c["t_out"]}
+
+
+def _rot(v, axis, ang):
+    """v turned by ang (radians) about the unit axis (right-handed)."""
+    v = np.asarray(v, float)
+    c, s_ = math.cos(ang), math.sin(ang)
+    return v * c + np.cross(axis, v) * s_ + axis * float(axis @ v) * (1.0 - c)
+
+
+def _elbow_axis(c):
+    a = np.cross(c["t_in"], c["t_out"])
+    return a / (np.linalg.norm(a) or 1.0)
+
+
+def _turned(v, c):
+    """v turned as the rail turns at corner c (t_in onto t_out)."""
+    return _rot(v, _elbow_axis(c), math.radians(c["deg"]))
+
+
+def elbow_reach(c, bend):
+    """How far before (and after) corner c an elbow of centreline radius bend starts."""
+    return float(bend) * math.tan(math.radians(c["deg"]) / 2.0)
+
+
+def elbow_geometry(c, bend):
+    """(start point, centre, axis, turn in radians) of the elbow at corner c:
+    its centreline is the arc of radius bend tangent to both legs."""
+    th = math.radians(c["deg"])
+    d = elbow_reach(c, bend)
+    p0 = c["C"] - d * c["t_in"]
+    m = c["t_out"] - float(c["t_out"] @ c["t_in"]) * c["t_in"]
+    m /= np.linalg.norm(m)
+    return p0, p0 + bend * m, _elbow_axis(c), th
+
+
+def elbow_cvs(X, w, c, bend):
+    """CVs (nu, nv, 3), weights (nu, nv) and u knots of the exact elbow: the
+    pipe's end circle (CVs X, weights w, in the plane square to t_in where
+    the elbow starts) turned round the elbow's axis through the turn, a
+    rational quadratic arc per quarter turn or less."""
+    _, O, ax, th = elbow_geometry(c, bend)
+    nseg = max(1, int(math.ceil(th / (math.pi / 2) - 1e-9)))
+    dth = th / nseg
+    rel = np.asarray(X, float) - O
+    along = np.outer(rel @ ax, ax)
+    rho = rel - along
+    rows, wts = [], []
+    for i in range(nseg):
+        a0 = i * dth
+        if i == 0:
+            rows.append(O + along + _rot_rows(rho, ax, a0))
+            wts.append(np.asarray(w, float))
+        rows.append(O + along + _rot_rows(rho, ax, a0 + dth / 2) / math.cos(dth / 2))
+        wts.append(np.asarray(w, float) * math.cos(dth / 2))
+        rows.append(O + along + _rot_rows(rho, ax, a0 + dth))
+        wts.append(np.asarray(w, float))
+    U = [0.0, 0.0, 0.0] + [x for i in range(1, nseg) for x in (i / nseg, i / nseg)] + [1.0, 1.0, 1.0]
+    return np.array(rows), np.array(wts), U
+
+
+def _rot_rows(V, axis, ang):
+    c, s_ = math.cos(ang), math.sin(ang)
+    return V * c + np.cross(axis, V) * s_ + np.outer(V @ axis, axis) * (1.0 - c)
+
+
+def elbow_limit(tracks):
+    """The largest elbow centreline radius every stretch has room for: the
+    elbows at its two ends may take it all, no more."""
+    best = math.inf
+    for tr in tracks:
+        L = float(tr["s"][-1])
+        k = sum(math.tan(math.radians(tr[key]["deg"]) / 2.0) for key in ("start", "end")
+                if tr[key] is not None and tr[key].get("kind") != "split")
+        if k > 0:
+            best = min(best, L / k)
+    return best
+
+
+def pipe_tracks(rail_k, closed, corner="MITRE"):
+    """The rail split at its corners into stretches, each a dict: s, P, T, N
+    (frames), h (B = h T x N), start / end (the mitre there: {"C", "n"}, None
+    at an open end). A stretch's first frame is the one before it mirrored in
+    the mitre plane (the mirror turns the rail's direction round too, so the
+    frame keeps its handedness), so the two tubes' end CVs are the same points
+    and the tubes face the same way. corner ROUND: the stretches end short of
+    each corner for an elbow (a torus patch, elbow_surface) and a stretch's
+    first frame is the last one turned round the elbow's axis. None when the
+    rail has no corner (a pipe of one piece, as pipe_frames makes it)."""
+    corners = rail_corners(rail_k)
+    if not corners:
+        return None
+    for c in corners:
+        if c["deg"] > 175.0:
+            raise RuntimeError(f"the rail turns back on itself ({c['deg']:.0f}°): a pipe can't take that corner")
+        # the mitre plane mirrors the tube before the corner (running back, -t_in) onto the one after (t_out)
+        c["n"] = (c["t_in"] + c["t_out"]) / np.linalg.norm(c["t_in"] + c["t_out"])
+    t0, t1 = rail_k.parameter_range()
+    spans = []
+    if not closed:
+        cuts = [t0] + [c["u"] for c in corners] + [t1]
+        cs = [None] + corners + [None]
+        for i in range(len(cuts) - 1):
+            spans.append(([(cuts[i], cuts[i + 1])], cs[i], cs[i + 1]))
+    else:
+        seam = corners[0] if abs(corners[0]["u"] - t0) < 1e-12 else None
+        inner = [c for c in corners if c is not seam]
+        if seam is not None:
+            cuts = [t0] + [c["u"] for c in inner] + [t1]
+            cs = [seam] + inner + [seam]
+            for i in range(len(cuts) - 1):
+                spans.append(([(cuts[i], cuts[i + 1])], cs[i], cs[i + 1]))
+        else:               # the seam is smooth: the stretch over it runs from the last corner round to the first
+            for i in range(len(inner) - 1):
+                spans.append(([(inner[i]["u"], inner[i + 1]["u"])], inner[i], inner[i + 1]))
+            spans.append(([(inner[-1]["u"], t1), (t0, inner[0]["u"])], inner[-1], inner[0]))
+    tracks, prev = [], None
+    for ranges, a, b in spans:
+        s, P, T = _track(rail_k, ranges, 241)
+        if prev is None:
+            r0, h = _perp(T[0], np.array([0, 0, 1.0])), 1.0
+        else:
+            r0 = _turned(prev["N"][-1], a) if corner == "ROUND" else _mirror(prev["N"][-1], a["n"])
+            h = prev["h"]
+        N = _rmf(P, T, r0)
+        kind = "elbow" if corner == "ROUND" else "mitre"
+        tracks.append({"s": s, "P": P, "T": T, "N": N, "h": h,
+                       "start": None if a is None else dict(_corner_info(a), kind=kind),
+                       "end": None if b is None else dict(_corner_info(b), kind=kind)})
+        prev = tracks[-1]
+    return tracks
+
+
+def _ramp(x):
+    x = np.clip(x, 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _frame_end(tr, k):
+    T, N = tr["T"][k], tr["N"][k]
+    return tr["P"][k], T, N, tr["h"] * np.cross(T, N)
+
+
+PIPE_TAPERS = ("LINEAR", "SMOOTH")
+
+
+class RadiusLaw:
+    """The pipe's radius along its rail (g: rail length from its start, of
+    total L): constant, or through radius points (f, r) -- f the share of the
+    rail's length, 0 and 1 its ends -- Linear (straight between the points),
+    or Smooth: a monotone cubic (PCHIP) through them, level at both ends, at
+    every highest and lowest point and nowhere overshooting the points, so a
+    round cap on an end is a half sphere. Two points, Smooth: the smoothstep."""
+
+    def __init__(self, r0, r1=None, taper="LINEAR", L=1.0, points=()):
+        r1 = float(r0 if r1 is None else r1)
+        pts = sorted((min(1.0, max(0.0, float(f))), float(r)) for f, r in points if 0.0 < float(f) < 1.0)
+        self.f = np.array([0.0] + [f for f, _ in pts] + [1.0])
+        self.r = np.array([float(r0)] + [r for _, r in pts] + [r1])
+        keep = np.concatenate([[True], np.diff(self.f) > 1e-9])      # two points at one place: the later one
+        self.f, self.r = self.f[keep], self.r[keep]
+        self.f[-1] = 1.0
+        self.r0, self.r1 = float(self.r[0]), float(self.r[-1])
+        self.taper = taper if taper in PIPE_TAPERS else "LINEAR"
+        self.L = float(L) or 1.0
+        h = np.diff(self.f)
+        d = np.diff(self.r) / h
+        m = np.zeros(len(self.f))                 # slopes dr/df at the points: level at both ends
+        for k in range(1, len(self.f) - 1):
+            if d[k - 1] * d[k] > 0.0:             # Fritsch-Carlson: weighted harmonic mean; 0 at an extreme
+                w1, w2 = 2.0 * h[k] + h[k - 1], h[k] + 2.0 * h[k - 1]
+                m[k] = (w1 + w2) / (w1 / d[k - 1] + w2 / d[k])
+        self._m = m
+
+    @property
+    def constant(self):
+        return float(np.ptp(self.r)) <= 1e-12 * max(abs(self.r0), 1e-12)
+
+    @property
+    def rmax(self):
+        return float(self.r.max())
+
+    @property
+    def rmin(self):
+        return float(self.r.min())
+
+    def _eval(self, f, deriv=False):
+        f = np.clip(np.asarray(f, float), 0.0, 1.0)
+        k = np.clip(np.searchsorted(self.f, f, side="right") - 1, 0, len(self.f) - 2)
+        f0, h = self.f[k], self.f[k + 1] - self.f[k]
+        t = (f - f0) / h
+        ra, rb = self.r[k], self.r[k + 1]
+        if self.taper == "LINEAR":
+            return (rb - ra) / h if deriv else ra + (rb - ra) * t
+        ma, mb = self._m[k], self._m[k + 1]
+        if deriv:
+            return ((6 * t * t - 6 * t) * ra + (-6 * t * t + 6 * t) * rb) / h + \
+                (3 * t * t - 4 * t + 1) * ma + (3 * t * t - 2 * t) * mb
+        t2, t3 = t * t, t * t * t
+        return (2 * t3 - 3 * t2 + 1) * ra + (t3 - 2 * t2 + t) * h * ma + (-2 * t3 + 3 * t2) * rb + (t3 - t2) * h * mb
+
+    def __call__(self, g):
+        if self.constant:
+            return np.full(np.shape(g), self.r0) if np.ndim(g) else self.r0
+        out = self._eval(np.asarray(g, float) / self.L)
+        return out if np.ndim(g) else float(out)
+
+    def slope(self, g):
+        """dr / dg."""
+        if self.constant:
+            return 0.0
+        return float(self._eval(float(g) / self.L, deriv=True)) / self.L
+
+
+def pipe_radius_law(p, L):
+    r0 = float(p.get("radius", 0.2))
+    if not p.get("variable"):
+        return RadiusLaw(r0, r0, "LINEAR", L)
+    return RadiusLaw(r0, float(p.get("radius_end", r0)), str(p.get("taper", "LINEAR")).upper(), L,
+                     p.get("radius_points", ()))
+
+
+def mitre_reach(tr, q, bend=None, scale=(1.0, 1.0)):
+    """(t0, t1): how far each profile point q (n, 2) lies from the stretch's
+    start / end mitre plane along the rail (0 at an open end). At an elbow
+    (bend: its centreline radius) every column stops bend tan(turn / 2) short
+    of the corner, where the elbow starts. scale: the pipe's radius at the
+    start / end corner when q is the unit circle."""
+    out = []
+    for (k, key, sgn), sc in zip(((0, "start", 1.0), (-1, "end", -1.0)), scale):
+        m = tr[key]
+        if m is None:
+            out.append(np.zeros(len(q)))
+            continue
+        if m["kind"] == "split":                  # a Linear radius point: the tube just ends there, square
+            out.append(np.zeros(len(q)))
+            continue
+        if m["kind"] == "elbow":
+            out.append(np.full(len(q), sgn * elbow_reach(m, bend)))
+            continue
+        P, T, N, B = _frame_end(tr, k)
+        X = P + sc * (np.outer(q[:, 0], N) + np.outer(q[:, 1], B))
+        out.append(((m["C"] - X) @ m["n"]) / float(T @ m["n"]))
+    return out
+
+
+def mitre_limit(tracks):
+    """The largest radius every mitre has room for: a mitre reaches back
+    r tan(turn / 2) along its stretch, at most PIPE_MITRE_SHARE of it."""
+    best = math.inf
+    unit = np.array([[math.cos(a), math.sin(a)] for a in np.linspace(0, 2 * math.pi, 73)])
+    for tr in tracks:
+        L = float(tr["s"][-1])
+        for t in mitre_reach(tr, unit):
+            e = float(np.abs(t).max())
+            if e > 0:
+                best = min(best, PIPE_MITRE_SHARE * L / e)
+    return best
+
+
+def mitred_rows(tr, q, n, bend=None, law=None, s0=0.0):
+    """Rows (n, len(q), 3) of the tube along one stretch, each column the
+    profile point q_j carried along the rail; at a mitred end the columns are
+    cut off on the mitre plane (an end row on it: the circle projected along
+    the rail, an exact ellipse, the same points as the next tube's). Each
+    column runs its own length of the rail (from its start mitre to its end
+    mitre) at an even pace, so on a straight stretch every column is a
+    straight line at constant speed: the exact cylinder, and a light fit.
+    A column reaching past the corner runs on straight along the end tangent;
+    one ending short of it on a curved stretch is eased onto the ellipse over
+    the mitre's reach, so the tube leaves its true shape there by about the
+    rail's sag over that reach (no mitre between curved tubes is exact: their
+    true cuts by the mitre plane are not the same curve).
+    law (RadiusLaw, s0: the rail length where this stretch starts): q is then
+    the unit circle and the radius follows the law, held at the corner's
+    value over the mitre's / elbow's reach and eased back after it, so the
+    mitre / elbow stays exact (two tapering tubes have no common cut)."""
+    s, P, T, N, h = tr["s"], tr["P"], tr["T"], tr["N"], tr["h"]
+    L = float(s[-1])
+    if law is None:
+        law = RadiusLaw(1.0)
+    rc0, rc1 = law(s0), law(s0 + L)
+    t0, t1 = mitre_reach(tr, q, bend, (rc0, rc1))
+    e0, e1 = float(np.abs(t0).max()), float(np.abs(t1).max())
+    qx, qy = q[:, 0], q[:, 1]
+
+    def radius(S):
+        r_ = law(s0 + np.clip(S, 0.0, L))
+        if law.constant:
+            return r_
+        w0 = _ramp((2.0 * e0 - S) / e0) if tr["start"] is not None and e0 > 0 else 0.0 * S
+        w1 = _ramp((S - (L - 2.0 * e1)) / e1) if tr["end"] is not None and e1 > 0 else 0.0 * S
+        tot = np.maximum(w0 + w1, 1.0)
+        w0, w1 = w0 / tot, w1 / tot
+        return (1.0 - w0 - w1) * r_ + w0 * rc0 + w1 * rc1
+
+    def sweep(S):
+        """Column points at rail lengths S (any shape; the last axis runs over q), straight past the ends."""
+        Sc = np.clip(S, 0.0, L)
+        A = np.stack([np.stack([np.interp(Sc, s, M[:, i]) for i in range(3)], axis=-1) for M in (P, T, N)])
+        Pi, Ti, Ni = A[0], A[1], A[2]
+        Ti /= np.linalg.norm(Ti, axis=-1, keepdims=True)
+        Ni -= np.sum(Ni * Ti, axis=-1, keepdims=True) * Ti
+        Ni /= np.linalg.norm(Ni, axis=-1, keepdims=True)
+        rS = np.asarray(radius(S), float)[..., None]
+        X = Pi + rS * (qx[..., None] * Ni + qy[..., None] * (h * np.cross(Ti, Ni)))
+        return X + np.minimum(S, 0.0)[..., None] * T[0] + np.maximum(S - L, 0.0)[..., None] * T[-1]
+
+    sig = np.linspace(0.0, 1.0, n)[:, None]
+    chord = P[-1] - P[0]
+    chord = chord / (np.linalg.norm(chord) or 1.0)
+    rel = P - P[0]
+    straight = float(np.linalg.norm(rel - np.outer(rel @ chord, chord), axis=1).max()) <= 1e-9 * L
+    if straight:            # every column a straight line at an even pace: the exact cylinder, a light fit
+        S = t0[None, :] + sig * (L + t1 - t0)[None, :]
+    else:                   # the columns' offsets only near the corners: the rows stay circles in between
+        S = sig * L
+        if e0 > 0:
+            lam = min(0.45, max(0.12, 1.6 * e0 / L))
+            S = S + _ramp(1.0 - sig / lam) * t0[None, :]
+        if e1 > 0:
+            lam = min(0.45, max(0.12, 1.6 * e1 / L))
+            S = S + _ramp((sig - (1.0 - lam)) / lam) * t1[None, :]
+    X = sweep(S)
+    for t, e, k in ((t0, e0, 0), (t1, e1, -1)):
+        if e <= 0:
+            continue
+        Pk, Tk, Nk, Bk = _frame_end(tr, k)
+        rc = rc0 if k == 0 else rc1
+        E = Pk + rc * (np.outer(qx, Nk) + np.outer(qy, Bk)) + t[:, None] * Tk      # the ellipse's points
+        end = t if k == 0 else L + t
+        corr = E - sweep(end)                                                # 0 where the column runs straight
+        far = (S - end[None, :]) if k == 0 else (end[None, :] - S)          # rail length from the column's end
+        X = X + _ramp(1.0 - far / e)[..., None] * corr[None, :, :]
+    return X
+
+
+def corner_message(inputs, corners):
+    names = sorted({o.name for o, _ in inputs})
+    where = names[0] if len(names) == 1 else f"the chain of {len(inputs)}"
+    worst = max(c["deg"] for c in corners)
+    n = len(corners)
+    return f"{where} turns {worst:.0f}° at {'a corner' if n == 1 else f'{n} corners'}"
+
+
+def mitre_message(inputs, tracks, r):
+    lim = mitre_limit(tracks)
+    return (f"the radius is too large for the mitred corners: at most {lim:.4g} here (a mitre may reach back "
+            f"a quarter of the stretch it ends) -- a smaller radius, or pipe the pieces separately")
+
+
+def cap_meridian(r, slope):
+    """(offset, R, theta0) of the round cap on a pipe end of radius r whose
+    radius grows outward at slope dr/ds: the sphere tangent to the tube along
+    the end circle has its centre offset r * slope along the outward axis and
+    radius R = r sqrt(1 + slope^2); seen from its centre the end circle lies
+    at theta0 = -atan(slope) and the pole at 90 degrees (slope 0: the half
+    sphere)."""
+    return r * slope, r * math.sqrt(1.0 + slope * slope), -math.atan(slope)
+
+
+def round_cap_cvs(C, N, B, T, q, w, r, slope=0.0):
+    """CVs (nu, nv, 3), weights (nu, nv) and u knots of the exact round cap
+    closing a pipe end: the end circle (centre C, CVs C + r (q_x N + q_y B)
+    for the unit circle q, weights w) carried over a sphere tangent to the
+    tube (cap_meridian) to its pole on the outward axis T. A rational
+    quadratic meridian per quarter turn or less (one for a half sphere)."""
+    off, R, th0 = cap_meridian(r, slope)
+    O = C + off * T
+    span = 0.5 * math.pi - th0
+    nseg = max(1, int(math.ceil(span / (0.5 * math.pi) - 1e-9)))
+    d = span / nseg
+    mer = []                                  # (rho, z, weight) of the meridian's CVs
+    for i in range(nseg):
+        a0 = th0 + i * d
+        if i == 0:
+            mer.append((R * math.cos(a0), R * math.sin(a0), 1.0))
+        am = a0 + d / 2
+        mer.append((R * math.cos(am) / math.cos(d / 2), R * math.sin(am) / math.cos(d / 2), math.cos(d / 2)))
+        mer.append((R * math.cos(a0 + d), R * math.sin(a0 + d), 1.0))
+    ring = np.outer(q[:, 0], N) + np.outer(q[:, 1], B)
+    P = np.array([O + z * T + rho * ring for rho, z, _ in mer])
+    P[-1] = O + R * T                         # the pole, exactly
+    W = np.array([[wm * wi for wi in w] for _, _, wm in mer])
+    U = [0.0, 0.0, 0.0] + [x for i in range(1, nseg) for x in (i / nseg, i / nseg)] + [1.0, 1.0, 1.0]
+    return P, W, U
+
+
+def _round_cap(C, N, B, T, prof, r, slope=0.0):
+    """prof: the unit circle's profile."""
+    _, ext = _k()
+    q = prof["points"]
+    w = prof["weights"] or [1.0] * len(q)
+    P, W, U = round_cap_cvs(C, N, B, T, q, w, r, slope)
+    pts = [tuple(map(float, P[j, i])) for j in range(len(P)) for i in range(len(q))]
+    wts = [float(W[j, i]) for j in range(len(P)) for i in range(len(q))]
+    return ext.surface_from_cvs(2, prof["degree"], pts, U, prof["knots"], wts)
+
+
+def _end_dirs(T, N, B, q, slope):
+    """The directions each column of a tapering tube leaves its end along
+    (T + dr/ds times the profile point's direction): G1 to a round cap."""
+    if abs(slope) <= 1e-15:
+        return T
+    return T[None, :] + slope * (np.outer(q[:, 0], N) + np.outer(q[:, 1], B))
+
+
+@features.builder("pipe")
+def build_pipe(inputs, p):
+    """The tube along the rail (inputs that touch end to end make one); with
+    caps (Cap Flat / Round, or a solid) a closed body: flat discs or exact
+    round caps on the ends. A closed rail has no ends: its tube is closed
+    already (a solid of it is the ring). A rail with sharp corners gets a
+    tube per stretch, mitred where they meet (pipe_tracks / mitred_rows), or
+    with Corners Round joined by exact torus elbows of centreline radius
+    Bend x the pipe's radius (elbow_cvs), G1 to straight legs. Variable
+    Radius: the radius runs from Radius to End Radius along the rail
+    (RadiusLaw); a round cap is then the sphere tangent to the tapering tube,
+    and the radius holds its corner's value through each mitre / elbow."""
+    from .primitives import exact_circle_spec, spec_to_kernel_curve
+    rail_k = pipe_rail(inputs)
+    closed = features.is_closed_curve(rail_k)
+    prof = _profile(spec_to_kernel_curve(exact_circle_spec(1.0)))
+    q = prof["points"]                       # the unit circle in its local XY plane, centre origin
+    samples = int(p.get("samples", 32))
+    style = pipe_cap_style(p)
+    corner = "ROUND" if str(p.get("corner_style", "MITRE")).upper() == "ROUND" else "MITRE"
+    tracks = pipe_tracks(rail_k, closed, corner)
+    creased = bool(p.get("variable")) and str(p.get("taper", "LINEAR")).upper() == "LINEAR" and \
+        any(0.0 < float(f) < 1.0 for f, _ in p.get("radius_points", ()))
+    if tracks is None and creased:
+        tracks = [_whole_track(rail_k)]         # built in pieces between the radius points
+    if tracks is None:
+        n = min(600, samples * len(inputs))      # samples per curve / edge of the rail
+        P, T, N, B = pipe_frames(rail_k, n, closed)
+        g = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))])
+        law = pipe_radius_law(p, float(g[-1]))
+        _check_law(law, closed)
+        rk = law(g)
+        rows = [P[k] + rk[k] * (np.outer(q[:, 0], N[k]) + np.outer(q[:, 1], B[k])) for k in range(n)]
+        round_ = style == "ROUND" and not closed
+        s_a, s_b = law.slope(0.0), law.slope(float(g[-1]))
+        # round caps: the tube leaves its ends along the cap's sphere, so the caps are G1 to it
+        ends = (_end_dirs(T[0], N[0], B[0], q, s_a), _end_dirs(T[-1], N[-1], B[-1], q, s_b)) if round_ else None
+        tube = _surface_from_rows(rows, prof, end_dirs=ends)
+        if style == "NONE":
+            return tube
+        walls = [tube]
+        if round_:
+            walls += [_round_cap(P[0], N[0], B[0], -T[0], prof, law.r0, -s_a),
+                      _round_cap(P[-1], N[-1], B[-1], T[-1], prof, law.r1, s_b)]
+        return features.cap_walls(walls)
+    total = sum(float(tr["s"][-1]) for tr in tracks)
+    law = pipe_radius_law(p, total)
+    _check_law(law, closed)
+    if creased:
+        tracks = _split_tracks(tracks, law)
+    rmax = law.rmax
+    bend = float(p.get("bend", 2.0)) * rmax
+    if corner == "MITRE" and rmax > mitre_limit(tracks) * (1.0 + 1e-9):
+        raise RuntimeError(mitre_message(inputs, tracks, rmax))
+    if corner == "ROUND":
+        if bend < rmax * (1.0 - 1e-9):
+            raise RuntimeError("the elbows' bend radius is smaller than the pipe's: Bend must be at least 1")
+        if bend > elbow_limit(tracks) * (1.0 + 1e-6):     # elbows that meet fill their stretch exactly
+            raise RuntimeError(elbow_message(tracks, rmax))
+    walls, caps = [], []
+    s0 = 0.0
+    for tr in tracks:
+        L = float(tr["s"][-1])
+        n = int(min(300, max(samples, round(samples * len(inputs) * L / total))))
+        used = sum(elbow_reach(tr[key], bend) for key in ("start", "end")
+                   if tr[key] is not None and tr[key]["kind"] == "elbow")
+        if L - used > 1e-7 * L:                  # elbows that meet leave no straight run between them
+            rows = _affine_rows(mitred_rows(tr, q, n, bend, law, s0), q)
+            ends = []
+            for k, key, out in ((0, "start", -1.0), (-1, "end", 1.0)):
+                Pk, Tk, Nk, Bk = _frame_end(tr, k)
+                if tr[key] is not None:
+                    # a mitre: a crease, the end row exact; an elbow: square to the leg, G1 to it
+                    ends.append(Tk if tr[key]["kind"] == "elbow" else None)
+                elif style == "ROUND":
+                    gk = s0 + (0.0 if k == 0 else L)
+                    sl = law.slope(gk)
+                    ends.append(_end_dirs(Tk, Nk, Bk, q, sl))
+                    caps.append(_round_cap(Pk, Nk, Bk, out * Tk, prof, law(gk), out * sl))
+                else:
+                    ends.append(None)
+            walls.append(_surface_from_rows(rows, prof, end_dirs=tuple(ends)))
+        elif style == "ROUND":                    # no tube, but an open end still gets its cap
+            for k, key, out in ((0, "start", -1.0), (-1, "end", 1.0)):
+                if tr[key] is None:
+                    gk = s0 + (0.0 if k == 0 else L)
+                    Pk, Tk, Nk, Bk = _frame_end(tr, k)
+                    caps.append(_round_cap(Pk, Nk, Bk, out * Tk, prof, law(gk), out * law.slope(gk)))
+        if tr["end"] is not None and tr["end"]["kind"] == "elbow":
+            walls.append(_elbow_surface(tr, prof, bend, law(s0 + L)))
+        s0 += L
+    walls += caps
+    if style == "NONE":
+        return _joined(walls)
+    return features.cap_walls(walls)
+
+
+def _whole_track(rail_k):
+    """The rail as one stretch (no corners), sampled densely: for building it
+    in pieces (Linear radius points)."""
+    t0, t1 = rail_k.parameter_range()
+    s, P, T = _track(rail_k, [(t0, t1)], 401)
+    N = _rmf(P, T, _perp(T[0], np.array([0, 0, 1.0])))
+    return {"s": s, "P": P, "T": T, "N": N, "h": 1.0, "start": None, "end": None}
+
+
+def _split_tracks(tracks, law):
+    """The stretches cut at the law's inner points (Linear: the radius turns
+    there, a crease between two cones, which one fit along the rail would round
+    off): the pieces share the point's sample, so their end circles are the same
+    CVs. Ends made by a cut are kind "split" (no cap, no mitre)."""
+    cuts = [float(f) * law.L for f in law.f[1:-1]]
+    out, s0 = [], 0.0
+    for tr in tracks:
+        L = float(tr["s"][-1])
+        pieces, cur, a = [], tr, s0
+        for g in cuts:
+            Lc = float(cur["s"][-1])
+            x = g - a
+            if not 1e-9 * L < x < Lc - 1e-9 * L:
+                continue
+            s, P, T, N = cur["s"], cur["P"], cur["T"], cur["N"]
+            j = int(np.searchsorted(s, x))
+            f = (x - s[j - 1]) / (s[j] - s[j - 1])
+            Px = P[j - 1] + f * (P[j] - P[j - 1])
+            Tx = T[j - 1] + f * (T[j] - T[j - 1])
+            Tx /= np.linalg.norm(Tx)
+            Nx = N[j - 1] + f * (N[j] - N[j - 1])
+            Nx -= float(Nx @ Tx) * Tx
+            Nx /= np.linalg.norm(Nx)
+            left = {"s": np.append(s[:j], x), "P": np.vstack([P[:j], Px]), "T": np.vstack([T[:j], Tx]),
+                    "N": np.vstack([N[:j], Nx]), "h": cur["h"], "start": cur["start"], "end": {"kind": "split"}}
+            right = {"s": np.concatenate([[0.0], s[j:] - x]), "P": np.vstack([Px, P[j:]]),
+                     "T": np.vstack([Tx, T[j:]]), "N": np.vstack([Nx, N[j:]]), "h": cur["h"],
+                     "start": {"kind": "split"}, "end": cur["end"]}
+            pieces.append(left)
+            cur, a = right, a + x
+        pieces.append(cur)
+        out += pieces
+        s0 += L
+    return out
+
+
+def _check_law(law, closed):
+    if closed and not law.constant:
+        raise RuntimeError("a closed rail has no start and end for a varying radius: use one radius")
+    if law.rmin <= 0.0:
+        raise RuntimeError("the radius must stay above 0")
+
+
+def _affine_rows(rows, q):
+    """Rows of profile CVs, each replaced by the affine image of the profile
+    (CVs q, in its plane) closest to it. A row that is not a rigid copy of
+    the circle (the columns of a mitred stretch run different lengths of a
+    curved rail) would bend at the circle's joints (its quarter points: knots
+    of full multiplicity, G1 only while the three CVs there stay in line), and
+    the normal would jump along those lines; an affine image keeps them in
+    line, so every row is an exact conic. The fit along the rail is linear in
+    the rows and affine images of q make a linear space, so the surface keeps
+    it: G1 across those lines. Circles and the ellipses they project to on a
+    mitre are affine images already, and are kept exactly."""
+    rows = np.asarray(rows, float)
+    A = np.hstack([np.asarray(q, float)[:, :2], np.ones((len(q), 1))])        # (nv, 3)
+    pinv = np.linalg.pinv(A)
+    return np.einsum("ij,kjl->kil", A, np.einsum("ij,kjl->kil", pinv, rows))
+
+
+def _elbow_surface(tr, prof, bend, r=1.0):
+    """The exact elbow at the end of stretch tr: its end frame's circle of
+    radius r (prof: the unit circle), where the elbow starts, turned round
+    the corner."""
+    _, ext = _k()
+    c = tr["end"]
+    Pk, Tk, Nk, Bk = _frame_end(tr, -1)
+    p0 = elbow_geometry(c, bend)[0]
+    q = prof["points"]
+    w = prof["weights"] or [1.0] * len(q)
+    X = p0 + r * (np.outer(q[:, 0], Nk) + np.outer(q[:, 1], Bk))
+    R, W, U = elbow_cvs(X, w, c, bend)
+    pts = [tuple(map(float, R[i, j])) for i in range(len(R)) for j in range(len(q))]
+    wts = [float(W[i, j]) for i in range(len(R)) for j in range(len(q))]
+    return ext.surface_from_cvs(2, prof["degree"], pts, U, prof["knots"], wts)
+
+
+def elbow_message(tracks, r):
+    lim = elbow_limit(tracks) / r
+    return (f"the elbows don't fit: Bend at most {lim:.3g} here (two elbows may take a whole stretch "
+            f"between them) -- a smaller Bend or radius, or Corners: Mitre")
+
+
+def _joined(walls):
+    """Surfaces (world) stitched along their shared edges into one open body."""
+    from . import jobs
+    from .steps import IDENT
+    objs = {f"s{i}": (store.brep_to_text(store.to_brep(w)), IDENT) for i, w in enumerate(walls)}
+    lo = np.min([np.array(store.to_brep(w).bounding_box()[0], float) for w in walls], axis=0)
+    hi = np.max([np.array(store.to_brep(w).bounding_box()[1], float) for w in walls], axis=0)
+    tol = 1e-6 * (float(np.linalg.norm(hi - lo)) or 1.0)
+    _, breps = jobs.run("join", objs, ["joined"], order=list(objs), into="s0", tolerance=tol)
+    return ("brep_text", breps["joined"])
 
 
 # --------------------------------------------------------------------------

@@ -141,49 +141,21 @@ def build_spec(clicks, mode, deg, closed, start_out=None, end_out=None):
 
 def through_ends(S, deg, ends):
     """CVs and degree of a uniform spline through the points S whose ends are
-    aligned (ends as align.align_open). Each G1 / G2 end adds one / two CVs:
-    the end CVs come from align_start applied to the plain interpolation's end
-    derivatives, the others are solved so the curve still passes through every
-    point. Returns (X, p, specs)."""
+    aligned (ends as align.align_open). G0 ends: the plain interpolation with
+    its ends put on their targets. G1 / G2 / G3 ends: the fairest curve that
+    passes every point and meets the ends exactly (fairthrough.py: no
+    overshoot next to an aligned end). Returns (X, p, specs)."""
     from . import align
     S = np.asarray(S, float)
-    n = len(S)
     specs = {e: dict(sp_) for e, (sp_, _) in ends.items()}
     ks = align.CONT[specs["0"]["cont"]] if "0" in specs else 0
     ke = align.CONT[specs["1"]["cont"]] if "1" in specs else 0
-    X0, p0 = interpolate(S, deg)
     if ks == 0 and ke == 0:
+        X0, p0 = interpolate(S, deg)
         X, p, specs = align.align_open(X0, p0, ends)        # G0: the ends sit on their targets
         return X, p, specs
-    N = n + ks + ke
-    p = min(max(deg, align.degree_for([s_["cont"] for s_ in specs.values()])), N - 1)
-    U0 = geom.clamped_uniform_knots(n, p0)
-    U = geom.clamped_uniform_knots(N, p)
-    Q = np.zeros((N, 3))
-    I = np.eye(4)
-    for e, k in (("0", ks), ("1", ke)):
-        A, Ua = (X0, U0) if e == "0" else align._reverse(X0, U0)
-        d1, d2, _, _ = align._derivs(A, Ua, p0) if p0 >= 1 else (A[1] - A[0], np.zeros(3), 1, 1)
-        seg, Ub = (Q, U) if e == "0" else align._reverse(Q, U)
-        seg = align._set_start(seg, Ub, p, min(k, 2) if p >= 2 else min(k, 1), A[0], d1, d2)
-        if e in ends:
-            sp_ = specs[e]
-            P, D, DD, surf = ends[e][1]
-            if sp_.get("snap") == "NEAREST" and sp_.get("mode", "EDGE") == "EDGE" and D @ d1 < 0:
-                D = -D
-                sp_["flip"] = not sp_.get("flip", False)
-            seg = align.align_start(seg, Ub, p, sp_, (P, D, DD, surf), I)
-        Q = seg if e == "0" else align._reverse(seg, Ub)[0]
-    fixed = list(range(ks + 1)) + list(range(N - 1 - ke, N))
-    free = [i for i in range(N) if i not in fixed]
-    if free:
-        t = _chord(S, False)
-        if t is None:
-            t = np.linspace(0.0, 1.0, n)
-        A = curvetools.Basis(N, p, False).matrix(t[1:-1])
-        rhs = S[1:-1] - A[:, fixed] @ Q[fixed]
-        Q[free] = np.linalg.lstsq(A[:, free], rhs, rcond=None)[0]
-    return Q, p, specs
+    from .fairthrough import through_ends as fair
+    return fair(S, deg, ends)
 
 
 def build_spec_ends(clicks, mode, deg, ends):
@@ -850,7 +822,10 @@ class SketchMixin:
         """Which edge / face an end follows: T next, L lock onto it, F edge or face."""
         return [hints.key("T", "next edge / face"),
                 hints.key("L", "lock onto the edge", on=True if getattr(self, "_edge_lock", None) else None),
-                hints.cycle("F", ["edge", "face"], "face" if mode == "SURFACE" else "edge")]
+                (hints.cycle("F", ["tangent", "square", "mirror", "edge"], {"SURFACE": "tangent", "NORMAL": "square",
+                                                                           "SYMMETRY": "mirror"}.get(mode, "edge"),
+                             "surface") if getattr(self, "ref_modes", 2) == 3 else
+                 hints.cycle("F", ["edge", "face"], "face" if mode == "SURFACE" else "edge"))]
 
     def hints_key(self, context, event):
         """? / F1: collapse or expand the key panel. True when handled."""
@@ -1420,7 +1395,7 @@ class SketchMixin:
         mode = self.ref_mode()
         out, seen = [], set()
         for s3, meta, W in self._snaps.through(P, src):
-            if mode == "SURFACE" and "edge" in meta:
+            if mode in ("SURFACE", "NORMAL", "SYMMETRY") and "edge" in meta:
                 faces = snapping.edge_faces(meta["obj"], meta["edge"])
                 for k, key, outline in faces:
                     if key not in seen:
@@ -1508,10 +1483,20 @@ class SketchMixin:
 
 CONT_ITEMS = [("G0", "G0", "Position: the end only sits on what it was snapped to"),
               ("G1", "G1", "Tangent: the end leaves tangent to the curve or surface edge it was snapped to"),
-              ("G2", "G2", "Curvature: tangent, and the curvature matches as well")]
+              ("G2", "G2", "Curvature: tangent, and the curvature matches as well"),
+              ("G3", "G3", "Curvature rate: the curvature also changes at the rate of what it was snapped to "
+                           "(degree 4 or more)")]
 EDGE_MODES = [("SURFACE", "Tangent to Surface", "On a surface edge the curve stays tangent to the surface "
                                                 "(G2: matches its normal curvature); curves are continued"),
               ("EDGE", "Continue Edge", "On a surface edge the curve continues the edge itself, like on a curve")]
+# CV Curve's: also square to the surface (on an edge, or on a face with face snapping, O)
+CURVE_EDGE_MODES = EDGE_MODES + [
+    ("NORMAL", "Perpendicular to Surface", "On a surface edge or face the curve leaves square to the surface, "
+                                           "along its normal, and starts out straight (G2 / G3: no curvature across "
+                                           "it); curves are continued"),
+    ("SYMMETRY", "Symmetry Plane", "On a surface edge or face the curve leaves square to it and joins its mirror "
+                                   "image smoothly: G2 keeps its bend there, G3 also its rate; curves are continued")]
+CURVE_MODE_NEXT = {"SURFACE": "NORMAL", "NORMAL": "SYMMETRY", "SYMMETRY": "EDGE", "EDGE": "SURFACE"}
 LAST_INFO = {"text": ""}
 START_MODES = [("FREE", "Free", "The line leaves its start in any direction"),
                ("TANGENT", "Tangent", "A line started on an edge or curve leaves tangent to it, and slides along it "
@@ -1526,10 +1511,12 @@ SLIDE_LABEL = {("tan", "tan"): "Tangent to both", ("perp", "perp"): "Perpendicul
 class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
     """Draw a NURBS curve by clicking: CVs, or points the curve passes through.
     The result is one clean uniform spline (no kinks when you move CVs later).
-    An end snapped onto a curve or surface edge can be G0 / G1 / G2 to it"""
+    An end snapped onto a curve, sketch or surface edge (or a surface face, O) can be
+    G0 / G1 / G2 / G3 to it: continuing it, tangent to the surface or perpendicular to it"""
     bl_idname = "nproto.draw_curve"
     bl_label = "CV Curve"
     bl_options = {'REGISTER', 'UNDO'}
+    ref_modes = 3               # F: tangent to the surface / square to it / continue the edge
 
     def guide_points(self):
         return list(getattr(self, "_pts", []))
@@ -1542,12 +1529,15 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
     degree: EnumProperty(name="Degree", items=DEGREE_ITEMS, default="3")
     closed: BoolProperty(name="Closed", default=False, description="Close the curve (smooth, periodic)")
     start_cont: EnumProperty(name="Start", items=CONT_ITEMS, default="G1",
-                             description="Continuity of the start with the curve or surface edge it was snapped "
-                                         "to (G1 / G2 add an Align history step, so the end stays there)")
+                             description="Continuity of the start with the curve or surface edge it was snapped to")
     end_cont: EnumProperty(name="End", items=CONT_ITEMS, default="G1",
-                           description="Continuity of the end with the curve or surface edge it was snapped to "
-                                       "(G1 / G2 add an Align history step, so the end stays there)")
-    edge_mode: EnumProperty(name="On Surface Edges", items=EDGE_MODES, default="SURFACE")
+                           description="Continuity of the end with the curve or surface edge it was snapped to")
+    keep_aligned: BoolProperty(name="Keep Aligned", default=False,
+                               description="Add an Align history step for G1 / G2 ends, so they stay on their "
+                                           "curve or edge when it moves and while you edit the CVs. Off: the ends "
+                                           "are aligned once, and the curve is a plain curve (Align Curve can "
+                                           "add the step later)")
+    edge_mode: EnumProperty(name="On Surfaces", items=CURVE_EDGE_MODES, default="SURFACE")
     data: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
 
     def draw(self, context):
@@ -1560,6 +1550,7 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
         col.active = not self.closed
         col.row().prop(self, "start_cont", expand=True)
         col.row().prop(self, "end_cont", expand=True)
+        col.prop(self, "keep_aligned")
         col.prop(self, "edge_mode")
         if LAST_INFO["text"]:
             for line in LAST_INFO["text"].split("\n"):
@@ -1583,13 +1574,14 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
 
     def _status(self, context):
         n = len(self._pts)
-        conts = ["G0", "G1", "G2"]
+        conts = ["G0", "G1", "G2", "G3"]
         rows = [("Place", [hints.key("Backspace", "undo"), hints.toggle("C", "close", self.closed),
                            hints.key("Enter", "done")]),
                 ("Direction", self.direction_hints())]
         if not self.closed:
             rows.append(("Ends", [hints.cycle("S", conts, self.start_cont, "start"),
-                                  hints.cycle("E", conts, self.end_cont, "end")]))
+                                  hints.cycle("E", conts, self.end_cont, "end"),
+                                  hints.toggle("A", "keep aligned", self.keep_aligned)]))
         rows += [("Snap", self.snap_hints()), ("Reference", self.reference_hints(self.edge_mode)),
                  ("Curve", [hints.cycle("M", ["CVs", "through points"],
                                         "CVs" if self.mode == "CV" else "through points"),
@@ -1607,8 +1599,8 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
         obj = bpy.data.objects.get(name)
         if obj is None:
             return None
-        mode = self.edge_mode if store.is_nurbs(obj) else "EDGE"
-        face = face if mode == "SURFACE" else None
+        mode = align.solve_mode(self.edge_mode, obj, ref)
+        face = face if mode in ("SURFACE", "NORMAL", "SYMMETRY") else None
         frames = getattr(self, "_frames", None)
         if frames is None:
             frames = self._frames = {}
@@ -1737,7 +1729,7 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
             self._preview(context, hover())
             self._status(context)
         elif event.value == 'PRESS' and event.type == 'F':
-            self.edge_mode = "EDGE" if self.edge_mode == "SURFACE" else "SURFACE"
+            self.edge_mode = CURVE_MODE_NEXT.get(self.edge_mode, "SURFACE")
             if self._pts and self._snapinfo[0] and self._snapinfo[0][2] is not None:
                 sn = self._snapinfo[0]
                 self._refs = None
@@ -1749,8 +1741,11 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
             self._status(context)
         elif event.value == 'PRESS' and event.type in {'S', 'E'}:
             prop = "start_cont" if event.type == 'S' else "end_cont"
-            setattr(self, prop, {"G0": "G1", "G1": "G2", "G2": "G0"}[getattr(self, prop)])
+            setattr(self, prop, {"G0": "G1", "G1": "G2", "G2": "G3", "G3": "G0"}[getattr(self, prop)])
             self._preview(context, hover())
+            self._status(context)
+        elif event.value == 'PRESS' and event.type == 'A' and not self.closed:
+            self.keep_aligned = not self.keep_aligned
             self._status(context)
         elif event.value == 'PRESS' and event.type == 'M':
             self.mode = "THROUGH" if self.mode == "CV" else "CV"
@@ -1826,10 +1821,13 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
                 src = d["start"] if e == "0" else d["end"]
                 lines.append(f"{'Start' if e == '0' else 'End'}: {specs[e]['cont']} to {src[0]} {src[1]}"
                              + ("" if specs[e]["mode"] == "EDGE" else
-                                " (tangent to the surface" + (f", its face {specs[e]['face'] + 1})"
-                                                              if "face" in specs[e] else ")")))
+                                {"SURFACE": " (tangent to the surface", "NORMAL": " (perpendicular to the surface",
+                                 "SYMMETRY": " (symmetry plane"}.get(specs[e]["mode"], " (") + (f", its face {specs[e]['face'] + 1})"
+                                                                      if "face" in specs[e] else ")")))
         if any(align.CONT[s_["cont"]] >= 1 for s_ in specs.values()):
-            if edit is not None:
+            if not self.keep_aligned:
+                lines.append("Ends aligned once (Keep Aligned adds an Align history step)")
+            elif edit is not None:
                 lines.append("No history in Edit Mode: the ends are aligned once")
             elif not features.history_enabled(context):
                 lines.append("Construction History is off: the ends are aligned once")
@@ -2061,6 +2059,16 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
         if obj is None:
             return
         mode = self.line_mode if store.is_nurbs(obj) else "EDGE"
+        if align.is_face_ref(ref):
+            # started on a face (O): Perpendicular along its normal, Tangent in its tangent plane
+            try:
+                n = np.asarray(align.surface_jet(obj, ref, self._start)[1], float)
+            except Exception as exc:
+                print("Line: no normal at", name, ref, exc)
+                return
+            self._lock, self._tvec, self._tkind = ("T", n, "square") if self.start_mode == "PERP" else \
+                ("-T", n, "tangent")
+            return
         try:
             P, D, DD, surf = align.end_frame(obj, ref, self._start, snap, mode, face=face or 0)
         except Exception as exc:
@@ -2500,7 +2508,7 @@ class NPROTO_OT_draw_plane(SketchMixin, bpy.types.Operator):
     it square, Ctrl snaps to the grid. Degree and spans per direction in the
     Adjust Last Operation panel, later in the Feature panel"""
     bl_idname = "nproto.draw_plane"
-    bl_label = "Draw Plane"
+    bl_label = "Plane"
     bl_options = {'REGISTER', 'UNDO'}
 
     size_x: FloatProperty(name="Size X", default=2.0, min=1e-6, unit='LENGTH')
@@ -2695,7 +2703,7 @@ class NPROTO_OT_draw_plane(SketchMixin, bpy.types.Operator):
         except ValueError:
             d = {}
         if not d.get("anchor"):
-            self.report({'WARNING'}, "Draw Plane is interactive: start it from the panel or menu")
+            self.report({'WARNING'}, "Plane is interactive: start it from the panel or menu")
             return {'CANCELLED'}
         A, u, v = (np.array(d[k], float) for k in ("anchor", "u", "v"))
         X, Y = float(self.size_x), float(self.size_y)

@@ -132,18 +132,60 @@ for hist in (True, False):
     check(f"[{tag}] hole offset bigger", r == {'FINISHED'} and solid(X) and abs(vol(X) - want) < 1e-4,
           f"vol {vol(X):.5f} want {want:.5f}")
 
-# --- a cone's side leans against its caps: made, with a warning (a small step at the caps)
-hist_on(False)
-clear()
-bpy.ops.curve.primitive_nurbs_circle_add(radius=1.0, location=(0, 0, 0))
-a = ctx.active_object
-bpy.ops.curve.primitive_nurbs_circle_add(radius=0.5, location=(0, 0, 2))
-b = ctx.active_object
-bpy.ops.nproto.loft(inputs=ins((a, "S0"), (b, "S0")), body="NEW")
-Fr = ctx.active_object
-v0 = vol(Fr)
-r = run(bpy.ops.nproto.push_pull, faces=faces((Fr, (0.75, 0, 1))), distance=0.1)
-check("frustum side offset (leaning caps)", r == {'FINISHED'} and solid(Fr) and vol(Fr) > v0, f"{vol(Fr):.5f} > {v0:.5f}")
+# --- leaning neighbours: extended on their own surfaces (exact, no step)
+def frustum(R1, R2, h):
+    return math.pi * h / 3 * (R1 * R1 + R1 * R2 + R2 * R2)
+
+def drafted(H, sgn, ang=10.0, w0=4.0, h0=3.0):
+    """Volume of a w0 x h0 rectangle extruded H with draft ang (sgn +1 wider going up)."""
+    t = sgn * math.tan(math.radians(ang))
+    a, b = w0 + 2 * H * t, h0 + 2 * H * t      # top sides; the area is quadratic in z: Simpson is exact
+    m = (w0 + H * t) * (h0 + H * t)
+    return H / 6 * (w0 * h0 + 4 * m + a * b)
+
+for hist in (True, False):
+    hist_on(hist)
+    tag = "history" if hist else "no history"
+    clear()
+    R = poly("R", [(-2, -1.5, 0), (2, -1.5, 0), (2, 1.5, 0), (-2, 1.5, 0)])
+    bpy.ops.nproto.extrude(inputs=ins((R, "S0")), distance=2.0, direction="Z", draft=10.0, body="NEW")
+    D = ctx.active_object
+    t0 = time.perf_counter()
+    r = run(bpy.ops.nproto.push_pull, faces=faces((D, (0, 0, 2))), distance=1.0)
+    dt = time.perf_counter() - t0
+    check(f"[{tag}] drafted box: top pulled, the draft carries on", r == {'FINISHED'} and solid(D)
+          and abs(vol(D) - drafted(3, 1)) < 1e-6 and store.get_brep(D).face_count() == 6,
+          f"vol {vol(D):.6f} want {drafted(3, 1):.6f} faces {store.get_brep(D).face_count()} {dt * 1000:.0f} ms")
+    r = run(bpy.ops.nproto.push_pull, faces=faces((D, (0, 0, 3))), distance=-1.5)
+    check(f"[{tag}] drafted box: top pushed", r == {'FINISHED'} and abs(vol(D) - drafted(1.5, 1)) < 1e-6,
+          f"vol {vol(D):.6f} want {drafted(1.5, 1):.6f}")
+    if hist:
+        features.rebuild(D, ctx)
+        check("[history] the exact steps replay", abs(vol(D) - drafted(1.5, 1)) < 1e-6, f"vol {vol(D):.6f}")
+    clear()
+    bpy.ops.curve.primitive_nurbs_circle_add(radius=1.0, location=(0, 0, 0))
+    a = ctx.active_object
+    bpy.ops.curve.primitive_nurbs_circle_add(radius=0.5, location=(0, 0, 2))
+    b = ctx.active_object
+    bpy.ops.nproto.loft(inputs=ins((a, "S0"), (b, "S0")), body="NEW")
+    Fr = ctx.active_object
+    v0 = vol(Fr)
+    ex = frustum(1, 0.5, 2) / v0                  # the loft's circles are exact: ex ~ 1
+    r = run(bpy.ops.nproto.push_pull, faces=faces((Fr, (0.1, 0.1, 2))), distance=1.0)
+    want = frustum(1, 0.25, 3) / ex
+    check(f"[{tag}] frustum: top pulled, the cone carries on", r == {'FINISHED'} and solid(Fr)
+          and abs(vol(Fr) - want) < 1e-5 and store.get_brep(Fr).face_count() == 3,
+          f"vol {vol(Fr):.6f} want {want:.6f} faces {store.get_brep(Fr).face_count()}")
+    clear()
+    a = bpy.ops.curve.primitive_nurbs_circle_add(radius=1.0, location=(0, 0, 0)) and ctx.active_object
+    b = bpy.ops.curve.primitive_nurbs_circle_add(radius=0.5, location=(0, 0, 2)) and ctx.active_object
+    bpy.ops.nproto.loft(inputs=ins((a, "S0"), (b, "S0")), body="NEW")
+    Fr = ctx.active_object
+    k = math.sqrt(1 + 0.25 ** 2)                  # the side's slope 1/4: its radius grows by d k
+    r = run(bpy.ops.nproto.push_pull, faces=faces((Fr, (0.75, 0, 1))), distance=0.1)
+    want = frustum(1 + 0.1 * k, 0.5 + 0.1 * k, 2) / ex
+    check(f"[{tag}] frustum: side offset, the caps follow", r == {'FINISHED'} and solid(Fr)
+          and abs(vol(Fr) - want) < 1e-5, f"vol {vol(Fr):.6f} want {want:.6f}")
 
 # --- history: the step follows the body's rebuild (a taller box: its top found by its normal)
 hist_on(True)

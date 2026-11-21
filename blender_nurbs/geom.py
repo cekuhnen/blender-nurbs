@@ -902,8 +902,10 @@ class EdgeSample:
         return self._pass_ddd(out, c)
 
 
-def sample_surface_edge(surface, which, matrix, n):
+def sample_surface_edge(surface, which, matrix, n, share=None):
+    """EdgeSample along an iso edge; share: only lo..hi of it (shares of its domain)."""
     (u0, u1), (v0, v1) = surface.u_domain(), surface.v_domain()
+    s_lo, s_hi = share if share is not None else (0.0, 1.0)
     M = np.array(matrix)
     R = M[:3, :3]
     T = M[:3, 3]
@@ -912,7 +914,7 @@ def sample_surface_edge(surface, which, matrix, n):
     span = (u1 - u0) if along_v else (v1 - v0)
     h = 1e-4 * span
     for i in range(n):
-        s = i / (n - 1)
+        s = s_lo + (s_hi - s_lo) * i / (n - 1)
         if along_v:
             u = u0 if which == "U0" else u1
             v = v0 + (v1 - v0) * s
@@ -1492,54 +1494,120 @@ def curve_derivs(kcurve, t, nd=3):
     return C
 
 
-def blend_curve_cvs(frame_a, frame_b, cont_a="G1", cont_b="G1", w_a=1.0, w_b=1.0, c_a=0.0, c_b=0.0):
-    """CVs of a single Bezier-span blend from end A to end B.
+def blend_side_cvs(P, D, DD, D3, k, n, L, w=1.0, c=0.0, d=0.0):
+    """The CVs one blend side fixes, P0 .. Pk (k = 0 for G0 .. 3 for G3).
 
     Same construction as the G1/G2/G3 blend loft: P1 = P0 + w*L/n * T (G1),
     P2 = 2 P1 - P0 + (lam^2 C'' + c*L*T) / (n(n-1)) (G2) with lam = w*L/|C'|,
-    P3 = 3 P2 - 3 P1 + P0 + (lam^3 C''' + 3 lam (c L / |C'|) C'') / (n(n-1)(n-2))
-    (G3: the curve reparameterised, f' = lam, f'' = c L / |C'|, f''' = 0),
-    where L = distance between the ends and n = degree = 1 + kA + kB. A
-    frame is (P, C', C'') or, for G3, (P, C', C'', C''')."""
-    PA, DA, DDA = frame_a[:3]
-    PB, DB, DDB = frame_b[:3]
+    P3 = 3 P2 - 3 P1 + P0 + (lam^3 C''' + 3 lam mu C'' + d*L*T) / (n(n-1)(n-2))
+    (G3), mu = c L / |C'|: the input curve reparameterised with f' = lam,
+    f'' = mu, f''' = d L / |C'|. Every w > 0, c, d gives exact Gk and nothing
+    else does: these three numbers are all a side's CVs can change."""
+    P, D, DD = (np.asarray(v, float) for v in (P, D, DD))
+    rows = [P]
+    if k == 0:
+        return rows
+    dn = float(np.linalg.norm(D)) or 1.0
+    T = D / dn
+    P1 = P + (w * L / n) * T
+    rows.append(P1)
+    lam = w * L / dn
+    if k >= 2:
+        P2 = 2 * P1 - P + (lam * lam * DD + c * L * T) / (n * (n - 1))
+        rows.append(P2)
+    if k >= 3:
+        if D3 is None:
+            raise ValueError("G3 needs the curve's third derivative")
+        S3 = lam ** 3 * np.asarray(D3, float) + 3.0 * lam * (c * L / dn) * DD + d * L * T
+        rows.append(3 * P2 - 3 * P1 + P + S3 / (n * (n - 1) * (n - 2)))
+    return rows
+
+
+def blend_curve_cvs(frame_a, frame_b, cont_a="G1", cont_b="G1", w_a=1.0, w_b=1.0, c_a=0.0, c_b=0.0,
+                    d_a=0.0, d_b=0.0):
+    """CVs of a single Bezier-span blend from end A to end B: side A's CVs,
+    then side B's reversed (blend_side_cvs), n = degree = 1 + kA + kB, L =
+    distance between the ends. A frame is (P, C', C'') or, for G3,
+    (P, C', C'', C''')."""
     ka, kb = CONT_ORDER[cont_a], CONT_ORDER[cont_b]
     n = 1 + ka + kb
-    L = float(np.linalg.norm(PB - PA)) or 1.0
-
-    def side(P, D, DD, D3, k, w, c):
-        rows = [P]
-        if k == 0:
-            return rows
-        dn = float(np.linalg.norm(D)) or 1.0
-        T = D / dn
-        P1 = P + (w * L / n) * T
-        rows.append(P1)
-        lam = w * L / dn
-        if k >= 2:
-            P2 = 2 * P1 - P + (lam * lam * DD + c * L * T) / (n * (n - 1))
-            rows.append(P2)
-        if k >= 3:
-            if D3 is None:
-                raise ValueError("G3 needs the curve's third derivative")
-            S3 = lam ** 3 * D3 + 3.0 * lam * (c * L / dn) * DD
-            rows.append(3 * P2 - 3 * P1 + P + S3 / (n * (n - 1) * (n - 2)))
-        return rows
-
-    a = side(PA, DA, DDA, frame_a[3] if len(frame_a) > 3 else None, ka, w_a, c_a)
-    b = side(PB, DB, DDB, frame_b[3] if len(frame_b) > 3 else None, kb, w_b, c_b)
+    L = float(np.linalg.norm(np.asarray(frame_b[0], float) - np.asarray(frame_a[0], float))) or 1.0
+    a = side_cvs(frame_a, ka, n, L, w_a, c_a, d_a)
+    b = side_cvs(frame_b, kb, n, L, w_b, c_b, d_b)
     return n, [tuple(map(float, p)) for p in a + b[::-1]]
+
+
+class SymFrame(tuple):
+    '''A blend side on a symmetry plane: (P, the normal, 0[, 0]) and sym_u,
+    the direction in the plane the blend bends toward (Curvature).'''
+    sym_u = None
+
+
+def sym_frame(P, D, u, third=False):
+    z = np.zeros(3)
+    f = SymFrame((np.asarray(P, float), np.asarray(D, float), z, z) if third else
+                 (np.asarray(P, float), np.asarray(D, float), z))
+    f.sym_u = np.asarray(u, float)
+    return f
+
+
+def flip_frame(f):
+    '''The frame turned round (odd derivatives change sign); a symmetry side stays one.'''
+    out = (f[0], -np.asarray(f[1], float), f[2]) + tuple(-np.asarray(x, float) for x in f[3:])
+    if getattr(f, "sym_u", None) is not None:
+        g = SymFrame(out)
+        g.sym_u = f.sym_u
+        return g
+    return out
+
+
+def blend_sym_side_cvs(P, D, u, k, n, L, w=1.0, c=0.0, d=0.0):
+    '''A blend side on a symmetry plane, P0 .. Pk: P1 = P0 + w L/n T (T the
+    normal), P2 at twice P1's height (n.C2 = 0: the blend and its mirror
+    image join C2) moved by c L/(n(n-1)) along u in the plane (the bend at
+    the plane), P3 = 3 P2 - 3 P1 + P0 + d L/(n(n-1)(n-2)) T (C3 along the
+    normal only: C3 with the mirror image).'''
+    P, D, u = (np.asarray(v, float) for v in (P, D, u))
+    rows = [P]
+    if k == 0:
+        return rows
+    T = D / (float(np.linalg.norm(D)) or 1.0)
+    P1 = P + (w * L / n) * T
+    rows.append(P1)
+    if k >= 2:
+        P2 = 2 * P1 - P + (c * L / (n * (n - 1))) * u
+        rows.append(P2)
+    if k >= 3:
+        rows.append(3 * P2 - 3 * P1 + P + (d * L / (n * (n - 1) * (n - 2))) * T)
+    return rows
+
+
+def side_cvs(frame, k, n, L, w=1.0, c=0.0, d=0.0):
+    '''One blend side's CVs from its frame (blend_side_cvs, or a symmetry plane's).'''
+    if getattr(frame, "sym_u", None) is not None:
+        return blend_sym_side_cvs(frame[0], frame[1], frame.sym_u, k, n, L, w, c, d)
+    return blend_side_cvs(*frame[:3], frame[3] if len(frame) > 3 else None, k, n, L, w, c, d)
 
 
 def write_curve_object(obj, degree, points_world):
     """Replace a Blender curve object's splines with one endpoint NURBS spline
-    (a single Bezier span: order = degree + 1, clamped)."""
+    (a single Bezier span: order = degree + 1, clamped). A spline of that
+    shape already there only gets its CVs moved: in Edit Mode (a blend curve's
+    CVs being edited, blendedit.py) it keeps its point selection."""
     cu = obj.data
     cu.dimensions = '3D'
+    Mi = world_matrix(obj).inverted()
+    if len(cu.splines) == 1:
+        sp = cu.splines[0]
+        if sp.type == 'NURBS' and len(sp.points) == len(points_world) and sp.order_u == degree + 1 \
+                and sp.use_endpoint_u and not sp.use_bezier_u and not sp.use_cyclic_u:
+            co = np.array([(*(Mi @ Vector(w)), 1.0) for w in points_world], float).ravel()
+            sp.points.foreach_set("co", co)
+            cu.update_tag()
+            return
     cu.splines.clear()
     sp = cu.splines.new('NURBS')
     sp.points.add(len(points_world) - 1)
-    Mi = world_matrix(obj).inverted()
     for p, w in zip(sp.points, points_world):
         p.co = (*(Mi @ Vector(w)), 1.0)
     sp.order_u = degree + 1

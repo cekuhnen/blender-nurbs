@@ -50,7 +50,14 @@ def is_surface_edge(ref):
 
 
 def input_curve(obj, ref):
-    """Kernel curve in world space for a curve spline or a surface edge."""
+    """Kernel curve in world space for a curve spline or a surface edge (only
+    the stretch a loft's slid end covers, while EDGE_RANGES names it)."""
+    c = _input_curve_full(obj, ref)
+    rng = edge_range(obj, ref)
+    return c if rng is None else _sub_curve(c, *rng)
+
+
+def _input_curve_full(obj, ref):
     sm, ext = _k()
     if is_brep_edge_ref(ref) or is_edge_ref(ref):
         # EXACT edge curves (an interpolation through sample points would make
@@ -191,15 +198,22 @@ def exact_side(obj, ref):
     sm, ext = _k()
     M = np.array(geom.world_matrix(obj), dtype=float)
     R, T = M[:3, :3], M[:3, 3]
+    rng = edge_range(obj, ref)
     if is_edge_ref(ref):
         if not store.is_natural(obj):
             return None
-        return _iso_side(ext, store.get_surfaces(obj)[0], ref, R, T)
+        surf = store.get_surfaces(obj)[0]
+        side = _iso_side(ext, surf, ref, R, T)
+        if side is None or rng is None:
+            return side
+        return geom.sub_side(side, *_domain_share(surf, ref, rng))
     if is_brep_edge_ref(ref):
         hit = brep_edge_iso(obj, ref)
         if hit is None:
             return None
         surf, iso, lo, hi = hit
+        if rng is not None:
+            lo, hi = _iso_stretch(obj, ref, surf, iso, rng)
         side = _iso_side(ext, surf, iso, R, T)
         if side is None or (lo == 0.0 and hi == 1.0):
             return side
@@ -216,6 +230,238 @@ def exact_side(obj, ref):
 def _same_layout(sa, sb):
     return (sa["deg"] == sb["deg"] and len(sa["knots"]) == len(sb["knots"])
             and np.allclose(sa["knots"], sb["knots"], atol=1e-9))
+
+
+# --------------------------------------------------------------------------
+# Slid ends: a two-sided loft over a stretch of each side
+# --------------------------------------------------------------------------
+
+# {(object name, ref): (t0, t1)} while a loft with slid ends builds or is
+# measured: the stretch of that input it spans, in the parameter of the
+# input's own exact curve (a surface edge: its surface's parameter along it;
+# a B-rep edge: the edge's). input_curve, exact_side, input_samples and
+# square.sample_side all cut the input to it, so every path of the loft (the
+# exact rows, the sampled G1 / G2 fits, Align Edges / Surface) and the
+# continuity check see the same shorter edge.
+EDGE_RANGES = {}
+SLIDE_KEYS = ("a_from", "a_to", "b_from", "b_to")
+SLIDE_MIN = 0.01          # a slid side spans at least this share of its length
+
+
+def edge_range(obj, ref):
+    if not EDGE_RANGES:
+        return None
+    return EDGE_RANGES.get((getattr(obj, "name", None), ref))
+
+
+def _sub_curve(c, t0, t1):
+    """The kernel curve c cut exactly to t0..t1 of its parameter (0..1 after)."""
+    sm, ext = _k()
+    d = ext.curve_cvs(c)
+    U = [float(k) for k in d["knots"]]
+    P = np.array(d["points"], float)
+    w = np.array(d["weights"], float) if d.get("weights") else None
+    a, b = U[0], U[-1]
+    f = lambda t: min(max((t - a) / (b - a), 0.0), 1.0)
+    # rational: homogeneous points, the weight carried as the first column of a second row
+    side = {"deg": int(d["degree"]), "knots": [f(k) for k in U],
+            "P": P if w is None else P * w[:, None],
+            "D": None if w is None else np.c_[w, np.zeros_like(w), np.zeros_like(w)]}
+    cut = geom.sub_side(side, f(t0), f(t1))
+    Q = cut["P"]
+    W = None
+    if w is not None:
+        W = cut["D"][:, 0]
+        Q = Q / W[:, None]
+        W = None if np.allclose(W, 1.0, atol=1e-12) else [float(x) for x in W]
+    return ext.curve_from_cvs(int(cut["deg"]), [tuple(map(float, q)) for q in Q],
+                              [float(k) for k in cut["knots"]], W)
+
+
+def _domain_share(surf, ref, rng):
+    """t0..t1 of a natural edge's surface parameter as shares of its domain."""
+    a, b = surf.v_domain() if ref in ("U0", "U1") else surf.u_domain()
+    t0, t1 = sorted(((rng[0] - a) / (b - a), (rng[1] - a) / (b - a)))
+    return max(t0, 0.0), min(t1, 1.0)
+
+
+def _iso_stretch(obj, ref, surf, iso, rng):
+    """lo..hi (0..1 along the surface's side `iso`) of B-rep edge ref's stretch rng."""
+    sm, _ = _k()
+    e = store.get_brep(obj).edges()[int(ref[1:])]
+    (u0, u1), (v0, v1) = surf.u_domain(), surf.v_domain()
+    out = []
+    for t in rng:
+        w = sm.surface_closest_point(surf, tuple(map(float, e.point_at(t))))[1][0]
+        out.append((float(w.y) - v0) / (v1 - v0) if iso in ("U0", "U1") else (float(w.x) - u0) / (u1 - u0))
+    lo, hi = sorted(out)
+    return max(lo, 0.0), min(hi, 1.0)
+
+
+def side_slides(p):
+    """((from, to) of side A, of side B): the share of each side's length the loft spans."""
+    out = []
+    for s in "ab":
+        lo = min(max(float(p.get(f"{s}_from", 0.0)), 0.0), 1.0)
+        hi = min(max(float(p.get(f"{s}_to", 1.0)), 0.0), 1.0)
+        out.append(tuple(sorted((lo, hi))))
+    return out
+
+
+def has_slides(inputs, p):
+    """Does this loft span only a stretch of a side? (Two sides, no rails, open.)"""
+    if p.get("closed") or loft_rail_count(inputs, p) or len(loft_sides(inputs, p)) != 2:
+        return False
+    return any(lo > 1e-6 or hi < 1.0 - 1e-6 for lo, hi in side_slides(p))
+
+
+def _arc_table(c, n=512):
+    """(parameters, arc length to each) along a kernel curve: chord sums at
+    two spacings, Richardson-extrapolated (fourth order: 1e-9 of the length)."""
+    t0, t1 = c.parameter_range()
+    tt = np.linspace(t0, t1, 2 * n + 1)
+    P = np.array([c.evaluate(float(t)) for t in tt], float)
+    fine = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))])[::2]
+    coarse = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(P[::2], axis=0), axis=1))])
+    return tt[::2], (4.0 * fine - coarse) / 3.0
+
+
+def _arc_param(c, tt, s, target, k=64):
+    """The parameter at arc length `target` along c (its _arc_table tt, s): the
+    table's step around it resampled k times, so the point is exact to ~1e-10
+    of the length (linear in the table alone it was off by 1e-6)."""
+    if target <= s[0]:
+        return float(tt[0])
+    if target >= s[-1]:
+        return float(tt[-1])
+    i = int(min(max(np.searchsorted(s, target) - 1, 0), len(s) - 2))
+    ts = np.linspace(tt[i], tt[i + 1], 2 * k + 1)
+    P = np.array([c.evaluate(float(t)) for t in ts], float)
+    fine = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))])[::2]
+    coarse = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(P[::2], axis=0), axis=1))])
+    loc = (4.0 * fine - coarse) / 3.0
+    loc = s[i] + loc * ((s[i + 1] - s[i]) / (loc[-1] or 1.0))     # agree with the table at the step's ends
+    return float(np.interp(target, loc, ts[::2]))
+
+
+def _slide_side(side, lo, hi, name):
+    """[(obj, ref)] of the pieces of a side that the stretch lo..hi of its
+    length (along the side as chained) covers, and {(name, ref): (t0, t1)}
+    of the pieces it cuts."""
+    chain = chain_side(side)
+    curves = [input_curve(o, r) for o, r, _ in chain]
+    tabs = [_arc_table(c) for c in curves]
+    total = sum(s[-1] for _, s in tabs) or 1.0
+    a, b = lo * total, hi * total
+    eps = 1e-9 * total
+    pieces, rng, acc = [], {}, 0.0
+    for (o, r, rev), c, (tt, s) in zip(chain, curves, tabs):
+        L = float(s[-1])
+        f0, f1 = max(a - acc, 0.0), min(b - acc, L)       # along the side, within this piece
+        acc += L
+        if f1 - f0 <= eps:
+            continue
+        if rev:
+            f0, f1 = L - f1, L - f0
+        pieces.append((o, r))
+        if f0 > eps or f1 < L - eps:
+            rng[(o.name, r)] = (_arc_param(c, tt, s, f0), _arc_param(c, tt, s, f1))
+    if not pieces:
+        raise ValueError(f"side {name} spans nothing: its From and To must differ")
+    return pieces, rng
+
+
+def _b_runs_back(sides, p):
+    """Does side B run the other way from A (so its From / To count from its far end)?"""
+    if not p.get("auto_align", True):
+        return False
+    pa = geom.sample_curve(side_curve(sides[0]), 16)
+    pb = geom.sample_curve(side_curve(sides[1]), 16)
+    return bool(geom.should_flip(pa, pb))
+
+
+def can_slide(inputs, p):
+    """Can this loft's ends slide (two sides, no rails, open)?"""
+    return not p.get("closed") and not loft_rail_count(inputs, p) and len(loft_sides(inputs, p)) == 2
+
+
+def slide_tracks(inputs, p, n=401):
+    """[(points, runs_back)] of side A and B, whole (not slid): n points evenly
+    spaced along the side's length (world), and whether its From / To count
+    from the far end of them (side B running against A)."""
+    saved = dict(EDGE_RANGES)
+    EDGE_RANGES.clear()
+    try:
+        sides = loft_sides(inputs, p)
+        back = _b_runs_back(sides, p)
+        out = []
+        for i, sd in enumerate(sides):
+            c = side_curve(sd)
+            tt, s = _arc_table(c)
+            ts = np.interp(np.linspace(0.0, s[-1], n), s, tt)
+            out.append((np.array([c.evaluate(float(t)) for t in ts], float), back and i == 1))
+        return out
+    finally:
+        EDGE_RANGES.clear()
+        EDGE_RANGES.update(saved)
+
+
+def slide_inputs(inputs, p):
+    """(inputs, p, ranges) of a two-sided loft whose ends slide along its
+    sides (From / To, shares of each side's length; B counted from the same
+    end as A): the inputs cut to the pieces the stretches cover, p's side
+    counts to match, and the stretches of the pieces cut (EDGE_RANGES).
+    The inputs as they are when nothing slides."""
+    if not has_slides(inputs, p):
+        return inputs, p, {}
+    saved = dict(EDGE_RANGES)
+    EDGE_RANGES.clear()
+    try:
+        sides = loft_sides(inputs, p)
+        (la, ha), (lb, hb) = side_slides(p)
+        for nm, lo, hi in (("A", la, ha), ("B", lb, hb)):
+            if hi - lo < SLIDE_MIN:
+                raise ValueError(f"side {nm}: From and To are too close (at least {SLIDE_MIN:g} of its length)")
+        if _b_runs_back(sides, p):
+            lb, hb = 1.0 - hb, 1.0 - lb
+        sa, ra = _slide_side(sides[0], la, ha, "A")
+        sb, rb = _slide_side(sides[1], lb, hb, "B")
+    finally:
+        EDGE_RANGES.clear()
+        EDGE_RANGES.update(saved)
+    if set(ra) & set(rb):
+        raise ValueError("a slid loft cannot take the same edge on both sides")
+    return sa + sb, dict(p, sides=[len(sa), len(sb)]), {**ra, **rb}
+
+
+class slid_ends:
+    """with slid_ends(inputs, p) as (inputs, p): the loft's inputs and params
+    cut to its slid stretches, EDGE_RANGES set while inside."""
+
+    def __init__(self, inputs, p):
+        self.ins, self.p, self.rng = slide_inputs(inputs, p)
+
+    def __enter__(self):
+        self.saved = dict(EDGE_RANGES)
+        EDGE_RANGES.update(self.rng)
+        return self.ins, self.p
+
+    def __exit__(self, *exc):
+        EDGE_RANGES.clear()
+        EDGE_RANGES.update(self.saved)
+        return False
+
+
+def slid_scope(obj):
+    """slid_ends of obj's loft history (nothing slid for anything else)."""
+    h = history(obj)
+    if h is None or h.get("op") != "loft":
+        return slid_ends([], {})
+    try:
+        return slid_ends(h["inputs"], h["params"])
+    except Exception as exc:
+        print("NURBS loft slid ends:", getattr(obj, "name", obj), exc)
+        return slid_ends([], {})
 
 
 # --------------------------------------------------------------------------
@@ -716,7 +962,9 @@ def side_edge_modes(p):
 def input_samples(obj, ref, n):
     if is_edge_ref(ref):
         surf = store.get_surfaces(obj)[0]
-        return geom.sample_surface_edge(surf, ref, geom.world_matrix(obj), n)
+        rng = edge_range(obj, ref)
+        share = None if rng is None else _domain_share(surf, ref, rng)
+        return geom.sample_surface_edge(surf, ref, geom.world_matrix(obj), n, share)
     if is_brep_edge_ref(ref):
         # trimmed / B-rep edge: exact points on the face, cross tangent and
         # cross curvature from the face (same sampling as Square)
@@ -1430,6 +1678,8 @@ def _extrude_side(obj, curve, p):
     d = extrude_direction(obj, curve, p)
     h = float(p.get("distance", 1.0))
     draft = float(p.get("draft", 0.0))
+    if p.get("start"):                       # Extrude Face: the walls start a hair behind the face
+        curve = geom.translate_curve(curve, tuple(d * float(p["start"])))
     if abs(draft) > 1e-9:
         # Multi-Draft: height h along d, the far edge moved outward by h tan(draft)
         return geom.draft_extrude(curve, d, h, draft, flip=bool(p.get("draft_flip")),
@@ -1439,6 +1689,103 @@ def _extrude_side(obj, curve, p):
         curve = geom.translate_curve(curve, tuple(-vec))
         vec = vec * 2.0
     return sm.create_extrude_surface(curve, tuple(vec))
+
+
+def is_face_ref(ref):
+    """A face of a NURBS object as an input: F<index> (Extrude Face)."""
+    return isinstance(ref, str) and len(ref) > 1 and ref[0] == "F" and ref[1:].isdigit()
+
+
+def face_at(obj, p, ref=None):
+    """The index of the face an Extrude Face means: the one at its point
+    (face_local, the object's local space), else the one its ref names."""
+    faces = store.get_brep(obj).faces()
+    q = p.get("face_local")
+    if q is not None:
+        return min(range(len(faces)), key=lambda k: faces[k].closest_point(tuple(map(float, q)))[1])
+    i = int(ref[1:]) if ref else 0
+    if not 0 <= i < len(faces):
+        raise RuntimeError(f"{obj.name} has no face {i}")
+    return i
+
+
+def face_direction(obj, i, p):
+    """Unit direction (world) an Extrude Face goes before the distance's sign:
+    Face Normal is the face's outward normal (a flat face's plane normal, a
+    curved face's averaged over it), the other Directions as Extrude's."""
+    if p.get("direction", "NORMAL") != "NORMAL":
+        return extrude_direction(obj, None, p)
+    return geom.tilt_direction(Vector(face_normal(obj, i)), float(p.get("tilt", 0.0)),
+                               float(p.get("tilt_azimuth", 0.0)))
+
+
+def face_normal(obj, i):
+    """World unit outward normal of face i: a flat face's, or a curved face's
+    averaged over its tessellation points (a bump's comes out straight up)."""
+    from .pushpull import face_frame, normals_at
+    _, _, n, flat = face_frame(obj, i)
+    if not flat:
+        from . import subsel
+        pts = subsel.face_tris(obj, i)[0]
+        if len(pts):
+            m = normals_at(obj, i, pts[::max(1, len(pts) // 200)]).mean(axis=0)
+            if np.linalg.norm(m) > 1e-6:
+                n = m / np.linalg.norm(m)
+    return np.asarray(n, float)
+
+
+def face_loop_inputs(obj, i):
+    """The edges round face i as inputs ((obj, ref), each once: seams and
+    zero-length pole edges left out) -- an untrimmed surface's sides U0 / U1 /
+    V0 / V1, else its B-rep edges E<k>."""
+    if store.is_natural(obj):
+        surf = store.get_surfaces(obj)[0]
+        out = []
+        for which in ("U0", "U1", "V0", "V1"):
+            P = geom.boundary_points(surf, which, 9, corners=True)
+            if np.linalg.norm(np.ptp(np.asarray(P, float), axis=0)) > 1e-9:
+                out.append((obj, which))
+        return out
+    b = store.get_brep(obj)
+    F = b.faces()[i]
+    uses = {}
+    for loop in F.boundary_loops():
+        for e, _ in loop:
+            uses[e] = uses.get(e, 0) + 1
+    edges = b.edges()
+    return [(obj, f"E{k}") for k, e in enumerate(edges) if uses.get(e) == 1 and e.length() > 1e-9]
+
+
+@builder("extrude_face")
+def build_extrude_face(inputs, p):
+    """A closed solid from a face swept along a direction (Fusion's Extrude
+    of a face): the face, its copy moved by Distance and walls from its loops.
+    Draft (a flat face only) leans the walls as Extrude's Multi-Draft, holes
+    the other way. reach: the solid starts that far behind the face, so a Join
+    or Cut with the face's own body never meets the face exactly."""
+    from . import jobs
+    obj, ref = inputs[0]
+    i = face_at(obj, p, ref)
+    from .pushpull import face_frame
+    _, pw, _, flat = face_frame(obj, i)
+    d = np.array(face_direction(obj, i, p), float)
+    h = float(p.get("distance", 1.0))
+    if abs(h) <= 0.0:
+        raise RuntimeError("the distance is 0")
+    reach = float(p.get("reach", 0.0))
+    sym = bool(p.get("symmetric"))
+    a, b = (-abs(h), abs(h)) if sym else (-reach if h > 0 else reach, h)
+    if abs(float(p.get("draft", 0.0))) > 1e-9:
+        if not flat:
+            raise RuntimeError("Draft needs a flat face: a curved face extrudes straight (Draft 0)")
+        q = dict(p, direction="VECTOR", dir_vec=[float(x) for x in d], tilt=0.0, tilt_azimuth=0.0)
+        q.pop("draft_centre", None)
+        if not sym:
+            q["start"], q["distance"] = a, b - a
+        return _solid(face_loop_inputs(obj, i), q, _extrude_side)
+    info, breps = jobs.run("extrude_face", {"target": obj}, ["result"], face_pt=[float(x) for x in pw],
+                           dir=[float(x) for x in d], start=a, distance=b, into="_world_")
+    return ("brep_text", breps["result"])
 
 
 def revolve_exact(curve, origin, axis, angle_deg, start_deg=0.0):
@@ -1681,8 +2028,9 @@ def check_cap_inputs(op, inputs, p):
 
 
 # Features whose wall becomes a solid with caps=True (Extrude and Revolve do it
-# in their builders: they group profiles into outlines and holes)
-CAP_OPS = {"sweep", "pipe", "loft"}
+# in their builders: they group profiles into outlines and holes; Pipe too: its
+# caps can be round)
+CAP_OPS = {"sweep", "loft"}
 
 
 @builder("offset")
@@ -1719,19 +2067,56 @@ def build_planar(inputs, p):
     return sm.create_planar_faces(curves)
 
 
-@builder("blend_curve")
-def build_blend_curve(inputs, p):
-    """Returns ('curve', degree, world CVs): written into a Blender curve object."""
-    (oa, ra), (ob, rb) = inputs[0], inputs[1]
-    fa = geom.curve_end_frame(input_curve(oa, ra), int(p.get("end_a", 1)), p.get("cont_a") == "G3")
-    fb = geom.curve_end_frame(input_curve(ob, rb), int(p.get("end_b", 0)), p.get("cont_b") == "G3")
-    flip = lambda f: (f[0], -f[1], f[2]) + tuple(-x for x in f[3:])      # odd derivatives turn round
+# a Blend Curve side's own settings besides G0-G3 / weight / curvature / rate / flip:
+#   bc_mode_<s>  EDGE (continue the curve / edge), SURFACE (tangent to the edge's
+#                surface, across the edge), NORMAL (perpendicular to the surface)
+#   bc_on_<s>    start at a point along the curve / edge (bc_at_<s>: 0..1 of its
+#                parameter) instead of its end (end_<s>)
+#   uv_<s>       a face input (F<i>): the point on it (fractions of its domain)
+#   face_<s>     an edge between two faces: which face SURFACE / NORMAL use
+BLEND_SIDE_KEYS = ("bc_mode_a", "bc_mode_b", "bc_on_a", "bc_on_b", "bc_at_a", "bc_at_b", "uv_a", "uv_b",
+                   "face_a", "face_b")
+
+
+def _blend_side(inputs, p, s):
+    """keyword arguments of align.side_frame for side s ('a' / 'b')."""
+    obj, ref = inputs[0 if s == "a" else 1]
+    on = bool(p.get(f"bc_on_{s}")) and not (ref.startswith("F") and ref[1:].isdigit())
+    return obj, ref, dict(end=int(p.get(f"end_{s}", 1 if s == "a" else 0)),
+                          at=float(p.get(f"bc_at_{s}", 0.5)) if on else None, uv=p.get(f"uv_{s}"),
+                          mode=p.get(f"bc_mode_{s}", "EDGE"), face=int(p.get(f"face_{s}", 0) or 0),
+                          third=p.get(f"cont_{s}") == "G3")
+
+
+def blend_frames(inputs, p):
+    """A Blend Curve's two end frames: (P, C', C''[, C''']) at each side,
+    turned round where Flip is on. A side is a curve or surface edge (its end,
+    outward, or a point along it), or a face point; on a surface it is the
+    edge continued, tangent to the surface or perpendicular to it
+    (align.side_frame). Directions that are not outward by themselves (a point
+    along a curve, the normal) lead toward the other side."""
+    from . import align
+    oa, ra, ka = _blend_side(inputs, p, "a")
+    ob, rb, kb = _blend_side(inputs, p, "b")
+    pa = align.side_point(oa, ra, ka["end"], ka["at"], ka["uv"])
+    pb = align.side_point(ob, rb, kb["end"], kb["at"], kb["uv"])
+    fa = align.side_frame(oa, ra, toward=pb, **ka)
+    fb = align.side_frame(ob, rb, toward=pa, **kb)
+    flip = geom.flip_frame                                               # odd derivatives turn round
     if p.get("flip_a"):
         fa = flip(fa)
     if p.get("flip_b"):
         fb = flip(fb)
+    return fa, fb
+
+
+@builder("blend_curve")
+def build_blend_curve(inputs, p):
+    """Returns ('curve', degree, world CVs): written into a Blender curve object."""
+    fa, fb = blend_frames(inputs, p)
     deg, pts = geom.blend_curve_cvs(fa, fb, p.get("cont_a", "G1"), p.get("cont_b", "G1"),
-                                    p.get("w_a", 1.0), p.get("w_b", 1.0), p.get("c_a", 0.0), p.get("c_b", 0.0))
+                                    p.get("w_a", 1.0), p.get("w_b", 1.0), p.get("c_a", 0.0), p.get("c_b", 0.0),
+                                    p.get("d_a", 0.0), p.get("d_b", 0.0))
     return ("curve", deg, pts)
 
 
@@ -1816,7 +2201,8 @@ def record(obj, op, inputs, params):
 
 HISTORY_COLL = "NURBS History"
 PROP_HOME = "nproto_home"      # JSON list: the collections an input was in before it was kept
-KEEP_OPS = ("join", "join_curves", "boolean", "thicken", "boundary_fill", "split_region", "iso_detach")   # results that keep their inputs
+KEEP_OPS = ("join", "join_curves", "boolean", "thicken", "boundary_fill", "split_region", "iso_detach",
+            "extrude_face")   # results that keep their inputs
 
 
 def history_collection(context, create=True):
@@ -2160,6 +2546,9 @@ def base_text(obj):
         elif h["op"] == "patch":
             from .patch import store_info
             store_info(obj)
+        elif h["op"] == "unroll":
+            from .unroll import store_info
+            store_info(obj)
         g = placed(obj, g)
         if isinstance(g, tuple) and g and g[0] == "brep_text":
             return g[1]
@@ -2257,6 +2646,13 @@ LAST_FLIP = [None]                # the last run()'s decision for an ORIENT_OPS 
 
 
 def run(op, inputs, params):
+    if op == "loft" and has_slides(inputs, params):
+        with slid_ends(inputs, params) as (ins, prm):
+            return _run(op, ins, prm)
+    return _run(op, inputs, params)
+
+
+def _run(op, inputs, params):
     if op not in BUILDERS:
         raise RuntimeError(f"no builder for feature '{op}' (reload the add-on)")
     capped = bool(params.get("caps")) and op in CAP_OPS
@@ -2544,6 +2940,9 @@ def _rebuild_inner(obj, context, h, entries, steps, turned):
             store_info(obj)
         elif h["op"] == "patch":
             from .patch import store_info
+            store_info(obj)
+        elif h["op"] == "unroll":
+            from .unroll import store_info
             store_info(obj)
         if isinstance(g, tuple) and g and g[0] == "inplace":
             g[1](obj)

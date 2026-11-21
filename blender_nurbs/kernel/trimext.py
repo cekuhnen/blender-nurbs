@@ -19,14 +19,20 @@ Kernel and numpy only: used by extend.py in Blender, testable without it.
 
 import numpy as np
 
-from .natext import deboor, end_curve, extend_u_end, flip, span
+try:
+    from .natext import deboor, end_curve, extend_u_end, flip, span
+except ImportError:          # the worker imports the kernel folder's modules top-level
+    from natext import deboor, end_curve, extend_u_end, flip, span
 
 EDGES = ("U0", "U1", "V0", "V1")
 
 
 def _k():
-    from . import load
-    sm = load()
+    try:
+        from . import load
+        sm = load()
+    except ImportError:      # in the worker
+        import _nproto_kernel as sm
     return sm, sm.blender_ext
 
 
@@ -147,6 +153,37 @@ def extended_surface(surf, iso, distance):
     if start:
         G, Uu = flip(G, Uu)
         Uu = [x + far - Uu[-1] for x in Uu]       # flipping back shifts them: the far end stays put
+    if iso in ("V0", "V1"):
+        G, Uu, Uv, du, dv = G.transpose(1, 0, 2).copy(), Uv, Uu, dv, du
+    w = G[..., 3]
+    pts = [tuple(map(float, G[i, j, :3] / w[i, j])) for i in range(G.shape[0]) for j in range(G.shape[1])]
+    rational = np.abs(w - 1.0).max() > 1e-12
+    return ext.surface_from_cvs(du, dv, pts, Uu, Uv, [float(x) for x in w.reshape(-1)] if rational else None)
+
+
+def extended_surface_to(surf, iso, value):
+    """surf extended at iso so that boundary sits at the parameter `value`
+    (beyond the old one): the same polynomial continued, knots NOT
+    normalised, so the old part keeps its parameters. Exact: the target is a
+    parameter, not an averaged arc length."""
+    _, ext = _k()
+    G, Uu, Uv, du, dv = _grid(ext.surface_cvs(surf))
+    if iso in ("V0", "V1"):
+        G, Uu, Uv, du, dv = G.transpose(1, 0, 2).copy(), Uv, Uu, dv, du
+    start = iso in ("U0", "V0")
+    far = Uu[-1]
+    t = float(value)
+    if start:
+        t = Uu[0] + Uu[-1] - t
+        G, Uu = flip(G, Uu)
+    if t <= Uu[-1] + 1e-12:
+        raise ValueError("the new boundary lies inside the surface")
+    cols = [end_curve([G[i, j] for i in range(G.shape[0])], Uu, du, t) for j in range(G.shape[1])]
+    Uu = cols[0][1]
+    G = np.array([[cols[j][0][i] for j in range(G.shape[1])] for i in range(len(cols[0][0]))])
+    if start:
+        G, Uu = flip(G, Uu)
+        Uu = [x + far - Uu[-1] for x in Uu]
     if iso in ("V0", "V1"):
         G, Uu, Uv, du, dv = G.transpose(1, 0, 2).copy(), Uv, Uu, dv, du
     w = G[..., 3]
@@ -304,11 +341,14 @@ def run_range(brep, iso, at, tol=None):
 # extend / shrink
 # --------------------------------------------------------------------------
 
-def extend_trimmed(brep, iso, at, distance):
+def extend_trimmed(brep, iso, at, distance, to=None):
     """A new Brep: the one-face trimmed brep extended (distance > 0) or cut
-    back (< 0) at the run of boundary edges on iso around along = at."""
+    back (< 0) at the run of boundary edges on iso around along = at. to:
+    grow until that boundary sits at this parameter instead (distance unused)."""
     if brep.face_count() != 1:
         raise RuntimeError("only single surfaces can be extended (Unjoin first)")
+    if to is not None:
+        return _grow(brep, iso, at, None, to)
     if abs(distance) <= 1e-12:
         return brep.copy()
     if distance > 0:
@@ -316,7 +356,7 @@ def extend_trimmed(brep, iso, at, distance):
     return _shrink(brep, iso, at, distance)
 
 
-def _grow(brep, iso, at, distance):
+def _grow(brep, iso, at, distance, to=None):
     sm, ext = _k()
     face = brep.faces()[0]
     surf = face.surface()
@@ -333,7 +373,7 @@ def _grow(brep, iso, at, distance):
     area0 = face.area(1e-6)
 
     def attempt(tight):
-        big = extended_surface(surf, iso, distance)
+        big = extended_surface(surf, iso, distance) if to is None else extended_surface_to(surf, iso, to)
         c_new = _boundary_value(big, iso)
         n = len(outer)
         start = (idx[-1] + 1) % n        # the loop from just after the run back round to it

@@ -109,6 +109,7 @@ def _compute_base(obj):
         out.append({"pos": _mid(src, ref), "param": "dome_cont", "value": cur if cur in vals else vals[0],
                     "values": vals, "name": f"{src.name} {ref}", "src": (src, ref)})
     elif op == "loft":
+        ins, p, _ = features.slide_inputs(ins, p)        # slid ends: the stretches it spans
         groups = features.loft_sides(ins, p)
         nr = features.loft_rail_count(ins, p)
         profs, rails = groups[:len(groups) - nr], groups[len(groups) - nr:]
@@ -285,6 +286,11 @@ def labels(obj):
     hit = _cache.get(obj.session_uid)
     if hit and hit[0] == key:
         return hit[1]
+    with features.slid_scope(obj):          # a loft's slid ends: labels measure the stretches it spans
+        return _labels(obj, key)
+
+
+def _labels(obj, key):
     try:
         out = _compute(obj)
     except Exception as exc:

@@ -213,23 +213,23 @@ bpy.ops.nproto.scan_tube_cage(rings=6, segments=8)
 rc = ctx.active_object
 before = dict(sf.LAST_INFO)
 n0 = len(rc.data.vertices)
-res = bpy.ops.nproto.scan_refine_cage(loops=1)
+res = bpy.ops.nproto.scan_fit_cage(add_loops=1)
 V1 = np.array([v.co[:] for v in rc.data.vertices])
 new = V1[n0:]
 ang = np.degrees(np.arctan2(new[:, 1] / 0.05, new[:, 0] / 0.065))
 side = (new[:, 2] > 0.25) & (np.abs(ang) < 90)             # up the ridge's side (the loop runs on over the cap
-check("Refine: a ridge running along the scan gets a loop along it, next to the ridge "   # and up the far side)
+check("Add Loops: a ridge running along the scan gets a loop along it, next to the ridge "   # and up the far side)
       "(not a ring around)",
       res == {'FINISHED'} and np.ptp(new[:, 2]) > 0.15 and side.sum() >= 3 and np.abs(ang[side]).max() < 30,
       f"{len(new)} new, z span {np.ptp(new[:, 2]) * MM:.0f} mm, ridge side at {np.round(ang[side])}°")
-res = bpy.ops.nproto.scan_refine_cage(loops=4)
+res = bpy.ops.nproto.scan_fit_cage(add_loops=4)
 after = dict(sf.LAST_INFO)
-check("Refine: 5 loops take the RMS down by half, the cage stays all quads",
+check("Add Loops: 5 loops take the RMS down by half, the cage stays all quads",
       res == {'FINISHED'} and after["dev_rms"] < 0.5 * before["dev_rms"]
       and all(len(p.vertices) == 4 for p in rc.data.polygons),
       f"{before['dev_rms'] * MM:.2f} -> {after['dev_rms'] * MM:.2f} mm, {n0} -> {len(rc.data.vertices)} vertices")
-res = bpy.ops.nproto.scan_refine_cage(loops=3, tolerance=0.05)
-check("Refine: nothing beyond the tolerance, no loop added", res == {'FINISHED'} and sf.LAST_INFO["loops"] == 0)
+res = bpy.ops.nproto.scan_fit_cage(add_loops=3, tolerance=0.05)
+check("Add Loops: nothing beyond the tolerance, no loop added", res == {'FINISHED'} and sf.LAST_INFO["loops"] == 0)
 for o in ctx.scene.objects:
     o.select_set(False)
 rc.select_set(True)
@@ -237,7 +237,7 @@ ctx.view_layer.objects.active = rc
 res = bpy.ops.nproto.subd_to_brep()
 rb = ctx.active_object
 sf.deviation_mesh(rb, ridge_obj)
-check("Refine: SubD to BREP of the refined cage measures as the SubD",
+check("Add Loops: SubD to BREP of the refined cage measures as the SubD",
       res == {'FINISHED'} and store.is_nurbs(rb) and abs(sf.STATS[rb.name]["dev_rms"] - after["dev_rms"]) < 0.15 * after["dev_rms"],
       f"{sf.STATS[rb.name]['dev_rms'] * MM:.3f} vs {after['dev_rms'] * MM:.3f} mm")
 # Edit Mode: only the selected faces get loops, the unselected vertices stay
@@ -251,14 +251,14 @@ rc.data.polygons.foreach_set("select", np.zeros(len(rc.data.polygons), bool))
 rc.data.edges.foreach_set("select", np.zeros(len(rc.data.edges), bool))
 rc.data.vertices.foreach_set("select", sel)
 bpy.ops.object.mode_set(mode='EDIT')
-res = bpy.ops.nproto.scan_refine_cage(loops=2, tolerance=0.0)
+res = bpy.ops.nproto.scan_fit_cage(add_loops=2, tolerance=0.0)
 bpy.ops.object.mode_set(mode='OBJECT')
 Va = np.array([v.co[:] for v in rc.data.vertices])
 moved = np.linalg.norm(Va[:len(Vb)] - Vb, axis=1)
-check("Refine in Edit Mode: the unselected vertices stay, loops are added",
+check("Add Loops in Edit Mode: the unselected vertices stay, loops are added",
       res == {'FINISHED'} and moved[~sel].max() < 1e-9 and len(Va) > len(Vb), f"{moved[~sel].max():.1e}, +{len(Va) - len(Vb)}")
 
-# -- 8. Trim Cage to Curve: the open edge held to a closed curve drawn on the scan -------------
+# -- 8. Trim to Curve (Fit Cage to Scan with a curve selected): the open edge held to a closed curve drawn on the scan -------------
 def on_capsule(t, z, out=0.0, rx=0.065, ry=0.05, h=0.26, z0=0.2):
     sc = 1.0 + 0.12 * np.sin(np.pi * (z - z0) / h)
     p = np.stack([rx * sc * np.cos(t), ry * sc * np.sin(t), z], 1)
@@ -289,13 +289,13 @@ ctx.view_layer.objects.active = scan_obj
 bpy.ops.nproto.scan_tube_cage(rings=8, segments=12)
 tc = ctx.active_object
 trim.select_set(True)
-res = bpy.ops.nproto.scan_trim_cage()
+res = bpy.ops.nproto.scan_fit_cage()
 ti = dict(sf.LAST_INFO)
 Vt, Ft, sht, kct = sf.cage_of(tc)
 smt = sf.Sampler(len(Vt), Ft, sht, kct, 3)
 Pt = smt.points(Vt)
 edge = sf.poly_border_loops(smt.Fs)[0]
-check("Trim Cage to Curve: the open edge lies on the trim line (both ways within 0.3 mm), the surface on the scan",
+check("Fit Cage to Scan with a trim curve selected: the open edge lies on the trim line (both ways within 0.3 mm), the surface on the scan",
       res == {'FINISHED'} and ti["edge_max"] < 0.3e-3 and ti["edge_along"] < 0.2e-3 and ti["dev_rms"] < 0.4e-3,
       f"edge {ti['edge_max'] * MM:.3f} mm ({ti['edge_along'] * MM:.3f} along the scan), RMS {ti['dev_rms'] * MM:.3f} mm")
 check("the edge follows the line's 10 cm dip, the cage remembers its trim line",
@@ -308,8 +308,8 @@ res = bpy.ops.nproto.scan_fit_cage(smoothness=0.2)
 check("Fit Cage to Scan afterwards keeps the edge on the trim line", res == {'FINISHED'}
       and sf.LAST_INFO.get("edge_max") is not None and sf.LAST_INFO["edge_max"] < 0.3e-3,
       f"{sf.LAST_INFO.get('edge_max', 1) * MM:.3f} mm")
-res = bpy.ops.nproto.scan_refine_cage(loops=2, tolerance=0.0)
-check("Refine Cage to Scan keeps it too (loops across the edge add edge vertices)", res == {'FINISHED'}
+res = bpy.ops.nproto.scan_fit_cage(add_loops=2, tolerance=0.0)
+check("Add Loops keeps it too (loops across the edge add edge vertices)", res == {'FINISHED'}
       and sf.LAST_INFO["edge_max"] < 0.3e-3 and sf.LAST_INFO["loops"] == 2, f"{sf.LAST_INFO['edge_max'] * MM:.3f} mm")
 # edge_need: a face whose open edge runs off the line asks to be halved along that edge
 Fe = [(0, 1, 2, 3), (1, 4, 5, 2), (3, 2, 6, 7), (2, 5, 8, 6)]
@@ -326,7 +326,7 @@ check("Hold Trim Line off: the fit is free of it", res == {'FINISHED'} and sf.LA
 open_c = curve_obj("OpenTrim", on_capsule(tt[:30], trim_z[:30]), cyclic=False)
 open_c.select_set(True)
 Vb = np.array([v.co[:] for v in tc.data.vertices])
-res = bpy.ops.nproto.scan_trim_cage()
+res = bpy.ops.nproto.scan_fit_cage()
 check("an open curve is refused, the cage left as it was",
       res == {'CANCELLED'} and np.allclose(Vb, np.array([v.co[:] for v in tc.data.vertices])))
 # a trim line with a drape offset: the edge sits the offset off the scan, over the line
@@ -335,7 +335,7 @@ for o in ctx.scene.objects:
 tc.select_set(True)
 trim.select_set(True)
 ctx.view_layer.objects.active = tc
-res = bpy.ops.nproto.scan_trim_cage(drape=True, offset=0.003)
+res = bpy.ops.nproto.scan_fit_cage(drape=True, offset=0.003)
 Vt, Ft, sht, kct = sf.cage_of(tc)
 smt = sf.Sampler(len(Vt), Ft, sht, kct, 3)
 Pe = smt.points(Vt)[sf.poly_border_loops(smt.Fs)[0]]

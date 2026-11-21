@@ -20,7 +20,7 @@ _syncing = [False]
 STEP_FIELDS = {
     "trim": ["action", "scope", "projection", "reach", "through"],
     "edge_fillet": ["shape", "rail_type", "radius", "variable", "end_radius", "continuity", "thumbweight",
-                    "class_a", "ca_tolerance", "ca_angle", "ca_degree", "ca_continuity"],
+                    "smoothing", "fill_corners", "class_a", "ca_tolerance", "ca_angle", "ca_degree", "ca_continuity"],
     "rebuild_surface": ["degree_u", "degree_v", "spans_u", "spans_v"],
     "extend_surface": ["distance"],
     "push_pull": ["distance"],
@@ -97,7 +97,7 @@ class NprotoStep(bpy.types.PropertyGroup):
     through: BoolProperty(name="Surfaces Through", description="A cutting surface is extended until it cuts "
                           "all the way through the part", **_S())
     shape: EnumProperty(name="Shape", items=[("CIRCULAR", "Circular", ""), ("CHAMFER", "Chamfer", ""),
-                                             ("BLEND", "Blend", "")], **_S())
+                                             ("BLEND", "Blend", ""), ("SOFT", "Soft", "")], **_S())
     rail_type: EnumProperty(name="Rail", items=[
         ("RADIUS", "Rolling Ball", "The size is the radius of a ball rolling between the faces"),
         ("CHORD", "Chord", "The size is the distance between the two rails")], **_S())
@@ -106,6 +106,8 @@ class NprotoStep(bpy.types.PropertyGroup):
     end_radius: FloatProperty(name="End Radius", min=1e-4, soft_max=5.0, unit='LENGTH', **_S())
     continuity: EnumProperty(name="Continuity", items=[("1", "G1", ""), ("2", "G2", ""), ("3", "G3", "")], **_S())
     thumbweight: FloatProperty(name="Fullness", min=0.1, soft_max=3.0, **_S())
+    smoothing: FloatProperty(name="Smoothing", min=0.1, max=1.0, subtype='FACTOR', **_S())
+    fill_corners: BoolProperty(name="Fill Corners", **_S())
     class_a: BoolProperty(name="Class-A Patches", **_S())
     ca_tolerance: FloatProperty(name="Tolerance", min=1e-6, soft_max=0.01, precision=5, unit='LENGTH', **_S())
     ca_angle: FloatProperty(name="Angle Tolerance", min=0.001, soft_max=1.0, precision=3, **_S())
@@ -157,6 +159,10 @@ def sync_step(obj, k):
                     pg.continuity = str(int(p.get("continuity", 2)))
                 elif name == "ca_continuity":
                     pg.ca_continuity = str(int(p.get("ca_continuity", 2)))
+                elif name == "smoothing":
+                    pg.smoothing = float(p.get("smoothing", 0.6))
+                elif name == "fill_corners":
+                    pg.fill_corners = bool(p.get("fill_corners", True))
                 elif name == "reach":
                     pg.reach = p.get("reach", "BOTH")
                 elif name == "through":
@@ -380,18 +386,27 @@ def draw_steps(box, obj, only=None, bare=False):
                 from . import steps as _steps
                 rims = _steps.rims_of(obj, e["params"].get("mids_local", []))
             if fields:
+                soft = pg.shape == 'SOFT'
                 for name in fields:
+                    if name in ("rail_type", "variable", "end_radius") and soft:
+                        continue                  # (a soft fillet's size is its minimum radius)
                     if name == "end_radius" and (not pg.variable or pg.rail_type == "CHORD"):
                         continue
                     if name == "variable" and pg.rail_type == "CHORD":
                         continue
                     if name == "radius":
-                        inner.prop(pg, name, text="Chord" if pg.rail_type == "CHORD" else
+                        inner.prop(pg, name, text="Min Radius" if soft else "Chord" if pg.rail_type == "CHORD" else
                                    ("Distance" if pg.shape == "CHAMFER" else "Radius"))
                         continue
                     if name == "thumbweight" and pg.shape != 'BLEND':
                         continue
-                    if name == "continuity" and pg.shape != 'BLEND':
+                    if name in ("smoothing", "fill_corners") and not soft:
+                        continue
+                    if name == "continuity" and pg.shape not in ('BLEND', 'SOFT'):
+                        continue
+                    if name.startswith("ca_") and soft:
+                        continue                  # (every soft strip is rebuilt anyway)
+                    if name == "class_a" and soft:
                         continue
                     if name.startswith("ca_") and not pg.class_a:
                         continue

@@ -1,4 +1,4 @@
-"""STEP export of true cylinders, cones, spheres, tori, revolutions, extrusions, planes, circles, ellipses and lines:
+"""STEP export of true cylinders, cones, spheres, tori, revolutions, extrusions, offsets, planes, circles, ellipses and lines:
 blender -b --factory-startup --python tests/test_step_analytic.py"""
 import json, math, os, re, sys, tempfile
 import bpy
@@ -137,7 +137,7 @@ def add(kind, **kw):
 def kinds(txt):
     return {k: len(re.findall(r"=%s\(" % k, txt)) for k in ("CYLINDRICAL_SURFACE", "CONICAL_SURFACE", "SPHERICAL_SURFACE",
                                                              "TOROIDAL_SURFACE", "SURFACE_OF_REVOLUTION", "SURFACE_OF_LINEAR_EXTRUSION",
-                                                             "PLANE", "CIRCLE",
+                                                             "OFFSET_SURFACE", "PLANE", "CIRCLE",
                                                              "ELLIPSE", "LINE")} | {
         "BSPLINE_SURF": txt.count("B_SPLINE_SURFACE"), "BSPLINE_CURVE": txt.count("B_SPLINE_CURVE")}
 
@@ -158,7 +158,7 @@ ctx.view_layer.update()
 st, txt, res, rep = export(cyl, "cyl")
 k = kinds(txt)
 check("exact solid cylinder: a CYLINDRICAL_SURFACE, two PLANEs, two CIRCLEs, the seam a LINE; no B-splines",
-      k == {"CYLINDRICAL_SURFACE": 1, "CONICAL_SURFACE": 0, "SPHERICAL_SURFACE": 0, "TOROIDAL_SURFACE": 0, "SURFACE_OF_REVOLUTION": 0, "SURFACE_OF_LINEAR_EXTRUSION": 0, "PLANE": 2, "CIRCLE": 2, "ELLIPSE": 0, "LINE": 1, "BSPLINE_SURF": 0, "BSPLINE_CURVE": 0}, str(k))
+      k == {"CYLINDRICAL_SURFACE": 1, "CONICAL_SURFACE": 0, "SPHERICAL_SURFACE": 0, "TOROIDAL_SURFACE": 0, "SURFACE_OF_REVOLUTION": 0, "SURFACE_OF_LINEAR_EXTRUSION": 0, "OFFSET_SURFACE": 0, "PLANE": 2, "CIRCLE": 2, "ELLIPSE": 0, "LINE": 1, "BSPLINE_SURF": 0, "BSPLINE_CURVE": 0}, str(k))
 r_ = float(re.search(r"=CYLINDRICAL_SURFACE\('',#\d+,([^)]+)\)", txt).group(1))
 # (within Blender's single-precision object matrix: rotated, it is a hair from rigid)
 check("its radius in millimetres", abs(r_ - 500) < 1e-4, f"{r_}")
@@ -210,7 +210,7 @@ ctx.view_layer.update()
 st, txt, res, rep = export(fr, "frustum")
 k = kinds(txt)
 check("exact frustum: a CONICAL_SURFACE, two PLANEs, two CIRCLEs, the seam a LINE; no B-splines",
-      k == {"CYLINDRICAL_SURFACE": 0, "CONICAL_SURFACE": 1, "SPHERICAL_SURFACE": 0, "TOROIDAL_SURFACE": 0, "SURFACE_OF_REVOLUTION": 0, "SURFACE_OF_LINEAR_EXTRUSION": 0, "PLANE": 2, "CIRCLE": 2, "ELLIPSE": 0, "LINE": 1, "BSPLINE_SURF": 0,
+      k == {"CYLINDRICAL_SURFACE": 0, "CONICAL_SURFACE": 1, "SPHERICAL_SURFACE": 0, "TOROIDAL_SURFACE": 0, "SURFACE_OF_REVOLUTION": 0, "SURFACE_OF_LINEAR_EXTRUSION": 0, "OFFSET_SURFACE": 0, "PLANE": 2, "CIRCLE": 2, "ELLIPSE": 0, "LINE": 1, "BSPLINE_SURF": 0,
             "BSPLINE_CURVE": 0}, str(k))
 m = re.search(r"=CONICAL_SURFACE\('',(#\d+),([^,]+),([^)]+)\)", txt)
 check("its semi-angle atan(0.35 / 0.9)", m and abs(float(m.group(3)) - math.atan(0.35 / 0.9)) < 1e-6, m and m.group(3))
@@ -440,6 +440,81 @@ k = kinds(txt)
 check("hyperboloid: a SURFACE_OF_REVOLUTION, its rims CIRCLEs; reads back", r == {'FINISHED'}
       and k["SURFACE_OF_REVOLUTION"] == 1 and k["CIRCLE"] == 2 and k["BSPLINE_SURF"] == 0 and rep["failed"] == 0
       and res and abs(res[0][1].area() / store.get_brep(hy).area() - 1) < 1e-6, str(k))
+
+# offsets: the kernel's exact offset surface (Offset of one surface) has no CV net; written as an
+# OFFSET_SURFACE of its basis (an offset plane is a plane), its edges refitted onto it
+q_ = np.array([[math.cos(a_), math.sin(a_), 0.1 * a_] for a_ in np.linspace(0, 2, 15)])
+dg_, P_, U_ = se._interp_cubic(q_)
+ch_ = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(q_, axis=0), axis=1))]
+check("cubic interpolation runs through its points", max(np.linalg.norm(se._eval_cubic(P_, U_, t_) - q_[i])
+                                                         for i, t_ in enumerate(ch_ / ch_[-1])) < 1e-12)
+from blender_nurbs.square import _foot
+def offset(o, d):
+    bpy.ops.object.select_all(action='DESELECT'); o.select_set(True); ctx.view_layer.objects.active = o
+    r = bpy.ops.nproto.offset(distance=d)
+    return r, ctx.active_object
+def world_surface_pts(o, n=9):
+    M = np.array(o.matrix_world, float)
+    s_ = list(store.get_brep(o).faces())[0].surface()
+    (u0, v0), (u1, v1) = s_.uv_domain()
+    return {(u, v): M[:3, :3] @ np.array(s_.evaluate(u, v), float) + M[:3, 3]
+            for u in np.linspace(u0, u1, n) for v in np.linspace(v0, v1, n)}
+la = nurbs("la", [(0, 0, 0), (1, 0, 0.4), (2, 0, -0.2), (3, 0, 0.3)])
+lb = nurbs("lb", [(0, 2, 0.2), (1, 2, -0.3), (2, 2, 0.4), (3, 2, 0)])
+bpy.ops.nproto.loft(inputs=json.dumps([[la.name, "S0"], [lb.name, "S0"]])); lo = ctx.active_object
+lo.location, lo.rotation_euler = (1, 2, 3), (0.3, 0.2, 0.1)
+ctx.view_layer.update()
+r, of = offset(lo, 0.15)
+st, txt, res, rep = export(of, "offset")
+k = kinds(txt)
+m = re.search(r"=OFFSET_SURFACE\('',#\d+,([^,]+),\.F\.\)", txt)
+check("offset loft: an OFFSET_SURFACE 150 mm off its B-spline basis (it failed to export before)", r == {'FINISHED'}
+      and k["OFFSET_SURFACE"] == 1 and k["BSPLINE_SURF"] == 1 and not st["failed"] and m
+      and abs(abs(float(m.group(1))) - 150) < 1e-4, f"{k} {st['failed']} {m and m.group(1)}")
+ref = world_surface_pts(of)
+sr = list(res[0][1].faces())[0].surface() if res else None
+dev = max(float(np.linalg.norm(np.array(sr.evaluate(u, v), float) - P))
+          for (u, v), P in ref.items()) if sr else None
+check("offset loft reads back: the same surface point for point (an offset of the same basis)",
+      rep["failed"] == 0 and dev is not None and dev < 1e-6, f"{rep} {dev}")
+so_ = list(store.get_brep(of).faces())[0].surface()
+Mo = np.array(of.matrix_world, float); Mi = np.linalg.inv(Mo)
+edev = 0.0
+for e in res[0][1].edges():
+    t0, t1 = e.parameter_range()
+    uv = None
+    for tt in np.linspace(t0, t1, 15):
+        pw = np.array(e.point_at(tt), float)
+        pl = Mi[:3, :3] @ pw + Mi[:3, 3]
+        uv = _foot(so_, pl, uv)
+        edev = max(edev, float(np.linalg.norm(np.array(so_.evaluate(*uv), float) - pl)))
+check("offset loft: its edges on the exact offset (the kernel's own fits are 2.5e-4 off)", edev < 3e-7, f"{edev:.2e}")
+r, of2 = offset(of, -0.05)
+st, txt, res, rep = export(of2, "offset2")
+m = re.search(r"=OFFSET_SURFACE\('',#\d+,([^,]+),\.F\.\)", txt)
+check("an offset of an offset: one OFFSET_SURFACE, 100 mm off the first basis", kinds(txt)["OFFSET_SURFACE"] == 1
+      and m and abs(abs(float(m.group(1))) - 100) < 1e-4 and rep["failed"] == 0, m and m.group(1))
+pl_ = add("PLANE")
+r, op_ = offset(pl_, 0.3)
+st, txt, res, rep = export(op_, "offset_plane")
+k = kinds(txt)
+check("an offset plane: a PLANE, no OFFSET_SURFACE", k["PLANE"] == 1 and k["OFFSET_SURFACE"] == 0
+      and rep["failed"] == 0, str(k))
+sm_ = add("SPHERE", radius=0.7, degree="3")
+r, os_ = offset(sm_, 0.1)
+st = se.export_step(os.path.join(TMP, "offset_sphere.step"), [os_], unit="MM")
+check("an offset smooth sphere: refused (no normal at its poles), said so", st["bodies"] == 0 and st["failed"]
+      and "pole" in st["failed"][0][1], str(st["failed"]))
+r, tb = revolve(nurbs("tube", [(0.5, 0, 0), (0.8, 0, 0.4), (0.4, 0, 0.8), (0.6, 0, 1.2)]), angle=360)
+r, otb = offset(tb, 0.05)
+st, txt, res, rep = export(otb, "offset_tube")
+k = kinds(txt)
+check("an offset revolved tube: an OFFSET_SURFACE of a SURFACE_OF_REVOLUTION", k["OFFSET_SURFACE"] == 1
+      and k["SURFACE_OF_REVOLUTION"] == 1 and k["BSPLINE_SURF"] == 0 and rep["failed"] == 0, str(k))
+ref = world_surface_pts(otb)
+sr = list(res[0][1].faces())[0].surface() if res else None
+dev = max(min(float(np.linalg.norm(np.array(sr.evaluate(*_foot(sr, P)), float) - P)), 1.0) for P in ref.values()) if sr else None
+check("offset tube reads back on the same surface", dev is not None and dev < 1e-6, f"{dev}")
 
 # the operator: the option, on by default, and the report
 p = os.path.join(TMP, "op.step")

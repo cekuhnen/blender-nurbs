@@ -6,14 +6,16 @@ import math
 
 import bpy
 import numpy as np
-from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
+from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
 from mathutils import Vector
 
 from . import draw, features, geom, store, sweeps, workplanes
 from . import hints
 from .kernel import load as load_kernel
-from .ops import AskValue, PickMixin, SolidBody, _decode_inputs, _encode_inputs, _kernel_ok, _select_only
-from .valuedrag import BASE_PX, ValueDrag, ruled_preview
+from .ops import (CHAIN_ITEMS, AskValue, PickMixin, SolidBody, _curve_inputs, _decode_inputs, _encode_inputs,
+                  _kernel_ok, _make_result, _select_only, tangent_chain)
+from .feature_ui import NprotoPipePoint, pipe_points_param
+from .valuedrag import BASE_PX, ValueDrag, fmt_length, ruled_preview
 
 
 def _new_surface(context, name, op, inputs, params):
@@ -128,8 +130,25 @@ def sweep_profile(crv, act):
     return min(crv, key=lambda c: sum(gap(c, o) for o in crv if o != c))
 
 
-class NPROTO_OT_pipe(SolidBody, AskValue, PickMixin, bpy.types.Operator):
-    """Sweep an exact circle along curves (selected, or pick one)"""
+PIPE_CORNER_ITEMS = [("MITRE", "Mitre", "Sharp corners of the rail: the tubes cut on the plane halving the turn"),
+                     ("ROUND", "Round", "Sharp corners of the rail: an exact torus elbow, G1 to straight legs")]
+
+PIPE_MAX_POINTS = 32       # radius points along a rail (each has its own drag fields pr_i / pa_i)
+
+PIPE_TAPER_ITEMS = [("LINEAR", "Linear", "The radius changes evenly along the rail (a cone on a line)"),
+                    ("SMOOTH", "Smooth", "The radius eases out of the start and into the end (level at both ends)")]
+
+PIPE_CAP_ITEMS = [("NONE", "None", "Open ends (a solid gets flat caps)"),
+                  ("FLAT", "Flat", "Flat discs close the ends: a closed body"),
+                  ("ROUND", "Round", "Half spheres close the ends, tangent to the tube: a closed body")]
+
+
+class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operator):
+    """Sweep an exact circle along curves or surface edges (selected, or pick
+    them: a click takes a tangent chain, Shift+click keeps picking). Pieces
+    that touch end to end make one pipe. From the UI the radius has an arrow
+    to drag on a live preview (D: diameter, V: variable radius, C: caps,
+    M: corners, J: join); type a value, click away or Enter to make it"""
     bl_idname = "nproto.pipe"
     bl_label = "Pipe"
     bl_options = {'REGISTER', 'UNDO'}
@@ -137,27 +156,105 @@ class NPROTO_OT_pipe(SolidBody, AskValue, PickMixin, bpy.types.Operator):
 
     accepts_picks = True
     pick_min = 1
-    pick_max = 1
+    pick_max = 256          # a click takes an edge (its tangent chain); Shift+click keeps picking, Enter finishes
+    extra_keys = (("C", "tangent chain on / off"),)
+    extra_help = "(pieces that touch end to end make one pipe; separate ones a pipe each)"
+    fit_view = "shrink"     # the last radius stays, unless it would swamp the view
     inputs: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     radius: FloatProperty(name="Radius", default=0.1, min=1e-4, unit='LENGTH')
-    samples: IntProperty(name="Samples", default=32, min=6, max=300)
+    diameter: FloatProperty(name="Diameter", default=0.2, min=2e-4, unit='LENGTH')
+    # each run writes the size into both fields, so switching it keeps the size
+    use_diameter: BoolProperty(name="Diameter", default=False,
+                               description="Give the pipe's size as its diameter instead of its radius")
+    use_variable: BoolProperty(name="Variable Radius", default=False,
+                               description="The radius runs from Radius at the rail's start to End Radius at its end")
+    radius_end: FloatProperty(name="End Radius", default=0.05, min=1e-4, unit='LENGTH')
+    diameter_end: FloatProperty(name="End Diameter", default=0.1, min=2e-4, unit='LENGTH')
+    taper: EnumProperty(name="Taper", items=PIPE_TAPER_ITEMS, default="LINEAR",
+                        description="How a variable radius runs along the rail")
+    points: CollectionProperty(type=NprotoPipePoint, options={'SKIP_SAVE'},
+                               description="Radius points along the rail, between its start and end")
+    cap_style: EnumProperty(name="Cap", items=PIPE_CAP_ITEMS, default="NONE",
+                            description="How the pipe's ends are closed (a closed rail has no ends)")
+    samples: IntProperty(name="Samples", default=32, min=6, max=300,
+                         description="Frames along each curve or edge of the rail")
+    join: BoolProperty(name="Join Touching", default=True,
+                       description="Curves and edges that touch end to end make one pipe (it can't turn a sharp "
+                                   "corner); off: a pipe each")
+    chain: EnumProperty(name="Pick", items=CHAIN_ITEMS, default="TANGENT",
+                        description="What one click on an edge picks")
+    chain_angle: FloatProperty(name="Chain Angle", default=2.0, min=0.01, max=sweeps.PIPE_CORNER_DEG,
+                               description="Tangent Chain: edges meeting within this angle (degrees) are one run")
+    corner_style: EnumProperty(name="Corners", items=PIPE_CORNER_ITEMS, default="MITRE",
+                               description="How the pipe turns a sharp corner of its rail")
+    bend: FloatProperty(name="Bend", default=2.0, min=1.0, soft_max=10.0,
+                        description="Round corners: the elbow's centreline radius, as a multiple of the pipe's "
+                                    "radius (1: the inside of the bend comes to a point)")
 
     def invoke(self, context, event):
         if not _kernel_ok(self):
             return {'CANCELLED'}
+        self._start_event = (event.mouse_x, event.mouse_y, event.type, event.value)
         self.body_prefer(context)
         if self.inputs:                     # picked already (see PickMixin._finish)
             return self.ask(context)
-        crv = [o for o in context.selected_objects if o.type == 'CURVE']
+        crv = _curve_inputs(context)          # every spline of the selected curves
         if crv and not event.alt:
-            self.inputs = _encode_inputs([(o, "S0") for o in crv])
+            self.inputs = _encode_inputs(crv)
             return self.ask(context)
         return self.start_picking(context, event)
+
+    # -- picking ------------------------------------------------------------------
+    def expand_pick(self, cand):
+        if self.chain == 'TANGENT':
+            have = {(o.name, r) for o, r in getattr(self, "_picks", [])}
+            return [c for c in tangent_chain(cand, self._cands, self.chain_angle) if (c[0].name, c[1]) not in have]
+        return [cand]
+
+    def pick_state(self):
+        mode = "tangent chain" if self.chain == 'TANGENT' else "single edge"
+        n = len(getattr(self, "_picks", []))
+        if not n:
+            return f"click a curve or edge ({mode})"
+        return f"{n} picked · Shift+click more ({mode})"
+
+    def tool_key(self, context, event):
+        if event.type == 'C' and not (event.ctrl or event.oskey or event.alt):
+            self.chain = 'SINGLE' if self.chain == 'TANGENT' else 'TANGENT'
+            return True
+        return False
+
+    def _groups(self, ins):
+        """The pipes to make: pieces that touch end to end together (Join Touching)."""
+        return features.profile_groups(ins) if self.join else [[x] for x in ins]
+
+    def _radius(self):
+        return 0.5 * self.diameter if self.use_diameter else self.radius
+
+    def _radius_end(self):
+        if not self.use_variable:
+            return self._radius()
+        return 0.5 * self.diameter_end if self.use_diameter else self.radius_end
+
+    def params(self):
+        p = {"radius": self._radius(), "samples": self.samples, "cap_style": self.cap_style,
+             "corner_style": self.corner_style, "bend": self.bend}
+        if self.use_variable:
+            p.update(variable=True, radius_end=self._radius_end(), taper=self.taper)
+            if len(self.points):
+                p["radius_points"] = pipe_points_param(self.points)
+        return p
 
     def execute(self, context):
         if not _kernel_ok(self):
             return {'CANCELLED'}
-        params = {"radius": self.radius, "samples": self.samples}
+        if self.use_diameter:               # both fields hold the size made (the redo panel, the next run)
+            self.radius = max(1e-4, 0.5 * self.diameter)
+            self.radius_end = max(1e-4, 0.5 * self.diameter_end)
+        else:
+            self.diameter = 2.0 * self.radius
+            self.diameter_end = 2.0 * self.radius_end
+        params = self.params()
         if self.body != "SURFACE":
             try:
                 inputs = _decode_inputs(self.inputs)
@@ -165,24 +262,482 @@ class NPROTO_OT_pipe(SolidBody, AskValue, PickMixin, bpy.types.Operator):
                 self.report({'ERROR'}, f"Pipe failed: {exc}")
                 return {'CANCELLED'}
             return self.execute_solid(context, inputs, params)
-        made = []
+        made, failed = [], []
         try:
-            for inp in _decode_inputs(self.inputs):
-                made.append(_new_surface(context, "Pipe", "pipe", [inp], params))
+            groups = self._groups(_decode_inputs(self.inputs))
         except Exception as exc:
             self.report({'ERROR'}, f"Pipe failed: {exc}")
             return {'CANCELLED'}
+        for g in groups:           # one rail that fails doesn't take the others with it
+            try:
+                made.append(_make_result(context, "Pipe", "pipe", g, params))
+            except Exception as exc:
+                failed.append(f"{g[0][0].name}: {exc}" if len(groups) > 1 else str(exc))
+        if failed:
+            self.report({'ERROR'} if not made else {'WARNING'}, "Pipe failed: " + "; ".join(failed))
+        if not made:
+            return {'CANCELLED'}
         _select_only(context, made)
-        return {'FINISHED'} if made else {'CANCELLED'}
+        return {'FINISHED'}
 
     def solid_groups(self, ins):
-        return [[i] for i in ins]     # a solid rod per curve
+        return self._groups(ins)      # a solid rod per rail
 
     def draw(self, context):
         lay = self.layout
         self.draw_body(lay)
-        lay.prop(self, "radius")
+        n_in = len(_decode_inputs(self.inputs)) if self.inputs else 0
+        if n_in > 1:
+            lay.prop(self, "join")
+        row = lay.row(align=True)
+        row.prop(self, "diameter" if self.use_diameter else "radius",
+                 text=("Start " if self.use_variable else "") + ("Diameter" if self.use_diameter else "Radius"))
+        row.prop(self, "use_diameter", text="", icon='ARROW_LEFTRIGHT')
+        lay.prop(self, "use_variable")
+        if self.use_variable:
+            col = lay.column(align=True)
+            col.prop(self, "diameter_end" if self.use_diameter else "radius_end")
+            col.row(align=True).prop(self, "taper", expand=True)
+            if len(self.points):
+                pc = lay.column(align=True)
+                pc.label(text="Radius Points (X over one in the preview removes it)")
+                for n, i in enumerate(sorted(range(len(self.points)), key=lambda i: self.points[i].at)):
+                    row = pc.row(align=True)
+                    row.prop(self.points[i], "at", text=f"{n + 1}  At", slider=True)
+                    row.prop(self.points[i], "radius", text="R")
+        lay.prop(self, "cap_style", expand=True)
+        if self.body != "SURFACE" and self.cap_style == "NONE":
+            lay.label(text="A solid gets flat caps", icon='INFO')
+        row = lay.row(align=True)
+        row.prop(self, "corner_style", expand=True)
+        sub = row.row(align=True)
+        sub.active = self.corner_style == "ROUND"
+        sub.prop(self, "bend", text="Bend ×")
         lay.prop(self, "samples")
+        row = lay.row(align=True)
+        row.prop(self, "chain", text="")
+        sub = row.row(align=True)
+        sub.active = self.chain == 'TANGENT'
+        sub.prop(self, "chain_angle", text="°")
+
+    # -- the live value stage (valuedrag.py) ----------------------------------
+    @property
+    def drag_fields(self):
+        size = "diameter" if self.use_diameter else "radius"
+        out = (size,) + ((size + "_end",) if self.use_variable else ())
+        if self.use_variable:
+            for i in range(min(len(self.points), PIPE_MAX_POINTS)):
+                out += (f"pr_{i}", f"pa_{i}")
+        return out + (("bend",) if self.corner_style == "ROUND" and getattr(self, "_corner", None) else ())
+
+    @property
+    def ratio_fields(self):
+        return ("bend",) + tuple(f"pa_{i}" for i in range(min(len(self.points), PIPE_MAX_POINTS)))
+
+    def _point_n(self, i):
+        """Point i's number along the rail (1 = nearest the start)."""
+        return 1 + sorted(range(len(self.points)), key=lambda j: self.points[j].at).index(i)
+
+    def _label(self, name):
+        if name.startswith(("pr_", "pa_")):
+            n = self._point_n(int(name[3:]))
+            if name.startswith("pa_"):
+                return f"Point {n} At"
+            return f"{'Diameter' if self.use_diameter else 'Radius'} {n}"
+        return ValueDrag._label(self, name)
+
+    def _fmt(self, context, name):
+        if name.startswith("pa_"):
+            return f"{100.0 * getattr(self, name):.3g} %"
+        return ValueDrag._fmt(self, context, name)
+
+    PREVIEW_ROWS = 48           # circles along the rail
+    PREVIEW_RING = 33           # points round a circle (closed)
+
+    def drag_setup(self, context, mouse):
+        """Per rail: its spans (one, or a stretch per corner: mitred), its open
+        ends (for the caps' preview) and the largest radius its mitres allow."""
+        self._pp, self._bad = [], []
+        self._n_in = len(_decode_inputs(self.inputs))
+        for g in self._groups(_decode_inputs(self.inputs)):      # curves and surface edges alike
+            rail = sweeps.pipe_rail(g)
+            closed = features.is_closed_curve(rail)
+            try:
+                tracks = sweeps.pipe_tracks(rail, closed, self.corner_style)
+            except RuntimeError as exc:         # a rail turning back on itself
+                self._bad.append((str(exc), [c["point"] for c in sweeps.rail_corners(rail) if c["deg"] > 175.0]))
+                tracks = None
+            if tracks is None:
+                P, T, N, B = sweeps.pipe_frames(rail, min(240, self.PREVIEW_ROWS * len(g)), closed)
+                gk = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))])
+                spans = [{"P": P, "T": T, "N": N, "B": B, "track": None, "g": gk, "s0": 0.0}]
+                total = float(gk[-1])
+                limit = math.inf
+            else:
+                spans, total = [], 0.0
+                for tr in tracks:
+                    T, N = tr["T"], tr["N"]
+                    spans.append({"P": tr["P"], "T": T, "N": N, "B": tr["h"] * np.cross(T, N), "track": tr,
+                                  "s0": total})
+                    total += float(tr["s"][-1])
+                # Mitre: the largest radius; Round: the largest elbow centreline radius
+                limit = sweeps.elbow_limit(tracks) if self.corner_style == "ROUND" else sweeps.mitre_limit(tracks)
+            ends = []
+            if not closed:
+                a_, b_ = spans[0], spans[-1]
+                ends = [(a_["P"][0], -a_["T"][0], a_["N"][0], a_["B"][0]),
+                        (b_["P"][-1], b_["T"][-1], b_["N"][-1], b_["B"][-1])]
+            G, Rp, Rt, Rn, Rb = [], [], [], [], []       # the rail sampled: rail length from its start, frames
+            for sp in spans:
+                G.append(sp["g"] if sp["track"] is None else sp["s0"] + sp["track"]["s"])
+                Rp.append(sp["P"]), Rt.append(sp["T"]), Rn.append(sp["N"]), Rb.append(sp["B"])
+            rail_s = {"g": np.concatenate(G), "P": np.vstack(Rp), "T": np.vstack(Rt), "N": np.vstack(Rn),
+                      "B": np.vstack(Rb)}
+            self._pp.append({"spans": spans, "ends": ends, "limit": limit, "inputs": g, "total": total,
+                             "closed": closed, "rail": rail_s})
+        if not self._pp:
+            return False
+        # the corner the Bend handle stands at: the first one of the first rail
+        self._corner = next((sp["track"]["end"] for pp in self._pp for sp in pp["spans"]
+                             if sp["track"] is not None and sp["track"]["end"] is not None), None)
+        spans = self._pp[0]["spans"]
+        mid = spans[len(spans) // 2]
+        kb, self._base_at_mouse = (len(spans) // 2, len(mid["P"]) // 2), False
+        if mouse is not None:
+            best = None
+            for i, sp in enumerate(spans):
+                for k, q in enumerate(sp["P"]):
+                    sq = self._screen(context, q)
+                    if sq is not None and (sq - mouse).length <= BASE_PX and (best is None or (sq - mouse).length < best[0]):
+                        best = ((sq - mouse).length, (i, k))
+            if best is not None:
+                kb, self._base_at_mouse = best[1], True
+        self._kb = kb
+        self._dir = self._arrow_dir(context)
+        return True
+
+    def _foot(self):
+        i, k = self._kb
+        sp = self._pp[0]["spans"][i]
+        return sp["P"][k], sp["T"][k], sp["N"][k], sp["B"][k]
+
+    def drag_on_input(self, context, mouse):
+        if self.use_variable and self._pp[0]["ends"]:
+            return False                # a press on the rail adds a radius point there (drag_modal_hook)
+        return self._near_screen(context, np.vstack([sp["P"] for sp in self._pp[0]["spans"]]), mouse)
+
+    # -- radius points ------------------------------------------------------------
+    def _rail_at(self, f):
+        """(point, T, N, B) on the first rail at share f of its length."""
+        rs = self._pp[0]["rail"]
+        g = min(1.0, max(0.0, f)) * self._pp[0]["total"]
+        k = int(np.argmin(np.abs(rs["g"] - g)))
+        return rs["P"][k], rs["T"][k], rs["N"][k], rs["B"][k]
+
+    def _rail_share(self, ray_o, ray_d):
+        """The share of the first rail's length nearest the mouse ray."""
+        rs = self._pp[0]["rail"]
+        d = ray_d / (np.linalg.norm(ray_d) or 1.0)
+        rel = rs["P"] - ray_o
+        off = rel - np.outer(rel @ d, d)
+        k = int(np.argmin(np.linalg.norm(off, axis=1)))
+        return float(rs["g"][k]) / (self._pp[0]["total"] or 1.0)
+
+    def _point_handles(self, k):
+        out = []
+        law = self._law(self._pp[0])
+        for i in range(min(len(self.points), PIPE_MAX_POINTS)):
+            pt = self.points[i]
+            C, T, N, B = self._rail_at(pt.at)
+            d = self._side(N, B, T)
+            out.append({"field": f"pr_{i}", "kind": "arrow", "origin": C, "dir": d, "param": pt.radius,
+                        "base": C, "to_value": lambda t, k=k: max(1e-4 * k, abs(t) * k)})
+            out.append({"field": f"pa_{i}", "kind": "draft", "origin": C, "dir": T, "param": pt.at,
+                        "pos": C, "pick": lambda o, r, prev: self._rail_share(o, r),
+                        "to_value": lambda t: min(0.995, max(0.005, t)), "snap": (0.05, 0.01)})
+        return out
+
+    def drag_modal_hook(self, context, event):
+        """Variable radius: a press on the rail (away from the handles) adds a
+        radius point there and takes its arrow, to pull the radius out; X or
+        Delete over a point's arrow or diamond removes the point."""
+        if not (self.use_variable and getattr(self, "_pp", None) and self._pp[0]["ends"]):
+            return None
+        if event.type == 'DEL' and event.value == 'PRESS':
+            return self._remove_hot(context)
+        if event.type != 'LEFTMOUSE' or event.value != 'PRESS' or self._grab is not None:
+            return None
+        from .ops import PickMixin
+        if not PickMixin._in_view(context, event):
+            return None
+        m = self._mouse(context, event)
+        if self._handle_at(context, m) is not None:
+            return None
+        if not self._near_screen(context, self._pp[0]["rail"]["P"], m):
+            return None
+        if len(self.points) >= PIPE_MAX_POINTS:
+            self._msg = f"at most {PIPE_MAX_POINTS} radius points"
+            self._drag_refresh(context)
+            return {'RUNNING_MODAL'}
+        region, rv3d = self._win(context)
+        from bpy_extras import view3d_utils
+        o = np.array(view3d_utils.region_2d_to_origin_3d(region, rv3d, m), float)
+        r = np.array(view3d_utils.region_2d_to_vector_3d(region, rv3d, m), float)
+        f = min(0.995, max(0.005, self._rail_share(o, r)))
+        pt = self.points.add()
+        pt.at, pt.radius = f, max(1e-4, float(self._law(self._pp[0])(f * self._pp[0]["total"])))
+        i = len(self.points) - 1
+        hs = self.drag_handles()
+        hi = next(j for j, h in enumerate(hs) if h["field"] == f"pr_{i}")
+        self._start_grab(context, hi, m)
+        self._drag_refresh(context)
+        return {'RUNNING_MODAL'}
+
+    def _remove_hot(self, context):
+        hs = self.drag_handles()
+        if self._hot is None or self._hot >= len(hs) or not hs[self._hot]["field"].startswith(("pr_", "pa_")):
+            return None
+        self.points.remove(int(hs[self._hot]["field"][3:]))
+        self._hot, self._field, self._typed = None, 0, ""
+        self._drag_refresh(context)
+        return {'RUNNING_MODAL'}
+
+    def _arrow_dir(self, context):
+        """Out of the rail at the arrow's foot, square to it: of the frame's
+        four directions the one most across the view, so it is seen side on."""
+        P, T, N, B = self._foot()
+        _, rv3d = self._win(context)
+        if rv3d is None:
+            return N
+        view = np.array(rv3d.view_rotation @ Vector((0.0, 0.0, -1.0)), float)
+        up = np.array(rv3d.view_rotation @ Vector((0.0, 1.0, 0.0)), float)
+        side = np.cross(view, T)
+        side = side if np.linalg.norm(side) > 1e-6 else up
+        return max((N, B, -N, -B), key=lambda d: float(d @ side))
+
+    def _law(self, pp):
+        pts = [(p.at, p.radius) for p in self.points] if self.use_variable else ()
+        return sweeps.RadiusLaw(self._radius(), self._radius_end(), self.taper, pp["total"], pts)
+
+    def drag_handles(self):
+        k = 2.0 if self.use_diameter else 1.0
+        pp = self._pp[0]
+        if self.use_variable and pp["ends"]:
+            # Variable: an arrow at each end of the first rail, square to it
+            out = []
+            for field, (C, out_, N, B), r_ in ((self.drag_fields[0], pp["ends"][0], self._radius()),
+                                                (self.drag_fields[1], pp["ends"][1], self._radius_end())):
+                d = self._side(N, B, out_)
+                out.append({"field": field, "kind": "arrow", "origin": C, "dir": d, "param": r_, "base": C,
+                            "to_value": lambda t, k=k: max(1e-4 * k, abs(t) * k)})
+            out += self._point_handles(k)
+        else:
+            B0 = self._foot()[0]
+            r_ = float(self._law(pp)(self._foot_g())) if self.use_variable else self._radius()
+            out = [{"field": self.drag_fields[0], "kind": "arrow", "origin": B0, "dir": self._dir,
+                    "param": r_, "base": B0,
+                    "to_value": lambda t, k=k: max(1e-4 * k, abs(t) * k)}]
+        c = getattr(self, "_corner", None)
+        if c is not None and self.corner_style == "ROUND":
+            # a diamond where the elbow meets the leg after the corner, slid along that leg
+            tn = math.tan(math.radians(c["deg"]) / 2.0)
+            r = max(self._radius(), self._radius_end())     # elbows: Bend x the largest radius
+            out.append({"field": "bend", "kind": "draft", "origin": c["C"], "dir": c["t_out"],
+                        "param": sweeps.elbow_reach(c, self.bend * r),
+                        "to_value": lambda t, tn=tn, r=r: max(1.0, abs(t) / tn / r) if tn > 1e-9 else None,
+                        "snap": (0.1, 0.01)})
+        return out
+
+    def _side(self, N, B, T):
+        """Of the frame's four directions square to the rail, the one most across the view."""
+        rv3d = self._win(bpy.context)[1]
+        if rv3d is None:
+            return N
+        view = np.array(rv3d.view_rotation @ Vector((0.0, 0.0, -1.0)), float)
+        side = np.cross(view, T)
+        if np.linalg.norm(side) < 1e-6:
+            side = np.array(rv3d.view_rotation @ Vector((0.0, 1.0, 0.0)), float)
+        return max((N, B, -N, -B), key=lambda d: float(d @ side))
+
+    def _foot_g(self):
+        i, k = self._kb
+        sp = self._pp[0]["spans"][i]
+        if sp["track"] is None:
+            return float(sp["g"][k])
+        return sp["s0"] + float(sp["track"]["s"][k])
+
+    def drag_preview(self):
+        r = self._radius()
+        style = sweeps.pipe_cap_style({"cap_style": self.cap_style, "caps": self.body != "SURFACE"})
+        a = np.linspace(0.0, 2.0 * math.pi, self.PREVIEW_RING)
+        ca, sa = np.cos(a), np.sin(a)
+        ring = r * np.stack([ca, sa], axis=1)
+        lines, tris, guides = [], [], []
+        rnd = self.corner_style == "ROUND"
+        unit = np.stack([ca, sa], axis=1)
+        for pp in self._pp:
+            law = self._law(pp)
+            rmax = law.rmax
+            bend = self.bend * rmax
+            too_big = (bend if rnd else rmax) > pp["limit"] * (1.0 + (1e-6 if rnd else 1e-9))
+            for sp in pp["spans"]:
+                tr = sp["track"]
+                pieces = []
+                if tr is None:
+                    P, N, B = sp["P"], sp["N"], sp["B"]
+                    rk = law(sp["g"])
+                    pieces.append(([P[k] + rk[k] * (np.outer(unit[:, 0], N[k]) + np.outer(unit[:, 1], B[k]))
+                                    for k in range(len(P))], 6))
+                else:           # a stretch between corners: its columns cut off on the mitres / where the elbows start
+                    L_ = float(tr["s"][-1])
+                    used = sum(sweeps.elbow_reach(tr[k], bend) for k in ("start", "end")
+                               if rnd and tr[k] is not None)
+                    if too_big or L_ - used > 1e-7 * L_:
+                        pieces.append((list(sweeps.mitred_rows(tr, unit, 25, bend, law, sp["s0"])), 4))
+                    if rnd and tr["end"] is not None and not too_big:
+                        c = tr["end"]
+                        Pk, Tk, Nk, Bk = sweeps._frame_end(tr, -1)
+                        p0, O, ax, th = sweeps.elbow_geometry(c, bend)
+                        rc = law(sp["s0"] + L_)
+                        X = p0 + rc * (np.outer(unit[:, 0], Nk) + np.outer(unit[:, 1], Bk))
+                        pieces.append(([O + sweeps._rot_rows(X - O, ax, f) for f in np.linspace(0.0, th, 13)], 3))
+                for rows, every in pieces:
+                    L, Tr = ruled_preview(rows, ribs=8, row_every=every)
+                    if too_big:                     # the mitres / elbows don't fit: shown in red, not made
+                        guides += [(ln, (1.0, 0.25, 0.2, 1.0)) for ln in L]
+                        continue
+                    lines += L
+                    tris.append(Tr)
+            if style == "NONE" or too_big:
+                continue
+            for (C, out, N, B), gk, sgn in zip(pp["ends"], (0.0, pp["total"]), (-1.0, 1.0)):
+                rk = law(gk)
+                dirs = np.outer(unit[:, 0], N) + np.outer(unit[:, 1], B)
+                circle = C + rk * dirs
+                if style == "FLAT":
+                    fan = np.stack([np.repeat(C[None], len(circle) - 1, axis=0), circle[:-1], circle[1:]], axis=1)
+                    tris.append(fan.reshape(-1, 3))
+                else:           # the round cap: latitude rings over its sphere, from the end circle to the pole
+                    off, R, th0 = sweeps.cap_meridian(rk, sgn * law.slope(gk))
+                    lat = np.linspace(th0, 0.5 * math.pi, 7)
+                    cap = [C + off * out + R * math.cos(f) * dirs + R * math.sin(f) * out for f in lat]
+                    L, Tr = ruled_preview(cap, ribs=8, row_every=2)
+                    lines += L
+                    tris.append(Tr)
+        for _, pts in self._bad:                # a red ring round a corner the pipe can't take
+            for q in pts:
+                guides.append((q + 1.6 * r * np.outer(ca, self._ring_x(q)) + 1.6 * r * np.outer(sa, self._ring_y(q)),
+                               (1.0, 0.25, 0.2, 1.0)))
+        return {"lines": lines, "tris": np.vstack(tris) if tris else np.zeros((0, 3)), "guides": guides}
+
+    def _ring_x(self, q):
+        rv3d = self._win(bpy.context)[1]
+        return np.array(rv3d.view_rotation @ Vector((1.0, 0.0, 0.0)), float)
+
+    def _ring_y(self, q):
+        rv3d = self._win(bpy.context)[1]
+        return np.array(rv3d.view_rotation @ Vector((0.0, 1.0, 0.0)), float)
+
+    def drag_check(self):
+        if self._bad:
+            return self._bad[0][0] + (" · J: a pipe each" if self.join and self._n_in > 1 else "")
+        r = self._law(self._pp[0]).rmax if self.use_variable else self._radius()
+        for pp in self._pp:
+            sep = " · J: a pipe each" if self.join and len(pp["inputs"]) > 1 else ""
+            if self.use_variable and pp["closed"] and abs(self._radius_end() - self._radius()) > 1e-12:
+                return "a closed rail has no start and end for a varying radius (V: one radius)"
+            if self.corner_style == "ROUND" and self.bend * r > pp["limit"] * (1.0 + 1e-6):
+                return f"the elbows don't fit: Bend at most ×{pp['limit'] / r:.2f} at this radius" + sep
+            if self.corner_style != "ROUND" and r > pp["limit"] * (1.0 + 1e-9):
+                lim = pp["limit"] * (2.0 if self.use_diameter else 1.0)
+                return f"too large for the mitred corners: at most {fmt_length(bpy.context, lim)}" + sep
+        return "" if r > 1e-4 else "Radius 0: drag the arrow out, or type a radius"
+
+    def drag_key(self, context, event, ch):
+        if ch == "d":                   # the same size, given the other way
+            r, re = self._radius(), (0.5 * self.diameter_end if self.use_diameter else self.radius_end)
+            self.use_diameter = not self.use_diameter
+            self.radius, self.diameter = max(1e-4, r), max(2e-4, 2.0 * r)
+            self.radius_end, self.diameter_end = max(1e-4, re), max(2e-4, 2.0 * re)
+        elif ch == "v":
+            if not self.use_variable:   # start the end where the start is: drag its arrow from there
+                r = self._radius()
+                self.radius_end, self.diameter_end = r, 2.0 * r
+            self.use_variable = not self.use_variable
+        elif ch == "t" and self.use_variable:
+            self.taper = "SMOOTH" if self.taper == "LINEAR" else "LINEAR"
+        elif ch == "x" and self.use_variable:
+            return self._remove_hot(context) is not None
+        elif ch == "c":
+            keys = [k for k, _, _ in PIPE_CAP_ITEMS]
+            self.cap_style = keys[(keys.index(self.cap_style) + 1) % len(keys)]
+        elif ch == "j" and self._n_in > 1:
+            self.join = not self.join
+            self.drag_setup(context, None)
+        elif ch == "m" and getattr(self, "_corner", None) is not None:
+            self.corner_style = "ROUND" if self.corner_style == "MITRE" else "MITRE"
+            self.drag_setup(context, None)
+        elif not self.body_key(ch):
+            return False
+        return True
+
+    def drag_handle_hints(self):
+        word = "diameter" if self.use_diameter else "radius"
+        out = ([hints.key("LMB drag", f"arrows: start / end / point {word}"),
+                hints.key("LMB drag", "diamond on the rail: slide a point"),
+                hints.key("LMB", "on the rail: add a radius point"),
+                hints.key("X", "remove the point under the mouse")] if self.use_variable
+               else [hints.key("LMB drag", "arrow: " + word)])
+        if self.corner_style == "ROUND" and getattr(self, "_corner", None) is not None:
+            out.append(hints.key("LMB drag", "diamond: bend"))
+        return out
+
+    def drag_rows(self):
+        names = {"NONE": "none", "FLAT": "flat", "ROUND": "round"}
+        rows = [("Size", [hints.toggle("D", "diameter", self.use_diameter),
+                          hints.toggle("V", "variable", self.use_variable)]
+                 + ([hints.cycle("T", ["linear", "smooth"], self.taper.lower())] if self.use_variable else [])),
+                ("Caps", [hints.cycle("C", list(names.values()), names[self.cap_style])])]
+        if getattr(self, "_corner", None) is not None:
+            rows.append(("Corners", [hints.cycle("M", ["mitre", "round"], self.corner_style.lower())]))
+        if self._n_in > 1:
+            rows.append(("Rails", [hints.toggle("J", "join touching", self.join)]))
+        return rows + [self.body_row()]
+
+    def drag_state(self):
+        style = sweeps.pipe_cap_style({"cap_style": self.cap_style, "caps": self.body != "SURFACE"})
+        caps = {"NONE": "Open", "FLAT": "Flat caps", "ROUND": "Round caps"}[style]
+        n = len(self._pp)
+        mitres = sum(len(pp["spans"]) - (1 if pp["ends"] else 0)        # a closed rail: one more joint
+                     for pp in self._pp if pp["spans"][0]["track"] is not None)
+        word = "elbow" if self.corner_style == "ROUND" else "mitre"
+        npts = len(self.points) if self.use_variable else 0
+        return (([f"{n} pipes"] if n > 1 else []) + ([f"{mitres} {word}{'s' if mitres > 1 else ''}"] if mitres else [])
+                + ([f"{npts} radius point{'s' if npts > 1 else ''}"] if npts else []) + [caps] + self.body_state())
+
+
+def _point_size(i):
+    def get(self):
+        r = self.points[i].radius
+        return 2.0 * r if self.use_diameter else r
+
+    def set_(self, v):
+        self.points[i].radius = max(1e-4, 0.5 * v if self.use_diameter else v)
+    return property(get, set_)
+
+
+def _point_at(i):
+    def get(self):
+        return self.points[i].at
+
+    def set_(self, v):
+        self.points[i].at = min(0.995, max(0.005, float(v)))
+    return property(get, set_)
+
+
+for _i in range(PIPE_MAX_POINTS):          # the value stage's fields for radius point i: pr_i (size), pa_i (where)
+    setattr(NPROTO_OT_pipe, f"pr_{_i}", _point_size(_i))
+    setattr(NPROTO_OT_pipe, f"pa_{_i}", _point_at(_i))
 
 
 BD_DEG = [("0", "Auto", "Auto: exact edges keep the curves' own degree; a fit uses 3")] + \

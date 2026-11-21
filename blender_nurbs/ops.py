@@ -286,6 +286,15 @@ class PickMixin:
     def pick_candidates(self, context):
         return _pick_candidates(context, self.allow_edges)
 
+    def pick_miss(self, context, event):
+        """A candidate (obj, ref, points) for a click that hit no curve or
+        edge (Extrude: the face under the mouse), or None."""
+        return None
+
+    def hover_miss(self, context, event, cur):
+        """Called on every hover with the candidate under the mouse (None: no
+        curve or edge there; Extrude lights the face under it)."""
+
     def closes_loop(self):
         return False
 
@@ -344,6 +353,7 @@ class PickMixin:
             self._tie_key, self._ties, self._cycle = key, ties, 0
         cur = self._ties[self._cycle % len(self._ties)] if self._ties else None
         draw.pick_overlay["hover"] = cur[2] if cur else None
+        self.hover_miss(context, event, cur)
         self._status(context)
         context.area.tag_redraw()
         return cur
@@ -433,6 +443,8 @@ class PickMixin:
         elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
             hit = self._update_hover(context, event)
             self._last_mouse = Vector((event.mouse_region_x, event.mouse_region_y))
+            if not hit:
+                hit = self.pick_miss(context, event)
             if hit:
                 self._tie_key = None
                 have = {(o.name, r) for o, r in self._picks}
@@ -738,6 +750,15 @@ class SolidBody:
                 failed.append(f"{reg[0][0].name}: {exc}" if len(groups) > 1 else str(exc))
         if not made or self.body == "NEW":
             return made, failed
+        made, more = self.combine_made(context, made)
+        return made, failed + more
+
+    def combine_made(self, context, made):
+        """(objects, failure texts): the new solids joined to, cut from or
+        intersected with the target body (Body), or kept as they are when
+        there is none."""
+        from . import jobs
+        failed = []
         word = {"JOIN": "join to", "CUT": "cut", "INTERSECT": "intersect with"}[self.body]
         target = self.find_target(context, made)
         if target is None:
@@ -847,6 +868,16 @@ class NPROTO_OT_loft(SolidBody, PickMixin, bpy.types.Operator):
                              description="Bezier Spans: degree along the sides")
     span_faces: BoolProperty(name="Split into Faces", default=False,
                              description="Bezier Spans: one Bezier patch per span, joined into one body")
+    a_from: FloatProperty(name="From A", default=0.0, min=0.0, max=1.0, subtype='FACTOR',
+                          description="Slide the loft's start along side A (share of its length): the loft "
+                                      "spans only From..To of the edge and still holds G0 - G3 along that stretch")
+    a_to: FloatProperty(name="To A", default=1.0, min=0.0, max=1.0, subtype='FACTOR',
+                        description="Slide the loft's end along side A (share of its length)")
+    b_from: FloatProperty(name="From B", default=0.0, min=0.0, max=1.0, subtype='FACTOR',
+                          description="Slide the loft's start along side B (share of its length, counted from "
+                                      "the same end as side A)")
+    b_to: FloatProperty(name="To B", default=1.0, min=0.0, max=1.0, subtype='FACTOR',
+                        description="Slide the loft's end along side B (share of its length)")
     edges_a: EnumProperty(name="Edges A", items=EDGE_ITEMS, default="EDGES",
                           description="G1 / G2: which way the loft leaves side A")
     edges_b: EnumProperty(name="Edges B", items=EDGE_ITEMS, default="EDGES",
@@ -1009,6 +1040,8 @@ class NPROTO_OT_loft(SolidBody, PickMixin, bpy.types.Operator):
         counts = self._side_counts()
         if counts and (any(c > 1 for c in counts) or self.rails):
             p["sides"] = counts
+        if (self.a_from, self.a_to, self.b_from, self.b_to) != (0.0, 1.0, 0.0, 1.0) and not self.rails:
+            p.update({k: getattr(self, k) for k in features.SLIDE_KEYS})
         if self.rails:
             p.update({"rails": int(self.rails), "cont_ra": self.cont_ra, "cont_rb": self.cont_rb,
                       "tan_ra": self.tan_ra, "tan_rb": self.tan_rb, "corner_ease": self.corner_ease,
@@ -1077,6 +1110,9 @@ class NPROTO_OT_loft(SolidBody, PickMixin, bpy.types.Operator):
             row.prop(self, f"tan_{side}", text="Weight" if nr else "Tangent")
             if not nr:
                 row.prop(self, f"cur_{side}", text="Curvature")
+                row = box.row(align=True)          # slide the ends along the side (curves too)
+                row.prop(self, f"{side}_from", text="From", slider=True)
+                row.prop(self, f"{side}_to", text="To", slider=True)
         for j in range(nr):
             i0, k = firsts[nprof + j], counts[nprof + j]
             ref = refs[i0]
@@ -1139,6 +1175,31 @@ def _curve_inputs(context):
         if o.type == 'CURVE':
             out += [(o, f"S{i}") for i in range(len(o.data.splines))]
     return out
+
+
+def _face_flat(obj, i):
+    try:
+        return bool(store.get_brep(obj).faces()[i].surface().is_planar())
+    except Exception:
+        return False
+
+
+def _face_inputs(context):
+    """Extrude Face inputs a selection gives: the faces picked in Face mode on
+    the selected NURBS objects, else every face of the selected open surfaces
+    (not solids: a solid's face is picked). None in Edge mode or with edges
+    picked: those are the inputs then."""
+    from . import subsel
+    try:
+        if "EDGE" in subsel.kinds(context) or subsel.selected_edges(context):
+            return []
+    except Exception:
+        pass
+    objs = [o for o in context.selected_objects if store.is_nurbs(o)]
+    out = [(o, f"F{i}") for o in objs for i in subsel.picks(o, "FACE")]
+    if out:
+        return out
+    return [(o, f"F{i}") for o in objs if not _is_solid(o) for i in range(store.get_brep(o).face_count())]
 
 
 class _CurveTool(PickMixin):
@@ -1228,7 +1289,8 @@ def extrude_rows(P, d, h, draft=0.0, flip=False, symmetric=False, smooth=True, c
 
 
 class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Operator):
-    """Extrude curves (or surface edges) into surfaces. From the UI the distance
+    """Extrude curves or surface edges into surfaces, or a surface face into a
+    solid (joined to its own body, or cut from it). From the UI the distance
     follows the mouse with a preview; type a value, Tab for the draft, LMB to apply"""
     bl_idname = "nproto.extrude"
     bl_label = "Extrude"
@@ -1236,6 +1298,7 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
     op_name = "extrude"
     start_value = 0.0      # the arrow stands on the curve: nothing is extruded until it is dragged
     pick_max = 256         # a click takes one curve or edge; Shift+click keeps picking, Enter finishes
+    extra_help = "click inside a face (away from its edges) to extrude the face into a solid"
 
     distance: FloatProperty(name="Distance", default=1.0, unit='LENGTH',
                             description="Height along the direction (with draft: the far edge also moves outward)")
@@ -1273,7 +1336,114 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
 
     def _groups(self, ins):
         """The surfaces to make: inputs that touch end to end together (Chain)."""
+        ins = [x for x in ins if not features.is_face_ref(x[1])]
+        if not ins:
+            return []
         return features.profile_groups(ins) if self.chain or self.body != "SURFACE" else [[x] for x in ins]
+
+    # -- faces: Extrude Face (features.build_extrude_face) -----------------------
+    @staticmethod
+    def _faces(ins):
+        return [x for x in ins if features.is_face_ref(x[1])]
+
+    def selection_inputs(self, context):
+        return _curve_inputs(context) or _face_inputs(context)
+
+    def pick_miss(self, context, event):
+        """A click inside a face (no edge near it) picks the face."""
+        from . import subsel
+        try:
+            hit = subsel.face_under(context, (event.mouse_region_x, event.mouse_region_y))
+        except Exception:
+            return None
+        if hit is None:
+            return None
+        o, i = hit
+        M = np.array(geom.world_matrix(o))
+        polys = subsel.face_tris(o, i)[2]
+        P = max(polys, key=len) if polys else np.zeros((0, 3))
+        return (o, f"F{i}", [Vector(q) for q in (np.c_[P, np.ones(len(P))] @ M.T)[:, :3]])
+
+    def hover_miss(self, context, event, cur):
+        """No edge near the mouse: light the face under it (a click picks it)."""
+        from . import subsel
+        hit = None
+        if cur is None:
+            try:
+                hit = subsel.face_under(context, (event.mouse_region_x, event.mouse_region_y))
+            except Exception:
+                hit = None
+        key = (hit[0].name, hit[1]) if hit else None
+        if key == getattr(self, "_face_hover", None):
+            return
+        self._face_hover = key
+        pv = None
+        if hit is not None:
+            from .pushpull import face_highlight
+            try:
+                pv = face_highlight(*hit)
+            except Exception as exc:
+                print("NURBS extrude face hover:", exc)
+        draw.pick_overlay["preview"] = pv
+
+    def _end(self, context):
+        super()._end(context)
+        if getattr(self, "_face_hover", None) is not None:
+            draw.pick_overlay["preview"] = None
+            self._face_hover = None
+
+    def _face_body(self, faces):
+        """A face always makes a solid: Body Surface becomes Join for a solid's
+        face (joined to its body) and New Solid for an open surface's."""
+        if faces and self.body == "SURFACE":
+            self.body = "JOIN" if all(_is_solid(o) for o, _ in faces) else "NEW"
+        if faces and self.body in BODY_BOOL and not self.target:
+            own = [o for o, _ in faces if _is_solid(o)]
+            if own:
+                self.target = own[0].name
+
+    def body_key(self, ch):
+        if not super().body_key(ch):
+            return False
+        if self.body == "SURFACE" and self._faces(_decode_inputs(self.inputs)):
+            super().body_key(ch)                 # a face makes a solid: no Surface
+        return True
+
+    def execute_faces(self, context, faces):
+        self._face_body(faces)
+        made, failed = [], []
+        reach = 0.0
+        if self.body in BODY_BOOL:              # a hair behind the face: the boolean never meets it exactly
+            size = max(float(np.linalg.norm(_world_box(o)[1] - _world_box(o)[0])) for o, _ in faces)
+            reach = 1e-5 * (size or 1.0)
+        for o, ref in faces:
+            p = self.params()
+            p.pop("normal_hint", None)
+            from .pushpull import face_frame
+            p["face_local"] = [float(x) for x in face_frame(o, int(ref[1:]))[0]]
+            p["reach"] = reach
+            try:
+                made.append(_make_result(context, self.bl_label, "extrude_face", [(o, ref)], p))
+            except Exception as exc:
+                failed.append(f"{o.name} face {ref[1:]}: {exc}")
+        # an open surface extruded whole: the solid replaces it (kept for Restore Inputs with history)
+        whole = [o for o in {o for o, _ in faces} if not _is_solid(o)
+                 and {r for x, r in faces if x is o} == {f"F{i}" for i in range(store.get_brep(o).face_count())}]
+        if made and self.body != "NEW":
+            made, more = self.combine_made(context, made)
+            failed += more
+        if made and whole:
+            if features.history_enabled(context):
+                features.keep_inputs(context, whole)
+            else:
+                for o in whole:
+                    bpy.data.objects.remove(o)
+        if failed:
+            self.report({'ERROR'} if not made else {'WARNING'}, f"{self.bl_label} failed: " + "; ".join(failed))
+        if not made:
+            return {'CANCELLED'}
+        _select_only(context, made)
+        return {'FINISHED'}
 
     @staticmethod
     def _centre(curves):
@@ -1287,6 +1457,15 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
     def execute(self, context):
         if not _kernel_ok(self):
             return {'CANCELLED'}
+        try:
+            faces = self._faces(_decode_inputs(self.inputs))
+        except Exception as exc:
+            self.report({'ERROR'}, f"{self.bl_label} failed: {exc}")
+            return {'CANCELLED'}
+        if faces:
+            if len(faces) < len(_decode_inputs(self.inputs)):
+                self.report({'WARNING'}, "Extrude: faces and curves together -- only the faces were extruded")
+            return self.execute_faces(context, faces)
         if self.body != "SURFACE":
             return self.execute_solid(context)
         try:
@@ -1317,19 +1496,31 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
     AXES = {"x": "X", "y": "Y", "z": "Z"}
 
     def drag_setup(self, context, mouse):
-        self._ex = []
+        self._ex, self._exf = [], []         # (obj, curve, points, smooth); the face index of each (or None)
         from .kernel import load
+        from . import subsel
         ext = load().blender_ext
-        for g in self._groups(_decode_inputs(self.inputs)):
+        ins = _decode_inputs(self.inputs)
+        faces = self._faces(ins)
+        self._face_body(faces)
+        for o, ref in faces:                   # a face: its outlines (curve None), moved along its direction
+            i = features.face_at(o, {}, ref)
+            M = np.array(geom.world_matrix(o))
+            for P in subsel.face_tris(o, i)[2]:
+                if len(P) > 1:
+                    self._ex.append((o, None, (np.c_[P, np.ones(len(P))] @ M.T)[:, :3], True))
+                    self._exf.append(i)
+        for g in self._groups(ins) if not faces else []:
             obj, curve = g[0][0], features.profile_curve(g)
             cv = ext.curve_cvs(curve)
             if cv["degree"] == 1 and not cv.get("weights"):     # a polyline: its corners, exact
                 self._ex.append((obj, curve, np.array(cv["points"], float), False))
             else:
                 self._ex.append((obj, curve, geom.sample_curve(curve, 97), True))
+            self._exf.append(None)
         if not self._ex:
             return False
-        self._ctr = self._centre([c for _, c, _, _ in self._ex])
+        self._ctr = None if faces else self._centre([c for _, c, _, _ in self._ex])
         # the handles stand on the first curve: the arrow where it was clicked
         # (when it was picked by a click), else halfway along it
         obj, curve, P, smooth = self._ex[0]
@@ -1357,7 +1548,16 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
 
     def _dirs(self):
         p = self.params()
-        return [np.array(features.extrude_direction(obj, curve, p)) for obj, curve, _, _ in self._ex]
+        memo = {}
+        out = []
+        for (obj, curve, _, _), f in zip(self._ex, self._exf):
+            if f is None:
+                out.append(np.array(features.extrude_direction(obj, curve, p)))
+            else:
+                if (obj.name, f) not in memo:
+                    memo[(obj.name, f)] = np.array(features.face_direction(obj, f, p))
+                out.append(memo[(obj.name, f)])
+        return out
 
     def _draft_normal(self, d):
         """Outward direction of the draft at the diamond's foot (sample kd),
@@ -1407,8 +1607,11 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
         size = max(float(np.ptp(np.vstack([P for _, _, P, _ in self._ex]), axis=0).max()), 1e-9)
         if abs(self.distance) <= 1e-6 * size:
             return "Distance 0: drag the arrow out, or type a distance"
-        if self.body != "SURFACE" and not all(features.is_closed_curve(c) for _, c, _, _ in self._ex):
+        if self.body != "SURFACE" and not all(features.is_closed_curve(c) for _, c, _, _ in self._ex if c is not None):
             return "A solid needs closed profiles (B: Body Surface for an open one)"
+        if abs(self.draft) > 1e-9 and any(f is not None and not _face_flat(o, f)
+                                          for (o, _, _, _), f in zip(self._ex, self._exf)):
+            return "Draft needs a flat face: a curved face extrudes straight (Draft 0)"
         return ""
 
     def drag_key(self, context, event, ch):
@@ -1442,7 +1645,8 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
                 self.body_row()]
 
     def drag_state(self):
-        names = {"NORMAL": "Curve Normal", "VECTOR": "Vector"}
+        names = {"NORMAL": "Face Normal" if any(f is not None for f in getattr(self, "_exf", ())) else "Curve Normal",
+                 "VECTOR": "Vector"}
         d = names.get(self.direction, self.direction.replace("LOCAL_", "Local ").replace("_", " "))
         if d in ("X", "Y", "Z"):
             d = "World " + d
@@ -2314,31 +2518,129 @@ def _closest_ends(ca, cb):
     return best
 
 
-ALIGN_MODES = [("EDGE", "Continue Edge", "The curve continues the edge (curve + edge form one G1/G2 curve)"),
+ALIGN_MODES = [("EDGE", "Continue Edge", "The curve continues the edge (curve + edge form one G1/G2/G3 curve)"),
                ("SURFACE", "Tangent to Surface", "The curve stays tangent to the edge's surface (G2: matches its "
-                                                 "normal curvature)")]
+                                                 "normal curvature, G3 its rate)"),
+               ("NORMAL", "Perpendicular to Surface", "The curve leaves the surface square to it, along its normal, "
+                                                      "and starts out straight (G2 / G3: no curvature across it, like "
+                                                      "the normal line)"),
+               ("SYMMETRY", "Symmetry Plane", "The curve leaves square to the plane and joins its mirror image "
+                                              "smoothly: G2 keeps its bend at the plane (curvature continuous "
+                                              "through the mirror), G3 also its rate")]
+BLEND_MODES = [("EDGE", "Continue Edge", "On a surface edge the blend continues the edge itself, like a curve"),
+               ("SURFACE", "Tangent to Surface", "The blend leaves the surface tangent to it, square to the edge "
+                                                 "(G2 / G3: its normal curvature and rate carry on)"),
+               ("NORMAL", "Perpendicular to Surface", "The blend leaves the surface square to it, along its normal, "
+                                                      "and starts out straight"),
+               ("SYMMETRY", "Symmetry Plane", "The blend leaves square to the plane and joins its mirror image "
+                                              "smoothly; Curvature bends it at the plane, Rate is G3's free amount")]
+
+
+def _face_hit(context, event):
+    """(NURBS object, face index, world point on its surface) under the mouse, or None."""
+    from . import subsel, align
+    xy = (event.mouse_region_x, event.mouse_region_y)
+    try:
+        hit = subsel.face_under(context, xy)
+    except Exception:
+        return None
+    if hit is None:
+        return None
+    o, i = hit
+    region, rv3d = context.region, context.region_data
+    org = view3d_utils.region_2d_to_origin_3d(region, rv3d, xy)
+    d = view3d_utils.region_2d_to_vector_3d(region, rv3d, xy)
+    ok, loc, _, _, _, _ = context.scene.ray_cast(context.evaluated_depsgraph_get(), org, d)
+    if not ok:
+        return None
+    P = np.array(loc, float)
+    org, d = np.array(org, float), np.array(d, float) / (np.linalg.norm(d) or 1.0)
+    try:
+        # the view ray's crossing with the exact surface (the hit is on the display mesh):
+        # nearest point of the surface to the ray, and back, until it stays put
+        for _ in range(30):
+            Q = align.surface_jet(o, f"F{i}", P)[0]
+            P_new = org + float((Q - org) @ d) * d
+            done = np.linalg.norm(P_new - P) < 1e-10 * (1.0 + np.linalg.norm(P))
+            P = P_new
+            if done:
+                break
+        P = align.surface_jet(o, f"F{i}", P)[0]
+    except Exception:
+        pass
+    return o, i, P
+
+
+def _face_cand(o, i, P):
+    """A pick candidate for face i of o: its outline, and a cross at the point."""
+    from . import subsel
+    M = np.array(geom.world_matrix(o))
+    try:
+        polys = subsel.face_tris(o, i)[2]
+        Q = max(polys, key=len) if polys else np.zeros((0, 3))
+        pts = [Vector(q) for q in (np.c_[Q, np.ones(len(Q))] @ M.T)[:, :3]]
+    except Exception:
+        pts = []
+    return (o, f"F{i}", pts or [Vector(P), Vector(P)])
+
+
+def _on_pick_point(context, cand, mouse):
+    """World point of a picked curve / edge (its drawn polyline) nearest the mouse."""
+    region, rv3d = context.region, context.region_data
+    pts = cand[2]
+    best = None
+    for a, b in zip(pts[:-1], pts[1:]):
+        qa = view3d_utils.location_3d_to_region_2d(region, rv3d, a)
+        qb = view3d_utils.location_3d_to_region_2d(region, rv3d, b)
+        if qa is None or qb is None:
+            continue
+        seg = qb - qa
+        L = seg.length_squared
+        t = 0.0 if L == 0 else max(0.0, min(1.0, (mouse - qa).dot(seg) / L))
+        dd = (qa + seg * t - mouse).length
+        if best is None or dd < best[0]:
+            best = (dd, a.lerp(b, t))
+    return np.array(best[1] if best else pts[0], float)
+
+
+def _param_fraction(obj, ref, P):
+    """0..1 of the curve / edge parameter range at its point nearest P."""
+    from . import align
+    kc = features.input_curve(obj, ref)
+    t0, t1 = kc.parameter_range()
+    return (align.curve_param_near(kc, np.asarray(P, float)) - t0) / ((t1 - t0) or 1.0)
+
+
+def _is_surface_input(obj, ref):
+    return obj.type != 'CURVE' and store.is_nurbs(obj) and (features.is_surface_edge(ref) or ref.startswith("F"))
 
 
 class NPROTO_OT_align_curve(PickMixin, bpy.types.Operator):
-    """Align a curve end to an edge with G0 / G1 / G2 by moving only the end CVs.
-    Click the curve near the end to align, then the edge (surface edge or curve)"""
+    """Align a curve end to an edge or surface with G0 / G1 / G2 / G3 by moving only the end CVs.
+    Click the curve near the end to align, then the edge (surface edge, curve or sketch), or a
+    surface's face (Tangent to it or Perpendicular)"""
     bl_idname = "nproto.align_curve"
     bl_label = "Align Curve"
     bl_options = {'REGISTER', 'UNDO'}
 
     pick_min = 2
     pick_max = 2
+    extra_help = "(2nd click: an edge or curve, or inside a surface's face)"
 
     inputs: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     end: IntProperty(name="End", default=0, min=0, max=1, options={'HIDDEN'})
-    cont: EnumProperty(name="Continuity", items=CONT_ITEMS, default="G2")
+    cont: EnumProperty(name="Continuity", items=BLEND_CONT_ITEMS, default="G2")
     weight: FloatProperty(name="Weight", default=1.0, min=0.01, soft_max=3.0,
                           description="Tangent length at the end, relative to the curve's own")
     mode: EnumProperty(name="Mode", items=ALIGN_MODES, default="EDGE")
     snap: EnumProperty(name="Snap", items=[("END", "Edge End", "The nearest end of the edge"),
                                            ("NEAREST", "Nearest Point", "The nearest point on the edge")],
                        default="END")
-    flip: BoolProperty(name="Flip", default=False, description="Reverse the edge direction used for G1 / G2")
+    flip: BoolProperty(name="Flip", default=False, description="Reverse the edge direction used for G1 / G2 "
+                                                               "(Perpendicular: leave on the other side)")
+    face_point: FloatVectorProperty(name="Face Point", size=3, subtype='XYZ', options={'HIDDEN'},
+                                    description="Where a face target was clicked: the end goes there")
+    use_face_point: BoolProperty(default=False, options={'HIDDEN'})
 
     def expand_pick(self, cand):
         if not getattr(self, "_picks", None):          # first pick: the curve; which end?
@@ -2350,6 +2652,18 @@ class NPROTO_OT_align_curve(PickMixin, bpy.types.Operator):
             if a is not None and b is not None and m is not None:
                 self.end = 0 if (a - m).length < (b - m).length else 1
         return [cand]
+
+    def pick_miss(self, context, event):
+        """The target can be a face (a click inside it, no edge near)."""
+        if len(getattr(self, "_picks", [])) != 1:
+            return None
+        hit = _face_hit(context, event)
+        if hit is None:
+            return None
+        if self.mode == "EDGE":
+            self.mode = "NORMAL"                         # a face is not an edge to continue
+        self.face_point, self.use_face_point = tuple(map(float, hit[2])), True
+        return _face_cand(*hit)
 
     def invoke(self, context, event):
         if not _kernel_ok(self):
@@ -2366,28 +2680,46 @@ class NPROTO_OT_align_curve(PickMixin, bpy.types.Operator):
                 raise ValueError("pick the curve (near the end to align), then the edge")
             obj, target = picks[0][0], picks[1]
             if target[0] == obj:
-                raise ValueError("pick an edge of another object")
+                raise ValueError("pick an edge of another object (Align's history follows it: not "
+                                 "the curve's own object)")
+            sref = picks[0][1] if picks[0][1].startswith("S") else "S0"
+            if align.is_face_ref(target[1]) and self.mode == "EDGE":
+                self.mode = "NORMAL"
             h = features.history(obj)
-            if h is not None and h["op"] == "align_curve":
+            if h is not None and h["op"] == "align_curve" and h["inputs"][0][1] == sref:
                 inputs = list(h["inputs"])
                 ends = dict(h["params"].get("ends", {}))
             else:
                 if features.has_history(obj):
                     features.clear_history(obj)
                     self.report({'INFO'}, f"{obj.name}: its construction history was replaced by Align")
-                inputs, ends = [(obj, "S0")], {}
+                inputs, ends = [(obj, sref)], {}
             # the other end keeps its alignment; this end gets the new edge
             keep = {e: v for e, v in ends.items() if e != str(self.end)}
             used = sorted({int(v["input"]) for v in keep.values()})
-            new_inputs = [(obj, "S0")] + [inputs[i] for i in used]
+            new_inputs = [(obj, sref)] + [inputs[i] for i in used]
             remap = {old: k + 1 for k, old in enumerate(used)}
             for v in keep.values():
                 v["input"] = remap[int(v["input"])]
             new_inputs.append(target)
-            keep[str(self.end)] = {"input": len(new_inputs) - 1, "cont": self.cont, "weight": self.weight,
-                                   "mode": self.mode, "snap": self.snap, "flip": self.flip}
-            kind, deg, Q, _ = align.solve(obj, keep, new_inputs)
-            align.write(obj, kind, deg, Q)
+            spec = {"input": len(new_inputs) - 1, "cont": self.cont, "weight": self.weight,
+                    "mode": self.mode, "snap": self.snap, "flip": self.flip}
+            if align.is_face_ref(target[1]) and self.use_face_point:
+                # the end goes where the face was clicked (rebuilds keep it: the
+                # point of the face nearest the end, as it is then)
+                align.move_end(obj, align.spline_index(new_inputs), self.end, np.array(self.face_point, float))
+            if align.solve_mode(self.mode, *target) in align.SQUARE:
+                # Perpendicular leaves on the side the curve is; Flip turns it to the other
+                kind, p, Q, _ = align.curve_state(obj, align.spline_index(new_inputs))
+                M = np.array(geom.world_matrix(obj), float)
+                W = Q @ M[:3, :3].T + M[:3, 3]
+                W = W if self.end == 0 else W[::-1]
+                fr = align.end_frame(target[0], target[1], W[0], self.snap, self.mode, False)
+                if fr[1] @ (np.mean(W[1:], axis=0) - fr[0]) < 0:
+                    spec["flip"] = not self.flip
+            keep[str(self.end)] = spec
+            kind, deg, Q, _ = align.solve(obj, keep, new_inputs, fresh=(str(self.end),))
+            align.write(obj, kind, deg, Q, align.spline_index(new_inputs))
             if features.history_enabled(context):
                 features.record(obj, "align_curve", new_inputs, {"ends": keep})
         except Exception as exc:
@@ -2400,16 +2732,27 @@ class NPROTO_OT_align_curve(PickMixin, bpy.types.Operator):
         lay = self.layout
         lay.label(text=f"End {'start' if self.end == 0 else 'end'} of the curve", icon='CURVE_DATA')
         lay.row().prop(self, "cont", expand=True)
-        lay.prop(self, "mode")
-        lay.prop(self, "snap")
+        try:
+            tgt = _decode_inputs(self.inputs)[1]
+        except Exception:
+            tgt = None
+        surf = tgt is not None and _is_surface_input(*tgt)
+        face = tgt is not None and tgt[1].startswith("F")
+        row = lay.row()
+        row.active = surf
+        row.prop(self, "mode")
+        row = lay.row()
+        row.active = not face
+        row.prop(self, "snap")
         row = lay.row(align=True)
         row.prop(self, "weight")
         row.prop(self, "flip", toggle=True)
 
 
 class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
-    """Blend curve between two curve ends with G0 / G1 / G2 / G3 and a weight per side.
-    Click each curve near the end to blend from"""
+    """Blend curve between two curves, sketches, surface edges or surface points with G0 / G1 / G2 / G3
+    and a weight per side. Click each curve near the end to blend from; P blends from the point
+    clicked along it instead (closed curves always do), a click inside a face starts on the surface"""
     bl_idname = "nproto.blend_curve"
     bl_label = "Blend Curve"
     bl_options = {'REGISTER', 'UNDO'}
@@ -2428,27 +2771,86 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
     c_a: FloatProperty(name="Curvature A", default=0.0, soft_min=-2.0, soft_max=2.0,
                        description="G2 / G3 shape at A (moves the 3rd CV along the tangent)")
     c_b: FloatProperty(name="Curvature B", default=0.0, soft_min=-2.0, soft_max=2.0)
+    d_a: FloatProperty(name="Rate A", default=0.0, soft_min=-2.0, soft_max=2.0,
+                       description="G3 shape at A (moves the 4th CV along the tangent)")
+    d_b: FloatProperty(name="Rate B", default=0.0, soft_min=-2.0, soft_max=2.0)
     flip_a: BoolProperty(name="Flip A", default=False, description="Reverse the tangent direction at A")
     flip_b: BoolProperty(name="Flip B", default=False)
+    mode_a: EnumProperty(name="Surface A", items=BLEND_MODES, default="SURFACE",
+                         description="How side A leaves a surface edge or face (a curve is always continued)")
+    mode_b: EnumProperty(name="Surface B", items=BLEND_MODES, default="SURFACE")
+    on_a: BoolProperty(name="Point Along A", default=False,
+                       description="Start at a point along the curve / edge (Position) instead of its end")
+    on_b: BoolProperty(name="Point Along B", default=False)
+    at_a: FloatProperty(name="Position A", default=0.5, min=0.0, max=1.0, subtype='FACTOR',
+                        description="Where along the curve / edge (0..1 of its parameter)")
+    at_b: FloatProperty(name="Position B", default=0.5, min=0.0, max=1.0, subtype='FACTOR')
+    uv_a: FloatVectorProperty(name="Face Point A", size=2, default=(0.5, 0.5), min=0.0, max=1.0,
+                              description="The point on a face input (0..1 of the surface's U and V)")
+    uv_b: FloatVectorProperty(name="Face Point B", size=2, default=(0.5, 0.5), min=0.0, max=1.0)
+
+    extra_keys = (("P", "point along / end"),)
+    extra_help = "(a click inside a face blends from that point of the surface)"
+
+    def tool_key(self, context, event):
+        if event.type == 'P':
+            self._point_mode = not getattr(self, "_point_mode", False)
+            return True
+        return False
+
+    def pick_state(self):
+        n = len(getattr(self, "_picks", []))
+        where = "the point clicked" if getattr(self, "_point_mode", False) else "the nearest end"
+        return f"pick side {'A' if n == 0 else 'B'} (from {where}; P switches)"
+
+    def pick_miss(self, context, event):
+        """A click inside a face (no edge near) blends from that point of the surface."""
+        hit = _face_hit(context, event)
+        if hit is None:
+            return None
+        self._miss_point = hit[2]
+        return _face_cand(*hit)
 
     def expand_pick(self, cand):
-        # which end of the picked curve is nearer the click (in screen space)?
         obj, ref, pts = cand
-        region, rv3d = bpy.context.region, bpy.context.region_data
-        a = view3d_utils.location_3d_to_region_2d(region, rv3d, pts[0])
-        b = view3d_utils.location_3d_to_region_2d(region, rv3d, pts[-1])
+        side = {"end": 1, "on": False, "at": 0.5, "uv": (0.5, 0.5), "mode": None}
         m = getattr(self, "_last_mouse", None)
-        end = 1
-        if a is not None and b is not None and m is not None:
-            end = 0 if (a - m).length < (b - m).length else 1
-        if not hasattr(self, "_ends"):
-            self._ends = []
-        self._ends = self._ends[:len(self._picks)] + [end]
+        if ref.startswith("F") and ref[1:].isdigit():
+            from . import align
+            try:
+                side["uv"] = tuple(align.surface_jet(obj, ref, getattr(self, "_miss_point", pts[0]))[4])
+            except Exception:
+                pass
+            side["mode"] = "NORMAL"          # from a point of a surface: square to it (Surface: Tangent in F9)
+        else:
+            # which end of the picked curve is nearer the click (in screen space)?
+            region, rv3d = bpy.context.region, bpy.context.region_data
+            a = view3d_utils.location_3d_to_region_2d(region, rv3d, pts[0])
+            b = view3d_utils.location_3d_to_region_2d(region, rv3d, pts[-1])
+            if a is not None and b is not None and m is not None:
+                side["end"] = 0 if (a - m).length < (b - m).length else 1
+            closed = (Vector(pts[0]) - Vector(pts[-1])).length <= 1e-6 * max(
+                1e-9, sum((Vector(pts[k + 1]) - Vector(pts[k])).length for k in range(len(pts) - 1)))
+            if (closed or getattr(self, "_point_mode", False)) and m is not None:
+                try:
+                    side["at"] = _param_fraction(obj, ref, _on_pick_point(bpy.context, cand, m))
+                    side["on"] = True
+                except Exception as exc:
+                    print("NURBS blend: no point along", obj.name, ref, exc)
+        if not hasattr(self, "_sides"):
+            self._sides = []
+        self._sides = self._sides[:len(self._picks)] + [side]
         return [cand]
 
     def _finish(self, context):
-        ends = getattr(self, "_ends", [1, 0])
-        self.end_a, self.end_b = ends[0], ends[1] if len(ends) > 1 else 0
+        sides = getattr(self, "_sides", [])
+        for s, d in zip("ab", sides):
+            setattr(self, f"end_{s}", d["end"])
+            setattr(self, f"on_{s}", d["on"])
+            setattr(self, f"at_{s}", d["at"])
+            setattr(self, f"uv_{s}", d["uv"])
+            if d.get("mode"):
+                setattr(self, f"mode_{s}", d["mode"])
         return super()._finish(context)
 
     def _from_selection(self, context):
@@ -2460,6 +2862,7 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
         ca = features.input_curve(sel[0], "S0")
         cb = features.input_curve(sel[1], "S0")
         self.end_a, self.end_b = _closest_ends(ca, cb)
+        self.on_a = self.on_b = False
         self.inputs = _encode_inputs([(sel[0], "S0"), (sel[1], "S0")])
         return True
 
@@ -2468,13 +2871,23 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
             return {'CANCELLED'}
         if not event.alt and self._from_selection(context):
             return self.execute(context)
-        self._ends = []
+        self._sides = []
+        self._point_mode = False
         return self.start_picking(context, event)
 
-    def _params(self):
-        return {"end_a": self.end_a, "end_b": self.end_b, "cont_a": self.cont_a, "cont_b": self.cont_b,
-                "w_a": self.w_a, "w_b": self.w_b, "c_a": self.c_a, "c_b": self.c_b,
-                "flip_a": self.flip_a, "flip_b": self.flip_b}
+    def _params(self, inputs=None):
+        p = {"end_a": self.end_a, "end_b": self.end_b, "cont_a": self.cont_a, "cont_b": self.cont_b,
+             "w_a": self.w_a, "w_b": self.w_b, "c_a": self.c_a, "c_b": self.c_b,
+             "d_a": self.d_a, "d_b": self.d_b, "flip_a": self.flip_a, "flip_b": self.flip_b}
+        for s, (o, r) in zip("ab", inputs or []):
+            if _is_surface_input(o, r):
+                p[f"bc_mode_{s}"] = getattr(self, f"mode_{s}")
+            if r.startswith("F"):
+                p[f"uv_{s}"] = [float(x) for x in getattr(self, f"uv_{s}")]
+            elif getattr(self, f"on_{s}"):
+                p[f"bc_on_{s}"] = True
+                p[f"bc_at_{s}"] = float(getattr(self, f"at_{s}"))
+        return p
 
     def execute(self, context):
         if not _kernel_ok(self):
@@ -2485,7 +2898,7 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
             inputs = _decode_inputs(self.inputs)
             if len(inputs) != 2:
                 raise ValueError("select or pick two curves")
-            g = features.run("blend_curve", inputs, self._params())
+            g = features.run("blend_curve", inputs, self._params(inputs))
         except Exception as exc:
             self.report({'ERROR'}, f"Blend curve failed: {exc}")
             return {'CANCELLED'}
@@ -2494,21 +2907,37 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
         (context.collection or context.scene.collection).objects.link(obj)
         geom.write_curve_object(obj, g[1], g[2])
         if context.scene.nproto_settings.construction_history:
-            features.record(obj, "blend_curve", inputs, self._params())
+            features.record(obj, "blend_curve", inputs, self._params(inputs))
         _select_only(context, [obj])
         return {'FINISHED'}
 
     def draw(self, context):
         lay = self.layout
-        for side in "ab":
+        try:
+            ins = _decode_inputs(self.inputs)
+        except Exception:
+            ins = []
+        for k, side in enumerate("ab"):
             box = lay.box()
-            box.label(text=f"Side {side.upper()}")
+            src = ins[k] if k < len(ins) else None
+            box.label(text=f"Side {side.upper()}" + (f": {src[0].name} {src[1]}" if src else ""))
             box.row().prop(self, f"cont_{side}", expand=True)
+            if src is not None and _is_surface_input(*src):
+                box.prop(self, f"mode_{side}", text="Surface")
+            if src is not None and not src[1].startswith("F"):
+                row = box.row(align=True)
+                row.prop(self, f"on_{side}", text="Point Along", toggle=True)
+                sub = row.row(align=True)
+                sub.active = getattr(self, f"on_{side}")
+                sub.prop(self, f"at_{side}", text="Position")
             col = box.column(align=True)
             col.prop(self, f"w_{side}", text="Weight")
             sub = col.row()
             sub.enabled = getattr(self, f"cont_{side}") in ("G2", "G3")
             sub.prop(self, f"c_{side}", text="Curvature")
+            sub = col.row()
+            sub.enabled = getattr(self, f"cont_{side}") == "G3"
+            sub.prop(self, f"d_{side}", text="Rate")
             box.prop(self, f"flip_{side}")
 
 

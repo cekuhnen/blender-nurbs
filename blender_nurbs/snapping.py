@@ -525,7 +525,27 @@ _SURF_FLAT = {}         # NURBS object session_uid -> (rev, {polygon: face index
 
 class SurfaceTarget(MeshTarget):
     """A NURBS object's displayed faces: only for the flat face under the
-    mouse (its vertices and edges snap exactly, through the B-rep)."""
+    mouse (its vertices and edges snap exactly, through the B-rep), and the
+    point on a face (O: face snapping on)."""
+
+    def face_src(self, P):
+        """(the point of the B-rep face hit at world P, exactly on its surface,
+        (object name, F<i>, NEAREST)), or None."""
+        from . import align
+        from .kernel import load as load_kernel
+        obj = self.obj
+        try:
+            brep = store.get_brep(obj)
+            q = self.Ri @ np.asarray(P, float) + self.ti
+            f = load_kernel().find_face(brep, tuple(float(x) for x in q))
+            i = next((k for k, g in enumerate(brep.faces()) if g == f), -1)
+            if i < 0:
+                return None
+            ref = f"F{i}"
+            return np.asarray(align.surface_jet(obj, ref, P)[0], float), (obj.name, ref, "NEAREST")
+        except Exception as exc:
+            print("NURBS face snap skipped", getattr(obj, "name", "?"), exc)
+            return None
 
     def flat(self, poly, P):
         obj = self.obj
@@ -829,9 +849,38 @@ class Targets:
         if hits:
             k = _choose(np.array([h[0] for h in hits]), np.array([h[1] for h in hits]))
             return hits[k][2], hits[k][3], hits[k][5], hits[k][4]
+        sf = self.surface_face(view, mouse)
         if mesh is not None and mesh["face"] is not None:
-            return np.asarray(mesh["face"], float), "face", None, None
+            o, d = view.ray(mouse)
+            if sf is None or float((np.asarray(mesh["face"], float) - o) @ d) < sf[2]:
+                return np.asarray(mesh["face"], float), "face", None, None
+        if sf is not None:
+            return sf[0], "face", None, sf[1]
         return None
+
+    def surface_face(self, view, mouse):
+        """With face snapping on (O): (the point of the NURBS face under the
+        mouse, exactly on its surface, src (object name, F<i>, NEAREST), its
+        distance along the view ray), or None. A CV Curve end placed there can
+        be perpendicular or tangent to the surface (align.py)."""
+        if "FACE" not in set(self.mesh_elements() or ()) or not self._surfaces:
+            return None
+        mouse = np.asarray(mouse, float)
+        o, d = view.ray(mouse)
+        best = None
+        for m in self._surfaces:
+            if not (m.near(view, mouse) and m.ready()):
+                continue
+            h = m.cast(o, d)
+            if h is not None and (best is None or h[2] < best[1][2]):
+                best = (m, h)
+        if best is None:
+            return None
+        m, h = best
+        got = m.face_src(h[0])
+        if got is None:
+            return None
+        return got[0], got[1], h[2]
 
     def near_lines(self, view, mouse, radius, limit=3):
         """[(line index, distance in px)] of the curves / edges passing within

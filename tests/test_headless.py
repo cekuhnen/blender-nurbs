@@ -3467,6 +3467,7 @@ for o in list(bpy.data.objects):
 ctx.scene.nproto_settings.construction_history = True
 TGT = nurbs("CondTarget", [(-3, 0, 0), (-2, 0.5, 0), (-1, 1.5, 0.3), (0, 1, 0)])
 def _draw(pts, start=None, end=None, **kw):
+    kw.setdefault("keep_aligned", True)
     r_ = bpy.ops.nproto.draw_curve(data=json.dumps({"pts": pts, "start": start, "end": end, "edit": ""}), **kw)
     return r_, ctx.active_object
 def _cvs(o):
@@ -3490,6 +3491,10 @@ X1 = _cvs(CG2)
 check("cv curve G2: moving the target keeps the start continuous (history)", gap < 1e-6 and ang < 1e-4 and dk < 1e-3
       and np.allclose(X1[3], X0[3], atol=1e-6) and np.linalg.norm(X1[2] - X0[2]) > 1e-3,
       f"{gap:.1e} {ang:.1e}° {dk:.1e}")
+r, CN = _draw(clk, [TGT.name, "S0", "END"], None, mode="CV", degree="3", start_cont="G2", end_cont="G1", keep_aligned=False)
+gap, ang, dk = _al.measure(CN, 0, TGT, "S0", "END")
+check("cv curve G2, Keep Aligned off: aligned once, no history", r == {'FINISHED'} and features.history(CN) is None
+      and gap < 1e-6 and ang < 1e-4 and dk < 1e-3, f"{gap:.1e} {ang:.1e}° {dk:.1e}")
 r, C0 = _draw(clk, [TGT.name, "S0", "END"], None, mode="CV", degree="3", start_cont="G0", end_cont="G0")
 check("cv curve G0 on a curve end: no history, the clicks are the CVs", r == {'FINISHED'}
       and features.history(C0) is None and np.allclose(_cvs(C0), clk, atol=1e-6))
@@ -3598,7 +3603,7 @@ MCY = ctx.active_object
 fc = _FCtx()
 rim = 0.5 * np.array([math.cos(math.radians(30)), math.sin(math.radians(30))])
 cv = _fake(_dt.NPROTO_OT_draw_curve, mode="CV", degree="3", closed=False, start_cont="G1", end_cont="G1",
-           edge_mode="SURFACE")
+           edge_mode="SURFACE", keep_aligned=True)
 cv._edit, cv._pts, cv._snapinfo, cv._frames, cv._start_refs = None, [], [], {}, None
 cv.sketch_start(fc)
 cv.modal(fc, _ev('MOUSEMOVE', _wpx(*rim), 'NOTHING'))
@@ -5222,16 +5227,18 @@ for _cls in _tg.classes:
             _drawn[_cls.__name__] = _draw(_cls, group=getattr(_cls, "group", ""))
     except Exception as _e:
         _ui_err.append(f"{_cls.__name__}: {_e!r}")
-_in_panels = [e["op"] for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r if "op" in e]
+_DROPS = {d.menu for d in _tg.dropdowns()}        # a panel's dropdown menus: their tools are the panel's
+_in_panels = [e["op"] for n, r in _drawn.items() if n.startswith("VIEW3D_PT") or n in _DROPS for e in r if "op" in e]
 _missing = []
 for _op in set(_in_panels):
     try:
         getattr(bpy.ops.nproto, _op.split(".")[1]).get_rna_type()
     except Exception:
         _missing.append(_op)
-_not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cycle_continuity", "delete_history", "collect_inputs", "export_step",
+_not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cycle_continuity", "loft_slide", "delete_history", "collect_inputs", "export_step",
               "import_step", "open_step", "history_focus", "history_toggle_hide", "tree_step", "step_unfocus", "mute_step", "patch_add_guides",
               "patch_auto_corners", "patch_corner", "patch_remove_guide", "rebuild", "rebuild_waiting", "remove_step",
+              "pipe_point_add", "pipe_point_remove",     # Pipe / Sweep points: Feature panel rows' buttons
               "restore_inputs", "sync_feature", "tab_edit", "continuity", "continuity_clear", "section_add", "section_orient",
               "section_targets", "section_curves", "section_remove", "subsel_picker", "bake_feature", "delete_feature",
               "curve_degree", "fix_clip_start", "delete_faces", "move_pivot", "cv_nudge", "pattern_select",
@@ -5239,11 +5246,13 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cy
               "square"}     # Square: merged into Patch (Quad Sided); kept for older files, off the menus
 _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto)
               if n not in _not_tools and not n.startswith("workplane_")}   # the Work Planes panel's own
+_menu_only = {t[0] for g in _tg.GROUPS for sec in g[2] for row in sec[1] if isinstance(row, _tg.MenuOnly)
+              for t in row if t[0] != "nproto.add_primitive"}     # Edit CVs: Tab does it, the menus list it
 _tool_ops = [o_ for o_ in _in_panels if o_ not in ("nproto.add_primitive", "nproto.boolean")] + \
-    ["nproto.boolean"]                              # (one button per operation)
+    ["nproto.boolean"] + sorted(_menu_only)          # (one button per operation)
 _bool_ops = sorted(e["props"].get("operation") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r
                    if e.get("op") == "nproto.boolean")
-_kinds = [e["props"].get("kind") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r
+_kinds = [e["props"].get("kind") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") or n in _DROPS for e in r
           if e.get("op") == "nproto.add_primitive"]
 check("UI: every tool is in exactly one group panel and all operators exist",
       not _ui_err and not _missing and sorted(_tool_ops) == sorted(_all_tools)
@@ -5252,17 +5261,79 @@ check("UI: every tool is in exactly one group panel and all operators exist",
       f"bool={_bool_ops} err={_ui_err} missing={_missing} extra={sorted(set(_tool_ops) - _all_tools)} "
       f"absent={sorted(_all_tools - set(_tool_ops))} dup={sorted({o for o in _tool_ops if _tool_ops.count(o) > 1})}")
 _menu_ops = sorted(e["op"] for n, r in _drawn.items() if n.startswith("VIEW3D_MT") and n != "VIEW3D_MT_nproto_tools"
-                   for e in r if "op" in e)
+                   and n not in _DROPS for e in r if "op" in e)
 _subs = [e["menu"] for e in _drawn["VIEW3D_MT_nproto_tools"] if "menu" in e]
 _menu_kinds = sorted(e["props"].get("kind") for n, r in _drawn.items() if n.startswith("VIEW3D_MT")
-                     and n != "VIEW3D_MT_nproto_tools" for e in r if e.get("op") == "nproto.add_primitive")
-check("UI: header menu holds the five groups, the same tools as the panels, and every shape (the curve shapes "
+                     and n != "VIEW3D_MT_nproto_tools" and n not in _DROPS for e in r
+                     if e.get("op") == "nproto.add_primitive")
+check("UI: header menu holds the six groups, the same tools as the panels, and every shape (the curve shapes "
       "only there: the panel draws them)",
-      sorted(set(_menu_ops)) == sorted(set(_in_panels))
+      sorted(set(_menu_ops)) == sorted(set(_in_panels) | _menu_only) and _menu_only == {"nproto.edit_cvs"}
       and _menu_kinds == sorted(list(_prims.CURVE_KINDS) + list(_prims.SURFACE_KINDS))
       and _subs == ["VIEW3D_MT_nproto_curves", "VIEW3D_MT_nproto_surfaces",
                     "VIEW3D_MT_nproto_curve_edit", "VIEW3D_MT_nproto_surface_edit",
-                    "VIEW3D_MT_nproto_convert"], f"{_subs} {_menu_kinds}")
+                    "VIEW3D_MT_nproto_convert", "VIEW3D_MT_nproto_scan"], f"{_subs} {_menu_kinds}")
+_prim_btn = [e["menu"] for e in _drawn["VIEW3D_PT_nproto_surfaces"] if "menu" in e]
+check("UI: the surface primitives are one Primitive dropdown in Create Surfaces (not seven buttons)",
+      _prim_btn == ["VIEW3D_MT_nproto_primitives"]
+      and not any(e.get("op") == "nproto.add_primitive" for e in _drawn["VIEW3D_PT_nproto_surfaces"]), str(_prim_btn))
+_scan_ops = [e["op"] for e in _drawn["VIEW3D_PT_nproto_scan"] if "op" in e]
+check("UI: the Scan panel holds the three scan tools; Convert none of them",
+      _scan_ops == ["nproto.scan_tube_cage", "nproto.scan_fit_cage", "nproto.scan_drape_patch"]
+      and not any("scan_" in e.get("op", "") for e in _drawn["VIEW3D_PT_nproto_convert"]), str(_scan_ops))
+_sel0 = [o_ for o_ in ctx.view_layer.objects if o_.select_get()]
+_act0 = ctx.view_layer.objects.active
+_cd = bpy.data.curves.new("DimCurve", 'CURVE')
+_cv = bpy.data.objects.new("DimCurve", _cd)
+ctx.collection.objects.link(_cv)
+for o_ in _sel0:
+    o_.select_set(False)
+ctx.view_layer.objects.active = None
+_none_sel = _tg.selected_kinds(ctx)
+_cv.select_set(True)
+ctx.view_layer.objects.active = _cv
+_have = _tg.selected_kinds(ctx)
+
+
+class _ActLay:
+    """Records each row's `active` and the operators drawn in it."""
+    def __init__(self, rows, cur=None):
+        object.__setattr__(self, "rows", rows)
+        object.__setattr__(self, "cur", cur)
+    def __setattr__(self, k, v):
+        if k == "active" and self.cur is not None:
+            self.cur["active"] = v
+    def row(self, **k):
+        r = {"active": True, "ops": []}
+        self.rows.append(r)
+        return _ActLay(self.rows, r)
+    def column(self, **k):
+        return self
+    def separator(self, **k):
+        pass
+    def operator(self, op, **k):
+        self.cur["ops"].append(op)
+        return _FakeProps({})
+    def menu(self, m, **k):
+        self.cur["ops"].append(m)
+
+
+_rows = []
+_tg.draw_panel(_ActLay(_rows), "SURFACE_EDIT", ctx)
+_rows_c = []
+_tg.draw_panel(_ActLay(_rows_c), "CURVE_EDIT", ctx)
+_cut = {"nproto.trim", "nproto.split"}             # they take the curve as a cutter
+check("UI: a curve selected dims Surface Edit (still clickable) but Trim / Split and not Curve Edit; "
+      "nothing selected dims nothing",
+      _none_sel is None and _have == {"CURVE"} and _tg.fits({"NURBS"}, None)
+      and _rows and all(r_["active"] == bool(set(r_["ops"]) & _cut) for r_ in _rows if r_["ops"])
+      and all(r_["active"] for r_ in _rows_c),
+      f"{_have} {[(r_['ops'], r_['active']) for r_ in _rows]}")
+bpy.data.objects.remove(_cv)
+bpy.data.curves.remove(_cd)
+for o_ in _sel0:
+    o_.select_set(True)
+ctx.view_layer.objects.active = _act0
 _act = ctx.view_layer.objects.active
 try:
     _shown = _ui.VIEW3D_PT_nproto_active.poll(ctx)
@@ -7183,13 +7254,14 @@ check("hints: Draw Line shows its groups, the start mode lit, a short header",
 f.modal(fc, _ev('ESC'))
 check("hints: leaving the tool clears the header and the panel", fc.area.text is None and _hn.HUD["spec"] is None)
 _cvh = _fake(_dt.NPROTO_OT_draw_curve, mode="CV", degree="3", closed=False, start_cont="G1", end_cont="G2",
-             edge_mode="EDGE")
+             edge_mode="EDGE", keep_aligned=True)
 _cvh._edit, _cvh._pts, _cvh._snapinfo, _cvh._frames, _cvh._start_refs = None, [], [], {}, None
 _cvh.sketch_start(fc)
 _cvh._status(fc)
 _ends = [i for r in _hn.HUD["spec"]["rows"] if r[0] == "Ends" for i in r[1]]
-check("hints: CV Curve shows start / end continuity as choices with the current ones lit",
-      [e["current"] for e in _ends] == ["G1", "G2"] and fc.area.text.startswith("CV Curve"), str(_ends))
+check("hints: CV Curve shows start / end continuity as choices with the current ones lit, and Keep Aligned (A)",
+      [e["current"] for e in _ends] == ["G1", "G2", "on"] and _ends[2]["keys"] == ["A"]
+      and fc.area.text.startswith("CV Curve"), str(_ends))
 _cvh.sketch_end(fc)
 from blender_nurbs import ops_trim as _otm
 _efr = _otm.NPROTO_OT_edge_fillet.pick_rows(_types.SimpleNamespace(
@@ -7378,7 +7450,7 @@ _v = ctx.window_manager.nproto_view
 _comb0 = _v.show_comb
 _v.show_comb = False
 _cvk = _fake(_dt.NPROTO_OT_draw_curve, mode="CV", degree="2", closed=False, start_cont="G0", end_cont="G0",
-             edge_mode="EDGE")
+             edge_mode="EDGE", keep_aligned=False)
 _cvk._edit, _cvk._pts, _cvk._snapinfo, _cvk._frames, _cvk._start_refs = None, [], [], {}, None
 _cvk.sketch_start(fc)
 for _q in ((-1.5, -1.5), (-0.5, 1.2), (0.7, 1.0), (1.6, -1.2)):

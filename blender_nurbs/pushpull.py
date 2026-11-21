@@ -62,12 +62,81 @@ def normals_at(obj, i, P):
     return Nw / np.maximum(np.linalg.norm(Nw, axis=1), 1e-300)[:, None]
 
 
+def _local_normal(face, q):
+    sm, _ = store._k()
+    _, uvs, _ = sm.surface_closest_point(face.surface(), tuple(map(float, q)))
+    n = np.array(face.outward_normal_at_uv(*_uvxy(uvs[0])), float)
+    return n / (np.linalg.norm(n) or 1.0)
+
+
+def rim_moves(obj, i, polys):
+    """For each outline polyline of face i (local), the world move of each of
+    its points per unit of distance as the tool makes it: off the face along
+    its normal while staying on the neighbour's surface (a leaning neighbour:
+    the point slides in its plane), the corners along their side edges."""
+    b = store.get_brep(obj)
+    F = b.faces()[i]
+    Fe = list(F.edges())
+    L = np.array(geom.world_matrix(obj).to_3x3())
+    out = []
+    for P in polys:
+        mid = P[len(P) // 2]
+        e = min(Fe, key=lambda x: x.closest_point(tuple(map(float, mid)))[-1])     # (point, t, distance)
+        others = [f for f in e.faces() if f != F]
+        D = []
+        for k, q in enumerate(P):
+            n = _local_normal(F, q)
+            if not others:                       # a seam: just along the normal
+                D.append(n)
+                continue
+            m = _local_normal(others[0], q)
+            T = P[min(k + 1, len(P) - 1)] - P[max(k - 1, 0)]
+            u = np.cross(T, n)
+            mu = float(m @ u)
+            D.append(n - (float(m @ n) / mu) * u if abs(mu) > 1e-9 * (np.linalg.norm(u) or 1.0) else n)
+        # the corners slide along the side edge where two neighbours meet
+        for k in (0, len(P) - 1):
+            q = P[k]
+            v = min(e.vertices(), key=lambda x: float(np.linalg.norm(np.array(x.point(), float) - q)))
+            if np.linalg.norm(np.array(v.point(), float) - q) > 1e-6 * (np.linalg.norm(np.ptp(P, axis=0)) or 1.0):
+                continue
+            sides = [x for x in v.edges() if x not in Fe]
+            if len(sides) != 1 or not others:
+                continue
+            fs = [f for f in sides[0].faces()]
+            if len(fs) != 2:
+                continue
+            w = np.cross(_local_normal(fs[0], q), _local_normal(fs[1], q))
+            n = _local_normal(F, q)
+            if abs(float(n @ w)) > 1e-6 * (np.linalg.norm(w) or 1.0):
+                D[k] = w / float(n @ w)
+        Dw = np.array(D) @ L.T
+        out.append(Dw)
+    return out
+
+
 def _world(M, P):
     return (np.c_[P, np.ones(len(P))] @ M.T)[:, :3]
 
 
 def _faces_json(items):
     return json.dumps([[o.name, [float(x) for x in p]] for o, p in items])
+
+
+def face_highlight(o, i, max_fill=3000):
+    """The overlay preview lighting face i of o: its outlines and fill (world),
+    lifted a hair off the face so they don't z-fight with it. A curved face
+    with more tessellation points than max_fill: outlines only."""
+    fr = face_frame(o, i)
+    pts, tris, polys = subsel.face_tris(o, i)
+    M = np.array(geom.world_matrix(o))
+    lift = 2e-3 * float(np.linalg.norm(np.ptp(np.vstack(polys), axis=0)) or 1.0)
+    if fr[3]:
+        W = lambda P: _world(M, P) + lift * fr[2]
+    else:
+        W = lambda P: _world(M, P) + lift * normals_at(o, i, P)
+    return {"lines": [W(P) for P in polys],
+            "tris": W(pts)[tris].reshape(-1, 3) if len(tris) and len(pts) <= max_fill else np.zeros((0, 3))}
 
 
 class _FacePicking:
@@ -100,17 +169,7 @@ class _FacePicking:
             o, i = hit
             try:
                 if _is_solid(o) == solids:
-                    fr = face_frame(o, i)
-                    pts, tris, polys = subsel.face_tris(o, i)
-                    M = np.array(geom.world_matrix(o))
-                    lift = 2e-3 * float(np.linalg.norm(np.ptp(np.vstack(polys), axis=0)) or 1.0)
-                    if fr[3]:                   # off the face: no z-fight
-                        W = lambda P: _world(M, P) + lift * fr[2]
-                    else:
-                        W = lambda P: _world(M, P) + lift * normals_at(o, i, P)
-                    pv = {"lines": [W(P) for P in polys],
-                          "tris": W(pts)[tris].reshape(-1, 3) if len(tris) and len(pts) <= self.MAX_FILL else
-                          np.zeros((0, 3))}
+                    pv = face_highlight(o, i, self.MAX_FILL)
             except Exception as exc:
                 print("NURBS push/pull hover:", exc)
         draw.pick_overlay["preview"] = pv
@@ -246,11 +305,14 @@ class NPROTO_OT_push_pull(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
             if not len(tris) or len(pts) > self.MAX_FILL:
                 pts, tris = np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
             if flat:
-                Np = [np.broadcast_to(nw, P.shape) for P in polys]
                 Nt = np.broadcast_to(nw, pts.shape)
             else:
-                Np = [normals_at(o, i, P) for P in polys]
                 Nt = normals_at(o, i, pts) if len(pts) else pts
+            try:
+                Np = rim_moves(o, i, polys)
+            except Exception as exc:              # the plain normals: walls along them
+                print("NURBS push/pull preview:", exc)
+                Np = [np.broadcast_to(nw, P.shape) if flat else normals_at(o, i, P) for P in polys]
             self._frames.append({"P": pw, "n": nw, "flat": flat, "polys": [_world(M, P) for P in polys], "Np": Np,
                                  "pts": _world(M, pts) if len(pts) else pts, "Nt": Nt, "tris": tris})
         if not self._frames:
@@ -375,12 +437,14 @@ class NPROTO_OT_push_pull(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
                 ("pulled" if self.distance > 0 else "pushed")
             self.report({'INFO'}, f"{o.name}: {len(pts)} face{'s' if len(pts) > 1 else ''} {how} "
                                   f"{abs(self.distance):.4g} · volume {info.get('volume', 0):.6g}")
+            if "exact" in info.get("how", []):
+                self.report({'INFO'}, f"{o.name}: the leaning neighbours were extended on their own surfaces")
             lean = float(info.get("lean", 0.0))
             if lean > 0.5:
                 step = abs(self.distance) * np.sin(np.radians(lean))
-                self.report({'WARNING'}, f"{o.name}: a neighbour meets the moved face {lean:.0f}° from square; "
-                                         f"the walls go along the face's normal, so a step of about {step:.3g} "
-                                         "is left along that edge")
+                self.report({'WARNING'}, f"{o.name}: a neighbour meets the moved face {lean:.0f}° from square and "
+                                         "could not be extended on its own surface; the walls go along the "
+                                         f"face's normal, so a step of about {step:.3g} is left along that edge")
         if not done:
             return {'CANCELLED'}
         _select_only(context, done)
@@ -532,7 +596,14 @@ class NPROTO_OT_replace_face(_FacePicking, bpy.types.Operator):
             subsel.set_picks(o, "FACE", [])        # the faces are gone: no pick moves onto a neighbour
             done.append(o)
             self.report({'INFO'}, f"{o.name}: {len(pts)} face{'s' if len(pts) > 1 else ''} replaced by "
-                                  f"{surf.name} · volume {info.get('volume', 0):.6g}")
+                                  f"{surf.name} · volume {info.get('volume', 0):.6g}"
+                                  + (" · leaning neighbours extended on their own surfaces"
+                                     if "exact" in info.get("how", []) else ""))
+            lean = float(info.get("lean", 0.0))
+            if lean > 0.5:
+                self.report({'WARNING'}, f"{o.name}: a neighbour meets the face {lean:.0f}° from square and "
+                                         "could not be extended on its own surface (the sides go along the "
+                                         "face's normal: a small step is left)")
         if not done:
             return {'CANCELLED'}
         _select_only(context, done)

@@ -55,19 +55,25 @@ everything built from it rebuilds.
 
 ### Curve Edit
 
-- Join Curves, Unjoin Curves, Trim Curves, Split Curves
-- Rebuild Curve, Extend Curve, Align Curve
+- **Shape:** Rebuild Curve, Extend Curve, Align Curve
+- **Trim and split:** Trim Curves, Split Curves
+- **Join:** Join Curves, Unjoin Curves
 
 ### Create Surfaces
 
-- **Draw:** Draw Plane, Cylinder (centre, radius, height, or around a circle or hole; exact or smooth, solid or
+- **Draw:** Plane, Box (corner to corner, centre to corner or 3 points, then the height; or diagonal, two corners in 3D), Cylinder (centre, radius, height, or around a circle or hole; exact or smooth, solid or
   open)
 - **Primitives:** Plane, Disk, Box, Cylinder, Cone, Sphere, Torus
-- **From curves:** Loft (G0 to G3 to surface edges), Loft Rails, Curve Network (a grid of crossing curves, G0 / G1 /
-  G2 to surface edges around it), Sweep, Pipe, Extrude, Revolve, Rail Revolve (exact), Planar
-- **Fill a gap:** Boundary, Square, Patch, Dome
-- **From surfaces:** Offset, Thicken, Flange (from free edges or curves on a surface: at an angle to the surface,
-  or a constant-draft surface to a pull direction; the base is the edge exactly), Convert Blender Surface
+- **Through curves or edges:** Loft (G0 to G3 to surface edges), Loft Rails, Curve Network (a grid of crossing
+  curves or edges, G0 / G1 / G2 to surface edges around it), Revolve, Rail Revolve (exact), Sweep, Pipe
+- **Extrude and fill:** Extrude (curves or edges into walls; a face into a solid joined to its body, cut from it
+  or new, with draft on flat faces), Flange (from free edges or curves on a surface: at an angle to the surface, or a
+  constant-draft surface to a pull direction; the base is the edge exactly), Planar, Dome, Boundary, Patch
+- **From surfaces:** Offset, Thicken, Pattern, Unroll, Flow, Convert Blender Surface
+- **Unroll and Flow:** Unroll Surface lays developable surfaces flat (sheet-metal patterns: cones, cylinders,
+  bent and folded sheets, joined parts with their bend lines; trims and curves on them come along); Flow Along
+  Surface bends curves and surfaces from a base surface onto a target, and folds what is drawn on an unrolled
+  pattern back onto its part exactly
 - **Pattern:** one button for linear, circular and path patterns (**M** switches) of curves and NURBS objects: real copies with their exact
   geometry (not Blender's mesh-only Array), on a snapping widget: a row, grid or block along its X / Y / Z (turned
   to any angle), around its axis, or along a curve or edge; number keys set the count; with history the copies
@@ -75,16 +81,17 @@ everything built from it rebuilds.
 
 ### Surface Edit
 
-- **Shape:** Edit CVs (Tab switches between Object and CV editing), Flip Normal, Rebuild Surface, Extend Surface,
-  Surface Align, Refit to Trim
+- **Edit CVs:** Tab on a NURBS surface switches between Object and CV editing (also in the NURBS menu)
+- **Shape:** Rebuild Surface, Extend Surface, Surface Align, Match Surface, Refit to Trim, Merge Patches, Flip Normal
 - **Merge Patches:** a four-sided grid of patches rebuilt as one surface. **Exact** joins them with full seam knots,
   **Reduce** removes knots within a tolerance, **Refit** finds the fewest spans of a chosen degree, with adaptive
   knots placed where the shape needs them. The outer edges hold Free, G0, G1 or G2 (all sides or each side), so
   continuity to the neighbours carries over; seams where the patches meet with a kink stay sharp (or Smooth).
   Gap, angle and curvature checks show in the panel; trimmed patches fall back to a projected grid (G0 edges)
-- **Trim and join:** Trim, Split, Untrim, Join, Unjoin
-- **Fillets:** Surface Fillet, Edge Fillet (circular, chamfer, or blends G1 to G3)
-- **Solids:** Union, Difference, Intersection, Boundary Fill
+- **Trim and split:** Trim, Split, Untrim, Untrim Region, Detach at Isoparm
+- **Join:** Join, Unjoin
+- **Fillets:** Surface Fillet, Edge Fillet (circular, chamfer, blends G1 to G3, or soft: curvature-ramped G2 / G3 with an exact minimum radius, box corners filled G2)
+- **Solids:** Union, Difference, Intersection, Push / Pull, Replace Face, Boundary Fill
 
 ### Analyze
 
@@ -112,9 +119,10 @@ everything built from it rebuilds.
   cage quads beside them at exact T-junctions
 - **Fit to Scan:** fit a SubD cage so its smooth surface (not its vertices, as a Shrinkwrap would) lies on a scan,
   a set offset off it, or draped over it (bridging folds, never dipping in: housings, covers, sockets), then SubD to
-  BREP makes the exact NURBS body. **Tube Cage from Scan** builds and fits a starting cage for limb-like scans,
-  **Refine Cage to Scan** adds edge loops only where the surface misses the scan (all quads, no new star points),
-  **Trim Cage to Curve** holds the cage's open edge to a trim line drawn on the scan, **Drape Patch to Scan** lays
+  BREP makes the exact NURBS body (the **Scan** panel). **Cage from Scan** builds and fits a starting cage for
+  limb-like scans; **Fit Cage to Scan** fits any SubD cage, its **Add Loops** cutting edge loops only where the
+  surface misses the scan (all quads, no new star points), and a selected curve becoming the trim line its open
+  edge is held to; **Drape Patch to Scan** lays
   one single-span NURBS patch (degree 5 from a 6 × 6 grid) straight down onto a scan, its CVs moving only up and
   down, its edges G0 / G1 / G2 to the neighbouring patches (exact where their edges are one span); the
   **Scan Deviation** overlay colours any surface by its distance from the scan
@@ -126,7 +134,7 @@ Exchange exact geometry with your CAD app: **File → Import / Export → NURBS 
 - **Import:** AP203, AP214 and AP242 solids and surface models, as exact trimmed NURBS,
   with units and assembly placements converted
 - **Export:** AP214 with exact B-spline surfaces and full B-rep topology; true planes,
-  cylinders, cones, spheres, tori, revolutions, extrusions, circles, ellipses and lines as STEP's own analytic entities; closed bodies as solids; in
+  cylinders, cones, spheres, tori, revolutions, extrusions, offsets, circles, ellipses and lines as STEP's own analytic entities; closed bodies as solids; in
   mm, cm or m
 
 ## Learn more
