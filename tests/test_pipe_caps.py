@@ -378,5 +378,73 @@ if made:
     check("history edit round -> mitre", solid(o) and store.get_brep(o).face_count() == 4,
           f"{store.get_brep(o).face_count()} faces")
 
+# --- variable radius ---------------------------------------------------------------
+clear()
+vl = poly("VL", [(0, 0, 0), (0, 0, 3)])
+r0, r1, Lv = 0.5, 0.2, 3.0
+frustum = math.pi * Lv * (r0 * r0 + r0 * r1 + r1 * r1) / 3
+r, made = pipes([(vl, "S0")], radius=r0, use_variable=True, radius_end=r1, taper="LINEAR", cap_style="FLAT")
+check("linear taper: a frustum", r == {'FINISHED'} and len(made) == 1 and solid(made[0])
+      and abs(vol(made[0]) - frustum) < 1e-4, f"{[round(vol(o), 5) for o in made]} want {frustum:.5f}")
+if made:
+    lo, hi = store.get_brep(made[0]).bounding_box()
+    check("  start radius r0 at the start", abs(hi[0] - r0) < 1e-4, f"{hi}")
+ss = np.linspace(0, 1, 20001)
+rs = r0 + (r1 - r0) * ss * ss * (3 - 2 * ss)
+smooth_v = math.pi * float(np.trapezoid(rs * rs, ss * Lv)) if hasattr(np, "trapezoid") else math.pi * float(np.trapz(rs * rs, ss * Lv))
+r, made = pipes([(vl, "S0")], radius=r0, use_variable=True, radius_end=r1, taper="SMOOTH", cap_style="FLAT")
+check("smooth taper: volume", r == {'FINISHED'} and len(made) == 1 and abs(vol(made[0]) - smooth_v) < 1e-4,
+      f"{[round(vol(o), 5) for o in made]} want {smooth_v:.5f}")
+def cap_vol(rr, slope):
+    off, R = rr * slope, rr * math.sqrt(1 + slope * slope)
+    h = off + R
+    return math.pi * h * h * (3 * R - h) / 3
+k_ = (r1 - r0) / Lv
+want = frustum + cap_vol(r0, -k_) + cap_vol(r1, k_)
+r, made = pipes([(vl, "S0")], radius=r0, use_variable=True, radius_end=r1, taper="LINEAR", cap_style="ROUND", body="NEW")
+check("linear taper, round caps: tangent sphere caps", r == {'FINISHED'} and len(made) == 1 and solid(made[0])
+      and abs(vol(made[0]) - want) < 1e-4, f"{[round(vol(o), 5) for o in made]} want {want:.5f}")
+if made:
+    b = store.get_brep(made[0])
+    def nrm(sf, u, v):
+        _, su, sv = sf.derivatives(u, v); n_ = np.cross(su, sv); return n_ / np.linalg.norm(n_)
+    sfs = [f.surface() for f in b.faces()]
+    worst = 0.0
+    for A in sfs:
+        for Bs in sfs:
+            if A is Bs:
+                continue
+            (au0, au1), (av0, av1) = A.u_domain(), A.v_domain()
+            (bu0, bu1), (bv0, bv1) = Bs.u_domain(), Bs.v_domain()
+            for ua in (au0, au1):
+                for ub in (bu0, bu1):
+                    pa = np.array(A.evaluate(ua, (av0 + av1) / 3)); pb = np.array(Bs.evaluate(ub, (bv0 + bv1) / 3))
+                    if np.linalg.norm(pa - pb) < 1e-6 and np.ptp(np.array([A.evaluate(ua, v) for v in np.linspace(av0, av1, 5)]), axis=0).max() > 1e-6:
+                        for v in np.linspace(av0, av1, 13)[:-1]:
+                            c_ = abs(float(nrm(A, ua, v) @ nrm(Bs, ub, v)))
+                            worst = max(worst, math.degrees(math.acos(min(1.0, c_))))
+    check("  caps G1 to the tapering tube", b.face_count() == 3 and worst < 1e-3, f"{b.face_count()} faces, {worst:.6f} deg")
+want = smooth_v + 2 / 3 * math.pi * (r0 ** 3 + r1 ** 3)
+r, made = pipes([(vl, "S0")], radius=r0, use_variable=True, radius_end=r1, taper="SMOOTH", cap_style="ROUND", body="NEW")
+check("smooth taper, round caps: half spheres", r == {'FINISHED'} and len(made) == 1
+      and abs(vol(made[0]) - want) < 1e-4, f"{[round(vol(o), 5) for o in made]} want {want:.5f}")
+if made:
+    h = features.history(made[0])["params"]
+    check("history keeps the taper", h.get("variable") is True and abs(h.get("radius_end") - r1) < 1e-6
+          and h.get("taper") == "SMOOTH")
+vb1 = poly("VB1", [(10, 0, 0), (13, 0, 0)]); vb2 = poly("VB2", [(13, 0, 0), (13, 3, 0)])
+for cs in ("MITRE", "ROUND"):
+    r, made = pipes([(vb1, "S0"), (vb2, "S0")], radius=0.3, use_variable=True, radius_end=0.1, cap_style="FLAT",
+                    corner_style=cs, bend=2.0)
+    nf = 4 if cs == "MITRE" else 5
+    lo_v = math.pi * 6 * 0.01
+    hi_v = math.pi * 6 * 0.09
+    check(f"tapering L, {cs.lower()} corner: closed body", r == {'FINISHED'} and len(made) == 1 and solid(made[0])
+          and store.get_brep(made[0]).face_count() == nf and lo_v < vol(made[0]) < hi_v,
+          f"{r} {[(store.get_brep(o).face_count(), round(vol(o), 4)) for o in made]}")
+vsq = poly("VSQ", [(20, 0, 0), (22, 0, 0), (22, 2, 0), (20, 2, 0)], cyclic=True)
+r, made = pipes([(vsq, "S0")], radius=0.2, use_variable=True, radius_end=0.1)
+check("closed rail with a varying radius is refused", "closed rail" in str(r) and not made, str(r)[:120])
+
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)
