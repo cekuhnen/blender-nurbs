@@ -141,52 +141,21 @@ def build_spec(clicks, mode, deg, closed, start_out=None, end_out=None):
 
 def through_ends(S, deg, ends):
     """CVs and degree of a uniform spline through the points S whose ends are
-    aligned (ends as align.align_open). Each G1 / G2 / G3 end adds one / two / three CVs:
-    the end CVs come from align_start applied to the plain interpolation's end
-    derivatives, the others are solved so the curve still passes through every
-    point. Returns (X, p, specs)."""
+    aligned (ends as align.align_open). G0 ends: the plain interpolation with
+    its ends put on their targets. G1 / G2 / G3 ends: the fairest curve that
+    passes every point and meets the ends exactly (fairthrough.py: no
+    overshoot next to an aligned end). Returns (X, p, specs)."""
     from . import align
     S = np.asarray(S, float)
-    n = len(S)
     specs = {e: dict(sp_) for e, (sp_, _) in ends.items()}
     ks = align.CONT[specs["0"]["cont"]] if "0" in specs else 0
     ke = align.CONT[specs["1"]["cont"]] if "1" in specs else 0
-    X0, p0 = interpolate(S, deg)
     if ks == 0 and ke == 0:
+        X0, p0 = interpolate(S, deg)
         X, p, specs = align.align_open(X0, p0, ends)        # G0: the ends sit on their targets
         return X, p, specs
-    N = n + ks + ke
-    p = min(max(deg, align.degree_for([s_["cont"] for s_ in specs.values()])), N - 1)
-    U0 = geom.clamped_uniform_knots(n, p0)
-    U = geom.clamped_uniform_knots(N, p)
-    Q = np.zeros((N, 3))
-    I = np.eye(4)
-    for e, k in (("0", ks), ("1", ke)):
-        A, Ua = (X0, U0) if e == "0" else align._reverse(X0, U0)
-        d1, d2, _, _ = align._derivs(A, Ua, p0) if p0 >= 1 else (A[1] - A[0], np.zeros(3), 1, 1)
-        seg, Ub = (Q, U) if e == "0" else align._reverse(Q, U)
-        d3 = align._d3(A, Ua, p0) if k >= 3 else None
-        seg = align._set_start(seg, Ub, p, min(k, p), A[0], d1, d2, d3)
-        if e in ends:
-            sp_ = specs[e]
-            fr = ends[e][1]
-            if sp_.get("mode", "EDGE") in align.SQUARE:
-                Se = S if e == "0" else S[::-1]
-                fr = align.orient(sp_, fr, np.mean(Se[1:], axis=0) - Se[0])     # off on the curve's side
-            elif sp_.get("snap") == "NEAREST" and sp_.get("mode", "EDGE") == "EDGE":
-                fr = align.orient(sp_, fr, d1)
-            seg = align.align_start(seg, Ub, p, sp_, fr, I)
-        Q = seg if e == "0" else align._reverse(seg, Ub)[0]
-    fixed = list(range(ks + 1)) + list(range(N - 1 - ke, N))
-    free = [i for i in range(N) if i not in fixed]
-    if free:
-        t = _chord(S, False)
-        if t is None:
-            t = np.linspace(0.0, 1.0, n)
-        A = curvetools.Basis(N, p, False).matrix(t[1:-1])
-        rhs = S[1:-1] - A[:, fixed] @ Q[fixed]
-        Q[free] = np.linalg.lstsq(A[:, free], rhs, rcond=None)[0]
-    return Q, p, specs
+    from .fairthrough import through_ends as fair
+    return fair(S, deg, ends)
 
 
 def build_spec_ends(clicks, mode, deg, ends):

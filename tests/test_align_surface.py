@@ -254,16 +254,13 @@ for mode in ("CV", "THROUGH"):
               "1": dict({k: specs["1"][k] for k in ("cont", "weight", "mode", "snap", "flip")}, input=2)}
     before = np.array([tuple(q.co)[:3] for q in obj.data.splines[0].points])
     kind, deg_, Q, _ = align.solve(obj, ends_h, inputs)
-    check(f"CV Curve ({mode}) G3 perpendicular from a face, on the clicks' side", ga < 1e-5 and upward, ga)
+    # (single-precision CVs: a G3 end's third derivative magnifies their rounding)
+    check(f"CV Curve ({mode}) G3 perpendicular from a face, on the clicks' side", ga < 1e-3 and upward, ga)
     check(f"CV Curve ({mode}): its Align history solves to itself", np.abs(Q - before).max() < 1e-6, np.abs(Q - before).max())
     if mode == "THROUGH":
-        # at the clicks' own (chord) parameters: a nearest-point search can lose itself on a
-        # curve that overshoots (close clicks turning away from a G2 / G3 end make one)
         kc = features.input_curve(obj, "S0")
-        t0, t1 = kc.parameter_range()
-        tc = drawtools._chord(np.array(clicks, float), False)
-        ds = [float(np.linalg.norm(np.array(kc.evaluate(t0 + t * (t1 - t0))) - c)) for t, c in zip(tc, clicks)]
-        check("CV Curve through points: still through every click", max(ds) < 1e-4, ds)
+        ds = [float(np.linalg.norm(np.array(kc.evaluate(align.curve_param_near(kc, np.array(c)))) - c)) for c in clicks]
+        check("CV Curve through points: still through every click", max(ds) < 1e-5, ds)
 
 # ------------------------------------------------------------- Symmetry Plane
 def flat(name, off):
@@ -347,6 +344,60 @@ obj = drawtools.add_curve(ctx, "CVSym", [sp_])
 P, C1, C2, C3 = start_jet(obj, 0)
 check("CV Curve G3 on a symmetry plane: square to it, mirror joins C3, on the clicks' side",
       sym_gaps(C1, C2, C3, nz, 3) < 1e-5 and C1[2] > 0, sym_gaps(C1, C2, C3, nz, 3))
+
+# ------------------------------------------------------------- Through Points: no overshoot next to an aligned end
+# (close clicks turning away from a G2 / G3 end used to give curves 15x to 35000x the clicks' path)
+Ed = nurbs("Ed", [(-2.0, 2.0, 0.5), (-1.0, 2.5, 0.5), (0.0, 2.0, 0.5), (1.6, 2.2, 0.5)], loc=(0, 0, 0))
+Gd = nurbs("Gd", [(5.0, 5.0, 3.0), (6.0, 5.5, 3.5), (7.0, 5.0, 3.2), (8.0, 4.0, 3.0)])
+P0e = np.array([1.6, 2.2, 0.5])
+P0s = align.surface_jet(S, "F0", P0e)[0]
+layouts = {"close turn": [(1.8, 2.4, 1.3), (2.6, 2.0, 2.0), (3.5, 2.6, 2.4), (5.0, 5.0, 3.0)],
+           "very close": [(1.65, 2.25, 0.7), (2.4, 2.8, 1.4), (3.6, 3.8, 2.4), (5.0, 5.0, 3.0)],
+           "many": [(1.8, 2.3, 0.9), (2.2, 2.5, 1.5), (2.8, 3.0, 2.0), (3.5, 3.6, 2.5), (4.3, 4.4, 2.8), (5.0, 5.0, 3.0)]}
+import time
+worst, slowest, gaps, cont_gaps = 0.0, 0.0, 0.0, 0.0
+for lname, rest in layouts.items():
+    for mode, tgt, ref, P0 in (("EDGE", Ed, "S0", P0e), ("NORMAL", S, "F0", P0s), ("SURFACE", S, "F0", P0s),
+                               ("SYMMETRY", S, "F0", P0s)):
+        for c0 in ("G1", "G2", "G3"):
+            Sx = np.array([P0] + rest, float)
+            snap = "END" if ref == "S0" else "NEAREST"
+            ends = {"0": ({"cont": c0, "weight": 1.0, "mode": mode, "snap": snap, "flip": False},
+                          align.end_frame(tgt, ref, P0, snap, mode)),
+                    "1": ({"cont": "G2", "weight": 1.0, "mode": "EDGE", "snap": "END", "flip": False},
+                          align.end_frame(Gd, "S0", Sx[-1], "END", "EDGE"))}
+            t_ = time.perf_counter()
+            sp_, specs = drawtools.build_spec_ends(Sx, "THROUGH", 3, ends)
+            slowest = max(slowest, time.perf_counter() - t_)
+            o = drawtools.add_curve(ctx, "Thr", [sp_])
+            kc = features.input_curve(o, "S0")
+            t0, t1 = kc.parameter_range()
+            W = np.array([kc.evaluate(t) for t in np.linspace(t0, t1, 3000)])
+            ratio = np.sum(np.linalg.norm(np.diff(W, axis=0), axis=1)) / np.sum(np.linalg.norm(np.diff(Sx, axis=0), axis=1))
+            worst = max(worst, ratio)
+            gaps = max(gaps, max(float(np.linalg.norm(np.array(kc.evaluate(align.curve_param_near(kc, c))) - c)) for c in Sx))
+            k = int(c0[1])
+            # measured on the solved CVs (double): Blender keeps CVs in single precision,
+            # and a G3 end's third derivative magnifies that rounding to ~1e-4
+            X = np.array(sp_["points"], float); pp = sp_["order"] - 1
+            U_ = geom.clamped_uniform_knots(len(X), pp)
+            C1, C2, _, _ = align._derivs(X, U_, pp)
+            C3, P = align._d3(X, U_, pp), X[0]
+            if mode == "EDGE":
+                fr = align.end_frame(tgt, ref, P0, snap, mode)
+                g = reparam_gap(C1, C2, C3, fr[1], fr[2], align.frame_d3(fr), k)
+            elif mode == "SURFACE":
+                g = surface_gap(C1, C2, C3, P, tgt, ref, k)
+            else:
+                n_ = align.surface_jet(tgt, ref, P)[1]
+                g = reparam_gap(C1, C2, C3, n_ if n_ @ C1 > 0 else -n_, z, z, k) if mode == "NORMAL" else \
+                    sym_gaps(C1, C2, C3, n_, k)
+            cont_gaps = max(cont_gaps, g)
+            bpy.data.objects.remove(o)
+check("Through Points with G1-G3 ends: no overshoot (curve <= 1.1x the clicks' path)", worst < 1.1, worst)
+check("Through Points: still through every click", gaps < 1e-5, gaps)
+check("Through Points: the start's G1-G3 condition holds exactly", cont_gaps < 1e-9, cont_gaps)
+check("Through Points: fast enough for the live preview (< 0.25 s)", slowest < 0.25, slowest)
 
 # ------------------------------------------------------------- the user's file: aligned curves rebuild stably
 user = sys.argv[sys.argv.index("--") + 1] if "--" in sys.argv else os.path.join(ROOT, "Blend Files", "blend cv align curve  spline surface.blend")

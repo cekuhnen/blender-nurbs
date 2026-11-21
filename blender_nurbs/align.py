@@ -404,10 +404,19 @@ def _derivs(Q, U, p):
 def _start_basis(U, p, k):
     """(k + 1, p + 1): the j-th derivative of basis function r at the start
     of a clamped knot vector (zero for r > j)."""
-    from .surfeval import basis_ders
     U = np.asarray(U, float)
-    _, N = basis_ders(U, p, len(U) - p - 1, np.array([U[0]]), k)
-    return N[0]
+    key = (p, k, tuple(np.round(U[:min(len(U), 2 * p + 2)] - U[0], 13)))   # the knots that matter at the start
+    hit = _START_BASIS.get(key)
+    if hit is None:
+        from .surfeval import basis_ders
+        _, N = basis_ders(U, p, len(U) - p - 1, np.array([U[0]]), k)
+        if len(_START_BASIS) > 256:
+            _START_BASIS.clear()
+        hit = _START_BASIS[key] = N[0]
+    return hit
+
+
+_START_BASIS = {}       # _start_basis results (CV Curve's fair Through Points asks thousands of times)
 
 
 def _d3(Q, U, p):
