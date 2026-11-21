@@ -152,7 +152,8 @@ def _surface_from_rows(rows, prof, tol_rel=1e-4, end_dirs=None):
     rail per CV (shared knots), keep the profile's v knots / weights.
     end_dirs: (d0, d1) unit directions the surface leaves its first / last row
     along (the second CV of every column moved onto that line): what a fit
-    alone only comes close to, so a part tangent to them there is G1."""
+    alone only comes close to, so a part tangent to them there is G1. Either
+    may be None (that end as fitted)."""
     _, ext = _k()
     rows = np.array(rows)                 # (K, nv, 3)
     K, nv, _ = rows.shape
@@ -163,6 +164,8 @@ def _surface_from_rows(rows, prof, tol_rel=1e-4, end_dirs=None):
     if end_dirs is not None and nu >= 4:
         for c in cv_cols:
             for a, b, d in ((0, 1, end_dirs[0]), (nu - 1, nu - 2, end_dirs[1])):
+                if d is None:
+                    continue
                 d = np.asarray(d, float)
                 c[b] = c[a] + float((c[b] - c[a]) @ d) * d
     pts, wts = [], []
@@ -295,7 +298,8 @@ def pipe_cap_style(p):
     return style
 
 
-PIPE_CORNER_DEG = 5.0     # a rail turning more than this at one point is a corner a pipe can't take
+PIPE_CORNER_DEG = 5.0     # a rail turning more than this at one point has a corner: the pipe mitres it
+PIPE_MITRE_SHARE = 0.25   # a mitre may reach back at most this share of the stretch it ends
 
 
 def pipe_frames(rail_k, n, closed=False):
@@ -320,9 +324,10 @@ def pipe_frames(rail_k, n, closed=False):
 
 
 def rail_corners(kc, max_deg=PIPE_CORNER_DEG):
-    """[(point, degrees)]: where the curve turns sharper than max_deg at one
-    point -- the joints of a chain of edges, a polyline's corners, a vector
-    handle -- and how much (a closed curve's seam counts too)."""
+    """Where the curve turns sharper than max_deg at one point -- the joints
+    of a chain of edges, a polyline's corners, a vector handle; a closed
+    curve's seam too -- as dicts: u (parameter), point, deg, t_in / t_out
+    (unit tangents arriving / leaving), in parameter order."""
     sm, ext = _k()
     d = ext.curve_cvs(kc)
     p, U = int(d["degree"]), [float(u) for u in d["knots"]]
@@ -332,15 +337,16 @@ def rail_corners(kc, max_deg=PIPE_CORNER_DEG):
     def tan(t):
         v = np.array(sm.evaluate_curve(kc, float(min(t1, max(t0, t))))["tangent"], float)
         return v / (np.linalg.norm(v) or 1.0)
-    out = []
     knots = sorted({round(u, 12) for u in U[p + 1:len(U) - p - 1] if t0 + eps < u < t1 - eps})
     tests = [(u, tan(u - 4 * eps), tan(u + 4 * eps)) for u in knots if sum(abs(x - u) < 1e-12 for x in U) >= p]
     if features.is_closed_curve(kc):
-        tests.append((t0, tan(t1 - 4 * eps), tan(t0 + 4 * eps)))
+        tests.insert(0, (t0, tan(t1 - 4 * eps), tan(t0 + 4 * eps)))
+    out = []
     for u, a, b in tests:
         deg = math.degrees(math.acos(max(-1.0, min(1.0, float(a @ b)))))
         if deg > max_deg:
-            out.append((np.array(kc.evaluate(float(u)), float), deg))
+            out.append({"u": float(u), "point": np.array(kc.evaluate(float(u)), float), "deg": deg,
+                        "t_in": a, "t_out": b})
     return out
 
 
@@ -349,14 +355,192 @@ def pipe_rail(inputs):
     return features.profile_curve(inputs)
 
 
+def _track(kc, ranges, m):
+    """A stretch of the rail between corners, resampled evenly by arc length:
+    (s, P, T) with m samples. ranges: [(ta, tb)] run in order (a closed
+    rail's stretch over its seam takes two). Tangents one-sided at the ends."""
+    sm, _ = _k()
+    t0, t1 = kc.parameter_range()
+    eps = 1e-9 * ((t1 - t0) or 1.0)
+    ts, rid = [], []
+    for i, (ta, tb) in enumerate(ranges):
+        x = np.linspace(ta, tb, 300)
+        x[0], x[-1] = ta + eps, tb - eps
+        ts += list(x)
+        rid += [i] * len(x)
+    ts, rid = np.array(ts), np.array(rid)
+    Q = np.array([kc.evaluate(float(t)) for t in ts], float)
+    L = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(Q, axis=0), axis=1))])
+    s = np.linspace(0.0, L[-1], m)
+    idx = np.clip(np.searchsorted(L, s, side="right") - 1, 0, len(L) - 2)
+    tt = []
+    for k, i in enumerate(idx):
+        if rid[i] != rid[i + 1] or L[i + 1] <= L[i]:
+            tt.append(ts[i + 1] if s[k] > L[i] else ts[i])
+        else:
+            f = (s[k] - L[i]) / (L[i + 1] - L[i])
+            tt.append(ts[i] + f * (ts[i + 1] - ts[i]))
+    P, T = [], []
+    for t in tt:
+        dd = sm.evaluate_curve(kc, float(t))
+        P.append(dd["point"])
+        v = np.array(dd["tangent"], float)
+        T.append(v / (np.linalg.norm(v) or 1.0))
+    P, T = np.array(P, float), np.array(T, float)
+    P[0], P[-1] = Q[0], Q[-1]
+    return s, P, T
+
+
+def _mirror(v, nrm):
+    return v - 2.0 * float(v @ nrm) * nrm
+
+
+def pipe_tracks(rail_k, closed):
+    """The rail split at its corners into stretches, each a dict: s, P, T, N
+    (frames), h (B = h T x N), start / end (the mitre there: {"C", "n"}, None
+    at an open end). A stretch's first frame is the one before it mirrored in
+    the mitre plane (the mirror turns the rail's direction round too, so the
+    frame keeps its handedness), so the two tubes' end CVs are the same points
+    and the tubes face the same way. None when the rail has no corner (a pipe
+    of one piece, as pipe_frames makes it)."""
+    corners = rail_corners(rail_k)
+    if not corners:
+        return None
+    for c in corners:
+        if c["deg"] > 175.0:
+            raise RuntimeError(f"the rail turns back on itself ({c['deg']:.0f}°): a pipe can't mitre that")
+        # the mitre plane mirrors the tube before the corner (running back, -t_in) onto the one after (t_out)
+        c["n"] = (c["t_in"] + c["t_out"]) / np.linalg.norm(c["t_in"] + c["t_out"])
+    t0, t1 = rail_k.parameter_range()
+    spans = []
+    if not closed:
+        cuts = [t0] + [c["u"] for c in corners] + [t1]
+        cs = [None] + corners + [None]
+        for i in range(len(cuts) - 1):
+            spans.append(([(cuts[i], cuts[i + 1])], cs[i], cs[i + 1]))
+    else:
+        seam = corners[0] if abs(corners[0]["u"] - t0) < 1e-12 else None
+        inner = [c for c in corners if c is not seam]
+        if seam is not None:
+            cuts = [t0] + [c["u"] for c in inner] + [t1]
+            cs = [seam] + inner + [seam]
+            for i in range(len(cuts) - 1):
+                spans.append(([(cuts[i], cuts[i + 1])], cs[i], cs[i + 1]))
+        else:               # the seam is smooth: the stretch over it runs from the last corner round to the first
+            for i in range(len(inner) - 1):
+                spans.append(([(inner[i]["u"], inner[i + 1]["u"])], inner[i], inner[i + 1]))
+            spans.append(([(inner[-1]["u"], t1), (t0, inner[0]["u"])], inner[-1], inner[0]))
+    tracks, prev = [], None
+    for ranges, a, b in spans:
+        s, P, T = _track(rail_k, ranges, 241)
+        if prev is None:
+            r0, h = _perp(T[0], np.array([0, 0, 1.0])), 1.0
+        else:
+            r0, h = _mirror(prev["N"][-1], a["n"]), prev["h"]
+        N = _rmf(P, T, r0)
+        tracks.append({"s": s, "P": P, "T": T, "N": N, "h": h,
+                       "start": None if a is None else {"C": a["point"], "n": a["n"], "deg": a["deg"]},
+                       "end": None if b is None else {"C": b["point"], "n": b["n"], "deg": b["deg"]}})
+        prev = tracks[-1]
+    return tracks
+
+
+def _ramp(x):
+    x = np.clip(x, 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _frame_end(tr, k):
+    T, N = tr["T"][k], tr["N"][k]
+    return tr["P"][k], T, N, tr["h"] * np.cross(T, N)
+
+
+def mitre_reach(tr, q):
+    """(t0, t1): how far each profile point q (n, 2) lies from the stretch's
+    start / end mitre plane along the rail (0 at an open end)."""
+    out = []
+    for k, key, sgn in ((0, "start", 1.0), (-1, "end", 1.0)):
+        m = tr[key]
+        if m is None:
+            out.append(np.zeros(len(q)))
+            continue
+        P, T, N, B = _frame_end(tr, k)
+        X = P + np.outer(q[:, 0], N) + np.outer(q[:, 1], B)
+        out.append(((m["C"] - X) @ m["n"]) / float(T @ m["n"]))
+    return out
+
+
+def mitre_limit(tracks):
+    """The largest radius every mitre has room for: a mitre reaches back
+    r tan(turn / 2) along its stretch, at most PIPE_MITRE_SHARE of it."""
+    best = math.inf
+    unit = np.array([[math.cos(a), math.sin(a)] for a in np.linspace(0, 2 * math.pi, 73)])
+    for tr in tracks:
+        L = float(tr["s"][-1])
+        for t in mitre_reach(tr, unit):
+            e = float(np.abs(t).max())
+            if e > 0:
+                best = min(best, PIPE_MITRE_SHARE * L / e)
+    return best
+
+
+def mitred_rows(tr, q, n):
+    """Rows (n, len(q), 3) of the tube along one stretch, each column the
+    profile point q_j carried along the rail; at a mitred end the columns are
+    cut off on the mitre plane (an end row on it: the circle projected along
+    the rail, an exact ellipse, the same points as the next tube's). Each
+    column runs its own length of the rail (from its start mitre to its end
+    mitre) at an even pace, so on a straight stretch every column is a
+    straight line at constant speed: the exact cylinder, and a light fit.
+    A column reaching past the corner runs on straight along the end tangent;
+    one ending short of it on a curved stretch is eased onto the ellipse over
+    the mitre's reach, so the tube leaves its true shape there by about the
+    rail's sag over that reach (no mitre between curved tubes is exact: their
+    true cuts by the mitre plane are not the same curve)."""
+    s, P, T, N, h = tr["s"], tr["P"], tr["T"], tr["N"], tr["h"]
+    L = float(s[-1])
+    t0, t1 = mitre_reach(tr, q)
+    e0, e1 = float(np.abs(t0).max()), float(np.abs(t1).max())
+    qx, qy = q[:, 0], q[:, 1]
+
+    def sweep(S):
+        """Column points at rail lengths S (any shape; the last axis runs over q), straight past the ends."""
+        Sc = np.clip(S, 0.0, L)
+        A = np.stack([np.stack([np.interp(Sc, s, M[:, i]) for i in range(3)], axis=-1) for M in (P, T, N)])
+        Pi, Ti, Ni = A[0], A[1], A[2]
+        Ti /= np.linalg.norm(Ti, axis=-1, keepdims=True)
+        Ni -= np.sum(Ni * Ti, axis=-1, keepdims=True) * Ti
+        Ni /= np.linalg.norm(Ni, axis=-1, keepdims=True)
+        X = Pi + qx[..., None] * Ni + qy[..., None] * (h * np.cross(Ti, Ni))
+        return X + np.minimum(S, 0.0)[..., None] * T[0] + np.maximum(S - L, 0.0)[..., None] * T[-1]
+
+    sig = np.linspace(0.0, 1.0, n)[:, None]
+    S = t0[None, :] + sig * (L + t1 - t0)[None, :]
+    X = sweep(S)
+    for t, e, k in ((t0, e0, 0), (t1, e1, -1)):
+        if e <= 0:
+            continue
+        Pk, Tk, Nk, Bk = _frame_end(tr, k)
+        E = Pk + np.outer(qx, Nk) + np.outer(qy, Bk) + t[:, None] * Tk      # the ellipse's points
+        end = t if k == 0 else L + t
+        corr = E - sweep(end)                                                # 0 where the column runs straight
+        far = (S - end[None, :]) if k == 0 else (end[None, :] - S)          # rail length from the column's end
+        X = X + _ramp(1.0 - far / e)[..., None] * corr[None, :, :]
+    return X
+
+
 def corner_message(inputs, corners):
     names = sorted({o.name for o, _ in inputs})
     where = names[0] if len(names) == 1 else f"the chain of {len(inputs)}"
-    worst = max(d for _, d in corners)
+    worst = max(c["deg"] for c in corners)
     n = len(corners)
-    fix = "pipe the pieces separately, or round the corner first" if len(inputs) > 1 else "round the corner first"
-    return (f"{where} turns {worst:.0f}° at {'a corner' if n == 1 else f'{n} corners'}: a pipe can't take "
-            f"a sharp corner ({fix})")
+    return f"{where} turns {worst:.0f}° at {'a corner' if n == 1 else f'{n} corners'}"
+
+
+def mitre_message(inputs, tracks, r):
+    lim = mitre_limit(tracks)
+    return (f"the radius is too large for the mitred corners: at most {lim:.4g} here (a mitre may reach back "
+            f"a quarter of the stretch it ends) -- a smaller radius, or pipe the pieces separately")
 
 
 def round_cap_cvs(C, N, B, T, q, w, r):
@@ -385,30 +569,67 @@ def _round_cap(C, N, B, T, prof, r):
 def build_pipe(inputs, p):
     """The tube along the rail (inputs that touch end to end make one); with
     caps (Cap Flat / Round, or a solid) a closed body: flat discs or exact
-    half spheres on the ends. A closed rail has no
-    ends: its tube is closed already (a solid of it is the ring)."""
+    half spheres on the ends. A closed rail has no ends: its tube is closed
+    already (a solid of it is the ring). A rail with sharp corners gets a
+    tube per stretch, mitred where they meet (pipe_tracks / mitred_rows)."""
     from .primitives import exact_circle_spec, spec_to_kernel_curve
     rail_k = pipe_rail(inputs)
-    corners = rail_corners(rail_k)
-    if corners:
-        raise RuntimeError(corner_message(inputs, corners))
     closed = features.is_closed_curve(rail_k)
-    n = min(600, int(p.get("samples", 32)) * len(inputs))      # samples per curve / edge of the rail
-    P, T, N, B = pipe_frames(rail_k, n, closed)
     r = float(p.get("radius", 0.2))
     prof = _profile(spec_to_kernel_curve(exact_circle_spec(r)))
     q = prof["points"]                       # circle in its local XY plane, centre origin
-    rows = [P[k] + np.outer(q[:, 0], N[k]) + np.outer(q[:, 1], B[k]) for k in range(n)]
+    w = prof["weights"] or [1.0] * len(q)
+    samples = int(p.get("samples", 32))
     style = pipe_cap_style(p)
-    round_ = style == "ROUND" and not closed
-    # round caps: the tube leaves its ends square to them, so the half spheres are G1 to it
-    tube = _surface_from_rows(rows, prof, end_dirs=(T[0], T[-1]) if round_ else None)
+    tracks = pipe_tracks(rail_k, closed)
+    if tracks is None:
+        n = min(600, samples * len(inputs))      # samples per curve / edge of the rail
+        P, T, N, B = pipe_frames(rail_k, n, closed)
+        rows = [P[k] + np.outer(q[:, 0], N[k]) + np.outer(q[:, 1], B[k]) for k in range(n)]
+        round_ = style == "ROUND" and not closed
+        # round caps: the tube leaves its ends square to them, so the half spheres are G1 to it
+        tube = _surface_from_rows(rows, prof, end_dirs=(T[0], T[-1]) if round_ else None)
+        if style == "NONE":
+            return tube
+        walls = [tube]
+        if round_:
+            walls += [_round_cap(P[0], N[0], B[0], -T[0], prof, r), _round_cap(P[-1], N[-1], B[-1], T[-1], prof, r)]
+        return features.cap_walls(walls)
+    if r > mitre_limit(tracks) * (1.0 + 1e-9):
+        raise RuntimeError(mitre_message(inputs, tracks, r))
+    total = sum(float(tr["s"][-1]) for tr in tracks)
+    walls, caps = [], []
+    for tr in tracks:
+        n = int(min(300, max(samples, round(samples * len(inputs) * float(tr["s"][-1]) / total))))
+        pr = prof
+        rows = mitred_rows(tr, q, n)
+        ends = []
+        for k, key, out in ((0, "start", -1.0), (-1, "end", 1.0)):
+            Pk, Tk, Nk, Bk = _frame_end(tr, k)
+            if tr[key] is not None:
+                ends.append(None)                # a mitre: a crease, the end row exact
+            elif style == "ROUND":
+                ends.append(Tk)
+                caps.append(_round_cap(Pk, Nk, Bk, out * Tk, pr, r))
+            else:
+                ends.append(None)
+        walls.append(_surface_from_rows(rows, pr, end_dirs=tuple(ends)))
+    walls += caps
     if style == "NONE":
-        return tube
-    walls = [tube]
-    if round_:
-        walls += [_round_cap(P[0], N[0], B[0], -T[0], prof, r), _round_cap(P[-1], N[-1], B[-1], T[-1], prof, r)]
+        return _joined(walls)
     return features.cap_walls(walls)
+
+
+def _joined(walls):
+    """Surfaces (world) stitched along their shared edges into one open body."""
+    from . import jobs
+    from .steps import IDENT
+    objs = {f"s{i}": (store.brep_to_text(store.to_brep(w)), IDENT) for i, w in enumerate(walls)}
+    lo = np.min([np.array(store.to_brep(w).bounding_box()[0], float) for w in walls], axis=0)
+    hi = np.max([np.array(store.to_brep(w).bounding_box()[1], float) for w in walls], axis=0)
+    tol = 1e-6 * (float(np.linalg.norm(hi - lo)) or 1.0)
+    _, breps = jobs.run("join", objs, ["joined"], order=list(objs), into="s0", tolerance=tol)
+    return ("brep_text", breps["joined"])
 
 
 # --------------------------------------------------------------------------

@@ -14,7 +14,7 @@ from . import hints
 from .kernel import load as load_kernel
 from .ops import (CHAIN_ITEMS, AskValue, PickMixin, SolidBody, _curve_inputs, _decode_inputs, _encode_inputs,
                   _kernel_ok, _make_result, _select_only, tangent_chain)
-from .valuedrag import BASE_PX, ValueDrag, ruled_preview
+from .valuedrag import BASE_PX, ValueDrag, fmt_length, ruled_preview
 
 
 def _new_surface(context, name, op, inputs, params):
@@ -276,55 +276,77 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
     PREVIEW_RING = 33           # points round a circle (closed)
 
     def drag_setup(self, context, mouse):
+        """Per rail: its spans (one, or a stretch per corner: mitred), its open
+        ends (for the caps' preview) and the largest radius its mitres allow."""
         self._pp, self._bad = [], []
         self._n_in = len(_decode_inputs(self.inputs))
         for g in self._groups(_decode_inputs(self.inputs)):      # curves and surface edges alike
             rail = sweeps.pipe_rail(g)
             closed = features.is_closed_curve(rail)
-            corners = sweeps.rail_corners(rail)
-            if corners:
-                self._bad.append((g, corners))
-            P, T, N, B = sweeps.pipe_frames(rail, min(240, self.PREVIEW_ROWS * len(g)), closed)
-            self._pp.append((P, T, N, B, closed))
+            try:
+                tracks = sweeps.pipe_tracks(rail, closed)
+            except RuntimeError as exc:         # a rail turning back on itself
+                self._bad.append((str(exc), [c["point"] for c in sweeps.rail_corners(rail) if c["deg"] > 175.0]))
+                tracks = None
+            if tracks is None:
+                P, T, N, B = sweeps.pipe_frames(rail, min(240, self.PREVIEW_ROWS * len(g)), closed)
+                spans = [{"P": P, "T": T, "N": N, "B": B, "track": None}]
+                limit = math.inf
+            else:
+                spans = []
+                for tr in tracks:
+                    T, N = tr["T"], tr["N"]
+                    spans.append({"P": tr["P"], "T": T, "N": N, "B": tr["h"] * np.cross(T, N), "track": tr})
+                limit = sweeps.mitre_limit(tracks)
+            ends = []
+            if not closed:
+                a_, b_ = spans[0], spans[-1]
+                ends = [(a_["P"][0], -a_["T"][0], a_["N"][0], a_["B"][0]),
+                        (b_["P"][-1], b_["T"][-1], b_["N"][-1], b_["B"][-1])]
+            self._pp.append({"spans": spans, "ends": ends, "limit": limit, "inputs": g})
         if not self._pp:
             return False
-        P = self._pp[0][0]
-        kb, self._base_at_mouse = len(P) // 2, False
+        spans = self._pp[0]["spans"]
+        mid = spans[len(spans) // 2]
+        kb, self._base_at_mouse = (len(spans) // 2, len(mid["P"]) // 2), False
         if mouse is not None:
             best = None
-            for k, q in enumerate(P):
-                sq = self._screen(context, q)
-                if sq is not None and (sq - mouse).length <= BASE_PX and (best is None or (sq - mouse).length < best[0]):
-                    best = ((sq - mouse).length, k)
+            for i, sp in enumerate(spans):
+                for k, q in enumerate(sp["P"]):
+                    sq = self._screen(context, q)
+                    if sq is not None and (sq - mouse).length <= BASE_PX and (best is None or (sq - mouse).length < best[0]):
+                        best = ((sq - mouse).length, (i, k))
             if best is not None:
                 kb, self._base_at_mouse = best[1], True
         self._kb = kb
         self._dir = self._arrow_dir(context)
         return True
 
+    def _foot(self):
+        i, k = self._kb
+        sp = self._pp[0]["spans"][i]
+        return sp["P"][k], sp["T"][k], sp["N"][k], sp["B"][k]
+
     def drag_on_input(self, context, mouse):
-        return self._near_screen(context, self._pp[0][0], mouse)
+        return self._near_screen(context, np.vstack([sp["P"] for sp in self._pp[0]["spans"]]), mouse)
 
     def _arrow_dir(self, context):
         """Out of the rail at the arrow's foot, square to it: of the frame's
         four directions the one most across the view, so it is seen side on."""
-        P, T, N, B, _ = self._pp[0]
-        k = self._kb
+        P, T, N, B = self._foot()
         _, rv3d = self._win(context)
         if rv3d is None:
-            return N[k]
+            return N
         view = np.array(rv3d.view_rotation @ Vector((0.0, 0.0, -1.0)), float)
         up = np.array(rv3d.view_rotation @ Vector((0.0, 1.0, 0.0)), float)
-        side = np.cross(view, T[k])
+        side = np.cross(view, T)
         side = side if np.linalg.norm(side) > 1e-6 else up
-        return max((N[k], B[k], -N[k], -B[k]), key=lambda d: float(d @ side))
+        return max((N, B, -N, -B), key=lambda d: float(d @ side))
 
     def drag_handles(self):
-        P = self._pp[0][0]
-        B0 = P[self._kb]
-        d = self._dir
+        B0 = self._foot()[0]
         k = 2.0 if self.use_diameter else 1.0
-        return [{"field": self.drag_fields[0], "kind": "arrow", "origin": B0, "dir": d,
+        return [{"field": self.drag_fields[0], "kind": "arrow", "origin": B0, "dir": self._dir,
                  "param": self._radius(), "base": B0,
                  "to_value": lambda t, k=k: max(1e-4 * k, abs(t) * k)}]
 
@@ -333,32 +355,40 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
         style = sweeps.pipe_cap_style({"cap_style": self.cap_style, "caps": self.body != "SURFACE"})
         a = np.linspace(0.0, 2.0 * math.pi, self.PREVIEW_RING)
         ca, sa = np.cos(a), np.sin(a)
-        lines, tris = [], []
-        for P, T, N, B, closed in self._pp:
-            rows = [P[k] + r * (np.outer(ca, N[k]) + np.outer(sa, B[k])) for k in range(len(P))]
-            L, Tr = ruled_preview(rows, ribs=8, row_every=6)
-            lines += L
-            tris.append(Tr)
-            if closed or style == "NONE":
+        ring = r * np.stack([ca, sa], axis=1)
+        lines, tris, guides = [], [], []
+        for pp in self._pp:
+            too_big = r > pp["limit"] * (1.0 + 1e-9)
+            for sp in pp["spans"]:
+                if sp["track"] is None:
+                    P, N, B = sp["P"], sp["N"], sp["B"]
+                    rows = [P[k] + np.outer(ring[:, 0], N[k]) + np.outer(ring[:, 1], B[k]) for k in range(len(P))]
+                else:           # a stretch between corners: its columns cut off on the mitres
+                    rows = list(sweeps.mitred_rows(sp["track"], ring, 25))
+                L, Tr = ruled_preview(rows, ribs=8, row_every=6 if sp["track"] is None else 4)
+                if too_big:                     # the mitres overlap: shown in red, not made
+                    guides += [(ln, (1.0, 0.25, 0.2, 1.0)) for ln in L]
+                    continue
+                lines += L
+                tris.append(Tr)
+            if style == "NONE" or too_big:
                 continue
-            for k, out in ((0, -T[0]), (len(P) - 1, T[-1])):
+            for C, out, N, B in pp["ends"]:
+                circle = C + np.outer(ring[:, 0], N) + np.outer(ring[:, 1], B)
                 if style == "FLAT":
-                    ring = rows[k]
-                    fan = np.stack([np.repeat(P[k][None], len(ring) - 1, axis=0), ring[:-1], ring[1:]], axis=1)
+                    fan = np.stack([np.repeat(C[None], len(circle) - 1, axis=0), circle[:-1], circle[1:]], axis=1)
                     tris.append(fan.reshape(-1, 3))
                 else:           # half a sphere: latitude rings from the end circle to the pole
                     lat = np.linspace(0.0, 0.5 * math.pi, 7)
-                    cap = [P[k] + r * math.cos(f) * (np.outer(ca, N[k]) + np.outer(sa, B[k]))
-                           + r * math.sin(f) * out for f in lat]
+                    cap = [C + math.cos(f) * (circle - C) + r * math.sin(f) * out for f in lat]
                     L, Tr = ruled_preview(cap, ribs=8, row_every=2)
                     lines += L
                     tris.append(Tr)
-        guides = []
-        for g, corners in self._bad:            # a red ring round each corner the pipe can't take
-            for q, _ in corners:
+        for _, pts in self._bad:                # a red ring round a corner the pipe can't take
+            for q in pts:
                 guides.append((q + 1.6 * r * np.outer(ca, self._ring_x(q)) + 1.6 * r * np.outer(sa, self._ring_y(q)),
                                (1.0, 0.25, 0.2, 1.0)))
-        return {"lines": lines, "tris": np.vstack(tris), "guides": guides}
+        return {"lines": lines, "tris": np.vstack(tris) if tris else np.zeros((0, 3)), "guides": guides}
 
     def _ring_x(self, q):
         rv3d = self._win(bpy.context)[1]
@@ -370,10 +400,14 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
 
     def drag_check(self):
         if self._bad:
-            g, corners = self._bad[0]
-            msg = sweeps.corner_message(g, corners)
-            return msg + (" · J: a pipe each" if self.join and len(g) > 1 else "")
-        return "" if self._radius() > 1e-4 else "Radius 0: drag the arrow out, or type a radius"
+            return self._bad[0][0] + (" · J: a pipe each" if self.join and self._n_in > 1 else "")
+        r = self._radius()
+        for pp in self._pp:
+            if r > pp["limit"] * (1.0 + 1e-9):
+                lim = pp["limit"] * (2.0 if self.use_diameter else 1.0)
+                return (f"too large for the mitred corners: at most {fmt_length(bpy.context, lim)}"
+                        + (" · J: a pipe each" if self.join and len(pp["inputs"]) > 1 else ""))
+        return "" if r > 1e-4 else "Radius 0: drag the arrow out, or type a radius"
 
     def drag_key(self, context, event, ch):
         if ch == "d":                   # the same size, given the other way
@@ -405,7 +439,10 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
         style = sweeps.pipe_cap_style({"cap_style": self.cap_style, "caps": self.body != "SURFACE"})
         caps = {"NONE": "Open", "FLAT": "Flat caps", "ROUND": "Round caps"}[style]
         n = len(self._pp)
-        return ([f"{n} pipes"] if n > 1 else []) + [caps] + self.body_state()
+        mitres = sum(len(pp["spans"]) - (1 if pp["ends"] else 0)        # a closed rail: one more joint
+                     for pp in self._pp if pp["spans"][0]["track"] is not None)
+        return (([f"{n} pipes"] if n > 1 else []) + ([f"{mitres} mitre{'s' if mitres > 1 else ''}"] if mitres else [])
+                + [caps] + self.body_state())
 
 
 BD_DEG = [("0", "Auto", "Auto: exact edges keep the curves' own degree; a fit uses 3")] + \

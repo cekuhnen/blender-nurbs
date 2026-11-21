@@ -137,13 +137,77 @@ h = features.history(made[0])
 check("history keeps both pieces", h is not None and len(h["inputs"]) == 2)
 
 b1 = poly("B1", [(10, 0, 0), (12, 0, 0)]); b2 = poly("B2", [(12, 0, 0), (12, 2, 0)])
+rod = lambda r, L: math.pi * r * r * L
+r, made = pipes([(b1, "S0"), (b2, "S0")], radius=0.2, cap_style="FLAT")
+check("90 degree corner: mitred, one closed body", r == {'FINISHED'} and len(made) == 1 and solid(made[0])
+      and abs(vol(made[0]) - rod(0.2, 4)) < 1e-4, f"{r} {[round(vol(o), 5) for o in made]} want {rod(0.2, 4):.5f}")
+if made:
+    b = store.get_brep(made[0])
+    check("  two tubes and two caps", b.face_count() == 4, f"{b.face_count()} faces")
 r, made = pipes([(b1, "S0"), (b2, "S0")], radius=0.2)
-check("a 90 degree corner is refused", "can't take" in str(r) and "90" in str(r) and not made, str(r)[:140])
+check("cap none: an open mitred pipe in one piece", r == {'FINISHED'} and len(made) == 1 and not solid(made[0])
+      and store.get_brep(made[0]).face_count() == 2)
+if made:
+    b = store.get_brep(made[0])
+    shared = sum(1 for e in b.edges() if len(e.faces()) == 2)
+    check("  the tubes share the mitre edge", shared >= 1, f"{shared} shared edges")
+r, made = pipes([(b1, "S0"), (b2, "S0")], radius=0.2, cap_style="ROUND", body="NEW")
+want = rod(0.2, 4) + 4 / 3 * math.pi * 0.008
+check("mitre with round caps, new solid", r == {'FINISHED'} and len(made) == 1 and solid(made[0])
+      and abs(vol(made[0]) - want) < 1e-4, f"{[round(vol(o), 5) for o in made]} want {want:.5f}")
 r, made = pipes([(b1, "S0"), (b2, "S0")], radius=0.2, join=False)
 check("join off: a pipe each", r == {'FINISHED'} and len(made) == 2)
-L3 = poly("L3", [(20, 0, 0), (22, 0, 0), (22, 2, 0)])
-r, made = pipes([(L3, "S0")], radius=0.2)
-check("a polyline with a corner is refused", "can't take" in str(r) and not made, str(r)[:140])
+L3 = poly("L3", [(20, 0, 0), (22, 0, 0), (23, 1.5, 0.5), (23, 3, 0)])
+r, made = pipes([(L3, "S0")], radius=0.15, cap_style="FLAT")
+segs = [np.linalg.norm(np.subtract(b_, a_)) for a_, b_ in zip([(20, 0, 0), (22, 0, 0), (23, 1.5, 0.5)],
+                                                             [(22, 0, 0), (23, 1.5, 0.5), (23, 3, 0)])]
+want = rod(0.15, sum(segs))
+check("3D polyline, two mitres", r == {'FINISHED'} and len(made) == 1 and solid(made[0])
+      and abs(vol(made[0]) - want) < 1e-4, f"{[round(vol(o), 5) for o in made]} want {want:.5f}")
+sq = poly("Sq", [(30, 0, 0), (32, 0, 0), (32, 2, 0), (30, 2, 0)], cyclic=True)
+r, made = pipes([(sq, "S0")], radius=0.2, body="NEW")
+check("closed square: a mitred solid frame", r == {'FINISHED'} and len(made) == 1 and solid(made[0])
+      and abs(vol(made[0]) - rod(0.2, 8)) < 1e-4, f"{r} {[round(vol(o), 5) for o in made]} want {rod(0.2, 8):.5f}")
+r, made = pipes([(sq, "S0")], radius=0.2)
+check("closed square, cap none: closed too (no ends)", r == {'FINISHED'} and len(made) == 1
+      and store.get_brep(made[0]).face_count() == 4)
+r, made = pipes([(b1, "S0"), (b2, "S0")], radius=0.6)
+check("a radius the mitre has no room for is refused", "too large" in str(r) and not made, str(r)[:150])
+# a curved stretch into a corner: the tube near the mitre runs straight; check it stays close to the radius
+bz = bpy.data.curves.new("CQ", 'CURVE'); bz.dimensions = '3D'
+sp = bz.splines.new('BEZIER'); sp.bezier_points.add(1)
+p0, p1 = sp.bezier_points
+p0.co = (40, 0, 0); p0.handle_right = (41, 0, 0); p0.handle_left = (39, 0, 0)
+p1.co = (42, 1, 0); p1.handle_left = (42, 0, 0); p1.handle_right = (42, 2, 0)
+cq = bpy.data.objects.new("CQ", bz); ctx.collection.objects.link(cq)
+up = poly("UP", [(42, 1, 0), (42, 1, 2)])
+r, made = pipes([(cq, "S0"), (up, "S0")], radius=0.1, cap_style="FLAT")
+check("curve into a corner: mitred solid", r == {'FINISHED'} and len(made) == 1 and solid(made[0]), str(r)[:150])
+if made:
+    rail = features.profile_curve([(cq, "S0"), (up, "S0")])
+    t0_, t1_ = rail.parameter_range()
+    # each tube is the rail on its side of the corner, its axis run on past the corner (the mitre's tips lie there)
+    from blender_nurbs import sweeps
+    c = sweeps.rail_corners(rail)[0]
+    ext_ = np.linspace(0.0, 0.3, 300)[:, None]
+    CA = np.vstack([np.array([rail.evaluate(t) for t in np.linspace(t0_, c["u"], 3000)]), c["point"] + ext_ * c["t_in"]])
+    CB = np.vstack([np.array([rail.evaluate(t) for t in np.linspace(c["u"], t1_, 3000)]), c["point"] - ext_ * c["t_out"]])
+    worst = 0.0
+    for f in store.get_brep(made[0]).faces():
+        sf = f.surface()
+        (u0_, u1_), (v0_, v1_) = sf.u_domain(), sf.v_domain()
+        if sf.is_planar():
+            continue                    # the flat caps
+        for u in np.linspace(u0_, u1_, 41):
+            for v in np.linspace(v0_, v1_, 17):
+                x = np.array(sf.evaluate(u, v))
+                if f.classify_uv(u, v) == "outside":
+                    continue
+                err = min(abs(np.min(np.linalg.norm(CA - x, axis=1)) - 0.1),
+                          abs(np.min(np.linalg.norm(CB - x, axis=1)) - 0.1))
+                worst = max(worst, err)
+    print("  curve into corner: worst radius error", round(worst, 6))
+    check("  stays within 3% of the radius", worst < 0.003, f"{worst:.6f}")
 
 # an arc and a line tangent to it: one smooth rail
 bpy.ops.curve.primitive_nurbs_path_add()
