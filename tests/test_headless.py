@@ -5238,6 +5238,7 @@ for _op in set(_in_panels):
 _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cycle_continuity", "loft_slide", "delete_history", "collect_inputs", "export_step",
               "import_step", "open_step", "history_focus", "history_toggle_hide", "tree_step", "step_unfocus", "mute_step", "patch_add_guides",
               "patch_auto_corners", "patch_corner", "patch_remove_guide", "rebuild", "rebuild_waiting", "remove_step",
+              "pipe_point_add", "pipe_point_remove",     # Pipe / Sweep points: Feature panel rows' buttons
               "restore_inputs", "sync_feature", "tab_edit", "continuity", "continuity_clear", "section_add", "section_orient",
               "section_targets", "section_curves", "section_remove", "subsel_picker", "bake_feature", "delete_feature",
               "curve_degree", "fix_clip_start", "delete_faces", "move_pivot", "cv_nudge", "pattern_select",
