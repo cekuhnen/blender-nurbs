@@ -252,9 +252,12 @@ def apply_fillet_trim(obj, text, inputs, p):
         objs = {"a": me, "b": partner, "a_base": me_base, "b_base": pa_base}
     else:
         objs = {"a": partner, "b": me, "a_base": pa_base, "b_base": me_base}
+    trim = p.get("trim", True)
     res, breps = jobs.run("fillet", objs, ["fillet", "a", "b"], radius_a=p["radius_a"], radius_b=p["radius_b"],
                           xsect=p["xsect"], chord=abs(p["radius_a"]) if p.get("chord") else None,
-                          blend=p.get("blend", 0), tolerance=1e-4, trim_bases=True)
+                          blend=p.get("blend", 0), tolerance=1e-4, trim_bases=trim, ends=p.get("ends", "NOTCH"))
+    if role not in breps and not trim:
+        return text                 # Extend without trimming: this side was not the one grown
     if role not in breps:
         raise RuntimeError(res.get("trim_errors", {}).get(role, "fillet trim failed"))
     return breps[role]
@@ -377,7 +380,7 @@ LABEL = {
     "edge_fillet": lambda p: f"Edge {p.get('shape', 'CIRCULAR').title()} · "
                              + ("chord" if p.get("chord") else "r") + f" {p.get('radius', 0):.3g}"
                              + (" · Class-A" if p.get("class_a") else ""),
-    "fillet_trim": lambda p: "Fillet trim",
+    "fillet_trim": lambda p: ("Fillet trim" if p.get("trim", True) else "Fillet extend"),
     "flip_normal": lambda p: "Flip Normal",
     "untrim_region": lambda p: "Untrim Region",
     "untrim": lambda p: "Untrim",
@@ -544,7 +547,7 @@ def _register():
         _, breps = jobs.run("fillet", objs, ["fillet"], radius_a=p["radius_a"],
                             radius_b=p["radius_b"], xsect=p["xsect"],
                             chord=abs(p["radius_a"]) if p.get("chord") else None, blend=p.get("blend", 0),
-                            tolerance=1e-4, trim_bases=False)
+                            tolerance=1e-4, trim_bases=False, ends=p.get("ends", "NOTCH"))
         return ("brep_text", breps["fillet"])
 
 

@@ -761,6 +761,12 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
                             description="If there is no fillet on the chosen sides, try the others")
     trim_bases: BoolProperty(name="Trim Surfaces", default=True,
                              description="Trim both surfaces back to the fillet rails")
+    ends: EnumProperty(name="Ends", items=[
+        ("NOTCH", "Notch", "Where one surface ends along the crossing before the other, the fillet stops there "
+                           "and the longer surface is cut back only along the fillet (a step at the end)"),
+        ("EXTEND", "Extend", "Where one surface ends along the crossing before the other, it is extended "
+                             "(naturally, exactly) to the other's end first: the fillet runs the whole edge"),
+    ], default="NOTCH")
 
     def invoke(self, context, event):
         given = [bpy.data.objects.get(n) for n in (self.surf_a, self.surf_b) if n]
@@ -881,9 +887,10 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         a, b = bpy.data.objects.get(self.surf_a), bpy.data.objects.get(self.surf_b)
         if a is None or b is None:
             return False
-        self._sf = surface_fillet_frames(a, b)
+        self._sf = surface_fillet_frames(a, b, getattr(self, "ends", "NOTCH"))
         if not self._sf:
             return False               # surfaces that do not cross: the dialog
+        self._uneven = surface_fillet_uneven(a, b)
         try:
             self._fits = surface_fillet_sides(a, b, self._sf, part_size([a, b]))
         except Exception as exc:
@@ -979,6 +986,14 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
             self.continuity = {"1": "2", "2": "3"}.get(self.continuity, "1")
         elif ch == "t":
             self.trim_bases = not self.trim_bases
+        elif ch == "e" and getattr(self, "_uneven", False):
+            self.ends = "EXTEND" if self.ends == "NOTCH" else "NOTCH"
+            a, b = bpy.data.objects.get(self.surf_a), bpy.data.objects.get(self.surf_b)
+            try:
+                self._sf = surface_fillet_frames(a, b, self.ends) or self._sf
+            except Exception as exc:          # the extension failed: say so, keep the plain preview
+                self._msg = str(exc)
+                self.ends = "NOTCH"
         else:
             return False
         return True
@@ -995,7 +1010,9 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
                            hints.toggle("S", "same radius", self.same_radius)]
                  + ([hints.cycle("G", ["G1", "G2", "G3"], "G" + self.continuity)] if self.shape == "BLEND" else [])),
                 ("Side", [hints.key("A", "other side of A"), hints.key("B", "other side of B"),
-                          hints.toggle("T", "trim the surfaces", self.trim_bases)])]
+                          hints.toggle("T", "trim the surfaces", self.trim_bases)]
+                 + ([hints.cycle("E", ["notch", "extend"], self.ends.lower(), "ends")]
+                    if getattr(self, "_uneven", False) else []))]
         return rows
 
     def drag_state(self):
@@ -1016,12 +1033,13 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         rb = self.radius if (self.same_radius or chord) else self.radius_b
         self._used = {"radius_a": -self.radius if fa else self.radius, "radius_b": -rb if fb else rb,
                       "xsect": 0 if self.shape == "CHAMFER" else 2, "chord": chord,
-                      "blend": int(self.continuity) if self.shape == "BLEND" else 0}
+                      "blend": int(self.continuity) if self.shape == "BLEND" else 0, "ends": self.ends,
+                      "trim": self.trim_bases}
         return jobs.run("fillet", {"a": a, "b": b}, ["fillet", "a", "b"],
                         radius_a=-self.radius if fa else self.radius,
                         radius_b=-rb if fb else rb,
                         xsect=0 if self.shape == "CHAMFER" else 2, chord=chord, blend=self._used["blend"],
-                        tolerance=1e-4, trim_bases=self.trim_bases)
+                        tolerance=1e-4, trim_bases=self.trim_bases, ends=self.ends)
 
     def execute(self, context):
         if not _kernel_ok(self):
@@ -1069,6 +1087,9 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
                     features.push_step(obj, "fillet_trim", [(partner, "SURF")], dict(u, role=key), base_text=pre)
         for key, err in res.get("trim_errors", {}).items():
             self.report({'WARNING'}, f"Could not trim {(a if key == 'a' else b).name}: {err}")
+        for g in res.get("extended", []):
+            self.report({'INFO'}, f"Extended {(a if g['surface'] == 'a' else b).name} by {g['length']:.4g} m "
+                                  "to the other surface's end")
         if res.get("note"):
             self.report({'WARNING'}, res["note"])
         if keep_history:
@@ -1102,6 +1123,7 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         row.prop(self, "flip_b", toggle=True)
         lay.prop(self, "auto_flip")
         lay.prop(self, "trim_bases")
+        lay.row(align=True).prop(self, "ends", expand=True)
 
 
 # --------------------------------------------------------------------------
@@ -2040,16 +2062,31 @@ def fillet_sections(P, D1, D2, r, shape="CIRCULAR", k=9, fullness=1.0):
     return C[:, None] + r[:, None, None] * (wa[..., None] * a[:, None] + wb[..., None] * b[:, None])
 
 
-def surface_fillet_frames(a, b, n=15):
+def surface_fillet_uneven(a, b):
+    """Does one surface end along the crossing before the other? (Ends: Notch / Extend matter)"""
+    from .kernel import load, filletends
+    from .sweeps import _world_brep
+    try:
+        return bool(filletends.uneven_ends(load(), _world_brep(a), _world_brep(b)))
+    except Exception:
+        return False
+
+
+def surface_fillet_frames(a, b, ends="NOTCH", n=15):
     """Where a fillet between surfaces a and b sits: per intersection curve,
     (P (n,3) points on it, NA, NB (n,3) the surfaces' outward normals there),
     world. None when they do not cross. With the ball on the normals' sides
     (Flip A / Flip B off) its centre C has n_A . (C - P) = r_A, n_B . (C - P)
-    = r_B: any radius is then a formula (the Surface Fillet preview)."""
+    = r_B: any radius is then a formula (the Surface Fillet preview). ends
+    EXTEND: the shorter surface grown to the longer one's end first, as the
+    worker does (kernel/filletends.py)."""
     from .kernel import load
     from .sweeps import _world_brep
     sm = load()
     wa, wb = _world_brep(a), _world_brep(b)
+    if ends == "EXTEND":
+        from .kernel import filletends
+        wa, wb, _ = filletends.extend_to_partner(sm, wa, wb)
     try:
         curves, _ = sm.intersect_breps(wa, wb)
     except RuntimeError:            # the kernel raises when they do not meet

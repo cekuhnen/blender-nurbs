@@ -330,6 +330,81 @@ def _near_edges(brep, tol):
     return on
 
 
+def _rejoin_runs(lp, segs, original, tol):
+    """The loop lp (indices into segs: (edge, forward, start, end)) with runs
+    of consecutive pieces of ONE original edge -- split where a cut crossed
+    it, at a point that is no vertex of the original -- given back as that
+    edge's own curve over their range (a curve in place of the indices).
+    Plain indices for everything else. Open original edges only."""
+    np = _np()
+    oedges = original.edges()
+    overts = [np.array(e.point_at(t), float) for e in oedges for t in e.parameter_range()]
+
+    def owner(j):
+        e = segs[j][0]
+        t0, t1 = e.parameter_range()
+        best = None
+        for f in (0.25, 0.5, 0.75):
+            q = tuple(map(float, e.point_at(t0 + f * (t1 - t0))))
+            ds = [oe.closest_point(q)[2] for oe in oedges]
+            k = int(np.argmin(ds))
+            if ds[k] > 10 * tol or (best is not None and k != best):
+                return None
+            best = k
+        oe = oedges[best]
+        a, z = oe.parameter_range()
+        if np.linalg.norm(np.array(oe.point_at(a), float) - np.array(oe.point_at(z), float)) <= 10 * tol:
+            return None                     # a closed rim: its pieces stay
+        return best
+
+    def joint(p):
+        return not any(np.linalg.norm(p - v) <= 10 * tol for v in overts)
+
+    try:
+        own = [owner(j) for j in lp]
+    except Exception:
+        return list(lp)
+    n = len(lp)
+    if n < 2 or all(o is None for o in own):
+        return list(lp)
+    # start the walk at a break so a run never wraps round the loop's start
+    starts = [i for i in range(n) if not (own[i] is not None and own[i] == own[i - 1] and joint(segs[lp[i]][2]))]
+    if not starts:
+        return list(lp)
+    k0 = starts[0]
+    order = [(k0 + i) % n for i in range(n)]
+    out, run = [], []
+
+    def flush():
+        if len(run) == 1:
+            out.append(lp[run[0]])
+        elif run:
+            try:
+                import trimext
+                oe = oedges[own[run[0]]]
+                d = ext.curve_cvs(oe.curve())
+                P = np.array(d["points"], float)
+                w = np.array(d["weights"], float) if d.get("weights") else np.ones(len(P))
+                Q = list(np.concatenate([P * w[:, None], w[:, None]], axis=1))
+                U = [float(x) for x in d["knots"]]
+                ta = oe.closest_point(tuple(map(float, segs[lp[run[0]]][2])))[1]
+                tb = oe.closest_point(tuple(map(float, segs[lp[run[-1]]][3])))[1]
+                Q, U = trimext._cut(Q, U, int(d["degree"]), max(min(ta, tb), U[0]), min(max(ta, tb), U[-1]))
+                out.append(trimext._make_curve(Q, U, int(d["degree"]), reverse=ta > tb))
+            except Exception:
+                out.extend(lp[i] for i in run)
+        run.clear()
+
+    for i in order:
+        if run and own[i] is not None and own[i] == own[run[-1]] and joint(segs[lp[i]][2]):
+            run.append(i)
+            continue
+        flush()
+        run.append(i)
+    flush()
+    return out
+
+
 def heal_cut_seams(b, original):
     """Remove the cut edges that have kept surface on both sides: a trim
     imprints every cutter, and where a region on each side is kept (the far
@@ -337,7 +412,10 @@ def heal_cut_seams(b, original):
     faces, or one face whose loop runs out and back along a slit. Each such
     set of faces on one surface is trimmed again to the outline of their
     union, exactly (the edges' own curves). Original edges (a revolve's seam)
-    stay. Returns b unchanged when anything does not check out."""
+    stay. Pieces of one original face count as one surface even when the
+    kernel's split gave them different representations of it (a cubic plane
+    split into bilinear patches): they are trimmed again on the original
+    face's surface. Returns b unchanged when anything does not check out."""
     np = _np()
     lo, hi = (np.array(v) for v in original.bounding_box())
     size = float(np.linalg.norm(hi - lo)) or 1.0
@@ -355,6 +433,26 @@ def heal_cut_seams(b, original):
             skeys.append(_surface_key(f.surface()))
         except Exception:
             skeys.append(None)
+    ofaces = original.faces()
+    okeys = {}
+
+    def origin(i):
+        """Index of the original face piece i lies on (None: none clearly)."""
+        if i not in okeys:
+            try:
+                p = tuple(map(float, _inner_point(faces[i])))
+                ds = [of.closest_point(p)[1] for of in ofaces]
+                j = int(np.argmin(ds))
+                okeys[i] = j if ds[j] <= 10 * tol else None
+            except Exception:
+                okeys[i] = None
+        return okeys[i]
+
+    def same_surface(i, j):
+        if skeys[i] is not None and skeys[i] == skeys[j]:
+            return True
+        return origin(i) is not None and origin(i) == origin(j)
+
     uses = {}       # edge key -> [(face index, forward)]
     edge_of = {}
     for i, f in enumerate(faces):
@@ -374,8 +472,7 @@ def heal_cut_seams(b, original):
             i = parent[i]
         return i
     for k, us in uses.items():
-        if len(us) != 2 or us[0][1] == us[1][1] or skeys[us[0][0]] is None \
-                or skeys[us[0][0]] != skeys[us[1][0]]:
+        if len(us) != 2 or us[0][1] == us[1][1] or not same_surface(us[0][0], us[1][0]):
             continue
         pts = _edge_poly(edge_of[k], 7)[1:-1]
         if pts and all(on_original(np.array(p)) for p in pts):
@@ -457,10 +554,14 @@ def heal_cut_seams(b, original):
                 continue
             loops_try.sort(key=span, reverse=True)          # the outer loop first
             for tight in (True, False):
-                curves = []
+                curves, sizes = [], []
                 for lp in loops_try:
-                    for j in lp:
-                        e, fw = segs[j][0], segs[j][1]
+                    n0 = len(curves)
+                    for item in _rejoin_runs(lp, segs, original, tol):
+                        if not isinstance(item, int):    # a piece of an original edge, rejoined
+                            curves.append(item)
+                            continue
+                        e, fw = segs[item][0], segs[item][1]
                         d = ext.curve_cvs(e.curve())
                         U, Pc, Wt = list(d["knots"]), list(d["points"]), d.get("weights")
                         if not fw:
@@ -468,16 +569,18 @@ def heal_cut_seams(b, original):
                             U = [a0 + a1 - k for k in reversed(U)]
                             Pc, Wt = Pc[::-1], (list(Wt)[::-1] if Wt else None)
                         curves.append(ext.curve_from_cvs(d["degree"], Pc, U, list(Wt) if Wt else None))
-                sd = ext.surface_cvs(faces[members[0]].surface())
+                    sizes.append(len(curves) - n0)
+                one = len({skeys[i] for i in members}) == 1 and skeys[members[0]] is not None
+                carrier = faces[members[0]].surface() if one else ofaces[origin(members[0])].surface()
+                sd = ext.surface_cvs(carrier)
                 surf = ext.surface_from_cvs(sd["degree_u"], sd["degree_v"], list(sd["points"]), list(sd["knots_u"]),
                                             list(sd["knots_v"]), list(sd["weights"]) if sd.get("weights") else None) \
-                    if "knots_u" in sd else faces[members[0]].surface()
+                    if "knots_u" in sd else carrier
                 try:
                     if tight and hasattr(ext, "trim_surface_with_3d_curves_tol"):
-                        cand = ext.trim_surface_with_3d_curves_tol(surf, [len(lp) for lp in loops_try], curves, tol,
-                                                                   0.01)
+                        cand = ext.trim_surface_with_3d_curves_tol(surf, sizes, curves, tol, 0.01)
                     else:
-                        cand = sm.trim_surface_with_3d_curves(surf, [len(lp) for lp in loops_try], curves)
+                        cand = sm.trim_surface_with_3d_curves(surf, sizes, curves)
                 except Exception:
                     continue
                 if cand.face_count() == 1 and abs(cand.area(1e-6) - area) <= 1e-4 * max(area, 1e-12):
@@ -814,9 +917,53 @@ def job_fillet(job):
     With job['chord'] (the rails that far apart, the ball radius changing
     with the angle between the surfaces) or job['blend'] (1 / 2 / 3: a G1 / G2 /
     G3 blend between the rolling ball's rails): built from exact sections
-    (secfillet.py). Either way the bases are trimmed back to its rails."""
+    (secfillet.py). Either way the bases are trimmed back to its rails.
+    job['ends'] EXTEND: where one surface ends along the crossing before the
+    other, it is grown to the other's end first (filletends.py); NOTCH
+    (default): the longer one is cut back only along the fillet."""
+    grown = []
+    if job.get("ends") == "EXTEND":
+        job, grown = _grow_shorter(job)
     A = world_brep(job, "a_base" if "a_base" in job["breps"] else "a")
     B = world_brep(job, "b_base" if "b_base" in job["breps"] else "b")
+    res = _job_fillet(job, A, B)
+    if grown:
+        res["extended"] = [{"surface": r["key"], "length": r["grown"]} for r in grown]
+    return res
+
+
+def _grow_shorter(job):
+    """(job, records): the job with the shorter surface grown to the longer
+    one's end wherever the crossing ends before the longer one does (its base
+    and its trim target both); unchanged with no records."""
+    import filletends
+    ka = "a_base" if "a_base" in job["breps"] else "a"
+    kb = "b_base" if "b_base" in job["breps"] else "b"
+    A2, B2, recs = filletends.extend_to_partner(sm, world_brep(job, ka), world_brep(job, kb))
+    if not recs:
+        return job, recs
+    job = dict(job, breps=dict(job["breps"]), xforms=dict(job.get("xforms") or {}))
+    folder = job.get("out_dir") or os.path.dirname(job["breps"][ka])
+    for key, base in (("a", A2), ("b", B2)):
+        if not any(r["key"] == key for r in recs):
+            continue
+        bk = key + "_base" if key + "_base" in job["breps"] else key
+        target = base
+        if bk != key:           # a history replay: the trim target is the current geometry
+            try:
+                target = filletends.apply_records(sm, world_brep(job, key), recs, key)
+            except Exception:   # already grown (the partner's own step ran): leave it
+                target = world_brep(job, key)
+        for k, br in ((bk, base), (key, target)):
+            path = os.path.join(folder, f"grown_{k}.sm")
+            save(to_local(br.copy(), job["xforms"].get(k)), path)
+            job["breps"][k] = path
+        if key in job.get("out", {}):        # shown grown even when it is not trimmed (or the trim fails)
+            save(to_local(target.copy(), job["xforms"].get(key)), job["out"][key])
+    return job, recs
+
+
+def _job_fillet(job, A, B):
     chord = job.get("chord")
     blend = int(job.get("blend") or 0)
     if chord or blend:
@@ -839,6 +986,23 @@ def job_fillet(job):
         if info.get("note"):
             res["note"] = info["note"]
         return res
+    import filletends
+    if filletends.uneven_ends(sm, A, B):
+        # one surface ends along the crossing before the other: the kernel's
+        # ball runs on past that end in a tapering one-sided tail; the same
+        # circle / chamfer from exact sections ends square to the crossing
+        # there. (Where a section's ball does not fit -- a crossing leaving a
+        # surface through an edge at an angle -- the kernel's fillet as before.)
+        import secfillet
+        sa = 1.0 if float(job["radius_a"]) >= 0 else -1.0
+        sb = 1.0 if float(job["radius_b"]) >= 0 else -1.0
+        try:
+            f, _ = secfillet.build(sm, A, B, sa, sb, abs(float(job["radius_a"])), abs(float(job["radius_b"])),
+                                   shape="LINEAR" if int(job["xsect"]) == 0 else "CIRCULAR",
+                                   tolerance=float(job.get("tolerance", 1e-4)))
+            return _fillet_finish(job, _orient_fillet(f, (A, B)), A, B)
+        except Exception:
+            pass
     return _fillet_finish(job, _surface_fillet(job, A, B), A, B)
 
 
@@ -888,6 +1052,9 @@ def _fillet_finish(job, f, A, B):
         for key, base in (("a", A), ("b", B)):
             rail[key] = min(edges, key=lambda e: dist_to_brep(mid(e), base))
         rmax = max(abs(float(job["radius_a"])), abs(float(job["radius_b"])))
+        import filletends
+        size = filletends.size_of(A, B)
+        ends = filletends.crossing_ends(sm, A, B, size)
         for key, other in (("a", "b"), ("b", "a")):
             try:
                 base = world_brep(job, key)  # fresh: the fillet must not share it
@@ -898,21 +1065,34 @@ def _fillet_finish(job, f, A, B):
                 # exact imprint along the rail (a sheet standing across the base;
                 # a single-direction projection also hits the far side of closed
                 # surfaces such as a revolve and deletes the wrong region)
-                sheet = _rail_sheet(rail[key], base, max(0.25 * rmax, 1e-4))
+                sheets = [_rail_sheet(rail[key], base, max(0.25 * rmax, 1e-4))]
+                # a rail that stops inside the base (the other surface ends first
+                # along the crossing): close the cut square to the crossing at its
+                # end -- a notch, the rest of the base keeps its own edge
+                t0, t1 = rail[key].parameter_range()
+                for q in (rail[key].point_at(t0), rail[key].point_at(t1)):
+                    end = filletends.notch_sheet(sm, base, q, ends, size, max(0.25 * rmax, 1e-4))
+                    if end is not None:
+                        sheets.append(end)
                 import os, tempfile
-                fd, sp = tempfile.mkstemp(suffix=".sm")
-                os.close(fd)
-                save(sheet, sp)
+                paths = {}
+                for i, sh in enumerate(sheets):
+                    fd, sp = tempfile.mkstemp(suffix=".sm")
+                    os.close(fd)
+                    save(sh, sp)
+                    paths[f"sheet{i}"] = sp
                 fd, op_ = tempfile.mkstemp(suffix=".sm")
                 os.close(fd)
-                sub = {"breps": {"target": job["breps"][key], "sheet": sp},
+                sub = {"breps": dict(target=job["breps"][key], **paths),
                        "xforms": {"target": job.get("xforms", {}).get(key)},
-                       "cutter_breps": ["sheet"], "ref_point": list(ref), "action": "DELETE", "scope": "PICKED",
-                       "direction": [0.0, 0.0, 1.0], "out": {"DELETE": op_}}
+                       "cutter_breps": list(paths), "ref_point": list(ref), "action": "DELETE", "scope": "PICKED",
+                       "direction": [0.0, 0.0, 1.0], "out": {"DELETE": op_},
+                       "extend": len(sheets) > 1}   # the notch's cuts reach across; the seams heal again
                 job_trim(sub)
                 import shutil
                 shutil.move(op_, job["out"][key])
-                os.remove(sp)
+                for sp in paths.values():
+                    os.remove(sp)
                 t = load(job["out"][key])
                 out[key] = {"faces": t.face_count(), "area": t.area()}
             except Exception as exc:
