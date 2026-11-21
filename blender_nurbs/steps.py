@@ -363,6 +363,19 @@ def class_a_params(p):
             "ca_continuity": int(p.get("ca_continuity", 2))}
 
 
+def fillet_radii(p):
+    """A Surface Fillet step's variable radius (start, end) as worker job
+    parameters ({} for a constant one), scaled with its radius_a: the larger
+    of the two is |radius_a| (so a radius edited in the feature panel scales
+    the whole run)."""
+    r = p.get("radii")
+    if not r or p.get("chord") or p.get("soft") is not None:
+        return {}
+    m = max(float(x) for x in r)
+    k = abs(float(p["radius_a"])) / m if m > 0 else 1.0
+    return {"radii": [float(x) * k for x in r], "start_point": p.get("start_point")}
+
+
 def apply_fillet_trim(obj, text, inputs, p):
     """Trim this surface back to the rail of its fillet with the partner surface."""
     from . import features
@@ -381,7 +394,7 @@ def apply_fillet_trim(obj, text, inputs, p):
     res, breps = jobs.run("fillet", objs, ["fillet", "a", "b"], radius_a=p["radius_a"], radius_b=p["radius_b"],
                           xsect=p["xsect"], chord=abs(p["radius_a"]) if p.get("chord") else None,
                           blend=p.get("blend", 0), soft=p.get("soft"), tolerance=1e-4, trim_bases=trim,
-                          ends=p.get("ends", "NOTCH"))
+                          ends=p.get("ends", "NOTCH"), **fillet_radii(p))
     if role not in breps and not trim:
         return text                 # Extend without trimming: this side was not the one grown
     if role not in breps:
@@ -673,7 +686,8 @@ def _register():
         _, breps = jobs.run("fillet", objs, ["fillet"], radius_a=p["radius_a"],
                             radius_b=p["radius_b"], xsect=p["xsect"],
                             chord=abs(p["radius_a"]) if p.get("chord") else None, blend=p.get("blend", 0),
-                            soft=p.get("soft"), tolerance=1e-4, trim_bases=False, ends=p.get("ends", "NOTCH"))
+                            soft=p.get("soft"), tolerance=1e-4, trim_bases=False, ends=p.get("ends", "NOTCH"),
+                            **fillet_radii(p))
         return ("brep_text", breps["fillet"])
 
 

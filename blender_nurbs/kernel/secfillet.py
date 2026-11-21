@@ -14,7 +14,9 @@ also with the rate that curvature changes at (the surface's third-order
 form, from the exact third derivatives of its CV net). SOFT2 / SOFT3: the
 soft fillet (softfillet.py), a G2 quintic / G3 degree-7 span whose curvature
 peaks at exactly 1 / R in the middle; each section's ball is sized from its
-own angle so the rails sit where that span needs them.
+own angle so the rails sit where that span needs them. A variable radius
+(radius_law): each section's ball its own radius, linear in length along
+the crossing; a 0 section is the crossing's point (the rails meet there).
 
 The sections are skinned through, in homogeneous coordinates (rational arcs
 stay exact), periodic round a closed crossing; a section is added halfway
@@ -394,11 +396,12 @@ def _plane(T):
 
 
 class Solver:
-    def __init__(self, A, B, ra, rb, chord=None, scale=1.0, soft=None):
+    def __init__(self, A, B, ra, rb, chord=None, scale=1.0, soft=None, law=None):
         self.A, self.B = A, B
         self.ra, self.rb, self.chord = ra, rb, chord
         self.scale = scale
         self.soft = soft            # (R, smoothing, cont): each section's ball from its own angle
+        self.law = law              # s -> ball radius (a variable radius; 0 allowed: the rails meet)
 
     def ball(self, P0, T, ra, rb, C):
         """Centre in the plane (P0, T) at signed distances ra from A, rb from B."""
@@ -500,9 +503,15 @@ class Solver:
                 C, pa, na, wa, pb, nb, wb = self.ball(P0, T, r, r, C)
             ra = rb = r
         else:
-            ra, rb = self.ra, self.rb
-            C = guess if guess is not None else self.start(P0, ra, rb)[0]
-            C, pa, na, wa, pb, nb, wb = self.ball(P0, T, ra, rb, C)
+            ra, rb = (self.law(s),) * 2 if self.law else (self.ra, self.rb)
+            if max(ra, rb) <= 1e-12 * self.scale:
+                # no ball: the section is the crossing's point, both rails on it
+                pa, na, wa = self.A.foot(P0)
+                pb, nb, wb = self.B.foot(P0)
+                C = pa = pb = P0
+            else:
+                C = guess if guess is not None else self.start(P0, ra, rb)[0]
+                C, pa, na, wa, pb, nb, wb = self.ball(P0, T, ra, rb, C)
         x = Section()
         x.s, x.P0, x.C, x.pa, x.pb, x.na, x.nb, x.wa, x.wb, x.ra, x.rb = s, P0, C, pa, pb, na, nb, wa, wb, ra, rb
         x.turn = math.acos(max(-1.0, min(1.0, float(na @ nb))))
@@ -657,8 +666,22 @@ def _sides_on(sm, brep_a, brep_b, cr, ra, rb, chord, size, faces, soft=None):
         raise RuntimeError("no fillet of this size fits between the two faces")
     return best[1], best[2]
 
+def radius_law(cr, radii, start=None):
+    """s -> ball radius running linearly with arc length along the crossing
+    from radii[0] to radii[1], radii[0] at the crossing's end nearer start
+    (a world point; None: s = 0)."""
+    r0, r1 = (max(0.0, float(r)) for r in radii)
+    if cr.closed and abs(r1 - r0) > 1e-12 * max(r0, r1):
+        raise RuntimeError("a closed crossing has no ends: a variable radius needs an open one")
+    if start is not None:
+        q = np.asarray(start, float)
+        if np.linalg.norm(cr.at(1.0)[0] - q) < np.linalg.norm(cr.at(0.0)[0] - q):
+            r0, r1 = r1, r0
+    return lambda s: r0 + (r1 - r0) * min(max(float(s), 0.0), 1.0)
+
+
 def build(sm, brep_a, brep_b, side_a, side_b, ra, rb, chord=None, shape="CIRCULAR", tolerance=1e-4,
-          curves=None, on_faces=None, smoothing=0.6):
+          curves=None, on_faces=None, smoothing=0.6, radii=None, start=None):
     """(fillet brep, info) between two world-space breps. side_a / side_b: +1
     for the fillet on that surface's outward-normal side, -1 the other.
     curves: the crossing to follow (an edge fillet's edges) instead of the
@@ -666,7 +689,10 @@ def build(sm, brep_a, brep_b, side_a, side_b, ra, rb, chord=None, shape="CIRCULA
     side_b None: the sides are the ones whose rails land on those faces
     (an edge fillet: the one corner between the two faces that both have).
     SOFT2 / SOFT3: ra is the soft fillet's minimum radius R (rb is not used),
-    smoothing its share of the turn in the ramps."""
+    smoothing its share of the turn in the ramps. radii = (r0, r1): a variable
+    ball radius (the same from both surfaces, not with chord or soft) running
+    from r0 at the crossing's end nearer the point start to r1 at the other;
+    a 0 end closes the rails on the crossing there."""
     ext = sm.blender_ext
     if shape not in SHAPES:
         raise ValueError(f"unknown section {shape}")
@@ -689,10 +715,13 @@ def build(sm, brep_a, brep_b, side_a, side_b, ra, rb, chord=None, shape="CIRCULA
     if not crossings:
         raise RuntimeError("the surfaces do not cross")
     cr = max(crossings, key=lambda c: c.length)
+    law = None
+    if radii is not None and chord is None and soft is None:
+        law = radius_law(cr, radii, start)
     if side_a is None or side_b is None:
         side_a, side_b = _sides_on(sm, brep_a, brep_b, cr, ra, rb, chord, size, on_faces, soft)
     A, B = Base(sm, brep_a, side_a), Base(sm, brep_b, side_b)
-    solver = Solver(A, B, ra, rb, chord, size, soft)
+    solver = Solver(A, B, ra, rb, chord, size, soft, law)
     polys = []
     for br in (brep_a, brep_b):
         for e in br.edges():

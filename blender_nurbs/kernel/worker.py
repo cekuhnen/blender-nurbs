@@ -989,17 +989,22 @@ def _job_fillet(job, A, B):
         if info.get("note"):
             res["note"] = info["note"]
         return res
-    if chord or blend:
+    radii = None if chord else job.get("radii")
+    if chord or blend or radii:
         # our own sections (secfillet.py): the kernel's fillet has one ball
-        # radius, a chord needs one per section; a blend is built between the
-        # rails directly (no circular fillet, trim and loft between its edges)
+        # radius, a chord or a variable radius (job['radii'] = start, end;
+        # start at the crossing's end nearer job['start_point']) needs one
+        # per section; a blend is built between the rails directly (no
+        # circular fillet, trim and loft between its edges)
         import secfillet
         sa = 1.0 if float(job["radius_a"]) >= 0 else -1.0
         sb = 1.0 if float(job["radius_b"]) >= 0 else -1.0
         shape = {1: "G1", 2: "G2", 3: "G3"}.get(blend) or ("LINEAR" if int(job["xsect"]) == 0 else "CIRCULAR")
         f, info = secfillet.build(sm, A, B, sa, sb, abs(float(job["radius_a"])), abs(float(job["radius_b"])),
                                   chord=float(chord) if chord else None, shape=shape,
-                                  tolerance=float(job.get("tolerance", 1e-4)))
+                                  tolerance=float(job.get("tolerance", 1e-4)),
+                                  radii=[float(r) for r in radii] if radii else None,
+                                  start=job.get("start_point"))
         f = _orient_fillet(f, (A, B))
         res = _fillet_finish(job, f, A, B)
         res["radius"] = info["radius"][1]
@@ -1072,6 +1077,9 @@ def _fillet_finish(job, f, A, B):
         # rails = fillet boundary edges lying on each base
         edges = f.edges()
         rail = {}
+        # (not an end collapsed to a point: a variable radius tapering to 0)
+        span = lambda e: _np().linalg.norm(_np().subtract(e.point_at(e.parameter_range()[0]), mid(e)))
+        edges = [e for e in edges if span(e) > 1e-9] or edges
         for key, base in (("a", A), ("b", B)):
             rail[key] = min(edges, key=lambda e: dist_to_brep(mid(e), base))
         rmax = max(abs(float(job["radius_a"])), abs(float(job["radius_b"])))
