@@ -649,11 +649,29 @@ def degree_for(conts):
     return 4 if k >= 3 else (3 if k >= 2 else (2 if k >= 1 else 1))
 
 
+def refit_count(n_cvs, need, deg):
+    """CVs of a curve that must be refitted for its aligned ends (a degree
+    raised, or too few CVs; need: each end's G level). The ends take
+    sum(need) CVs from it besides their end points: those are added, so the
+    CVs the curve had stay free to keep its shape (else G3, raising a 5-CV
+    cubic to a 5-CV quartic and fixing 4 of them, bends it far off)."""
+    k_need = sum(need) + len(need)
+    return max(n_cvs + sum(need), k_need, deg + 1)
+
+
 def _refit_points(Q, p, n, q):
     """n CVs of degree q (endpoint uniform) fitting the curve of CVs Q, degree p."""
     from .curvetools import Basis, fit
     S = Basis(len(Q), p, False).matrix(np.linspace(0.0, 1.0, 40 * len(Q) + 1)) @ Q
     return fit(S, q, n, False)[0]
+
+
+def _insert_cv(Q, e):
+    """One more CV on the leg next to end e ("0" / "1"), a third of the way in."""
+    Q = np.asarray(Q, float)
+    if e == "1":
+        return _insert_cv(Q[::-1], "0")[::-1].copy()
+    return np.vstack([Q[:1], Q[:1] + (Q[1] - Q[0]) / 3.0, Q[1:]])
 
 
 def align_open(Q, p, ends):
@@ -671,9 +689,14 @@ def align_open(Q, p, ends):
     if not need:
         return Q, p, specs
     q = max(p, degree_for([s.get("cont", "G1") for s in specs.values()]))
-    n = max(len(Q), sum(need) + len(need), q + 1)
-    if n != len(Q):
-        Q = _refit_points(Q, p, n, q)
+    # CV mode: the clicks are the CVs, and an end moves the ones next to it (G1
+    # the 2nd, G2 the 3rd too). A G3 end adds a CV on its first leg instead of
+    # taking a 4th click, so it moves the same clicks as G2 and the shape holds
+    for e, (s_, _) in sorted(ends.items()):
+        if CONT[s_.get("cont", "G1")] >= 3 and len(Q) >= 2:
+            Q = _insert_cv(Q, e)
+    if max(len(Q), sum(need) + len(need), q + 1) != len(Q):         # too few CVs: refit, with room
+        Q = _refit_points(Q, p, refit_count(len(Q), need, q), q)
     p = q
     U = geom.clamped_uniform_knots(len(Q), p)
     I = np.eye(4)
@@ -741,7 +764,7 @@ def solve(obj, ends, inputs, fresh=()):
     if kind == "REFIT" or (kind == "NURBS" and (len(Q) < max(k_need, 2) or p < max(need + [1]) + (1 if 2 in need else 0)
                                                   or (p == 1 and max(need + [0]) >= 1) or (g3 and p < 4))):
         deg = max(4 if g3 else 3, p) if kind != "REFIT" or p < (4 if g3 else 2) else p
-        n = max(len(Q), k_need, deg + 1)
+        n = refit_count(len(Q), need, deg)
         Q, U = _refit(obj, deg, n, si)
         p, kind = deg, "NURBS"
     if kind == "NURBS":
