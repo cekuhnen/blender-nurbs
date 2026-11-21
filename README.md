@@ -55,8 +55,9 @@ everything built from it rebuilds.
 
 ### Curve Edit
 
-- Join Curves, Unjoin Curves, Trim Curves, Split Curves
-- Rebuild Curve, Extend Curve, Align Curve
+- **Shape:** Rebuild Curve, Extend Curve, Align Curve
+- **Trim and split:** Trim Curves, Split Curves
+- **Join:** Join Curves, Unjoin Curves
 
 ### Create Surfaces
 

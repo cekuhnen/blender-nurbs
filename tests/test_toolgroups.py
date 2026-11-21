@@ -66,6 +66,12 @@ check("Create Surfaces rows", rows == [
     ["extrude", "flange"], ["planar", "dome"], ["boundary", "patch"],
     ["offset", "thicken"], ["pattern"], ["unroll", "flow"], ["from_blender_surface"]], rows)
 
+rows = [[t[0].split(".")[1] for t in row] for sec in tg.GROUP["CURVE_EDIT"][2] for row in sec[1]]
+check("Curve Edit rows, in Surface Edit's order (shape, trim, join)", rows == [
+    ["rebuild_curve", "extend_curve"], ["align_curve"], ["trim_curves", "split_curves"],
+    ["join_curves", "unjoin_curves"]] and [sec[0] for sec in tg.GROUP["CURVE_EDIT"][2]] ==
+    [sec[0] for sec in tg.GROUP["SURFACE_EDIT"][2] if sec[0] in ("Shape", "Trim and Split", "Join")], rows)
+
 rows = [[t[0].split(".")[1] for t in row] for sec in tg.GROUP["SURFACE_EDIT"][2] for row in sec[1]
         if not isinstance(row, tg.MenuOnly)]
 check("Surface Edit rows (Edit CVs only in the menus: Tab does it)", rows == [

@@ -103,16 +103,18 @@ GROUPS = (
             (_t("nproto.from_blender_surface", icon='SURFACE_NSURFACE', needs={SURFACE}),),
         ), {NURBS}),
     )),
-    ("CURVE_EDIT", "Curve Edit", (
-        ("Join and Trim", (
-            (_t("nproto.join_curves", "Join Curves", 'AUTOMERGE_ON'),
-             _t("nproto.unjoin_curves", "Unjoin Curves", 'AUTOMERGE_OFF')),
-            (_t("nproto.trim_curves", "Trim Curves", 'X'), _t("nproto.split_curves", "Split Curves", 'MOD_EDGESPLIT')),
-        ), {CURVE}),
+    ("CURVE_EDIT", "Curve Edit", (                         # in Surface Edit's order: shape, trim, join
         ("Shape", (
             (_t("nproto.rebuild_curve", "Rebuild Curve", 'FILE_REFRESH'),
              _t("nproto.extend_curve", "Extend Curve", 'FORWARD')),
             (_t("nproto.align_curve", icon='SNAP_MIDPOINT'),),
+        ), {CURVE}),
+        ("Trim and Split", (
+            (_t("nproto.trim_curves", "Trim Curves", 'X'), _t("nproto.split_curves", "Split Curves", 'MOD_EDGESPLIT')),
+        ), {CURVE}),
+        ("Join", (
+            (_t("nproto.join_curves", "Join Curves", 'AUTOMERGE_ON'),
+             _t("nproto.unjoin_curves", "Unjoin Curves", 'AUTOMERGE_OFF')),
         ), {CURVE}),
     )),
     ("SURFACE_EDIT", "Surface Edit", (
