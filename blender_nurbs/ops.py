@@ -2386,7 +2386,7 @@ class NPROTO_OT_align_curve(PickMixin, bpy.types.Operator):
             new_inputs.append(target)
             keep[str(self.end)] = {"input": len(new_inputs) - 1, "cont": self.cont, "weight": self.weight,
                                    "mode": self.mode, "snap": self.snap, "flip": self.flip}
-            kind, deg, Q, _ = align.solve(obj, keep, new_inputs)
+            kind, deg, Q, _ = align.solve(obj, keep, new_inputs, fresh=(str(self.end),))
             align.write(obj, kind, deg, Q)
             if features.history_enabled(context):
                 features.record(obj, "align_curve", new_inputs, {"ends": keep})
@@ -2428,6 +2428,9 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
     c_a: FloatProperty(name="Curvature A", default=0.0, soft_min=-2.0, soft_max=2.0,
                        description="G2 / G3 shape at A (moves the 3rd CV along the tangent)")
     c_b: FloatProperty(name="Curvature B", default=0.0, soft_min=-2.0, soft_max=2.0)
+    d_a: FloatProperty(name="Rate A", default=0.0, soft_min=-2.0, soft_max=2.0,
+                       description="G3 shape at A (moves the 4th CV along the tangent)")
+    d_b: FloatProperty(name="Rate B", default=0.0, soft_min=-2.0, soft_max=2.0)
     flip_a: BoolProperty(name="Flip A", default=False, description="Reverse the tangent direction at A")
     flip_b: BoolProperty(name="Flip B", default=False)
 
@@ -2474,7 +2477,7 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
     def _params(self):
         return {"end_a": self.end_a, "end_b": self.end_b, "cont_a": self.cont_a, "cont_b": self.cont_b,
                 "w_a": self.w_a, "w_b": self.w_b, "c_a": self.c_a, "c_b": self.c_b,
-                "flip_a": self.flip_a, "flip_b": self.flip_b}
+                "d_a": self.d_a, "d_b": self.d_b, "flip_a": self.flip_a, "flip_b": self.flip_b}
 
     def execute(self, context):
         if not _kernel_ok(self):
@@ -2509,6 +2512,9 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
             sub = col.row()
             sub.enabled = getattr(self, f"cont_{side}") in ("G2", "G3")
             sub.prop(self, f"c_{side}", text="Curvature")
+            sub = col.row()
+            sub.enabled = getattr(self, f"cont_{side}") == "G3"
+            sub.prop(self, f"d_{side}", text="Rate")
             box.prop(self, f"flip_{side}")
 
 

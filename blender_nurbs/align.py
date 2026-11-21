@@ -182,11 +182,106 @@ def align_start(Q, U, p, spec, frame_world, Mi):
         kn = k_n(np.linalg.solve(A, t / np.linalg.norm(t)))
         d2 = d2_cur - (d2_cur @ n) * n + kn * (t @ t) * n
     else:
-        Dl = A @ D
-        lam = w * m / (np.linalg.norm(Dl) or 1.0)
+        Dl, DDl = A @ D, A @ DD
+        dn2 = float(Dl @ Dl) or 1.0
+        lam1 = m / dn2 ** 0.5
+        lam = w * lam1
         d1 = lam * Dl
-        d2 = lam * lam * (A @ DD)
+        # a fresh align: C'' = lam^2 C_e'' exactly. A rebuild (spec "keep"):
+        # keep the curve's own part of C'' along the tangent (f'' of the
+        # reparameterisation) -- still G2, and an aligned curve, CV-edited or
+        # not, solves to itself
+        mu = float((d2_cur - lam1 * lam1 * DDl) @ Dl) / dn2 if spec.get("keep") else 0.0
+        d2 = lam * lam * DDl + mu * Dl
     return _set_start(Q, U, p, k, P0, d1, d2)
+
+
+# --------------------------------------------------------------------------
+# An aligned end's free numbers (constrained CV editing, blendedit.py)
+# --------------------------------------------------------------------------
+
+class EndShape:
+    """The CVs Q0..Qk an aligned start of (seg, Ub, p) may take, as a function
+    of a few numbers x -- everything else would break the alignment:
+      EDGE     x = (s, mu): Q1 = P + s T on the edge's tangent; C'' = lam^2 C_e''
+               + mu C_e' (lam from s), so Q2 only slides along the tangent
+               beyond the height its curvature needs.
+      SURFACE  x = (t1, t2, e1, e2): C' = t in the tangent plane, C'' = e
+               in it plus the surface's normal curvature along t times |t|^2.
+    frame_world = (P, D, DD, surf) as align_start; A, b = the curve's world ->
+    local matrix (rotation part, offset)."""
+
+    def __init__(self, Ub, p, k, mode, frame_world, A, b, size):
+        self.Ub, self.p, self.k = Ub, p, k
+        P, D, DD, surf = frame_world
+        self.A = A
+        self.P0 = A @ P + b
+        self.mode = "SURFACE" if mode == "SURFACE" and surf is not None else "EDGE"
+        self.smin = 1e-3 * size
+        if self.mode == "EDGE":
+            self.D, self.DD = A @ D, A @ DD
+            self.T = self.D / (np.linalg.norm(self.D) or 1.0)
+        else:
+            n_w, self.k_n = surf
+            n = A @ n_w
+            self.n = n / (np.linalg.norm(n) or 1.0)
+            a = np.array([1.0, 0.0, 0.0]) if abs(self.n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+            e1 = a - (a @ self.n) * self.n
+            self.e1 = e1 / np.linalg.norm(e1)
+            self.e2 = np.cross(self.n, self.e1)
+
+    def size(self):
+        return self.k if self.mode == "EDGE" else 2 * self.k
+
+    def clamp(self, x):
+        x = np.array(x, float)
+        if self.mode == "EDGE" and len(x):
+            x[0] = max(x[0], self.smin)
+        return x
+
+    def rows(self, x, seg):
+        """Q0..Qk for the numbers x (seg: the curve's CVs from this end, for _set_start's shape)."""
+        p, Ub, k = self.p, self.Ub, self.k
+        u1 = Ub[p + 1] - Ub[0]
+        if k == 0:
+            return [self.P0]
+        if self.mode == "EDGE":
+            s = max(float(x[0]), self.smin)
+            d1 = (p / u1) * s * self.T
+            if k >= 2:
+                lam = np.linalg.norm(d1) / (np.linalg.norm(self.D) or 1.0)
+                d2 = lam * lam * self.DD + float(x[1]) * self.D
+            else:
+                d2 = np.zeros(3)
+        else:
+            d1 = x[0] * self.e1 + x[1] * self.e2
+            d2 = np.zeros(3)
+            if k >= 2:
+                tn = float(np.linalg.norm(d1))
+                kn = self.k_n(np.linalg.solve(self.A, d1 / tn)) if tn > 1e-300 else 0.0
+                d2 = x[2] * self.e1 + x[3] * self.e2 + kn * tn * tn * self.n
+        Q = _set_start(np.asarray(seg, float), Ub, p, k, self.P0, d1, d2)
+        return [Q[i] for i in range(k + 1)]
+
+    def numbers(self, seg):
+        """x read off the curve's present end CVs (projected where they are off)."""
+        p, Ub, k = self.p, self.Ub, self.k
+        if k == 0:
+            return np.zeros(0)
+        seg = np.asarray(seg, float).copy()
+        seg[0] = self.P0
+        d1, d2, _, _ = _derivs(seg, Ub, p)
+        if self.mode == "EDGE":
+            s = float((seg[1] - seg[0]) @ self.T)
+            x = [s]
+            if k >= 2:
+                lam = (p / (Ub[p + 1] - Ub[0])) * max(s, self.smin) / (np.linalg.norm(self.D) or 1.0)
+                x.append(float((d2 - lam * lam * self.DD) @ self.D) / (float(self.D @ self.D) or 1.0))
+            return self.clamp(x)
+        x = [float(d1 @ self.e1), float(d1 @ self.e2)]
+        if k >= 2:
+            x += [float(d2 @ self.e1), float(d2 @ self.e2)]
+        return np.array(x)
 
 
 def _reverse(Q, U):
@@ -253,9 +348,12 @@ def align_open(Q, p, ends):
     return Q, p, specs
 
 
-def solve(obj, ends, inputs):
+def solve(obj, ends, inputs, fresh=()):
     """New local CVs (and knots/degree) for the object's curve with the given
-    ends aligned. ends: {"0"/"1": spec}; inputs: [(obj, ref)] (index 0 = the curve)."""
+    ends aligned. ends: {"0"/"1": spec}; inputs: [(obj, ref)] (index 0 = the curve).
+    fresh: the ends aligned just now, whose Weight scales the curve's tangent.
+    The others already carry their weight: a rebuild must not scale them again
+    (it compounded on every rebuild)."""
     kind, p, Q, U = curve_state(obj)
     M = np.array(geom.world_matrix(obj), float)
     Mi = np.linalg.inv(M)
@@ -294,6 +392,8 @@ def solve(obj, ends, inputs):
         surf = None
         if spec.get("mode") == "SURFACE" and store.is_nurbs(src):
             surf = surface_frame(src, ref, Pt, spec.get("face", 0))
+        if e not in fresh:
+            spec = dict(spec, weight=1.0, keep=True)
         new = align_start(seg, Ub, 3 if kind_out == "BEZIER" else p, spec, (Pt, D, DD, surf), Mi)
         if kind_out == "BEZIER":
             if e == "0":
@@ -350,7 +450,7 @@ def write(obj, kind, p, Q):
 def build_align(inputs, p):
     obj = inputs[0][0]
     ends = p.get("ends", {})
-    kind, deg, Q, _ = solve(obj, ends, inputs)
+    kind, deg, Q, _ = solve(obj, ends, inputs)          # (no fresh end: the weights are in the curve already)
     return ("inplace", lambda o: write(o, kind, deg, Q))
 
 

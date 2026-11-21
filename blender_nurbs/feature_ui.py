@@ -25,7 +25,7 @@ FIELDS = {
     "loft": ["closed", "cont_a", "tan_a", "cur_a", "cont_b", "tan_b", "cur_b", "auto_align", "flip_b", "ruled", "samples",
              "edges_a", "edges_b", "fit", "span_degree", "span_faces", "cont_ra", "tan_ra", "cont_rb", "tan_rb", "corner_ease", "even_net",
              "flip_normal", "caps"],
-    "blend_curve": ["cont_a", "w_a", "c_a", "flip_a", "cont_b", "w_b", "c_b", "flip_b"],
+    "blend_curve": ["cont_a", "w_a", "c_a", "d_a", "flip_a", "cont_b", "w_b", "c_b", "d_b", "flip_b"],
     "extrude": ["distance", "direction", "dir_vec", "tilt", "tilt_azimuth", "draft", "draft_flip", "symmetric", "caps"],
     "revolve": ["angle", "axis", "pivot", "seam_angle", "axis_point", "axis_dir", "caps"],
     "offset": ["distance"],
@@ -75,6 +75,7 @@ FIELDS = {
 MISSING = {"fl_corner": "OPEN"}
 LABELS = {"tan_a": "Tangent A", "tan_b": "Tangent B", "cur_a": "Curvature A", "cur_b": "Curvature B",
           "w_a": "Weight A", "w_b": "Weight B", "c_a": "Curvature A", "c_b": "Curvature B",
+          "d_a": "Rate A", "d_b": "Rate B",
           "spans_u": "Spans U", "spans_v": "Spans V", "radius2": "Radius 2", "width": "Size X", "depth": "Size Y",
           "e0": "Edge 1", "e1": "Edge 2", "e2": "Edge 3", "e3": "Edge 4", "w0": "Weight 1", "w1": "Weight 2",
           "w2": "Weight 3", "w3": "Weight 4", "sq_spans_u": "Spans U (0 auto)", "sq_spans_v": "Spans V (0 auto)"}
@@ -307,6 +308,8 @@ class NprotoFeature(bpy.types.PropertyGroup):
     w_b: FloatProperty(name="Weight B", min=0.0, soft_max=3.0, **_F())
     c_a: FloatProperty(name="Curvature A", soft_min=-2.0, soft_max=2.0, **_F())
     c_b: FloatProperty(name="Curvature B", soft_min=-2.0, soft_max=2.0, **_F())
+    d_a: FloatProperty(name="Rate A", soft_min=-2.0, soft_max=2.0, **_F())
+    d_b: FloatProperty(name="Rate B", soft_min=-2.0, soft_max=2.0, **_F())
     flip_a: BoolProperty(name="Flip A", **_F())
     flip_b: BoolProperty(name="Flip B", **_F())
     auto_align: BoolProperty(name="Auto Align", **_F())

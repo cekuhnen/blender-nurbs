@@ -1719,9 +1719,9 @@ def build_planar(inputs, p):
     return sm.create_planar_faces(curves)
 
 
-@builder("blend_curve")
-def build_blend_curve(inputs, p):
-    """Returns ('curve', degree, world CVs): written into a Blender curve object."""
+def blend_frames(inputs, p):
+    """A Blend Curve's two end frames: (P, C', C''[, C''']) at each picked end,
+    outward, turned round where Flip is on."""
     (oa, ra), (ob, rb) = inputs[0], inputs[1]
     fa = geom.curve_end_frame(input_curve(oa, ra), int(p.get("end_a", 1)), p.get("cont_a") == "G3")
     fb = geom.curve_end_frame(input_curve(ob, rb), int(p.get("end_b", 0)), p.get("cont_b") == "G3")
@@ -1730,8 +1730,16 @@ def build_blend_curve(inputs, p):
         fa = flip(fa)
     if p.get("flip_b"):
         fb = flip(fb)
+    return fa, fb
+
+
+@builder("blend_curve")
+def build_blend_curve(inputs, p):
+    """Returns ('curve', degree, world CVs): written into a Blender curve object."""
+    fa, fb = blend_frames(inputs, p)
     deg, pts = geom.blend_curve_cvs(fa, fb, p.get("cont_a", "G1"), p.get("cont_b", "G1"),
-                                    p.get("w_a", 1.0), p.get("w_b", 1.0), p.get("c_a", 0.0), p.get("c_b", 0.0))
+                                    p.get("w_a", 1.0), p.get("w_b", 1.0), p.get("c_a", 0.0), p.get("c_b", 0.0),
+                                    p.get("d_a", 0.0), p.get("d_b", 0.0))
     return ("curve", deg, pts)
 
 
