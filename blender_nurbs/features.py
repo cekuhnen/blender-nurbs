@@ -1780,8 +1780,9 @@ def check_cap_inputs(op, inputs, p):
 
 
 # Features whose wall becomes a solid with caps=True (Extrude and Revolve do it
-# in their builders: they group profiles into outlines and holes)
-CAP_OPS = {"sweep", "pipe", "loft"}
+# in their builders: they group profiles into outlines and holes; Pipe too: its
+# caps can be round)
+CAP_OPS = {"sweep", "loft"}
 
 
 @builder("offset")

@@ -147,9 +147,12 @@ def _normal_near(surf, q):
 # Surface from cross-section rows
 # --------------------------------------------------------------------------
 
-def _surface_from_rows(rows, prof, tol_rel=1e-4):
+def _surface_from_rows(rows, prof, tol_rel=1e-4, end_dirs=None):
     """rows: K arrays (nv,3) of profile CVs at each rail sample. Fit along the
-    rail per CV (shared knots), keep the profile's v knots / weights."""
+    rail per CV (shared knots), keep the profile's v knots / weights.
+    end_dirs: (d0, d1) unit directions the surface leaves its first / last row
+    along (the second CV of every column moved onto that line): what a fit
+    alone only comes close to, so a part tangent to them there is G1."""
     _, ext = _k()
     rows = np.array(rows)                 # (K, nv, 3)
     K, nv, _ = rows.shape
@@ -157,6 +160,11 @@ def _surface_from_rows(rows, prof, tol_rel=1e-4):
     size = float(np.linalg.norm(np.ptp(rows.reshape(-1, 3), axis=0))) or 1.0
     cv_cols, U, deg_u = geom.fit_rows(cols, 3, tol=tol_rel * size)
     nu = len(cv_cols[0])
+    if end_dirs is not None and nu >= 4:
+        for c in cv_cols:
+            for a, b, d in ((0, 1, end_dirs[0]), (nu - 1, nu - 2, end_dirs[1])):
+                d = np.asarray(d, float)
+                c[b] = c[a] + float((c[b] - c[a]) @ d) * d
     pts, wts = [], []
     w = prof["weights"] or [1.0] * nv
     for iu in range(nu):
@@ -273,20 +281,134 @@ def _sweep_two_rails(inputs, p, prof, n):
     return _surface_from_rows(rows, prof)
 
 
-@features.builder("pipe")
-def build_pipe(inputs, p):
-    from .primitives import exact_circle_spec, spec_to_kernel_curve
-    sm, ext = _k()
-    rail_k = features.input_curve(*inputs[0])
-    n = int(p.get("samples", 32))
+PIPE_CAPS = ("NONE", "FLAT", "ROUND")
+
+
+def pipe_cap_style(p):
+    """The ends a Pipe gets: NONE (an open tube), FLAT or ROUND. A solid
+    (caps=True, Body: Solid / Join / Cut / Intersect) always has caps: flat
+    unless round ones are asked for."""
+    style = str(p.get("cap_style", "NONE")).upper()
+    style = style if style in PIPE_CAPS else "NONE"
+    if p.get("caps") and style == "NONE":
+        return "FLAT"
+    return style
+
+
+PIPE_CORNER_DEG = 5.0     # a rail turning more than this at one point is a corner a pipe can't take
+
+
+def pipe_frames(rail_k, n, closed=False):
+    """(P, T, N, B): the rail's samples and the pipe's rotation-minimising
+    frames there (what build_pipe moves the circle along). closed: the frames
+    are turned a little more along the way so the last one is the first
+    again (rotation-minimising frames round a loop that is not flat come back
+    turned), so a closed rail's tube meets itself at its seam."""
     P, T = _arc_samples(rail_k, n)
     N = _rmf(P, T, _perp(T[0], np.array([0, 0, 1.0])))
+    if closed and len(P) > 2:
+        t = T[0]
+        a = N[-1] - (N[-1] @ t) * t
+        phi = math.atan2(float(np.cross(a, N[0]) @ t), float(a @ N[0]))   # N[-1] turned by phi about t is N[0]
+        s = np.linspace(0.0, 1.0, len(P))
+        for k in range(1, len(P)):
+            c, si = math.cos(phi * s[k]), math.sin(phi * s[k])
+            N[k] = c * N[k] + si * np.cross(T[k], N[k])
+        N[-1] = N[0]
     B = np.cross(T, N)
+    return P, T, N, B
+
+
+def rail_corners(kc, max_deg=PIPE_CORNER_DEG):
+    """[(point, degrees)]: where the curve turns sharper than max_deg at one
+    point -- the joints of a chain of edges, a polyline's corners, a vector
+    handle -- and how much (a closed curve's seam counts too)."""
+    sm, ext = _k()
+    d = ext.curve_cvs(kc)
+    p, U = int(d["degree"]), [float(u) for u in d["knots"]]
+    t0, t1 = kc.parameter_range()
+    eps = 1e-7 * ((t1 - t0) or 1.0)
+
+    def tan(t):
+        v = np.array(sm.evaluate_curve(kc, float(min(t1, max(t0, t))))["tangent"], float)
+        return v / (np.linalg.norm(v) or 1.0)
+    out = []
+    knots = sorted({round(u, 12) for u in U[p + 1:len(U) - p - 1] if t0 + eps < u < t1 - eps})
+    tests = [(u, tan(u - 4 * eps), tan(u + 4 * eps)) for u in knots if sum(abs(x - u) < 1e-12 for x in U) >= p]
+    if features.is_closed_curve(kc):
+        tests.append((t0, tan(t1 - 4 * eps), tan(t0 + 4 * eps)))
+    for u, a, b in tests:
+        deg = math.degrees(math.acos(max(-1.0, min(1.0, float(a @ b)))))
+        if deg > max_deg:
+            out.append((np.array(kc.evaluate(float(u)), float), deg))
+    return out
+
+
+def pipe_rail(inputs):
+    """The rail of one pipe: inputs that touch end to end make one exact curve."""
+    return features.profile_curve(inputs)
+
+
+def corner_message(inputs, corners):
+    names = sorted({o.name for o, _ in inputs})
+    where = names[0] if len(names) == 1 else f"the chain of {len(inputs)}"
+    worst = max(d for _, d in corners)
+    n = len(corners)
+    fix = "pipe the pieces separately, or round the corner first" if len(inputs) > 1 else "round the corner first"
+    return (f"{where} turns {worst:.0f}° at {'a corner' if n == 1 else f'{n} corners'}: a pipe can't take "
+            f"a sharp corner ({fix})")
+
+
+def round_cap_cvs(C, N, B, T, q, w, r):
+    """CVs (3, nv, 3) and weights (3, nv) of the exact half sphere closing a
+    pipe end: the end circle (centre C, CVs C + q_x N + q_y B, weights w)
+    turned a quarter round towards T (outward), the last row the pole at
+    C + r T. Rational quadratic across (weights 1, sqrt(1/2), 1)."""
+    ring = np.outer(q[:, 0], N) + np.outer(q[:, 1], B)
+    a, b, wa = (1.0, 1.0, 0.0), (0.0, 1.0, 1.0), (1.0, math.sqrt(0.5), 1.0)
+    P = np.array([C + a[j] * ring + b[j] * r * T for j in range(3)])
+    W = np.array([[wa[j] * wi for wi in w] for j in range(3)])
+    return P, W
+
+
+def _round_cap(C, N, B, T, prof, r):
+    _, ext = _k()
+    q = prof["points"]
+    w = prof["weights"] or [1.0] * len(q)
+    P, W = round_cap_cvs(C, N, B, T, q, w, r)
+    pts = [tuple(map(float, P[j, i])) for j in range(3) for i in range(len(q))]
+    wts = [float(W[j, i]) for j in range(3) for i in range(len(q))]
+    return ext.surface_from_cvs(2, prof["degree"], pts, [0.0, 0.0, 0.0, 1.0, 1.0, 1.0], prof["knots"], wts)
+
+
+@features.builder("pipe")
+def build_pipe(inputs, p):
+    """The tube along the rail (inputs that touch end to end make one); with
+    caps (Cap Flat / Round, or a solid) a closed body: flat discs or exact
+    half spheres on the ends. A closed rail has no
+    ends: its tube is closed already (a solid of it is the ring)."""
+    from .primitives import exact_circle_spec, spec_to_kernel_curve
+    rail_k = pipe_rail(inputs)
+    corners = rail_corners(rail_k)
+    if corners:
+        raise RuntimeError(corner_message(inputs, corners))
+    closed = features.is_closed_curve(rail_k)
+    n = min(600, int(p.get("samples", 32)) * len(inputs))      # samples per curve / edge of the rail
+    P, T, N, B = pipe_frames(rail_k, n, closed)
     r = float(p.get("radius", 0.2))
     prof = _profile(spec_to_kernel_curve(exact_circle_spec(r)))
     q = prof["points"]                       # circle in its local XY plane, centre origin
     rows = [P[k] + np.outer(q[:, 0], N[k]) + np.outer(q[:, 1], B[k]) for k in range(n)]
-    return _surface_from_rows(rows, prof)
+    style = pipe_cap_style(p)
+    round_ = style == "ROUND" and not closed
+    # round caps: the tube leaves its ends square to them, so the half spheres are G1 to it
+    tube = _surface_from_rows(rows, prof, end_dirs=(T[0], T[-1]) if round_ else None)
+    if style == "NONE":
+        return tube
+    walls = [tube]
+    if round_:
+        walls += [_round_cap(P[0], N[0], B[0], -T[0], prof, r), _round_cap(P[-1], N[-1], B[-1], T[-1], prof, r)]
+    return features.cap_walls(walls)
 
 
 # --------------------------------------------------------------------------
