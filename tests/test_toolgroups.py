@@ -66,6 +66,24 @@ check("Create Surfaces rows", rows == [
     ["extrude", "flange"], ["planar", "dome"], ["boundary", "patch"],
     ["offset", "thicken"], ["pattern"], ["unroll", "flow"], ["from_blender_surface"]], rows)
 
+rows = [[t[0].split(".")[1] for t in row] for sec in tg.GROUP["SURFACE_EDIT"][2] for row in sec[1]
+        if not isinstance(row, tg.MenuOnly)]
+check("Surface Edit rows (Edit CVs only in the menus: Tab does it)", rows == [
+    ["rebuild_surface", "extend"], ["surface_align", "match_surface"], ["refit_trim", "merge_patches"],
+    ["flip_normal"], ["trim", "split"], ["untrim", "untrim_region"], ["detach_iso"], ["join", "unjoin"],
+    ["fillet", "edge_fillet"], ["boolean", "boolean", "boolean"], ["push_pull", "replace_face"],
+    ["boundary_fill"]], rows)
+menu = []
+class _M:
+    def separator(self, **k): pass
+    def label(self, **k): menu.append(("label", k.get("text")))
+    def operator(self, op, **k):
+        menu.append((op, k.get("text"))); return _Props()
+    def menu(self, m, **k): pass
+tg.draw_menu(_M(), "SURFACE_EDIT")
+check("Surface Edit menu: Edit CVs (Tab) first, no heading of its own",
+      menu[0] == ("nproto.edit_cvs", "Edit CVs (Tab)") and ("label", "Edit CVs") not in menu, str(menu[:3]))
+
 # --- dimming -----------------------------------------------------------------------------
 cd = bpy.data.curves.new("C", 'CURVE')
 cd.splines.new('NURBS').points.add(3)
@@ -104,6 +122,12 @@ check("a curve: the surface-only tools dim, Pattern and Flow stay lit beside the
       not s["nproto.offset"] and not s["nproto.thicken"] and not s["Unroll"] and s["Flow"] and s["Pattern"]
       and s["nproto.loft"] and s["Network"] and s["nproto.extrude"] and s["nproto.flange"]
       and not s["nproto.from_blender_surface"], str(sorted(lit_names)))
+
+select(curve)
+e = lit("SURFACE_EDIT")
+check("a curve: Trim and Split lit (it cuts), the rest of Surface Edit dim",
+      e["nproto.trim"] and e["nproto.split"] and not e["nproto.join"] and not e["Union"]
+      and not e["nproto.rebuild_surface"], str({k: v for k, v in e.items() if v}))
 
 select(bsurf)
 s = lit("SURFACES")

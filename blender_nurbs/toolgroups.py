@@ -116,27 +116,32 @@ GROUPS = (
         ), {CURVE}),
     )),
     ("SURFACE_EDIT", "Surface Edit", (
+        ("", (                                               # Tab on the surface does it: the menus only
+            MenuOnly((_t("nproto.edit_cvs", "Edit CVs (Tab)", 'EDITMODE_HLT'),)),
+        )),
         ("Shape", (
-            (_t("nproto.edit_cvs", icon='EDITMODE_HLT'), _t("nproto.flip_normal", icon='NORMALS_FACE')),
             (_t("nproto.rebuild_surface", icon='MOD_REMESH'), _t("nproto.extend", icon='FULLSCREEN_ENTER')),
             (_t("nproto.surface_align", icon='SNAP_EDGE'), _t("nproto.match_surface", icon='SNAP_FACE')),
             (_t("nproto.refit_trim", icon='MOD_LATTICE'), _t("nproto.merge_patches", icon='MESH_GRID')),
+            (_t("nproto.flip_normal", icon='NORMALS_FACE'),),
         ), {NURBS}),
-        ("Trim and Join", (
-            (_t("nproto.trim", icon='MOD_BOOLEAN'), _t("nproto.split", icon='MOD_EDGESPLIT')),
+        ("Trim and Split", (
+            (_t("nproto.trim", icon='MOD_BOOLEAN', needs=EDGES), _t("nproto.split", icon='MOD_EDGESPLIT', needs=EDGES)),
             (_t("nproto.untrim", icon='LOOP_BACK'), _t("nproto.untrim_region", icon='SELECT_SUBTRACT')),
-            (_t("nproto.join", icon='AUTOMERGE_ON'), _t("nproto.unjoin", icon='AUTOMERGE_OFF')),
             (_t("nproto.detach_iso", icon='UV_EDGESEL'),),
+        ), {NURBS}),
+        ("Join", (
+            (_t("nproto.join", icon='AUTOMERGE_ON'), _t("nproto.unjoin", icon='AUTOMERGE_OFF')),
         ), {NURBS}),
         ("Fillets", (
             (_t("nproto.fillet", "Surface Fillet", 'MOD_BEVEL'), _t("nproto.edge_fillet", icon='MOD_BEVEL')),
         ), {NURBS}),
-        ("Boolean (solids)", (
+        ("Solids", (
             (("nproto.boolean", "Union", 'SELECT_EXTEND', {"operation": "UNION"}),
              ("nproto.boolean", "Difference", 'SELECT_SUBTRACT', {"operation": "DIFFERENCE"}),
              ("nproto.boolean", "Intersection", 'SELECT_INTERSECT', {"operation": "INTERSECTION"})),
-            (_t("nproto.boundary_fill", icon='MESH_CUBE'), _t("nproto.push_pull", icon='FACESEL'),
-             _t("nproto.replace_face", icon='FACE_MAPS')),
+            (_t("nproto.push_pull", icon='FACESEL'), _t("nproto.replace_face", icon='FACE_MAPS')),
+            (_t("nproto.boundary_fill", icon='MESH_CUBE'),),
         ), {NURBS}),
     )),
     ("CONVERT", "Convert", (

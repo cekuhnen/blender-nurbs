@@ -80,16 +80,17 @@ everything built from it rebuilds.
 
 ### Surface Edit
 
-- **Shape:** Edit CVs (Tab switches between Object and CV editing), Flip Normal, Rebuild Surface, Extend Surface,
-  Surface Align, Refit to Trim
+- **Edit CVs:** Tab on a NURBS surface switches between Object and CV editing (also in the NURBS menu)
+- **Shape:** Rebuild Surface, Extend Surface, Surface Align, Match Surface, Refit to Trim, Merge Patches, Flip Normal
 - **Merge Patches:** a four-sided grid of patches rebuilt as one surface. **Exact** joins them with full seam knots,
   **Reduce** removes knots within a tolerance, **Refit** finds the fewest spans of a chosen degree, with adaptive
   knots placed where the shape needs them. The outer edges hold Free, G0, G1 or G2 (all sides or each side), so
   continuity to the neighbours carries over; seams where the patches meet with a kink stay sharp (or Smooth).
   Gap, angle and curvature checks show in the panel; trimmed patches fall back to a projected grid (G0 edges)
-- **Trim and join:** Trim, Split, Untrim, Join, Unjoin
+- **Trim and split:** Trim, Split, Untrim, Untrim Region, Detach at Isoparm
+- **Join:** Join, Unjoin
 - **Fillets:** Surface Fillet, Edge Fillet (circular, chamfer, or blends G1 to G3)
-- **Solids:** Union, Difference, Intersection, Boundary Fill
+- **Solids:** Union, Difference, Intersection, Push / Pull, Replace Face, Boundary Fill
 
 ### Analyze
 

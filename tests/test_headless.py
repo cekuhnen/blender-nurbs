@@ -5240,8 +5240,10 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cy
               "square"}     # Square: merged into Patch (Quad Sided); kept for older files, off the menus
 _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto)
               if n not in _not_tools and not n.startswith("workplane_")}   # the Work Planes panel's own
+_menu_only = {t[0] for g in _tg.GROUPS for sec in g[2] for row in sec[1] if isinstance(row, _tg.MenuOnly)
+              for t in row if t[0] != "nproto.add_primitive"}     # Edit CVs: Tab does it, the menus list it
 _tool_ops = [o_ for o_ in _in_panels if o_ not in ("nproto.add_primitive", "nproto.boolean")] + \
-    ["nproto.boolean"]                              # (one button per operation)
+    ["nproto.boolean"] + sorted(_menu_only)          # (one button per operation)
 _bool_ops = sorted(e["props"].get("operation") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r
                    if e.get("op") == "nproto.boolean")
 _kinds = [e["props"].get("kind") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") or n in _DROPS for e in r
@@ -5260,7 +5262,7 @@ _menu_kinds = sorted(e["props"].get("kind") for n, r in _drawn.items() if n.star
                      if e.get("op") == "nproto.add_primitive")
 check("UI: header menu holds the six groups, the same tools as the panels, and every shape (the curve shapes "
       "only there: the panel draws them)",
-      sorted(set(_menu_ops)) == sorted(set(_in_panels))
+      sorted(set(_menu_ops)) == sorted(set(_in_panels) | _menu_only) and _menu_only == {"nproto.edit_cvs"}
       and _menu_kinds == sorted(list(_prims.CURVE_KINDS) + list(_prims.SURFACE_KINDS))
       and _subs == ["VIEW3D_MT_nproto_curves", "VIEW3D_MT_nproto_surfaces",
                     "VIEW3D_MT_nproto_curve_edit", "VIEW3D_MT_nproto_surface_edit",
@@ -5314,10 +5316,13 @@ _rows = []
 _tg.draw_panel(_ActLay(_rows), "SURFACE_EDIT", ctx)
 _rows_c = []
 _tg.draw_panel(_ActLay(_rows_c), "CURVE_EDIT", ctx)
-check("UI: a curve selected dims Surface Edit (still clickable) but not Curve Edit; nothing selected dims nothing",
+_cut = {"nproto.trim", "nproto.split"}             # they take the curve as a cutter
+check("UI: a curve selected dims Surface Edit (still clickable) but Trim / Split and not Curve Edit; "
+      "nothing selected dims nothing",
       _none_sel is None and _have == {"CURVE"} and _tg.fits({"NURBS"}, None)
-      and _rows and not any(r_["active"] for r_ in _rows) and all(r_["active"] for r_ in _rows_c),
-      f"{_have} {[r_['active'] for r_ in _rows]}")
+      and _rows and all(r_["active"] == bool(set(r_["ops"]) & _cut) for r_ in _rows if r_["ops"])
+      and all(r_["active"] for r_ in _rows_c),
+      f"{_have} {[(r_['ops'], r_['active']) for r_ in _rows]}")
 bpy.data.objects.remove(_cv)
 bpy.data.curves.remove(_cd)
 for o_ in _sel0:
