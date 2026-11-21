@@ -16,9 +16,9 @@ import bpy
 from bpy.app.handlers import persistent
 
 from . import (anamesh, brep_mesh, contlabels, cvnudge, cvs, curvejoin, curveoffset, diagnostics, draw,
-               drawtools, extend, feature_ui, pattern, features, hints, history, isocombs, isodetach, loft_rails, merge, ops, patch, refit,
+               drawtools, extend, feature_ui, flow, pattern, features, hints, history, isocombs, isodetach, loft_rails, merge, ops, patch, refit,
                scanfit, scanpatch, sections, snapping, square, steps, store, subd_brep, subsel, surfoffset, flange, network, railrevolve, measure, sweeps,
-               workplanes)
+               unroll, workplanes)
 
 # overlays and tool flags with a fixed shape: put back to how they start
 _SHAPED = (cvnudge.overlay, draw.pick_overlay, draw.sketch_overlay, draw.ghost, contlabels.hover, ops.GIZMO,
@@ -33,7 +33,7 @@ def _emptied():
         # last-operation reports (Adjust Last Operation panels, notes)
         curvejoin.LAST_INFO, curveoffset.LAST_INFO, surfoffset.LAST_INFO, flange.LAST_INFO, network.LAST_INFO, railrevolve.LAST_INFO, loft_rails.LAST_INFO, merge.LAST_INFO, refit.LAST_INFO,
         square.LAST_INFO, square.LAST_NOTES, brep_mesh.LAST, features.LOFT_NOTES, features.LAST_EASES,
-        sweeps.boundary_info, patch.info, diagnostics.LAST_RANGE, merge.DEVMAP, scanfit.LAST_INFO, scanpatch.LAST_INFO,
+        sweeps.boundary_info, patch.info, diagnostics.LAST_RANGE, merge.DEVMAP, scanfit.LAST_INFO, scanpatch.LAST_INFO, unroll.LAST_INFO, flow.LAST_INFO,
         # pending work on object names of the old file
         history._dirty, history._just_built, history._held, cvs._dirty, cvs._modes, cvs._finish,
         feature_ui._resyncing, workplanes._anims, subd_brep._LAST,

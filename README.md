@@ -68,6 +68,10 @@ everything built from it rebuilds.
 - **Fill a gap:** Boundary, Square, Patch, Dome
 - **From surfaces:** Offset, Thicken, Flange (from free edges or curves on a surface: at an angle to the surface,
   or a constant-draft surface to a pull direction; the base is the edge exactly), Convert Blender Surface
+- **Unroll and Flow:** Unroll Surface lays developable surfaces flat (sheet-metal patterns: cones, cylinders,
+  bent and folded sheets, joined parts with their bend lines; trims and curves on them come along); Flow Along
+  Surface bends curves and surfaces from a base surface onto a target, and folds what is drawn on an unrolled
+  pattern back onto its part exactly
 - **Pattern:** one button for linear, circular and path patterns (**M** switches) of curves and NURBS objects: real copies with their exact
   geometry (not Blender's mesh-only Array), on a snapping widget: a row, grid or block along its X / Y / Z (turned
   to any angle), around its axis, or along a curve or edge; number keys set the count; with history the copies

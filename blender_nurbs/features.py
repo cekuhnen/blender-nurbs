@@ -2160,6 +2160,9 @@ def base_text(obj):
         elif h["op"] == "patch":
             from .patch import store_info
             store_info(obj)
+        elif h["op"] == "unroll":
+            from .unroll import store_info
+            store_info(obj)
         g = placed(obj, g)
         if isinstance(g, tuple) and g and g[0] == "brep_text":
             return g[1]
@@ -2544,6 +2547,9 @@ def _rebuild_inner(obj, context, h, entries, steps, turned):
             store_info(obj)
         elif h["op"] == "patch":
             from .patch import store_info
+            store_info(obj)
+        elif h["op"] == "unroll":
+            from .unroll import store_info
             store_info(obj)
         if isinstance(g, tuple) and g and g[0] == "inplace":
             g[1](obj)

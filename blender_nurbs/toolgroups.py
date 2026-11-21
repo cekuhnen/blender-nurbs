@@ -88,6 +88,7 @@ GROUPS = (
             (_t("nproto.offset", icon='MOD_OFFSET'), _t("nproto.thicken", icon='MOD_SOLIDIFY')),
             (_t("nproto.flange", icon='MOD_SOLIDIFY'),
              ("nproto.pattern", "Pattern", 'MOD_ARRAY', {"auto": True})),     # linear / circular / path: M
+            (_t("nproto.unroll", "Unroll", 'UV'), _t("nproto.flow", "Flow", 'MOD_SIMPLEDEFORM')),
             (_t("nproto.from_blender_surface", icon='SURFACE_NSURFACE'),),
         ), {NURBS, SURFACE}),
     )),

@@ -29,6 +29,8 @@ FIELDS = {
     "extrude": ["distance", "direction", "dir_vec", "tilt", "tilt_azimuth", "draft", "draft_flip", "symmetric", "caps"],
     "revolve": ["angle", "axis", "pivot", "seam_angle", "axis_point", "axis_dir", "caps"],
     "offset": ["distance"],
+    "unroll": ["ur_place", "ur_relax"],
+    "flow": ["fw_rigid", "fw_fold", "fw_flip_u", "fw_flip_v", "fw_swap"],
     "thicken": ["distance", "symmetric"],
     "planar": [],
     "join": ["tolerance"],
@@ -80,7 +82,8 @@ PRETTY = {"patch": "Patch", "dome": "Dome", "square": "Square", "sweep": "Sweep"
           "dup_edge": "Duplicate Edge", "project_curve": "Projected Curve", "intersect": "Intersection",
           "join": "Join", "split_region": "Split", "iso_detach": "Detach at Isoparm", "boolean": "Boolean", "boundary_fill": "Boundary Fill", "join_curves": "Join Curves", "offset_curve": "Offset Curve", "offset_on_surface": "Offset on Surface", "flange": "Flange", "network": "Curve Network", "rail_revolve": "Rail Revolve", "loft_rails": "Loft Rails", "surface_fillet": "Surface Fillet", "loft": "Loft", "blend_curve": "Blend Curve", "extrude": "Extrude", "revolve": "Revolve",
           "offset": "Offset", "thicken": "Thicken", "planar": "Planar", "perp_profile": "Profile",
-          "subd_to_brep": "SubD to BREP", "pattern": "Pattern"}
+          "subd_to_brep": "SubD to BREP", "pattern": "Pattern", "unroll": "Unroll Surface",
+          "flow": "Flow Along Surface"}
 
 
 def _on_change(self, context):
@@ -444,6 +447,15 @@ class NprotoFeature(bpy.types.PropertyGroup):
     measure: EnumProperty(name="Measure", items=[("RULING", "Along Surface", ""), ("HEIGHT", "Height", "")], **_F())
     flip: BoolProperty(name="Flip", **_F())
     both_sides: BoolProperty(name="Both Sides", **_F())
+    ur_place: EnumProperty(name="Place", items=[("BESIDE", "Beside", "Flat on the ground beside the object"),
+                                                ("TOUCHING", "Touching", "In the tangent plane at the surface's middle")],
+                           **_F())
+    ur_relax: BoolProperty(name="Relax", **_F())
+    fw_rigid: BoolProperty(name="Rigid", **_F())
+    fw_fold: BoolProperty(name="Fold Back", **_F())
+    fw_flip_u: BoolProperty(name="Flip U", **_F())
+    fw_flip_v: BoolProperty(name="Flip V", **_F())
+    fw_swap: BoolProperty(name="Swap UV", **_F())
     jc_cvs: IntProperty(name="CVs (Rebuild, 0 auto)", min=0, max=200, **_F())
 
 
