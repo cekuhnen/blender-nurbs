@@ -3467,6 +3467,7 @@ for o in list(bpy.data.objects):
 ctx.scene.nproto_settings.construction_history = True
 TGT = nurbs("CondTarget", [(-3, 0, 0), (-2, 0.5, 0), (-1, 1.5, 0.3), (0, 1, 0)])
 def _draw(pts, start=None, end=None, **kw):
+    kw.setdefault("keep_aligned", True)
     r_ = bpy.ops.nproto.draw_curve(data=json.dumps({"pts": pts, "start": start, "end": end, "edit": ""}), **kw)
     return r_, ctx.active_object
 def _cvs(o):
@@ -3490,6 +3491,10 @@ X1 = _cvs(CG2)
 check("cv curve G2: moving the target keeps the start continuous (history)", gap < 1e-6 and ang < 1e-4 and dk < 1e-3
       and np.allclose(X1[3], X0[3], atol=1e-6) and np.linalg.norm(X1[2] - X0[2]) > 1e-3,
       f"{gap:.1e} {ang:.1e}° {dk:.1e}")
+r, CN = _draw(clk, [TGT.name, "S0", "END"], None, mode="CV", degree="3", start_cont="G2", end_cont="G1", keep_aligned=False)
+gap, ang, dk = _al.measure(CN, 0, TGT, "S0", "END")
+check("cv curve G2, Keep Aligned off: aligned once, no history", r == {'FINISHED'} and features.history(CN) is None
+      and gap < 1e-6 and ang < 1e-4 and dk < 1e-3, f"{gap:.1e} {ang:.1e}° {dk:.1e}")
 r, C0 = _draw(clk, [TGT.name, "S0", "END"], None, mode="CV", degree="3", start_cont="G0", end_cont="G0")
 check("cv curve G0 on a curve end: no history, the clicks are the CVs", r == {'FINISHED'}
       and features.history(C0) is None and np.allclose(_cvs(C0), clk, atol=1e-6))
@@ -3598,7 +3603,7 @@ MCY = ctx.active_object
 fc = _FCtx()
 rim = 0.5 * np.array([math.cos(math.radians(30)), math.sin(math.radians(30))])
 cv = _fake(_dt.NPROTO_OT_draw_curve, mode="CV", degree="3", closed=False, start_cont="G1", end_cont="G1",
-           edge_mode="SURFACE")
+           edge_mode="SURFACE", keep_aligned=True)
 cv._edit, cv._pts, cv._snapinfo, cv._frames, cv._start_refs = None, [], [], {}, None
 cv.sketch_start(fc)
 cv.modal(fc, _ev('MOUSEMOVE', _wpx(*rim), 'NOTHING'))
@@ -7248,13 +7253,14 @@ check("hints: Draw Line shows its groups, the start mode lit, a short header",
 f.modal(fc, _ev('ESC'))
 check("hints: leaving the tool clears the header and the panel", fc.area.text is None and _hn.HUD["spec"] is None)
 _cvh = _fake(_dt.NPROTO_OT_draw_curve, mode="CV", degree="3", closed=False, start_cont="G1", end_cont="G2",
-             edge_mode="EDGE")
+             edge_mode="EDGE", keep_aligned=True)
 _cvh._edit, _cvh._pts, _cvh._snapinfo, _cvh._frames, _cvh._start_refs = None, [], [], {}, None
 _cvh.sketch_start(fc)
 _cvh._status(fc)
 _ends = [i for r in _hn.HUD["spec"]["rows"] if r[0] == "Ends" for i in r[1]]
-check("hints: CV Curve shows start / end continuity as choices with the current ones lit",
-      [e["current"] for e in _ends] == ["G1", "G2"] and fc.area.text.startswith("CV Curve"), str(_ends))
+check("hints: CV Curve shows start / end continuity as choices with the current ones lit, and Keep Aligned (A)",
+      [e["current"] for e in _ends] == ["G1", "G2", "on"] and _ends[2]["keys"] == ["A"]
+      and fc.area.text.startswith("CV Curve"), str(_ends))
 _cvh.sketch_end(fc)
 from blender_nurbs import ops_trim as _otm
 _efr = _otm.NPROTO_OT_edge_fillet.pick_rows(_types.SimpleNamespace(
@@ -7443,7 +7449,7 @@ _v = ctx.window_manager.nproto_view
 _comb0 = _v.show_comb
 _v.show_comb = False
 _cvk = _fake(_dt.NPROTO_OT_draw_curve, mode="CV", degree="2", closed=False, start_cont="G0", end_cont="G0",
-             edge_mode="EDGE")
+             edge_mode="EDGE", keep_aligned=False)
 _cvk._edit, _cvk._pts, _cvk._snapinfo, _cvk._frames, _cvk._start_refs = None, [], [], {}, None
 _cvk.sketch_start(fc)
 for _q in ((-1.5, -1.5), (-0.5, 1.2), (0.7, 1.0), (1.6, -1.2)):

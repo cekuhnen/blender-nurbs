@@ -1542,11 +1542,14 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
     degree: EnumProperty(name="Degree", items=DEGREE_ITEMS, default="3")
     closed: BoolProperty(name="Closed", default=False, description="Close the curve (smooth, periodic)")
     start_cont: EnumProperty(name="Start", items=CONT_ITEMS, default="G1",
-                             description="Continuity of the start with the curve or surface edge it was snapped "
-                                         "to (G1 / G2 add an Align history step, so the end stays there)")
+                             description="Continuity of the start with the curve or surface edge it was snapped to")
     end_cont: EnumProperty(name="End", items=CONT_ITEMS, default="G1",
-                           description="Continuity of the end with the curve or surface edge it was snapped to "
-                                       "(G1 / G2 add an Align history step, so the end stays there)")
+                           description="Continuity of the end with the curve or surface edge it was snapped to")
+    keep_aligned: BoolProperty(name="Keep Aligned", default=False,
+                               description="Add an Align history step for G1 / G2 ends, so they stay on their "
+                                           "curve or edge when it moves and while you edit the CVs. Off: the ends "
+                                           "are aligned once, and the curve is a plain curve (Align Curve can "
+                                           "add the step later)")
     edge_mode: EnumProperty(name="On Surface Edges", items=EDGE_MODES, default="SURFACE")
     data: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
 
@@ -1560,6 +1563,7 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
         col.active = not self.closed
         col.row().prop(self, "start_cont", expand=True)
         col.row().prop(self, "end_cont", expand=True)
+        col.prop(self, "keep_aligned")
         col.prop(self, "edge_mode")
         if LAST_INFO["text"]:
             for line in LAST_INFO["text"].split("\n"):
@@ -1589,7 +1593,8 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
                 ("Direction", self.direction_hints())]
         if not self.closed:
             rows.append(("Ends", [hints.cycle("S", conts, self.start_cont, "start"),
-                                  hints.cycle("E", conts, self.end_cont, "end")]))
+                                  hints.cycle("E", conts, self.end_cont, "end"),
+                                  hints.toggle("A", "keep aligned", self.keep_aligned)]))
         rows += [("Snap", self.snap_hints()), ("Reference", self.reference_hints(self.edge_mode)),
                  ("Curve", [hints.cycle("M", ["CVs", "through points"],
                                         "CVs" if self.mode == "CV" else "through points"),
@@ -1752,6 +1757,9 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
             setattr(self, prop, {"G0": "G1", "G1": "G2", "G2": "G0"}[getattr(self, prop)])
             self._preview(context, hover())
             self._status(context)
+        elif event.value == 'PRESS' and event.type == 'A' and not self.closed:
+            self.keep_aligned = not self.keep_aligned
+            self._status(context)
         elif event.value == 'PRESS' and event.type == 'M':
             self.mode = "THROUGH" if self.mode == "CV" else "CV"
             self._preview(context, hover())
@@ -1829,7 +1837,9 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
                                 " (tangent to the surface" + (f", its face {specs[e]['face'] + 1})"
                                                               if "face" in specs[e] else ")")))
         if any(align.CONT[s_["cont"]] >= 1 for s_ in specs.values()):
-            if edit is not None:
+            if not self.keep_aligned:
+                lines.append("Ends aligned once (Keep Aligned adds an Align history step)")
+            elif edit is not None:
                 lines.append("No history in Edit Mode: the ends are aligned once")
             elif not features.history_enabled(context):
                 lines.append("Construction History is off: the ends are aligned once")
