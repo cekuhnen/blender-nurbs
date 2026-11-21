@@ -2059,29 +2059,6 @@ def _swept_solid(sheet, start, vec, tol):
     return b, (b0, b1, walls)
 
 
-def _heights(b, n, o, m=9):
-    """Signed heights along n (from the point o) of points spread over b's faces."""
-    np = _np()
-    hs = []
-    for f in b.faces():
-        for e in f.edges():
-            t0, t1 = e.parameter_range()
-            hs += [float((np.array(e.point_at(t), float) - o) @ n) for t in np.linspace(t0, t1, m)]
-        hs.append(float((np.array(f.interior_point(), float) - o) @ n))
-    return hs
-
-
-# ---------------------------------------------------------------------------
-# Exact face move: the neighbours' own surfaces extended / cut back to meet the
-# face's new surface (no walls along the normal, no boolean)
-# ---------------------------------------------------------------------------
-
-def _curve_piece(c, t0, t1):
-    """An exact copy of curve c between parameters t0 and t1 (knot insertion)."""
-    np = _np()
-    if t0 > t1:
-        t0, t1 = t1, t0
-    d = ext.curve_cvs(c)
 def job_extrude_face(job):
     """Extrude Face: the face of the body at face_pt (world) swept along dir,
     from start to distance (signed world lengths along dir): the face there,
@@ -2117,6 +2094,29 @@ def job_extrude_face(job):
     return {"faces": solid.face_count(), "volume": v}
 
 
+def _heights(b, n, o, m=9):
+    """Signed heights along n (from the point o) of points spread over b's faces."""
+    np = _np()
+    hs = []
+    for f in b.faces():
+        for e in f.edges():
+            t0, t1 = e.parameter_range()
+            hs += [float((np.array(e.point_at(t), float) - o) @ n) for t in np.linspace(t0, t1, m)]
+        hs.append(float((np.array(f.interior_point(), float) - o) @ n))
+    return hs
+
+
+# ---------------------------------------------------------------------------
+# Exact face move: the neighbours' own surfaces extended / cut back to meet the
+# face's new surface (no walls along the normal, no boolean)
+# ---------------------------------------------------------------------------
+
+def _curve_piece(c, t0, t1):
+    """An exact copy of curve c between parameters t0 and t1 (knot insertion)."""
+    np = _np()
+    if t0 > t1:
+        t0, t1 = t1, t0
+    d = ext.curve_cvs(c)
     p, U = int(d["degree"]), [float(k) for k in d["knots"]]
     P = np.array(d["points"], float)
     w = np.array(d["weights"], float) if d.get("weights") else np.ones(len(P))
