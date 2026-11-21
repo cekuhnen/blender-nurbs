@@ -1532,9 +1532,61 @@ def blend_curve_cvs(frame_a, frame_b, cont_a="G1", cont_b="G1", w_a=1.0, w_b=1.0
     ka, kb = CONT_ORDER[cont_a], CONT_ORDER[cont_b]
     n = 1 + ka + kb
     L = float(np.linalg.norm(np.asarray(frame_b[0], float) - np.asarray(frame_a[0], float))) or 1.0
-    a = blend_side_cvs(*frame_a[:3], frame_a[3] if len(frame_a) > 3 else None, ka, n, L, w_a, c_a, d_a)
-    b = blend_side_cvs(*frame_b[:3], frame_b[3] if len(frame_b) > 3 else None, kb, n, L, w_b, c_b, d_b)
+    a = side_cvs(frame_a, ka, n, L, w_a, c_a, d_a)
+    b = side_cvs(frame_b, kb, n, L, w_b, c_b, d_b)
     return n, [tuple(map(float, p)) for p in a + b[::-1]]
+
+
+class SymFrame(tuple):
+    '''A blend side on a symmetry plane: (P, the normal, 0[, 0]) and sym_u,
+    the direction in the plane the blend bends toward (Curvature).'''
+    sym_u = None
+
+
+def sym_frame(P, D, u, third=False):
+    z = np.zeros(3)
+    f = SymFrame((np.asarray(P, float), np.asarray(D, float), z, z) if third else
+                 (np.asarray(P, float), np.asarray(D, float), z))
+    f.sym_u = np.asarray(u, float)
+    return f
+
+
+def flip_frame(f):
+    '''The frame turned round (odd derivatives change sign); a symmetry side stays one.'''
+    out = (f[0], -np.asarray(f[1], float), f[2]) + tuple(-np.asarray(x, float) for x in f[3:])
+    if getattr(f, "sym_u", None) is not None:
+        g = SymFrame(out)
+        g.sym_u = f.sym_u
+        return g
+    return out
+
+
+def blend_sym_side_cvs(P, D, u, k, n, L, w=1.0, c=0.0, d=0.0):
+    '''A blend side on a symmetry plane, P0 .. Pk: P1 = P0 + w L/n T (T the
+    normal), P2 at twice P1's height (n.C2 = 0: the blend and its mirror
+    image join C2) moved by c L/(n(n-1)) along u in the plane (the bend at
+    the plane), P3 = 3 P2 - 3 P1 + P0 + d L/(n(n-1)(n-2)) T (C3 along the
+    normal only: C3 with the mirror image).'''
+    P, D, u = (np.asarray(v, float) for v in (P, D, u))
+    rows = [P]
+    if k == 0:
+        return rows
+    T = D / (float(np.linalg.norm(D)) or 1.0)
+    P1 = P + (w * L / n) * T
+    rows.append(P1)
+    if k >= 2:
+        P2 = 2 * P1 - P + (c * L / (n * (n - 1))) * u
+        rows.append(P2)
+    if k >= 3:
+        rows.append(3 * P2 - 3 * P1 + P + (d * L / (n * (n - 1) * (n - 2))) * T)
+    return rows
+
+
+def side_cvs(frame, k, n, L, w=1.0, c=0.0, d=0.0):
+    '''One blend side's CVs from its frame (blend_side_cvs, or a symmetry plane's).'''
+    if getattr(frame, "sym_u", None) is not None:
+        return blend_sym_side_cvs(frame[0], frame[1], frame.sym_u, k, n, L, w, c, d)
+    return blend_side_cvs(*frame[:3], frame[3] if len(frame) > 3 else None, k, n, L, w, c, d)
 
 
 def write_curve_object(obj, degree, points_world):

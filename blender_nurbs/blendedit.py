@@ -51,7 +51,7 @@ def _inputs_key(h):
     from .diagnostics import _curve_key
     p = h["params"]
     parts = [json.dumps([r for _, r in h["inputs"]]),
-             json.dumps([p.get(k) for k in ("end_a", "end_b", "flip_a", "flip_b", "cont_a", "cont_b")])]
+             json.dumps([p.get(k) for k in ("end_a", "end_b", "flip_a", "flip_b", "cont_a", "cont_b") + features.BLEND_SIDE_KEYS])]
     for src, _ in h["inputs"]:
         parts.append(src.name)
         parts.append(np.round(np.array(geom.world_matrix(src), float), 10).tobytes().hex())
@@ -77,7 +77,7 @@ def _side_x(p, s):
 
 
 def side_rows(frame, k, n, L, x):
-    return geom.blend_side_cvs(*frame[:3], frame[3] if len(frame) > 3 else None, k, n, L, *x)
+    return geom.side_cvs(frame, k, n, L, *x)
 
 
 def lm(res, x0, clamp=lambda x: x):
@@ -242,9 +242,10 @@ def constrain_align(obj):
     if h is None or h["op"] != ALIGN:
         return False
     ends, inputs = h["params"].get("ends", {}), h["inputs"]
-    if not ends or not obj.data.splines:
+    si = align.spline_index(inputs)
+    if not ends or len(obj.data.splines) <= si:
         return False
-    kind, p, Q, U = align.curve_state(obj)
+    kind, p, Q, U = align.curve_state(obj, si)
     if kind == "REFIT":
         return False
     need = [align.CONT[ends[e].get("cont", "G1")] for e in ("0", "1") if e in ends]
@@ -258,11 +259,12 @@ def constrain_align(obj):
         kind2, p2, Q2, _ = align.solve(obj, ends, inputs)
         if kind2 != "BEZIER" or len(Q2) != len(Q) or float(np.abs(Q2 - Q).max()) <= tol:
             return False
-        align.write(obj, kind2, p2, Q2)
+        align.write(obj, kind2, p2, Q2, si)
         return True
-    if len(Q) < max(k_need, 2) or p < max(need + [1]) + (1 if 2 in need else 0) or (p == 1 and max(need) >= 1):
+    if len(Q) < max(k_need, 2) or p < max(need + [1]) + (1 if 2 in need else 0) or (p == 1 and max(need) >= 1) \
+            or (3 in need and p < 3):
         return False                                      # too few CVs / too low a degree now: left as edited
-    sp = obj.data.splines[0]
+    sp = obj.data.splines[si]
     sel = np.array([q.select for q in sp.points], bool)
     Qn, changed = Q.copy(), False
     for e in ("0", "1"):

@@ -2067,13 +2067,42 @@ def build_planar(inputs, p):
     return sm.create_planar_faces(curves)
 
 
+# a Blend Curve side's own settings besides G0-G3 / weight / curvature / rate / flip:
+#   bc_mode_<s>  EDGE (continue the curve / edge), SURFACE (tangent to the edge's
+#                surface, across the edge), NORMAL (perpendicular to the surface)
+#   bc_on_<s>    start at a point along the curve / edge (bc_at_<s>: 0..1 of its
+#                parameter) instead of its end (end_<s>)
+#   uv_<s>       a face input (F<i>): the point on it (fractions of its domain)
+#   face_<s>     an edge between two faces: which face SURFACE / NORMAL use
+BLEND_SIDE_KEYS = ("bc_mode_a", "bc_mode_b", "bc_on_a", "bc_on_b", "bc_at_a", "bc_at_b", "uv_a", "uv_b",
+                   "face_a", "face_b")
+
+
+def _blend_side(inputs, p, s):
+    """keyword arguments of align.side_frame for side s ('a' / 'b')."""
+    obj, ref = inputs[0 if s == "a" else 1]
+    on = bool(p.get(f"bc_on_{s}")) and not (ref.startswith("F") and ref[1:].isdigit())
+    return obj, ref, dict(end=int(p.get(f"end_{s}", 1 if s == "a" else 0)),
+                          at=float(p.get(f"bc_at_{s}", 0.5)) if on else None, uv=p.get(f"uv_{s}"),
+                          mode=p.get(f"bc_mode_{s}", "EDGE"), face=int(p.get(f"face_{s}", 0) or 0),
+                          third=p.get(f"cont_{s}") == "G3")
+
+
 def blend_frames(inputs, p):
-    """A Blend Curve's two end frames: (P, C', C''[, C''']) at each picked end,
-    outward, turned round where Flip is on."""
-    (oa, ra), (ob, rb) = inputs[0], inputs[1]
-    fa = geom.curve_end_frame(input_curve(oa, ra), int(p.get("end_a", 1)), p.get("cont_a") == "G3")
-    fb = geom.curve_end_frame(input_curve(ob, rb), int(p.get("end_b", 0)), p.get("cont_b") == "G3")
-    flip = lambda f: (f[0], -f[1], f[2]) + tuple(-x for x in f[3:])      # odd derivatives turn round
+    """A Blend Curve's two end frames: (P, C', C''[, C''']) at each side,
+    turned round where Flip is on. A side is a curve or surface edge (its end,
+    outward, or a point along it), or a face point; on a surface it is the
+    edge continued, tangent to the surface or perpendicular to it
+    (align.side_frame). Directions that are not outward by themselves (a point
+    along a curve, the normal) lead toward the other side."""
+    from . import align
+    oa, ra, ka = _blend_side(inputs, p, "a")
+    ob, rb, kb = _blend_side(inputs, p, "b")
+    pa = align.side_point(oa, ra, ka["end"], ka["at"], ka["uv"])
+    pb = align.side_point(ob, rb, kb["end"], kb["at"], kb["uv"])
+    fa = align.side_frame(oa, ra, toward=pb, **ka)
+    fb = align.side_frame(ob, rb, toward=pa, **kb)
+    flip = geom.flip_frame                                               # odd derivatives turn round
     if p.get("flip_a"):
         fa = flip(fa)
     if p.get("flip_b"):

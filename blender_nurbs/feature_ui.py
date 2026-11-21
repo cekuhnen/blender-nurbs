@@ -12,7 +12,7 @@ from mathutils import Matrix
 
 from . import features, primitives, store
 from .kernel import load as load_kernel
-from .ops import AXIS_ITEMS, CONT_ITEMS, LOFT_CONT_ITEMS, REVOLVE_AXIS_ITEMS
+from .ops import AXIS_ITEMS, BLEND_MODES as _BLEND_MODES, CONT_ITEMS, LOFT_CONT_ITEMS, REVOLVE_AXIS_ITEMS
 
 _syncing = [False]
 
@@ -25,7 +25,8 @@ FIELDS = {
     "loft": ["closed", "cont_a", "tan_a", "cur_a", "cont_b", "tan_b", "cur_b", "auto_align", "flip_b", "ruled", "samples",
              "a_from", "a_to", "b_from", "b_to", "edges_a", "edges_b", "fit", "span_degree", "span_faces", "cont_ra", "tan_ra", "cont_rb", "tan_rb", "corner_ease", "even_net",
              "flip_normal", "caps"],
-    "blend_curve": ["cont_a", "w_a", "c_a", "d_a", "flip_a", "cont_b", "w_b", "c_b", "d_b", "flip_b"],
+    "blend_curve": ["cont_a", "bc_mode_a", "bc_on_a", "bc_at_a", "w_a", "c_a", "d_a", "flip_a",
+                    "cont_b", "bc_mode_b", "bc_on_b", "bc_at_b", "w_b", "c_b", "d_b", "flip_b"],
     "extrude": ["distance", "direction", "dir_vec", "tilt", "tilt_azimuth", "draft", "draft_flip", "symmetric", "caps"],
     "extrude_face": ["distance", "direction", "dir_vec", "tilt", "tilt_azimuth", "draft", "draft_flip", "symmetric"],
     "revolve": ["angle", "axis", "pivot", "seam_angle", "axis_point", "axis_dir", "caps"],
@@ -73,7 +74,8 @@ FIELDS = {
 }
 
 # what a feature made before a setting existed was built with (shown when its history lacks it)
-MISSING = {"fl_corner": "OPEN", "a_from": 0.0, "a_to": 1.0, "b_from": 0.0, "b_to": 1.0}
+MISSING = {"fl_corner": "OPEN", "bc_mode_a": "EDGE", "bc_mode_b": "EDGE", "bc_on_a": False, "bc_on_b": False,
+           "bc_at_a": 0.5, "bc_at_b": 0.5, "a_from": 0.0, "a_to": 1.0, "b_from": 0.0, "b_to": 1.0}
 LABELS = {"tan_a": "Tangent A", "tan_b": "Tangent B", "cur_a": "Curvature A", "cur_b": "Curvature B",
           "w_a": "Weight A", "w_b": "Weight B", "c_a": "Curvature A", "c_b": "Curvature B",
           "d_a": "Rate A", "d_b": "Rate B",
@@ -313,6 +315,12 @@ class NprotoFeature(bpy.types.PropertyGroup):
     d_b: FloatProperty(name="Rate B", soft_min=-2.0, soft_max=2.0, **_F())
     flip_a: BoolProperty(name="Flip A", **_F())
     flip_b: BoolProperty(name="Flip B", **_F())
+    bc_mode_a: EnumProperty(name="Surface A", items=_BLEND_MODES, **_F())
+    bc_mode_b: EnumProperty(name="Surface B", items=_BLEND_MODES, **_F())
+    bc_on_a: BoolProperty(name="Point Along A", **_F())
+    bc_on_b: BoolProperty(name="Point Along B", **_F())
+    bc_at_a: FloatProperty(name="Position A", min=0.0, max=1.0, subtype='FACTOR', **_F())
+    bc_at_b: FloatProperty(name="Position B", min=0.0, max=1.0, subtype='FACTOR', **_F())
     a_from: FloatProperty(name="From A", min=0.0, max=1.0, subtype='FACTOR',
                           description="Where along side A the loft starts (share of its length)", **_F())
     a_to: FloatProperty(name="To A", min=0.0, max=1.0, subtype='FACTOR',
@@ -718,6 +726,16 @@ def draw_feature(layout, context):
                         if name == "width" and shp == "SQUARE":
                             col.prop(pg, name, text="Size")
                             continue
+                    if op == "blend_curve" and name[:3] == "bc_":
+                        src_, ref_ = h["inputs"][0 if name.endswith("_a") else 1]
+                        face_ = ref_.startswith("F") and ref_[1:].isdigit()
+                        if name.startswith("bc_mode") and not (src_.type != 'CURVE' and store.is_nurbs(src_)):
+                            continue                     # a curve is always continued
+                        if name.startswith("bc_on") and face_:
+                            continue                     # a face point: no end / point along
+                        if name.startswith("bc_at"):
+                            if face_ or not getattr(pg, "bc_on" + name[5:]):
+                                continue
                     if op == "flange" and (name == "angle" and pg.fl_mode == "DRAFT" or name in (
                             "draft_angle", "pull_flip", "measure") and pg.fl_mode == "FLANGE"):
                         continue
