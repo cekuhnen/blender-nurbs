@@ -1654,5 +1654,193 @@ class NPROTO_OT_draw_cylinder(NPROTO_OT_draw_helix):
         return out
 
 
+# --------------------------------------------------------------------------
+# Box: a rectangle (Rectangle's modes), then its height along the normal
+# (Cylinder's height step)
+# --------------------------------------------------------------------------
+
+BOX_MODES = [("CORNERS", "Corner to Corner", "Two opposite corners of the base, then the height"),
+             ("CENTER", "Centre to Corner", "The base's centre, then a corner, then the height"),
+             ("THREE", "3 Points", "Two corners along one side (its direction), the other side's length, "
+                                   "then the height")]
+
+
+def box_outline(T, X, Y, Z):
+    """The 12 edges of a box in its frame (centred, sizes X Y Z), in world."""
+    c = lambda i, j, k: (0.5 * i * X, 0.5 * j * Y, 0.5 * k * Z)
+    edges = []
+    for k in (-1, 1):                                    # bottom and top rectangles
+        edges.append(to_world(T, [c(-1, -1, k), c(1, -1, k), c(1, 1, k), c(-1, 1, k), c(-1, -1, k)]))
+    for i, j in ((-1, -1), (1, -1), (1, 1), (-1, 1)):    # the four uprights
+        edges.append(to_world(T, [c(i, j, -1), c(i, j, 1)]))
+    return edges
+
+
+def base_rect(mode, pts, P, n, u, typed):
+    """The base rectangle from the clicked points and the mouse point P (on the
+    plane with normal n, axis u): (centre, X, Y, x direction) -- or, on the
+    first leg of 3 Points, ("leg", end point, length). None: no size yet."""
+    A = pts[0]
+    v = np.cross(_unit(n), u)
+    if mode == "THREE" and len(pts) == 1:
+        w = _flat((P if P is not None else A + u) - A, n)
+        L = typed.get("X", float(np.linalg.norm(w)))
+        return ("leg", A + _unit(w if np.linalg.norm(w) > 1e-12 else u) * L, L)
+    if mode == "THREE":
+        B = pts[1]
+        x = _unit(B - A)
+        X = float(np.linalg.norm(B - A))
+        y = np.cross(_unit(n), x)
+        h = float((P - A) @ y) if P is not None else 0.0
+        Y = typed.get("Y", abs(h))
+        C = 0.5 * (A + B) + 0.5 * math.copysign(Y, h or 1.0) * y
+        xdir = x
+    else:
+        w = _flat((P if P is not None else A + u + v) - A, n)
+        dx, dy = float(w @ u), float(w @ v)
+        k = 1.0 if mode == "CORNERS" else 2.0
+        X, Y = typed.get("X", k * abs(dx)), typed.get("Y", k * abs(dy))
+        C = A + 0.5 * (math.copysign(X, dx or 1.0) * u + math.copysign(Y, dy or 1.0) * v) if mode == "CORNERS" else A
+        xdir = u
+    if X < 1e-12 or Y < 1e-12:
+        return None
+    return (np.asarray(C, float), float(X), float(Y), np.asarray(xdir, float))
+
+
+class NPROTO_OT_draw_box(_TwoStep, bpy.types.Operator):
+    """Draw a box: its base as a rectangle -- two corners, the centre and a
+    corner, or three points (rotated; M switches) -- then its height along
+    the base's normal. Type the width and depth (Tab), then the height. It
+    stays editable in the Feature panel"""
+    bl_idname = "nproto.draw_box"
+    bl_label = "Box"
+    bl_options = {'REGISTER', 'UNDO'}
+    MODES, TITLE, PARAMS = BOX_MODES, "Box", ("width", "depth", "height", "degree", "spans_u")
+    FIELD_NAMES = dict(_ShapeTool.FIELD_NAMES, X="Width", Y="Depth", H="Height")
+    FIELD_HINTS = dict(_ShapeTool.FIELD_HINTS, X="the width", Y="the depth", H="the height")
+
+    mode: EnumProperty(name="Mode", items=BOX_MODES, default="CORNERS")
+    width: FloatProperty(name="Width", default=1.0, min=1e-6, unit='LENGTH')
+    depth: FloatProperty(name="Depth", default=1.0, min=1e-6, unit='LENGTH')
+    height: FloatProperty(name="Height", default=1.0, min=1e-6, unit='LENGTH')
+    degree: IntProperty(name="Degree", default=1, min=1, max=5, description="Degree of each side (1: flat, fewest CVs)")
+    spans_u: IntProperty(name="Spans", default=1, min=1, max=32, description="Spans across each side")
+    data: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+
+    @property
+    def STEPS(self):
+        return 4 if self.mode == "THREE" else 3
+
+    def draw(self, context):
+        lay = self.layout
+        lay.use_property_split = True
+        col = lay.column(align=True)
+        col.prop(self, "width")
+        col.prop(self, "depth")
+        col.prop(self, "height")
+        col = lay.column(align=True)
+        col.prop(self, "degree")
+        col.prop(self, "spans_u")
+        lay.label(text=f"{self.degree + self.spans_u} x {self.degree + self.spans_u} CVs a side")
+
+    def _reset(self):
+        self._base = None
+        _ShapeTool._reset(self)
+
+    def _needs_line(self):
+        return False
+
+    def _height_step(self):
+        return getattr(self, "_base", None) is not None
+
+    def _fields(self):
+        if self._height_step():
+            return ["H"]
+        if self.mode == "THREE":
+            return ["X"] if len(self._pts) == 1 else (["Y"] if len(self._pts) == 2 else [])
+        return ["X", "Y"] if len(self._pts) == 1 else []
+
+    def _step(self):
+        if self._height_step():
+            return "the height: move along the normal (or type it)"
+        if self.mode == "THREE":
+            return ["click a corner", "click the next corner (the side's direction)", "click the other side"][
+                min(len(self._pts), 2)]
+        return ["click a corner" if self.mode == "CORNERS" else "click the centre",
+                "click the opposite corner" if self.mode == "CORNERS" else "click a corner"][min(len(self._pts), 1)]
+
+    def _extra_key(self, context, event):
+        if event.value == 'PRESS' and event.type == 'BACK_SPACE' and self._height_step() \
+                and not self._buf and not self._vals:
+            self._base = None                            # back to the base rectangle
+            self._pts.pop()
+            self._reset_typing()
+            return True
+        return False
+
+    def _coaxial_rim(self, P, snap, C, a):
+        return None                                      # a box has no rims to follow (the helix's height helper)
+
+    _axis_h = NPROTO_OT_draw_helix._axis_h
+
+    def _shape(self, context, event, final=False):
+        if not self._pts:
+            return None
+        O, n, u, v = self._plane
+        typed = self._typed(context)
+        P, snap = self._point(context, event)
+        if not self._height_step():
+            b = base_rect(self.mode, self._pts, P, n, u, typed)
+            if b is None:
+                return None
+            if isinstance(b[0], str):            # 3 Points: the first side
+                return {"kind": "box", "poly": [self._pts[0], b[1]], "next": b[1], "ok": False, "vals": {"X": b[2]}}
+            C, X, Y, xdir = b
+            T = frame(C, xdir, n)
+            return {"kind": "box", "poly": to_world(T, rounded_outline(0.5 * X, 0.5 * Y, 0.0)), "base": b,
+                    "ok": False, "vals": {"X": X, "Y": Y}}
+        C, X, Y, xdir = self._base
+        a = _unit(n)
+        h, _ = self._axis_h(context, event, typed, P, snap, C, a)
+        H = abs(h)
+        if H < 1e-12:
+            return None
+        T = frame(C + a * (0.5 * h), xdir, a)
+        from .feature_ui import primitive_params
+        params = primitive_params("prim_box", width=X, depth=Y, height=H, degree=int(self.degree),
+                                  spans_u=int(self.spans_u))
+        polys = box_outline(T, X, Y, H)
+        return {"kind": "box", "op": "prim_box", "name": "NURBS Box", "T": T, "params": params,
+                "polys": polys, "poly": polys[0], "vals": {"X": X, "Y": Y, "H": H}}
+
+    def _click(self, context, event):
+        if not self._pts:
+            P, _ = self._point(context, event)
+            if P is not None:
+                self._add_point(context, P)
+            return None
+        sh = self._shape(context, event, final=True)
+        if sh is None:
+            return None
+        if self._height_step():
+            return self._finish(context, sh)
+        if sh.get("base") is None:                       # 3 Points: the first side
+            self._pts.append(np.asarray(sh["next"], float))
+        else:                                            # the base is done: on to the height
+            C, X, Y, xdir = sh["base"]
+            self._base = sh["base"]
+            y = np.cross(_unit(self._plane[1]), xdir)
+            # the corner it ended on (opposite the first one; Centre: a corner): a point guides run through
+            self._pts.append(C + 0.5 * X * xdir + 0.5 * Y * y if self.mode == "CENTER" else 2.0 * C - self._pts[0])
+        self._reset_typing()
+        return None
+
+    def _enter(self, context, event):
+        if not self._height_step():
+            return self._click(context, event)
+        return _ShapeTool._enter(self, context, event)
+
+
 classes = (NPROTO_OT_draw_circle, NPROTO_OT_draw_arc, NPROTO_OT_draw_ellipse, NPROTO_OT_draw_rectangle,
-           NPROTO_OT_draw_slot, NPROTO_OT_draw_polygon, NPROTO_OT_draw_helix, NPROTO_OT_draw_cylinder)
+           NPROTO_OT_draw_slot, NPROTO_OT_draw_polygon, NPROTO_OT_draw_helix, NPROTO_OT_draw_cylinder,
+           NPROTO_OT_draw_box)

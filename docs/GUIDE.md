@@ -16,7 +16,7 @@ Tools that don't fit the selection are dimmed: select a curve and the tools that
 |---|---|
 | **Active Object** | Shown only when the active object has something to show: CV editing (Done / Cancel), its feature settings and history, its face and edge count |
 | **Create Curves** | CV Curve, Draw Line, Arc, Circle, Ellipse, Rectangle, Polygon, Slot, Profile · between curves: Blend Curve, Fillet · from curves: Offset Curve, Offset on Surface · Helix (the other shapes, placed at the 3D cursor: Shift+A) · from surfaces: Iso Curve, Duplicate Edge, Project Curve, Intersect |
-| **Create Surfaces** | Draw Plane, Cylinder, **Primitive** ▾ (Plane, Disk, Box, Cylinder, Cone, Sphere, Torus) · from curves: Loft, Loft Rails, Curve Network, Sweep, Pipe, Extrude, Revolve, Rail Revolve, Planar · filling a gap: Boundary, Square, Patch, Dome · from surfaces: Offset, Thicken, Flange (and draft surface), Convert Blender Surface |
+| **Create Surfaces** | Draw Plane, Box, Cylinder, **Primitive** ▾ (Plane, Disk, Box, Cylinder, Cone, Sphere, Torus) · from curves: Loft, Loft Rails, Curve Network, Sweep, Pipe, Extrude, Revolve, Rail Revolve, Planar · filling a gap: Boundary, Square, Patch, Dome · from surfaces: Offset, Thicken, Flange (and draft surface), Convert Blender Surface |
 | **Curve Edit** | Join / Unjoin Curves, Trim / Split Curves, Rebuild / Extend Curve, Align Curve |
 | **Surface Edit** | Edit CVs, Flip Normal, Rebuild Surface, Extend Surface, Surface Align, Match Surface, Refit to Trim, Merge Patches · Trim, Split, Untrim, Join, Unjoin, Detach at Isoparm · Surface Fillet, Edge Fillet · solids: Union, Difference, Intersection, Boundary Fill |
 | **Convert** (closed at first) | BREP to Mesh, Mesh to BREP, SubD to BREP (all also in Object › Convert) |
@@ -417,6 +417,22 @@ Under Create Surfaces, next to Draw Plane: a cylinder drawn in place, with Helix
   the next one.
 * It is a Cylinder primitive placed where you drew it: radius, height, degree, spans and caps stay editable in the
   Feature panel.
+
+### Box (Draw)
+
+Under Create Surfaces, between Draw Plane and Cylinder: a box drawn in place -- its base as a rectangle, then its
+height -- with the drawing tools' snapping and guides.
+
+* **Corner to Corner** (default): click a corner of the base, then the opposite corner. **Centre to Corner** (**M**):
+  the base's centre, then a corner. **3 Points** (**M**): two corners along one side (it sets the box's direction, so
+  it can stand rotated), then the other side's length.
+* Type the width, **Tab** the depth (3 Points: the side's length, then the other side's) and **Enter**; Shift holds
+  the second corner to 15° steps (45°: a square base).
+* Then the height: move along the base's normal (it stands square to the plane you started on: the grid, a work
+  plane or a face) or type it; Ctrl snaps it to the grid, a snap to real geometry takes its level, a negative height
+  goes the other way. **Backspace** goes back to the base.
+* It is a Box primitive (a closed solid of six faces) placed where you drew it: width, depth, height, degree and spans
+  stay editable in the redo panel and the Feature panel.
 
 ### Draw Plane
 
