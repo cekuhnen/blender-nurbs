@@ -1655,11 +1655,17 @@ def _capped(walls, tol):
     return b, len(planes)
 
 
-def _volume(b):
+def _volume(b, accuracy=1e-6):
     try:
-        return float(b.volume(1e-6))
+        return float(b.volume(accuracy))
     except Exception:
         return 0.0
+
+
+def _vol(b):
+    """The volume for the face jobs' checks and reports: 1e-4 relative is ~5x
+    quicker than 1e-6 on curved bodies (a cone: 0.5 s instead of 2.4 s)."""
+    return _volume(b, 1e-4)
 
 
 def _turned_wall(w):
@@ -1862,6 +1868,543 @@ def _heights(b, n, o, m=9):
     return hs
 
 
+# ---------------------------------------------------------------------------
+# Exact face move: the neighbours' own surfaces extended / cut back to meet the
+# face's new surface (no walls along the normal, no boolean)
+# ---------------------------------------------------------------------------
+
+def _curve_piece(c, t0, t1):
+    """An exact copy of curve c between parameters t0 and t1 (knot insertion)."""
+    np = _np()
+    if t0 > t1:
+        t0, t1 = t1, t0
+    d = ext.curve_cvs(c)
+    p, U = int(d["degree"]), [float(k) for k in d["knots"]]
+    P = np.array(d["points"], float)
+    w = np.array(d["weights"], float) if d.get("weights") else np.ones(len(P))
+    Pw = [np.append(x * wi, wi) for x, wi in zip(P, w)]
+    eps = 1e-12 * ((U[-1] - U[0]) or 1.0)
+    for t, keep_left in ((t1, True), (t0, False)):
+        if not U[0] + eps < t < U[-1] - eps:
+            continue
+        have = sum(1 for k in U if abs(k - t) <= eps)
+        Pw, U = _insert_knot(Pw, U, p, t, max(0, p - have))
+        first = min(i for i in range(len(U)) if abs(U[i] - t) <= eps)
+        if keep_left:
+            Pw, U = Pw[:first], U[:first] + [t] * (p + 1)
+        else:
+            Pw, U = Pw[first - 1:], [t] * (p + 1) + U[first + p:]
+    pts = [tuple(map(float, x[:3] / x[3])) for x in Pw]
+    wts = [float(x[3]) for x in Pw]
+    return ext.curve_from_cvs(p, pts, U, wts if max(abs(x - 1.0) for x in wts) > 1e-12 else None)
+
+
+def _reversed_curve(c):
+    d = ext.curve_cvs(c)
+    U = [float(k) for k in d["knots"]]
+    a, b = U[0], U[-1]
+    return ext.curve_from_cvs(int(d["degree"]), [tuple(map(float, q)) for q in reversed(d["points"])],
+                              [a + b - k for k in reversed(U)],
+                              list(reversed(d["weights"])) if d.get("weights") else None)
+
+
+def _extended_curve(c, at_start, dist):
+    import natext
+    np = _np()
+    d = ext.curve_cvs(c)
+    P = np.array(d["points"], float)
+    if int(d["degree"]) == 1 and len(P) == 2 and not d.get("weights"):     # a line: just longer
+        t = (P[1] - P[0]) / (np.linalg.norm(P[1] - P[0]) or 1.0) * dist
+        if at_start:
+            P[0] = P[0] - t
+        else:
+            P[1] = P[1] + t
+        return ext.curve_from_cvs(1, [tuple(map(float, q)) for q in P], [0.0, 0.0, 1.0, 1.0], None)
+    e = natext.extend_curve({"degree": d["degree"], "points": d["points"], "knots": d["knots"],
+                             "weights": d.get("weights")}, at_start, dist)
+    return ext.curve_from_cvs(int(e["degree"]), [tuple(q) for q in e["points"]], e["knots"], e["weights"])
+
+
+def _closed_dirs(srf, tol):
+    """Is the surface closed round in u, in v (its two iso ends coincide)?"""
+    np = _np()
+    (u0, u1), (v0, v1) = srf.u_domain(), srf.v_domain()
+    ts = np.linspace(0.0, 1.0, 7)
+    cu = all(np.linalg.norm(np.array(srf.evaluate(u0, v0 + t * (v1 - v0)), float)
+                            - np.array(srf.evaluate(u1, v0 + t * (v1 - v0)), float)) <= tol for t in ts)
+    cv = all(np.linalg.norm(np.array(srf.evaluate(u0 + t * (u1 - u0), v0), float)
+                            - np.array(srf.evaluate(u0 + t * (u1 - u0), v1), float)) <= tol for t in ts)
+    return cu, cv
+
+
+def _extended_surface(srf, dist, tol):
+    """The surface continued as the same polynomial by dist past each side it
+    is open at (the old part stays exactly as it was)."""
+    import natext
+    np = _np()
+    d = ext.surface_cvs(srf)
+    if srf.is_planar():
+        # a plane: a parallelogram patch on it, over its CVs grown by dist (the
+        # trims are 3D curves, so the parameters need not be kept)
+        P = np.array(d["points"], float)
+        c = P.mean(axis=0)
+        (u0, u1), (v0, v1) = srf.u_domain(), srf.v_domain()
+        su, sv = (np.array(srf.evaluate(u1, v0), float) - np.array(srf.evaluate(u0, v0), float),
+                  np.array(srf.evaluate(u0, v1), float) - np.array(srf.evaluate(u0, v0), float))
+        nrm = np.cross(su, sv)
+        if np.linalg.norm(nrm) > 1e-12:
+            nrm /= np.linalg.norm(nrm)
+            a = su / np.linalg.norm(su)
+            b = np.cross(nrm, a)
+            x, y = (P - c) @ a, (P - c) @ b
+            x0, x1, y0, y1 = x.min() - dist, x.max() + dist, y.min() - dist, y.max() + dist
+            Q = [c + x0 * a + y0 * b, c + x0 * a + y1 * b, c + x1 * a + y0 * b, c + x1 * a + y1 * b]
+            return ext.surface_from_cvs(1, 1, [tuple(map(float, q)) for q in Q], [0.0, 0.0, 1.0, 1.0],
+                                        [0.0, 0.0, 1.0, 1.0])
+    cu, cv = _closed_dirs(srf, tol)
+    for side in [s for s, closed in (("U0", cu), ("U1", cu), ("V0", cv), ("V1", cv)) if not closed]:
+        du, dv, pts, Ku, Kv, w = natext.extend_grid(d, side, dist)
+        nu, nv = len(Ku) - du - 1, len(Kv) - dv - 1
+        d = {"degree_u": du, "degree_v": dv, "count_u": nu, "count_v": nv, "points": pts,
+             "knots_u": Ku, "knots_v": Kv, "weights": w}
+    return ext.surface_from_cvs(d["degree_u"], d["degree_v"], d["points"], d["knots_u"], d["knots_v"],
+                                d.get("weights"))
+
+
+def _chain(curves, tol):
+    """The curves in head-to-tail order (each turned round where needed), or None."""
+    np = _np()
+    if not curves:
+        return None
+    ends = lambda c: (np.array(c.start_point(), float), np.array(c.end_point(), float))
+    out = [curves[0]]
+    left = list(curves[1:])
+    while left:
+        tail = ends(out[-1])[1]
+        for i, c in enumerate(left):
+            a, b = ends(c)
+            if np.linalg.norm(a - tail) <= tol:
+                out.append(left.pop(i))
+                break
+            if np.linalg.norm(b - tail) <= tol:
+                out.append(_reversed_curve(left.pop(i)))
+                break
+        else:
+            return None
+    return out
+
+
+def _new_vertex(side, v, G, reach, tol):
+    """(new point, side curve from its far end to it) of the vertex v of the
+    moved face: the side edge -- extended exactly past v -- meeting the new
+    surface G nearest v."""
+    np = _np()
+    c = _edge_copy(side)
+    a, b = np.array(c.start_point(), float), np.array(c.end_point(), float)
+    at_start = np.linalg.norm(a - v) < np.linalg.norm(b - v)
+    far = b if at_start else a
+    cx = _extended_curve(c, at_start, reach)
+    _, points = sm.intersect_curve_surface(cx, G)
+    if not points:
+        raise RuntimeError("a side edge does not reach the new face")
+    q = min((np.array(x, float) for x in points), key=lambda x: float(np.linalg.norm(x - v)))
+    _, tq, _ = sm.curve_closest_point(cx, tuple(map(float, q)))
+    _, tf, _ = sm.curve_closest_point(cx, tuple(map(float, far)))
+    _, tv, _ = sm.curve_closest_point(cx, tuple(map(float, v)))
+    if (tq - tf) * (tv - tf) <= 0 or abs(tq - tf) <= 1e-9:
+        raise RuntimeError("the move runs past a side edge's far end (the face would vanish)")
+    return q, (cx, tf, tq)
+
+
+def _new_edge(srf_ext, G, qa, qb, closed, tol):
+    """The curve(s) where the neighbour's extended surface meets G, from qa to qb
+    (a closed edge -- a full circle -- comes back to qa: two pieces)."""
+    np = _np()
+    best = None
+    for c in sm.intersect_surfaces(srf_ext, G):
+        pa, ta, da = sm.curve_closest_point(c, tuple(map(float, qa)))
+        pb, tb, db = sm.curve_closest_point(c, tuple(map(float, qb)))
+        if best is None or da + db < best[0]:
+            best = (da + db, c, ta, tb)
+    if best is None or best[0] > 1e3 * tol:
+        raise RuntimeError("a neighbour does not meet the new face")
+    _, c, ta, tb = best
+    t0, t1 = c.parameter_range()
+    if closed:
+        return [p_ for p_ in (_curve_piece(c, t0, ta), _curve_piece(c, ta, t1)) if p_.length() > tol]
+    return [_curve_piece(c, ta, tb)]
+
+
+def _surface_piece(srf, along_v, t0, t1):
+    """srf cut exactly (knot insertion) to v in [t0, t1] (along_v) or u in [t0, t1]."""
+    np = _np()
+    d = ext.surface_cvs(srf)
+    nu, nv, du, dv = d["count_u"], d["count_v"], int(d["degree_u"]), int(d["degree_v"])
+    P = np.array(d["points"], float).reshape(nu, nv, 3)
+    w = np.array(d["weights"], float).reshape(nu, nv) if d.get("weights") else np.ones((nu, nv))
+    G = np.concatenate([P * w[..., None], w[..., None]], axis=2)
+    Ku, Kv = [float(k) for k in d["knots_u"]], [float(k) for k in d["knots_v"]]
+    if not along_v:                                   # work along v: transpose
+        G, Ku, Kv, du, dv = G.transpose(1, 0, 2), Kv, Ku, dv, du
+    if t0 > t1:
+        t0, t1 = t1, t0
+    rows, K = [], None
+    for i in range(G.shape[0]):
+        Pw, U = [np.array(x) for x in G[i]], list(Kv)
+        eps = 1e-12 * ((U[-1] - U[0]) or 1.0)
+        for t, keep_left in ((t1, True), (t0, False)):
+            if not U[0] + eps < t < U[-1] - eps:
+                continue
+            have = sum(1 for k in U if abs(k - t) <= eps)
+            Pw, U = _insert_knot(Pw, U, dv, t, max(0, dv - have))
+            first = min(j for j in range(len(U)) if abs(U[j] - t) <= eps)
+            if keep_left:
+                Pw, U = Pw[:first], U[:first] + [t] * (dv + 1)
+            else:
+                Pw, U = Pw[first - 1:], [t] * (dv + 1) + U[first + dv:]
+        rows.append(Pw)
+        K = U
+    G = np.array(rows, float)
+    if not along_v:
+        G, Ku, K, du, dv = G.transpose(1, 0, 2), K, Ku, dv, du
+    W = G[..., 3]
+    pts = [tuple(map(float, G[i, j, :3] / W[i, j])) for i in range(G.shape[0]) for j in range(G.shape[1])]
+    rational = np.abs(W - 1.0).max() > 1e-12
+    return ext.surface_from_cvs(du, dv, pts, Ku, K, [float(x) for x in W.reshape(-1)] if rational else None)
+
+
+def _boundary_iso(srf, along_v, at_end):
+    """The exact boundary curve of srf at its v (along_v) or u start / end."""
+    d = ext.surface_cvs(srf)
+    nu, nv = d["count_u"], d["count_v"]
+    P = d["points"]
+    w = d.get("weights")
+    if along_v:                      # v fixed: the curve runs in u
+        j = nv - 1 if at_end else 0
+        idx = [i * nv + j for i in range(nu)]
+        deg, K = d["degree_u"], d["knots_u"]
+    else:
+        i = nu - 1 if at_end else 0
+        idx = [i * nv + j for j in range(nv)]
+        deg, K = d["degree_v"], d["knots_v"]
+    return ext.curve_from_cvs(int(deg), [tuple(map(float, P[k])) for k in idx], [float(x) for x in K],
+                              [float(w[k]) for k in idx] if w else None)
+
+
+def _iso_cut(N, e, srf_ext, G, q_new, tol):
+    """(new face, new edge curve) for a closed natural neighbour N whose edge e
+    with the moved face is one of its isos, when G meets its extension along an
+    iso too (a cap moved along a cone's / a revolve's axis): the extended
+    surface cut exactly at that iso -- no trimming. None if it is not so."""
+    np = _np()
+    srf = N.surface()
+    mid = np.array(e.point_at(sum(e.parameter_range()) / 2), float)
+    _, uvs, _ = sm.surface_closest_point(srf_ext, tuple(map(float, mid)))
+    u_e, v_e = _uvxy(uvs[0])
+    ts = np.linspace(*e.parameter_range(), 9)
+    uvp = []
+    for t in ts:
+        _, uv_, _ = sm.surface_closest_point(srf_ext, tuple(map(float, e.point_at(t))))
+        uvp.append(_uvxy(uv_[0]))
+    uvp = np.array(uvp)
+    (u0, u1), (v0, v1) = srf_ext.u_domain(), srf_ext.v_domain()
+    if np.ptp(uvp[:, 1]) <= 1e-7 * (v1 - v0):
+        along_v = True                       # e is a v-iso
+    elif np.ptp(uvp[:, 0]) <= 1e-7 * (u1 - u0):
+        along_v = False
+    else:
+        return None
+    _, uvq, _ = sm.surface_closest_point(srf_ext, tuple(map(float, q_new)))
+    t_new = _uvxy(uvq[0])[1 if along_v else 0]
+    # G must hold that whole iso
+    for a in np.linspace(0.0, 1.0, 13):
+        uv = (u0 + a * (u1 - u0), t_new) if along_v else (t_new, v0 + a * (v1 - v0))
+        x = np.array(srf_ext.evaluate(*uv), float)
+        if sm.surface_closest_point(G, tuple(map(float, x)))[2] > 10 * tol:
+            return None
+    # the far iso of the old face: its point farthest (in parameter) from e's
+    far_pts = [np.array(f_.point_at(sum(f_.parameter_range()) / 2), float) for f_ in N.edges() if f_ != e]
+    t_old = t_new
+    for x in far_pts:
+        _, uv_, _ = sm.surface_closest_point(srf_ext, tuple(map(float, x)))
+        t = _uvxy(uv_[0])[1 if along_v else 0]
+        if abs(t - (v_e if along_v else u_e)) > abs(t_old - (v_e if along_v else u_e)):
+            t_old = t
+    if abs(t_old - t_new) <= 1e-9:
+        return None
+    piece = _surface_piece(srf_ext, along_v, t_old, t_new)
+    at_end = t_new > t_old
+    return ext.brep_from_surface(piece), _boundary_iso(piece, along_v, at_end)
+
+
+def _basis(U, p, t):
+    """All B-spline basis functions of degree p on knots U at t (a vector)."""
+    np = _np()
+    n = len(U) - p - 1
+    t = min(max(t, U[p]), U[n])
+    N = np.zeros(len(U) - 1)
+    k = n - 1 if t >= U[n] else max(i for i in range(p, n) if U[i] <= t)
+    N[k] = 1.0
+    for d in range(1, p + 1):
+        M = np.zeros(len(U) - 1)
+        for i in range(len(U) - d - 1):
+            a = (t - U[i]) / (U[i + d] - U[i]) * N[i] if U[i + d] > U[i] else 0.0
+            b = (U[i + d + 1] - t) / (U[i + d + 1] - U[i + 1]) * N[i + 1] if U[i + d + 1] > U[i + 1] else 0.0
+            M[i] = a + b
+        N = M
+    return N[:n]
+
+
+def _refit_like(srf, at, tol, k=4):
+    """A B-spline surface with srf's degrees, knots and weights through the
+    points at(u, v) (srf's parameters) -- least squares on a grid; exact when
+    the target is representable so (a cone's or a cylinder's offset, with the
+    arc weights). Raises if it misses by more than tol on a finer grid."""
+    np = _np()
+    d = ext.surface_cvs(srf)
+    nu, nv, du, dv = d["count_u"], d["count_v"], int(d["degree_u"]), int(d["degree_v"])
+    Ku, Kv = [float(x) for x in d["knots_u"]], [float(x) for x in d["knots_v"]]
+    w = np.array(d["weights"], float).reshape(nu, nv) if d.get("weights") else np.ones((nu, nv))
+    us = np.linspace(Ku[du], Ku[nu], k * nu + 1)
+    vs = np.linspace(Kv[dv], Kv[nv], k * nv + 1)
+    Bu = [_basis(Ku, du, u) for u in us]
+    Bv = [_basis(Kv, dv, v) for v in vs]
+    rows, rhs = [], []
+    for i, u in enumerate(us):
+        for j, v in enumerate(vs):
+            a = np.outer(Bu[i], Bv[j]) * w
+            W = a.sum()
+            rows.append((a / W).reshape(-1))
+            rhs.append(np.array(at(u, v), float))
+    X = np.linalg.lstsq(np.array(rows), np.array(rhs), rcond=None)[0]
+    out = ext.surface_from_cvs(du, dv, [tuple(map(float, q)) for q in X], Ku, Kv,
+                               [float(x) for x in w.reshape(-1)] if d.get("weights") else None)
+    for u in np.linspace(Ku[du], Ku[nu], 2 * k * nu + 3)[1::2]:
+        for v in np.linspace(Kv[dv], Kv[nv], 2 * k * nv + 3)[1::2]:
+            if np.linalg.norm(np.array(out.evaluate(u, v), float) - np.array(at(u, v), float)) > tol:
+                raise RuntimeError("the offset surface is not exact in the face's own form")
+    return out
+
+
+def _offset_like(srf, dist, tol):
+    """srf offset by dist along its own normal, as a B-spline in srf's form."""
+    off = sm.create_offset_surface(srf, dist)
+    return _refit_like(srf, lambda u, v: sm.evaluate_surface_point(off, u, v), tol)
+
+
+def _exact_move_closed(body, p, G, reach, tol):
+    """(solid, kept): _exact_move for a face closed round (a cone's or a
+    revolve's side, its seam an edge of its own) between flat-ish neighbours
+    (caps): the new face is G cut exactly at the isos where each extended
+    neighbour meets it, the neighbours re-trimmed to those isos."""
+    np = _np()
+    b = body.copy()
+    F = _face_at(b, p)
+    ext_d = 2.0 * reach + 10.0 * tol
+    rims = [e for e in F.edges() if len([f for f in e.faces() if f != F]) == 1]
+    seams = [e for e in F.edges() if not [f for f in e.faces() if f != F]]
+    if not rims or not seams:
+        raise RuntimeError("not a closed face between caps")
+    cu, cv = _closed_dirs(G, tol)
+    if cu == cv:
+        raise RuntimeError("the new face is not closed round one way")
+    G = _extended_surface(G, ext_d, tol)          # past where the neighbours meet it (open way only)
+    along_v = cu                         # closed in u: its rims are v-isos
+    (u0, u1), (v0, v1) = G.u_domain(), G.v_domain()
+    # G's seam line, extended past both ends: where each extended neighbour meets it
+    seam_c = _boundary_iso(G, not along_v, False)
+    seam_x = _extended_curve(_extended_curve(seam_c, True, ext_d), False, ext_d)
+    cuts, nbr = [], {}
+    for e in rims:
+        N = [f for f in e.faces() if f != F][0]
+        if N in nbr:
+            raise RuntimeError("a neighbour meets the face twice")
+        S = _extended_surface(N.surface(), ext_d, tol)
+        _, pts = sm.intersect_curve_surface(seam_x, S)
+        if not pts:
+            raise RuntimeError("a neighbour does not reach the new face")
+        mid = np.array(e.point_at(sum(e.parameter_range()) / 2), float)
+        q = min((np.array(x, float) for x in pts), key=lambda x: float(np.linalg.norm(x - mid)))
+        _, uvq, _ = sm.surface_closest_point(G, tuple(map(float, q)))
+        t = _uvxy(uvq[0])[1 if along_v else 0]
+        for a in np.linspace(0.0, 1.0, 13):            # G meets it along that whole iso
+            uv = (u0 + a * (u1 - u0), t) if along_v else (t, v0 + a * (v1 - v0))
+            x = np.array(G.evaluate(*uv), float)
+            if sm.surface_closest_point(S, tuple(map(float, x)))[2] > 10 * tol:
+                raise RuntimeError("a neighbour does not meet the new face along one of its circles")
+        cuts.append(t)
+        nbr[N] = (e, S, t)
+    if len(cuts) != 2:
+        raise RuntimeError("the face is not between two neighbours")
+    piece = _surface_piece(G, along_v, min(cuts), max(cuts))
+    new_face = ext.brep_from_surface(piece)
+    built = [new_face]
+    for N, (e, S, t) in nbr.items():
+        rim = _boundary_iso(piece, along_v, t == max(cuts))
+        loops = []
+        for loop in N.boundary_loops():
+            cs = []
+            for x, _ in loop:
+                if x == e:
+                    cs.append(ext.curve_from_cvs(*_cv_tuple(ext.curve_cvs(rim))))
+                elif x.length() > tol:
+                    cs.append(_edge_copy(x))
+            ch = _chain(cs, 1e3 * tol)
+            if ch is None:
+                raise RuntimeError("a neighbour's new outline does not close")
+            loops.append(ch)
+        if N.surface().is_planar():
+            built.append(sm.create_planar_faces([c for l in loops for c in l]))
+        else:
+            built.append(ext.trim_surface_with_3d_curves_tol(S, [len(l) for l in loops],
+                                                            [c for l in loops for c in l], 10 * tol, 1e2 * tol))
+    gone = [F] + list(nbr)
+    keep_pts = [np.array(f.interior_point(), float) for f in b.faces() if f not in gone]
+    ext.delete_faces(b, gone)
+    for nb in built:
+        ext.append_brep(b, nb)
+    b = sm.stitch_advanced(b, 10 * tol, squeeze_small_edges=False, making_manifold_solid=True)[0]
+    try:
+        sm.unify_normals(b, _face_at(b, keep_pts[0]) if keep_pts else b.faces()[1], 100)
+    except Exception:
+        pass
+    if not b.is_manifold_solid():
+        raise RuntimeError("the moved face and its neighbours do not close into a solid")
+    if _vol(b) <= 0:
+        raise RuntimeError("the moved face turned the body inside out")
+    return b, (built, piece)
+
+
+def _exact_move(body, p, G, reach, tol):
+    """(solid, kept): body with the face at p replaced by the untrimmed surface
+    G, each neighbour's own surface extended or cut back to meet it and each
+    vertex slid along its side edge -- no walls along the normal, so a leaning
+    neighbour stays on its plane / surface. Needs three faces at every vertex
+    of the face and neighbours that reach G; raises otherwise (the caller
+    falls back)."""
+    np = _np()
+    b = body.copy()
+    F = _face_at(b, p)
+    Fedges = set(F.edges())
+    ext_d = 2.0 * reach + 10.0 * tol
+    new_v = {}                                   # vertex -> (point, (curve, t_far, t_new), side edge)
+    for e in Fedges:
+        for v in e.vertices():
+            if v in new_v:
+                continue
+            sides = [x for x in v.edges() if x not in Fedges]
+            if len(sides) != 1:
+                raise RuntimeError("a vertex of the face has more than three faces")
+            q = np.array(v.point(), float)
+            new_v[v] = _new_vertex(sides[0], q, G, ext_d, tol) + (sides[0],)
+    side_of = {sd: (v, q, piece) for v, (q, piece, sd) in new_v.items()}
+    nbrs = {}
+    for e in Fedges:
+        others = [f for f in e.faces() if f != F]
+        if len(others) != 1:
+            raise RuntimeError("an edge of the face is not shared with one neighbour")
+        nbrs.setdefault(others[0], []).append(e)
+    ext_srf = {N: _extended_surface(N.surface(), ext_d, tol) for N in nbrs}
+    new_c = {}                                   # face edge -> its new curve(s) (fresh copies made from these)
+    iso_faces = {}                               # closed neighbour -> its new natural face
+    for N, es in nbrs.items():
+        if not any(_closed_dirs(N.surface(), tol)):
+            continue
+        if len(es) != 1:
+            raise RuntimeError("a closed neighbour meets the face along several edges")
+        e = es[0]
+        cut = _iso_cut(N, e, ext_srf[N], G, new_v[e.start_vertex()][0], tol)
+        if cut is None:
+            raise RuntimeError("a closed neighbour (a cone, a revolve) does not meet the new face along "
+                               "one of its circles")
+        iso_faces[N], c = cut
+        new_c[e] = [c]
+    for e in Fedges:
+        if e in new_c:
+            continue
+        N = [f for f in e.faces() if f != F][0]
+        va, vb = e.start_vertex(), e.end_vertex()
+        closed = va == vb
+        new_c[e] = _new_edge(ext_srf[N], G, new_v[va][0], new_v[vb][0], closed, tol)
+    copy_c = lambda c: ext.curve_from_cvs(*_cv_tuple(ext.curve_cvs(c)))
+
+    def side_piece(sd):
+        cx, tf, tq = side_of[sd][2]
+        return _curve_piece(cx, tf, tq)
+
+    built, kept = [], []
+    # the neighbours, re-trimmed on their extended surfaces
+    for N in nbrs:
+        if N in iso_faces:
+            built.append(iso_faces[N])
+            continue
+        loops = []
+        for loop in N.boundary_loops():
+            cs = []
+            for x, _ in loop:
+                if x in new_c:
+                    cs += [copy_c(c) for c in new_c[x]]
+                elif x in side_of:
+                    cs.append(side_piece(x))
+                elif x.length() > tol:
+                    cs.append(_edge_copy(x))
+            ch = _chain(cs, 1e3 * tol)
+            if ch is None:
+                raise RuntimeError("a neighbour's new outline does not close")
+            loops.append(ch)
+        srf = _extended_surface(N.surface(), ext_d, tol)
+        built.append(ext.trim_surface_with_3d_curves_tol(srf, [len(l) for l in loops],
+                                                        [c for l in loops for c in l], 10 * tol, 1e2 * tol))
+    # the new face: G trimmed to the new outline(s)
+    loops = []
+    for loop in F.boundary_loops():
+        ch = _chain([copy_c(c) for x, _ in loop for c in new_c[x]], 1e3 * tol)
+        if ch is None:
+            raise RuntimeError("the new face's outline does not close")
+        loops.append(ch)
+    if G.is_planar():
+        built.append(sm.create_planar_faces([c for l in loops for c in l]))
+    else:
+        Gc = ext.surface_from_cvs(*_srf_tuple(ext.surface_cvs(G)))
+        built.append(ext.trim_surface_with_3d_curves_tol(Gc, [len(l) for l in loops],
+                                                        [c for l in loops for c in l], 10 * tol, 1e2 * tol))
+    # the body without the face and its neighbours, the new faces in, stitched
+    gone = [F] + list(nbrs)
+    keep_pts = [np.array(f.interior_point(), float) for f in b.faces() if f not in gone]
+    if not keep_pts:
+        raise RuntimeError("nothing of the body stays as it was")
+    ext.delete_faces(b, gone)
+    for nb in built:
+        ext.append_brep(b, nb)
+    b = sm.stitch_advanced(b, 10 * tol, squeeze_small_edges=False, making_manifold_solid=True)[0]
+    try:
+        sm.unify_normals(b, _face_at(b, keep_pts[0]), 100)
+    except Exception:
+        pass
+    if not b.is_manifold_solid():
+        raise RuntimeError("the moved face and its neighbours do not close into a solid")
+    if _vol(b) <= 0:
+        raise RuntimeError("the moved face turned the body inside out")
+    return b, (built, ext_srf)
+
+
+def _cv_tuple(d):
+    return (int(d["degree"]), [tuple(map(float, q)) for q in d["points"]], [float(k) for k in d["knots"]],
+            d.get("weights") or None)
+
+
+def _srf_tuple(d):
+    return (int(d["degree_u"]), int(d["degree_v"]), [tuple(map(float, q)) for q in d["points"]],
+            [float(k) for k in d["knots_u"]], [float(k) for k in d["knots_v"]], d.get("weights") or None)
+
+
+def _moved_surface(srf, v):
+    d = ext.surface_cvs(srf)
+    a = _srf_tuple(d)
+    return ext.surface_from_cvs(a[0], a[1], [tuple(float(x + y) for x, y in zip(q, v)) for q in a[2]],
+                                a[3], a[4], a[5])
+
+
 def _face_sheet(body, p):
     """The face of body at p alone, as an open sheet."""
     b = body.copy()
@@ -1938,6 +2481,42 @@ def _over_face(sheet, face, n, reach, k=6):
     return out
 
 
+def _surface_sign(F):
+    """+1 when the face's surface normal is its outward normal, else -1."""
+    np = _np()
+    ip = np.array(F.interior_point(), float)
+    _, uvs, _ = sm.surface_closest_point(F.surface(), tuple(map(float, ip)))
+    sn = np.array(sm.evaluate_surface_normal(F.surface(), *_uvxy(uvs[0])), float)
+    return 1.0 if float(sn @ _face_normal(F, ip)) > 0 else -1.0
+
+
+def _try_exact(body, F, p, n, dist, G, reach, tol):
+    """The face moved exactly (its neighbours extended / cut back on their own
+    surfaces) to the new surface G -- or for Push / Pull (G None) its plane
+    moved by dist / its surface offset by dist. None when it can't be done
+    (the caller keeps the walls along the normal)."""
+    closed = any(not [f for f in e.faces() if f != F] for e in F.edges())     # a seam: closed round
+    try:
+        if G is None:
+            if F.surface().is_planar():
+                G = _moved_surface(F.surface(), dist * n)
+            else:
+                G = _offset_like(F.surface(), _surface_sign(F) * dist, tol)
+        if closed:
+            out, kept = _exact_move_closed(body, p, G, reach, tol)
+        else:
+            out, kept = _exact_move(body, p, _extended_surface(G, 2.0 * reach + 10.0 * tol, tol), reach, tol)
+    except Exception:
+        return None
+    if not out.is_manifold_solid():
+        return None
+    if dist:                                          # a pull must add, a push remove (when it tells)
+        V0, V1 = _volume(body, 1e-3), _volume(out, 1e-3)
+        if abs(V1 - V0) > 2e-3 * max(abs(V0), 1e-12) and (V1 - V0) * dist <= 0:
+            return None
+    return out, kept
+
+
 def job_replace_face(job):
     """Replace Face (world space): each face of the solid job['target'] at
     job['face_pts'] is replaced by the open surface job['surface'], its sides
@@ -1962,7 +2541,7 @@ def job_replace_face(job):
     pts = job["face_pts"]
     normals = job.get("face_normals") or [None] * len(pts)
     flats = job.get("face_flat") or [True] * len(pts)
-    keep, hows = [], []
+    keep, hows, lean = [], [], 0.0
     for p, want_n, was_flat in zip(pts, normals, flats):
         F, p = _find_face(body, p, want_n, was_flat, size)
         o = np.array(F.interior_point(), float)
@@ -1977,12 +2556,25 @@ def job_replace_face(job):
                         raise RuntimeError("the face turns too far to be replaced along one direction "
                                            "(pick a flatter face)")
         hs = _heights(sheet, n, o)
+        try:
+            face_lean = _lean(body, F)
+        except Exception:
+            face_lean = 0.0
+        if face_lean > 0.5 and sheet.face_count() == 1:      # leaning neighbours: extended on their own surfaces
+            ex = _try_exact(body, F, p, n, 0.0, sheet.faces()[0].surface(),
+                            max(abs(h) for h in hs) + 0.05 * size, tol)
+            if ex is not None:
+                keep.append(ex[1])
+                body = ex[0]
+                hows.append("exact")
+                continue
+        lean = max(lean, face_lean)
         reach = max(abs(h) for h in hs) + size
         if not _covers(sheet, F, n, reach, tol):
             raise RuntimeError("the surface does not cover the whole face (seen along its normal): "
                                "extend it past the face's edges")
         hi, lo = max(hs), min(hs)
-        V0 = _volume(body)
+        V0 = _vol(body)
         U, how = body, "cut"
         if hi > tol:                  # the face's column joined, up to past the surface
             H = hi + 0.1 * size
@@ -1994,7 +2586,7 @@ def job_replace_face(job):
                 out = sm.boolean(body.copy(), tool.copy(), operation=sm.BooleanOp.UNION)
             except Exception:
                 out = None
-            if out is None or not out.face_count() or not out.is_manifold_solid() or abs(_volume(out) - V0) <= tol:
+            if out is None or not out.face_count() or not out.is_manifold_solid() or abs(_vol(out) - V0) <= tol:
                 out, kept = _extruded_face(body, p, n, H, tol)
                 keep.append(kept)
                 how = "extrude"
@@ -2012,7 +2604,7 @@ def job_replace_face(job):
             cut = sm.boolean(col.copy(), far.copy(), operation=sm.BooleanOp.INTERSECTION)
         except Exception as exc:
             raise RuntimeError(f"the part beyond the surface could not be found ({exc})")
-        VU = _volume(U)
+        VU = _vol(U)
         if cut is None or not cut.face_count():
             res = U                   # nothing beyond the surface: the column ends exactly there
         else:
@@ -2026,9 +2618,9 @@ def job_replace_face(job):
                 raise RuntimeError("the cut back to the surface failed (the boolean)")
         body = res
         hows.append(how)
-    volume = _volume(body)
+    volume = _volume(body, 1e-3)               # for the report
     save(to_local(body, job.get("xforms", {}).get(job.get("into"))), job["out"]["result"])
-    return {"faces": body.face_count(), "volume": volume, "how": hows}
+    return {"faces": body.face_count(), "volume": volume, "how": hows, "lean": lean}
 
 
 def job_push_pull(job):
@@ -2065,14 +2657,22 @@ def job_push_pull(job):
         F, p = _find_face(body, p, want_n, was_flat, size)
         flat = bool(F.surface().is_planar())
         try:
-            lean = max(lean, _lean(body, F))
+            face_lean = _lean(body, F)
         except Exception:
-            pass
+            face_lean = 0.0
         n = _face_normal(F, np.array(F.interior_point(), float))
-        area = float(sm.face_area(F, 1e-6))
-        V = _volume(body)
-        change = area * dist
         res = None
+        if face_lean > 0.5:           # leaning neighbours: extended on their own surfaces
+            ex = _try_exact(body, F, p, n, dist, None, abs(dist) + 0.05 * size, tol)
+            if ex is not None:
+                keep.append(ex[1])
+                body = ex[0]
+                hows.append("exact")
+                continue
+        lean = max(lean, face_lean)
+        area = float(sm.face_area(F, 1e-6))
+        V = _vol(body)
+        change = area * dist
         try:
             if flat:
                 tool, kept = _face_prism(F, n, dist, eps, tol)
@@ -2081,7 +2681,7 @@ def job_push_pull(job):
             keep.append((tool, kept))
             out = sm.boolean(body.copy(), tool.copy(), operation=op)
             if out is not None and out.face_count():
-                if out.is_manifold_solid() and abs(_volume(out) - V) > 1e-3 * abs(change):
+                if out.is_manifold_solid() and abs(_vol(out) - V) > 1e-3 * abs(change):
                     res = (out, "boolean" if flat else "offset")
             elif dist < 0:
                 raise RuntimeError("nothing left: the push removes the whole body")
@@ -2095,7 +2695,7 @@ def job_push_pull(job):
             try:
                 out, kept = _extruded_face(body, p, n, dist, tol)
                 keep.append(kept)
-                if out.is_manifold_solid() and abs(_volume(out) - (V + change)) <= 1e-3 * abs(change) + tol:
+                if out.is_manifold_solid() and abs(_vol(out) - (V + change)) <= 1e-3 * abs(change) + 2e-4 * abs(V) + tol:
                     res = (out, "extrude")
             except Exception:
                 pass
@@ -2104,7 +2704,7 @@ def job_push_pull(job):
                                (" and the extruded face does not close into a solid)" if flat else ")"))
         body, how = res
         hows.append(how)
-    volume = _volume(body)
+    volume = _volume(body, 1e-3)               # for the report
     if volume <= 0:
         raise RuntimeError("nothing left: the push removes the whole body")
     save(to_local(body, job.get("xforms", {}).get(job.get("into"))), job["out"]["result"])

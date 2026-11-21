@@ -108,6 +108,29 @@ for hist in (True, False):
     r = run(bpy.ops.nproto.replace_face, faces=faces((B, (0, 0, 2))), surface=B2.name)
     check(f"[{tag}] a solid as the surface refused", r == {'CANCELLED'} and abs(vol(B) - 24) < 1e-9)
 
+# --- a drafted box's top replaced by a tilted sheet: its sides keep their draft up to it
+import numpy as np
+def drafted_under(t, z, w=4.0, h=3.0, n=1200):
+    """Volume of the w x h rectangle drafted outward (tan t) cut by the surface z(x, y): midpoint grid."""
+    X = np.linspace(-4, 4, n, endpoint=False) + 4.0 / n
+    Y = np.linspace(-3, 3, n, endpoint=False) + 3.0 / n
+    x, y = np.meshgrid(X, Y, indexing="ij")
+    zmin = np.maximum(0.0, np.maximum((np.abs(x) - w / 2) / t, (np.abs(y) - h / 2) / t))
+    return float(np.clip(z(x, y) - zmin, 0, None).sum() * (8.0 / n) * (6.0 / n))
+for hist in (True, False):
+    hist_on(hist)
+    tag = "history" if hist else "no history"
+    clear()
+    R = poly("R", [(-2, -1.5, 0), (2, -1.5, 0), (2, 1.5, 0), (-2, 1.5, 0)])
+    bpy.ops.nproto.extrude(inputs=ins((R, "S0")), distance=2.0, direction="Z", draft=10.0, body="NEW")
+    D = ctx.active_object
+    S = sheet("Tilt", lambda x, y: 2.5 + 0.1 * x, -4, 4, -3, 3)
+    r = run(bpy.ops.nproto.replace_face, faces=faces((D, (0, 0, 2))), surface=S.name)
+    want = drafted_under(math.tan(math.radians(10.0)), lambda x, y: 2.5 + 0.1 * x)
+    check(f"[{tag}] drafted box top replaced: the draft carries on to the surface", r == {'FINISHED'} and solid(D)
+          and abs(vol(D) - want) < 2e-3 and store.get_brep(D).face_count() == 6,
+          f"vol {vol(D):.5f} want ~{want:.5f} faces {store.get_brep(D).face_count()}")
+
 # --- Face mode + selection: the picked face, the selected surface
 hist_on(True)
 clear()
