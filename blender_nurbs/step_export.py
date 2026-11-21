@@ -4,7 +4,7 @@ Exact geometry: every face's surface is written as a B-spline surface (rational
 when it has weights), every edge as a B-spline curve cut exactly to the edge's
 range -- or, with analytic on (the default), as what it truly is when it is one
 within 1e-7 of the body's size: a PLANE, CYLINDRICAL_, CONICAL_, SPHERICAL_
-or TOROIDAL_SURFACE, a SURFACE_OF_REVOLUTION or _LINEAR_EXTRUSION, a CIRCLE, ELLIPSE or LINE, as CAD programs write them (an exact cylinder is then
+or TOROIDAL_SURFACE, a SURFACE_OF_REVOLUTION or _LINEAR_EXTRUSION, an OFFSET_SURFACE, a CIRCLE, ELLIPSE or LINE, as CAD programs write them (an exact cylinder is then
 a true cylinder in the file, its holes and bosses recognised by the reader) -- with full B-rep topology (vertices, edge curves shared by their two
 faces, oriented edges, outer / inner face bounds, face sense). Closed bodies
 become MANIFOLD_SOLID_BREPs, open ones SHELL_BASED_SURFACE_MODELs. Each object
@@ -379,6 +379,94 @@ def _iso_start(d, ax):
     return dv, [d["points"][k] for k in idx], Uv, ([W[k] for k in idx] if W else None)
 
 
+def _offset_basis(obj, surf, tol, depth=0):
+    """(basis Surf, distance) of a surface with no CV net that is obj's Offset
+    of one B-spline surface (through its history, offsets of offsets too):
+    every sample of it the basis' point plus distance x its unit normal, at the
+    same (u, v), within tol (obj's local units); else None."""
+    from . import features
+    from .surfeval import Surf
+    try:
+        h = features.history(obj)
+    except Exception:
+        return None
+    if not h or h.get("op") != "offset" or not h.get("inputs") or depth > 8:
+        return None
+    src = h["inputs"][0][0]
+    try:
+        bs = store.get_brep(src)
+        if bs.face_count() != 1:
+            return None
+        sb = list(bs.faces())[0].surface()
+    except Exception:
+        return None
+    try:
+        Eb = Surf(sb)
+    except Exception:
+        up = _offset_basis(src, sb, tol, depth + 1)
+        if up is None:
+            return None
+        Eb = up[0]
+    if (np.abs(np.subtract(surf.u_domain(), Eb.u_domain)).max() > 1e-12
+            or np.abs(np.subtract(surf.v_domain(), Eb.v_domain)).max() > 1e-12):
+        return None
+    us, vs = np.linspace(*Eb.u_domain, 9), np.linspace(*Eb.v_domain, 9)
+    D = Eb.grid(us, vs, 1)
+    P, N = D[0, 0], np.cross(D[1, 0], D[0, 1])
+    ln = np.linalg.norm(N, axis=-1)
+    ok = ln > 1e-9 * max(float(ln.max()), 1e-300)
+    N = N / np.maximum(ln, 1e-300)[..., None]
+    Q = np.array([[surf.evaluate(u, v) for v in vs] for u in us], float)
+    dd = ((Q - P) * N).sum(-1)[ok]
+    if not len(dd):
+        return None
+    if not ok.all():
+        # readers refuse an offset with no normal at a pole (FreeCAD: an invalid face)
+        raise ValueError(f"{obj.name}: an offset of a surface with a pole (no normal there) has no STEP form")
+    dist = float(np.median(dd))
+    if float(np.linalg.norm(Q - P - dist * N, axis=-1)[ok].max()) > tol:
+        return None
+    return Eb, dist
+
+
+def _interp_cubic(Q):
+    """(3, CVs, knots) of the cubic B-spline through the points Q (chord-length
+    parameters, averaged knots)."""
+    Q = np.asarray(Q, float)
+    n = len(Q)
+    ch = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(Q, axis=0), axis=1))]
+    t = ch / ch[-1]
+    U = np.r_[[0.0] * 4, [t[j:j + 3].mean() for j in range(1, n - 3)], [1.0] * 4]
+    N = np.zeros((n, n))
+    for i, ti in enumerate(t):
+        k = min(max(int(np.searchsorted(U, ti, side="right")) - 1, 3), n - 1)
+        N[i, k - 3:k + 1] = _basis(U, k, ti)
+    return 3, np.linalg.solve(N, Q), list(U)
+
+
+def _eval_cubic(P, U, t):
+    """Point of the cubic B-spline (P, U) at t."""
+    n = len(P)
+    k = min(max(int(np.searchsorted(U, t, side="right")) - 1, 3), n - 1)
+    return _basis(U, k, t) @ np.asarray(P, float)[k - 3:k + 1]
+
+
+def _basis(U, k, t, p=3):
+    """The p + 1 B-spline basis functions not zero at t in knot span k."""
+    N = np.zeros(p + 1)
+    N[0] = 1.0
+    left, right = np.zeros(p + 1), np.zeros(p + 1)
+    for j in range(1, p + 1):
+        left[j], right[j] = t - U[k + 1 - j], U[k + j] - t
+        saved = 0.0
+        for r in range(j):
+            tmp = N[r] / (right[r + 1] + left[j - r])
+            N[r] = saved + right[r + 1] * tmp
+            saved = left[j - r] * tmp
+        N[j] = saved
+    return N
+
+
 def _regular(su, sv, rel):
     """Do su, sv span a tangent plane (not a pole: one of them ~0, or parallel)?"""
     m = max(float(np.linalg.norm(su)), float(np.linalg.norm(sv)))
@@ -441,7 +529,7 @@ class StepExporter:
         self.stats = {"bodies": 0, "faces": 0, "edges": 0, "solids": 0, "sheets": 0,
                       "analytic": {"CYLINDRICAL_SURFACE": 0, "CONICAL_SURFACE": 0, "SPHERICAL_SURFACE": 0,
                                    "TOROIDAL_SURFACE": 0, "SURFACE_OF_REVOLUTION": 0,
-                                   "SURFACE_OF_LINEAR_EXTRUSION": 0, "PLANE": 0, "CIRCLE": 0, "ELLIPSE": 0, "LINE": 0}}
+                                   "SURFACE_OF_LINEAR_EXTRUSION": 0, "OFFSET_SURFACE": 0, "PLANE": 0, "CIRCLE": 0, "ELLIPSE": 0, "LINE": 0}}
         self._dir_cache = {}
 
     # -- small geometry ----------------------------------------------------
@@ -598,6 +686,55 @@ class StepExporter:
             return ent, normal, "SURFACE_OF_LINEAR_EXTRUSION"
         return None
 
+    def offset_surface(self, off, A, t, X, tol, size):
+        """(entity, normal, type) of a face on the kernel's exact offset surface
+        off = (basis Surf, distance in the body's own units): what it truly is
+        when analytic (an offset plane is a plane), else an OFFSET_SURFACE of
+        its basis (analytic, or the basis' B-spline)."""
+        Eb, dist = off
+        s = float(np.linalg.norm(A, 2))
+        if np.abs(A.T @ A - s * s * np.eye(3)).max() > 1e-6 * s * s:
+            raise ValueError("an offset surface under a non-uniform scale is no offset surface")
+        nu, nv = (min(4 * (n - 1) + 1, 61) for n in (Eb.nu, Eb.nv))
+        us, vs = np.linspace(*Eb.u_domain, max(nu, 9)), np.linspace(*Eb.v_domain, max(nv, 9))
+        D = Eb.grid(us, vs, 1)
+        Pb, Su, Sv = D[0, 0], D[1, 0], D[0, 1]
+        Nl = np.cross(Su, Sv)
+        Nl /= np.maximum(np.linalg.norm(Nl, axis=-1), 1e-300)[..., None]
+        Gb = Pb @ A.T + t                                   # the basis, and the offset, in the file
+        G = (Pb + dist * Nl) @ A.T + t
+        if self.analytic:
+            an = self.analytic_surface(G, tol, size)
+            if an is not None:
+                return an
+        from .kernel import load
+        db = load().blender_ext.surface_cvs(Eb.surf)
+        anb = self.analytic_surface(Gb, tol, size, db, X) if self.analytic else None
+        M = Nl @ A.T                                         # the basis normal, carried into the file
+        M /= np.maximum(np.linalg.norm(M, axis=-1), 1e-300)[..., None]
+        if anb is not None:
+            base, bnormal, _ = anb
+        else:
+            P = [X(p) for p in db["points"]]
+            W = list(db["weights"]) if db.get("weights") else None
+            base = self.bspline_surface(db["degree_u"], db["degree_v"], P, db["count_u"], db["count_v"],
+                                        list(db["knots_u"]), list(db["knots_v"]), W)
+            sg = 1.0 if np.linalg.det(A) > 0 else -1.0       # a B-spline's normal: su x sv as written
+            Fl, Ml = Gb.reshape(-1, 3), M.reshape(-1, 3)
+
+            def bnormal(P):
+                return sg * Ml[int(np.argmin(np.linalg.norm(Fl - np.asarray(P, float), axis=1)))]
+        # STEP offsets along the basis' own normal: the distance's sign from it
+        k = (M.shape[0] // 2) * M.shape[1] + M.shape[1] // 2
+        sgn = 1.0 if float(bnormal(Gb.reshape(-1, 3)[k]) @ M.reshape(-1, 3)[k]) >= 0 else -1.0
+        self.stats["analytic"]["OFFSET_SURFACE"] += 1
+        ent = self.w.add(f"OFFSET_SURFACE('',{base},{_f(sgn * dist * s)},.F.)")
+        Gf, Gbf = G.reshape(-1, 3), Gb.reshape(-1, 3)
+
+        def normal(P):                                       # the basis' normal at the point beneath
+            return bnormal(Gbf[int(np.argmin(np.linalg.norm(Gf - np.asarray(P, float), axis=1)))])
+        return ent, normal, "OFFSET_SURFACE"
+
     # -- curves / surfaces -------------------------------------------------
     def bspline_curve(self, deg, P, U, W=None):
         ks, ms = _knots(U)
@@ -689,6 +826,55 @@ class StepExporter:
             except Exception:
                 return None, None
 
+        # faces with no CV net: the kernel's exact offset surfaces (Offset of one surface), found through
+        # history. Their edges are the kernel's fits, ~1e-4 off them: edges only such faces share are
+        # written refitted onto the exact offset
+        from .square import _foot
+        all_f = list(brep.faces())
+        offs, on_off, on_other = {}, {}, set()
+        for fi, f in enumerate(all_f):
+            surf = f.surface()
+            try:
+                ext.surface_cvs(surf)
+                off = None
+            except Exception:
+                off = _offset_basis(obj, surf, tol / float(np.linalg.norm(A, 2)))
+                if off is None:
+                    raise
+                offs[fi] = off
+            for loop in f.boundary_loops():
+                for e, _ in loop:
+                    if off is None:
+                        on_other.add(edge_key(e))
+                    else:
+                        on_off[edge_key(e)] = (surf, off)
+
+        def refit(e, surf, off):
+            Eb, dist = off
+
+            def on(p, uv):
+                uv = _foot(surf, p, uv)
+                D = Eb.at([uv[0]], [uv[1]], 1)
+                n = np.cross(D[1, 0][0], D[0, 1][0])
+                return D[0, 0][0] + dist * n / np.linalg.norm(n), uv
+            t0, t1 = e.parameter_range()
+            loc = tol / float(np.linalg.norm(A, 2))
+            for m in (32, 64, 128, 256, 512):
+                ts = np.linspace(t0, t1, 2 * m + 1)
+                uv, Q = None, []
+                for tt in ts:
+                    q, uv = on(np.array(e.point_at(tt), float), uv)
+                    Q.append(q)
+                Q = np.array(Q)
+                dg, P, U = _interp_cubic(Q[::2])
+                # the interpolant against the in-between samples (at their chord parameters)
+                ch = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(Q, axis=0), axis=1))]
+                tm = ch / ch[-1]
+                worst = max(float(np.linalg.norm(_eval_cubic(P, U, tm[2 * i + 1]) - Q[2 * i + 1])) for i in range(m))
+                if worst <= 0.5 * loc:
+                    break
+            return self.bspline_curve(dg, [X(p) for p in P], U)
+
         def edge_curve(e):
             k = edge_key(e)
             if k in edges:
@@ -698,6 +884,8 @@ class StepExporter:
             if self.analytic:
                 S = np.array([X(e.point_at(t)) for t in np.linspace(t0, t1, 49)])
                 cur = self.analytic_curve(S, tol, xsize)
+            if cur is None and k in on_off and k not in on_other:
+                cur = refit(e, *on_off[k])
             if cur is None:
                 c = _edge_curve(e)
                 d = ext.curve_cvs(c)
@@ -718,12 +906,15 @@ class StepExporter:
             return ec
 
         faces = []
-        for f in brep.faces():
+        for fi, f in enumerate(all_f):
             surf = f.surface()
-            d = ext.surface_cvs(surf)
+            from .surfeval import Surf
+            off = offs.get(fi)
+            d = ext.surface_cvs(surf) if off is None else None
             an = None
-            if self.analytic:
-                from .surfeval import Surf
+            if off is not None:
+                an = self.offset_surface(off, A, t, X, tol, xsize)
+            elif self.analytic:
                 E = Surf(surf)
                 nu, nv = (min(4 * (n - 1) + 1, 61) for n in (E.nu, E.nv))
                 us, vs = np.linspace(*E.u_domain, max(nu, 9)), np.linspace(*E.v_domain, max(nv, 9))
@@ -758,10 +949,11 @@ class StepExporter:
                 # the analytic surface's own normal against the B-spline's (as written): flip the sense if opposed
                 try:
                     if uv is None:
-                        uv = (0.5 * sum(E.u_domain), 0.5 * sum(E.v_domain))
-                    D = E.at([uv[0]], [uv[1]], 1)
-                    Nb = np.cross(A @ D[1, 0][0], A @ D[0, 1][0])
-                    if float(Nb @ an_normal(X(D[0, 0][0]))) < 0:
+                        (u0, v0), (u1, v1) = surf.uv_domain()
+                        uv = _off_degenerate(surf, (0.5 * (u0 + u1), 0.5 * (v0 + v1)))
+                    p0, su, sv = surf.derivatives(*uv)
+                    Nb = np.cross(A @ np.asarray(su, float), A @ np.asarray(sv, float))
+                    if float(Nb @ an_normal(X(p0))) < 0:
                         sense = ".F." if sense == ".T." else ".T."
                 except Exception:
                     pass
@@ -913,7 +1105,7 @@ from bpy_extras.io_utils import ExportHelper  # noqa: E402
 
 class NPROTO_OT_export_step(bpy.types.Operator, ExportHelper):
     """Export NURBS objects as STEP (AP214): exact B-spline surfaces and curves
-    (true cylinders, planes, revolutions, extrusions, circles, ellipses and lines as STEP's own) with full B-rep
+    (true cylinders, planes, revolutions, extrusions, offsets, circles, ellipses and lines as STEP's own) with full B-rep
     topology; closed bodies as solids"""
     bl_idname = "nproto.export_step"
     bl_label = "Export STEP"
@@ -927,7 +1119,7 @@ class NPROTO_OT_export_step(bpy.types.Operator, ExportHelper):
                        description="Length unit of the file; Blender units are taken as metres")
     global_scale: FloatProperty(name="Scale", default=1.0, min=1e-6, soft_max=1000.0)
     analytic: BoolProperty(name="Analytic Surfaces", default=True,
-                           description="Write true planes, cylinders, cones, spheres, tori, revolutions, extrusions, circles, ellipses and lines as "
+                           description="Write true planes, cylinders, cones, spheres, tori, revolutions, extrusions, offsets, circles, ellipses and lines as "
                                        "STEP's own analytic entities, as CAD programs do (holes, bosses, countersinks "
                                        "and fillets are then recognised); off: everything as B-splines")
 
@@ -946,7 +1138,8 @@ class NPROTO_OT_export_step(bpy.types.Operator, ExportHelper):
         parts = [f"{an[k]} {w}" for k, w in (("CYLINDRICAL_SURFACE", "cylinder"), ("CONICAL_SURFACE", "cone"),
                                               ("SPHERICAL_SURFACE", "sphere"), ("TOROIDAL_SURFACE", "torus"),
                                               ("SURFACE_OF_REVOLUTION", "revolution"),
-                                              ("SURFACE_OF_LINEAR_EXTRUSION", "extrusion"))
+                                              ("SURFACE_OF_LINEAR_EXTRUSION", "extrusion"),
+                                              ("OFFSET_SURFACE", "offset"))
                  if an[k]]
         if self.analytic and parts:
             msg += f"; true {', '.join(parts)} faces"
