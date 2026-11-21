@@ -112,9 +112,10 @@ everything built from it rebuilds.
   cage quads beside them at exact T-junctions
 - **Fit to Scan:** fit a SubD cage so its smooth surface (not its vertices, as a Shrinkwrap would) lies on a scan,
   a set offset off it, or draped over it (bridging folds, never dipping in: housings, covers, sockets), then SubD to
-  BREP makes the exact NURBS body. **Tube Cage from Scan** builds and fits a starting cage for limb-like scans,
-  **Refine Cage to Scan** adds edge loops only where the surface misses the scan (all quads, no new star points),
-  **Trim Cage to Curve** holds the cage's open edge to a trim line drawn on the scan, **Drape Patch to Scan** lays
+  BREP makes the exact NURBS body (the **Scan** panel). **Cage from Scan** builds and fits a starting cage for
+  limb-like scans; **Fit Cage to Scan** fits any SubD cage, its **Add Loops** cutting edge loops only where the
+  surface misses the scan (all quads, no new star points), and a selected curve becoming the trim line its open
+  edge is held to; **Drape Patch to Scan** lays
   one single-span NURBS patch (degree 5 from a 6 × 6 grid) straight down onto a scan, its CVs moving only up and
   down, its edges G0 / G1 / G2 to the neighbouring patches (exact where their edges are one span); the
   **Scan Deviation** overlay colours any surface by its distance from the scan

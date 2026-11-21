@@ -22,7 +22,7 @@ Here the cage is solved instead:
     solved with Jacobi-preconditioned conjugate gradients on the normal
     equations (numpy only: no scipy in Blender).
 
-Tube Cage from Scan builds a starting cage for limb-like scans (a residual
+Cage from Scan builds a starting (tube) cage for limb-like scans (a residual
 limb, a forearm, a bottle): rings around the scan's main axis, the closed
 end capped with a quad grid, the open end left open.
 
@@ -1665,7 +1665,7 @@ def trim_target(curve_obj, scan, offset=0.0):
 
 
 def trim_object(cage):
-    """The trim curve the cage's edge is held to (Trim Cage to Curve), if it is still there."""
+    """The trim curve the cage's edge is held to (Fit Cage to Scan with a curve selected), if it is still there."""
     name = cage.get("nproto_trim")
     o = bpy.data.objects.get(name) if name else None
     return o if o is not None and o.type in {'CURVE', 'MESH'} else None
@@ -1705,8 +1705,8 @@ class _FitProps:
                                         "surface to its nearest scan point): bumps the surface would miss "
                                         "are reached")
     hold_trim: BoolProperty(name="Hold Trim Line", default=True,
-                            description="Keep the cage's open edge on its trim line (the curve set by Trim Cage "
-                                        "to Curve)")
+                            description="Keep the cage's open edge on its trim line (the curve it was trimmed "
+                                        "to)")
     max_distance: FloatProperty(name="Max Distance", default=0.0, min=0.0, subtype='DISTANCE', unit='LENGTH',
                                 precision=4,
                                 description="Scan points farther than this from the surface are ignored "
@@ -1762,14 +1762,36 @@ def _fit_object(context, cage, scan_obj, kw, only_selected=False):
     return info
 
 
+def _trim_curve_in(context, cage):
+    """A trim line among the other selected objects: a curve, or a mesh of edges only."""
+    sel = [o for o in context.selected_objects if o is not cage]
+    return next((o for o in sel if o.type == 'CURVE'), None) or next(
+        (o for o in sel if o.type == 'MESH' and not len(o.data.polygons) and len(o.data.edges)), None)
+
+
 class NPROTO_OT_scan_fit_cage(_FitProps, bpy.types.Operator):
     """Move the active SubD cage so its smooth surface lies on the scan (the other selected mesh, or the scan
     it was made from): the Catmull-Clark surface itself is fitted, not the cage's vertices, so SubD to BREP
-    then gives a NURBS body on the scan. In Edit Mode only the selected vertices move"""
+    then gives a NURBS body on the scan. Add Loops cuts edge loops where the surface still misses the scan;
+    a selected closed curve on the scan becomes the open edge's trim line (kept by later fits). In Edit Mode
+    only the selected vertices move"""
     bl_idname = "nproto.scan_fit_cage"
     bl_label = "Fit Cage to Scan"
     bl_options = {'REGISTER', 'UNDO'}
 
+    add_loops: IntProperty(name="Add Loops", default=0, min=0, max=40,
+                           description="Edge loops to cut, one at a time with a fit after each, where the "
+                                       "surface misses the scan most (0: fit the cage as it is). Each loop runs "
+                                       "across the faces whose leftover deviation it takes up best; the cage "
+                                       "stays all quads, with no new star points")
+    tolerance: FloatProperty(name="Tolerance", default=0.0005, min=0.0, subtype='DISTANCE', unit='LENGTH',
+                             precision=4,
+                             description="A face whose surface stays this close to the scan gets no loop "
+                                         "(fewer loops are added when every face is within it)")
+    trim_to_curve: BoolProperty(name="Trim to Curve", default=True,
+                                description="Put the cage's open edge on the selected closed curve (its trim "
+                                            "line): the edge is moved onto it, the rest of the cage following "
+                                            "less and less farther away, and later fits keep it there")
     show_deviation: BoolProperty(name="Show Deviation", default=True,
                                  description="Turn on the Scan Deviation overlay (Analyze) after the fit")
 
@@ -1781,34 +1803,99 @@ class NPROTO_OT_scan_fit_cage(_FitProps, bpy.types.Operator):
     def draw(self, context):
         lay = self.layout
         lay.use_property_split = True
-        lay.prop(self, "offset")
-        lay.prop(self, "drape")
-        lay.prop(self, "smoothness")
-        lay.prop(self, "stiffness")
-        lay.prop(self, "iterations")
-        lay.prop(self, "both_ways")
-        lay.prop(self, "max_distance")
-        if context.active_object is not None and trim_object(context.active_object) is not None:
+        cage = context.active_object
+        if cage is not None and _trim_curve_in(context, cage) is not None:
+            lay.prop(self, "trim_to_curve")
+        elif cage is not None and trim_object(cage) is not None:
             lay.prop(self, "hold_trim")
+        col = lay.column(align=True)
+        col.prop(self, "add_loops")
+        sub = col.row()
+        sub.active = self.add_loops > 0
+        sub.prop(self, "tolerance")
+        col = lay.column()
+        col.prop(self, "offset")
+        col.prop(self, "drape")
+        col.prop(self, "smoothness")
+        col.prop(self, "stiffness")
+        col.prop(self, "iterations")
+        col.prop(self, "both_ways")
+        col.prop(self, "max_distance")
         lay.prop(self, "show_deviation")
         _draw_report(lay, context)
 
     def execute(self, context):
         from . import subd_brep
         cage = context.active_object
-        scan_obj = pick_scan(context, cage)
-        if scan_obj is None or scan_obj is cage or scan_obj.type != 'MESH':
+        curve = _trim_curve_in(context, cage) if self.trim_to_curve else None
+        scans = [o for o in context.selected_objects
+                 if o not in (cage, curve) and o.type == 'MESH' and len(o.data.polygons)]
+        scan_obj = scans[0] if len(scans) == 1 else pick_scan(context, cage)
+        if scan_obj is None or scan_obj in (cage, curve) or scan_obj.type != 'MESH':
             self.report({'WARNING'}, "Select the scan too (or set it under Analyze > Scan Deviation)")
             return {'CANCELLED'}
         if not subd_brep._plain_cage(cage):
             self.report({'WARNING'}, f"{cage.name}: apply the modifiers above Subdivision (and shape keys) first: "
                                      "the fit moves the mesh itself")
             return {'CANCELLED'}
+        if self.add_loops and _subsurf(cage) is None:
+            self.report({'WARNING'}, f"{cage.name}: Add Loops needs a SubD cage (a Subdivision modifier)")
+            return {'CANCELLED'}
         was_edit = cage.mode == 'EDIT'
         if was_edit:
             bpy.ops.object.mode_set(mode='OBJECT')
+        me = cage.data
+        sel = None
+        if was_edit and curve is None:          # (a new trim line moves the whole cage onto it)
+            sel = np.zeros(len(me.vertices), bool)
+            me.vertices.foreach_get("select", sel)
+            if not sel.any():
+                sel = None
+        M = np.array(_world(cage))
+        Mi = np.linalg.inv(M)
+        n_start = len(me.vertices)
+        t0 = time.perf_counter()
+        added = 0
         try:
-            info = _fit_object(context, cage, scan_obj, _fit_kwargs(self), only_selected=was_edit)
+            scan = scan_for(scan_obj)
+            kw = _fit_kwargs(self)
+            hold = kw.pop("hold_trim")
+            if curve is not None:
+                kw["edge_curve"] = trim_target(curve, scan, kw["offset"])
+            elif hold and trim_object(cage) is not None:
+                kw["edge_curve"] = trim_target(trim_object(cage), scan, kw["offset"])
+            for rnd in range(self.add_loops + 1):
+                V, F, sharp, kc = cage_of(cage)
+                Xw = V @ M[:3, :3].T + M[:3, 3]
+                if rnd == 0 and curve is not None:
+                    Xw, _ = place_on_trim(Xw, F, kw["edge_curve"], scan=scan)
+                fixed = None if sel is None else ~np.r_[sel, np.ones(len(V) - len(sel), bool)]   # (new loops move)
+                # (a full fit every round: shorter in-between fits pick worse loops, about 35 % faster)
+                r = fit_cage(Xw, F, scan, sharp=sharp, keep_corners=kc, fixed=fixed, **kw)
+                me.vertices.foreach_set("co", (r["X"] @ Mi[:3, :3].T + Mi[:3, 3]).ravel())
+                me.update()
+                if rnd == self.add_loops:
+                    break
+                smp = r["sampler"]
+                P = smp.A @ r["X"]
+                resid = r["dev_signed"] - kw["offset"]
+                if kw["drape"]:
+                    resid = np.minimum(resid, 0.0)          # standing off (bridging) is what a drape is for
+                faces_ok = None
+                if sel is not None:
+                    s_all = np.r_[sel, np.ones(len(V) - len(sel), bool)]
+                    faces_ok = np.array([s_all[list(f)].all() for f in F])
+                nu, nv_, _ = face_need(F, r["levels"], P, smp.Fs, resid, self.tolerance, faces_ok)
+                if r.get("edge_loop") is not None:           # where the edge runs off its trim line
+                    eu, ev = edge_need(F, r["levels"], P, smp.Fs, r["edge_loop"], r["edge_miss"], self.tolerance)
+                    if faces_ok is not None:
+                        eu, ev = eu * faces_ok, ev * faces_ok
+                    nu, nv_ = nu + eu, nv_ + ev
+                ring, _ = best_ring(F, nu, nv_)
+                if ring is None:
+                    break
+                insert_loop(me, F, ring)
+                added += 1
         except (ValueError, np.linalg.LinAlgError) as exc:
             if was_edit:
                 bpy.ops.object.mode_set(mode='EDIT')
@@ -1817,11 +1904,28 @@ class NPROTO_OT_scan_fit_cage(_FitProps, bpy.types.Operator):
         if was_edit:
             bpy.ops.object.mode_set(mode='EDIT')
         cage["nproto_scan"] = scan_obj.name
+        if curve is not None:
+            cage["nproto_trim"] = curve.name
+            for o in context.selected_objects:
+                o.select_set(o is cage)
+            context.view_layer.objects.active = cage
+        info = {k: r[k] for k in ("dev_rms", "dev_p95", "dev_min", "dev_hi", "dev_max", "dev_mean")}
+        info.update(time=time.perf_counter() - t0, verts=len(me.vertices), iterations=len(r["history"]),
+                    offset=kw["offset"], edge_max=r.get("edge_max"), edge_along=r.get("edge_along"))
+        if self.add_loops:
+            info.update(loops=added, verts_before=n_start)
         LAST_INFO.clear()
         LAST_INFO.update(info)
         if self.show_deviation:
             _show_deviation(context, scan_obj)
-        self.report({'INFO'}, "Fit Cage to Scan: " + "  ·  ".join(_report_lines(context, info)[:2]))
+        head = []
+        if curve is not None:
+            head.append(f"edge on {curve.name}")
+        if self.add_loops:
+            head.append(f"{added} loop{'s' if added != 1 else ''} added ({n_start} -> {len(me.vertices)} vertices)")
+        lines = _report_lines(context, info)
+        self.report({'INFO'}, "Fit Cage to Scan: " + "  ·  ".join(head + lines[:2]
+                                                                   + (lines[2:3] if curve is not None else [])))
         return {'FINISHED'}
 
 
@@ -1830,7 +1934,7 @@ class NPROTO_OT_scan_tube_cage(_FitProps, bpy.types.Operator):
     quads along the scan's main axis from its closed end up to its open rim, the closed end capped with a
     quad grid, then fitted so its smooth surface lies on the scan"""
     bl_idname = "nproto.scan_tube_cage"
-    bl_label = "Tube Cage from Scan"
+    bl_label = "Cage from Scan"
     bl_options = {'REGISTER', 'UNDO'}
 
     rings: IntProperty(name="Rings", default=10, min=3, max=100,
@@ -1895,7 +1999,7 @@ class NPROTO_OT_scan_tube_cage(_FitProps, bpy.types.Operator):
             try:
                 LAST_INFO.update(_fit_object(context, cage, scan_obj, _fit_kwargs(self)))
             except (ValueError, np.linalg.LinAlgError) as exc:
-                self.report({'WARNING'}, f"Tube Cage from Scan: the fit failed ({exc}); the cage is unfitted")
+                self.report({'WARNING'}, f"Cage from Scan: the fit failed ({exc}); the cage is unfitted")
         for o in context.selected_objects:
             o.select_set(False)
         cage.select_set(True)
@@ -1903,10 +2007,10 @@ class NPROTO_OT_scan_tube_cage(_FitProps, bpy.types.Operator):
         context.scene.nproto_settings.scan_object = scan_obj
         if self.fit and LAST_INFO:
             _show_deviation(context, scan_obj)
-            self.report({'INFO'}, f"Tube Cage from Scan: {len(V)} vertices; "
+            self.report({'INFO'}, f"Cage from Scan: {len(V)} vertices; "
                         + "  ·  ".join(_report_lines(context, LAST_INFO)[:2]))
         else:
-            self.report({'INFO'}, f"Tube Cage from Scan: {len(V)} vertices, {len(F)} faces")
+            self.report({'INFO'}, f"Cage from Scan: {len(V)} vertices, {len(F)} faces")
         return {'FINISHED'}
 
 
@@ -1952,217 +2056,6 @@ def insert_loop(me, F, ring):
     bm.free()
     me.update()
     return added
-
-
-class NPROTO_OT_scan_refine_cage(_FitProps, bpy.types.Operator):
-    """Add edge loops to the active SubD cage where its surface misses the scan, one at a time with a fit after
-    each: every loop runs through the faces whose leftover deviation it can take up best, cutting them across
-    the way the deviation varies. The cage stays all quads, with no new star points. In Edit Mode only the
-    selected faces are looked at and the unselected vertices stay where they are"""
-    bl_idname = "nproto.scan_refine_cage"
-    bl_label = "Refine Cage to Scan"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    loops: IntProperty(name="Loops", default=4, min=1, max=40,
-                       description="Edge loops to add at most (fewer when the surface gets within the "
-                                   "tolerance everywhere first)")
-    tolerance: FloatProperty(name="Tolerance", default=0.0005, min=0.0, subtype='DISTANCE', unit='LENGTH',
-                             precision=4,
-                             description="A face whose surface stays this close to the scan gets no loop")
-    show_deviation: BoolProperty(name="Show Deviation", default=True,
-                                 description="Turn on the Scan Deviation overlay (Analyze) afterwards")
-
-    @classmethod
-    def poll(cls, context):
-        o = context.active_object
-        return o is not None and o.type == 'MESH' and 'nproto_brep' not in o and _subsurf(o) is not None
-
-    def draw(self, context):
-        lay = self.layout
-        lay.use_property_split = True
-        lay.prop(self, "loops")
-        lay.prop(self, "tolerance")
-        col = lay.column()
-        col.prop(self, "offset")
-        col.prop(self, "drape")
-        col.prop(self, "smoothness")
-        col.prop(self, "stiffness")
-        col.prop(self, "iterations")
-        if context.active_object is not None and trim_object(context.active_object) is not None:
-            col.prop(self, "hold_trim")
-        lay.prop(self, "show_deviation")
-        _draw_report(lay, context)
-
-    def execute(self, context):
-        from . import subd_brep
-        cage = context.active_object
-        scan_obj = pick_scan(context, cage)
-        if scan_obj is None or scan_obj is cage or scan_obj.type != 'MESH':
-            self.report({'WARNING'}, "Select the scan too (or set it under Analyze > Scan Deviation)")
-            return {'CANCELLED'}
-        if not subd_brep._plain_cage(cage):
-            self.report({'WARNING'}, f"{cage.name}: apply the modifiers above Subdivision (and shape keys) first: "
-                                     "loops are cut into the mesh itself")
-            return {'CANCELLED'}
-        was_edit = cage.mode == 'EDIT'
-        if was_edit:
-            bpy.ops.object.mode_set(mode='OBJECT')
-        me = cage.data
-        sel = None
-        if was_edit:
-            sel = np.zeros(len(me.vertices), bool)
-            me.vertices.foreach_get("select", sel)
-            if not sel.any():
-                sel = None
-        scan = scan_for(scan_obj)
-        try:
-            kw = _with_edge(cage, scan, _fit_kwargs(self))
-        except ValueError as exc:
-            if was_edit:
-                bpy.ops.object.mode_set(mode='EDIT')
-            self.report({'WARNING'}, f"Refine Cage to Scan: {exc}")
-            return {'CANCELLED'}
-        M = np.array(_world(cage))
-        Mi = np.linalg.inv(M)
-        n_start = len(me.vertices)
-        t0 = time.perf_counter()
-        added = 0
-        try:
-            for rnd in range(self.loops + 1):
-                V, F, sharp, kc = cage_of(cage)
-                Xw = V @ M[:3, :3].T + M[:3, 3]
-                fixed = None if sel is None else ~np.r_[sel, np.ones(len(V) - len(sel), bool)]
-                last = rnd == self.loops
-                # (a full fit every round: shorter in-between fits pick worse loops, about 35 % faster)
-                r = fit_cage(Xw, F, scan, sharp=sharp, keep_corners=kc, fixed=fixed, **kw)
-                Xl = r["X"] @ Mi[:3, :3].T + Mi[:3, 3]
-                me.vertices.foreach_set("co", Xl.ravel())
-                me.update()
-                if last:
-                    break
-                smp = r["sampler"]
-                P = smp.A @ r["X"]
-                resid = r["dev_signed"] - kw["offset"]
-                if kw["drape"]:
-                    resid = np.minimum(resid, 0.0)          # standing off (bridging) is what a drape is for
-                faces_ok = None
-                if sel is not None:
-                    s_all = np.r_[sel, np.ones(len(V) - len(sel), bool)]
-                    faces_ok = np.array([s_all[list(f)].all() for f in F])
-                nu, nv_, _ = face_need(F, r["levels"], P, smp.Fs, resid, self.tolerance, faces_ok)
-                if r.get("edge_loop") is not None:           # where the edge runs off its trim line
-                    eu, ev = edge_need(F, r["levels"], P, smp.Fs, r["edge_loop"], r["edge_miss"], self.tolerance)
-                    if faces_ok is not None:
-                        eu, ev = eu * faces_ok, ev * faces_ok
-                    nu, nv_ = nu + eu, nv_ + ev
-                ring, _ = best_ring(F, nu, nv_)
-                if ring is None:
-                    break
-                insert_loop(me, F, ring)
-                added += 1
-        except (ValueError, np.linalg.LinAlgError) as exc:
-            if was_edit:
-                bpy.ops.object.mode_set(mode='EDIT')
-            self.report({'WARNING'}, f"Refine Cage to Scan: {exc}")
-            return {'CANCELLED'}
-        if was_edit:
-            bpy.ops.object.mode_set(mode='EDIT')
-        cage["nproto_scan"] = scan_obj.name
-        info = {k: r[k] for k in ("dev_rms", "dev_p95", "dev_min", "dev_hi", "dev_max", "dev_mean")}
-        info.update(time=time.perf_counter() - t0, verts=len(me.vertices), iterations=len(r["history"]),
-                    offset=kw["offset"], loops=added, verts_before=n_start, edge_max=r.get("edge_max"), edge_along=r.get("edge_along"))
-        LAST_INFO.clear()
-        LAST_INFO.update(info)
-        if self.show_deviation:
-            _show_deviation(context, scan_obj)
-        self.report({'INFO'}, f"Refine Cage to Scan: {added} loop{'s' if added != 1 else ''} added "
-                    f"({n_start} -> {len(me.vertices)} vertices)  ·  " + _report_lines(context, info)[0])
-        return {'FINISHED'}
-
-
-class NPROTO_OT_scan_trim_cage(_FitProps, bpy.types.Operator):
-    """Put the active SubD cage's open edge on a trim line: a closed curve drawn on or near the scan (the other
-    selected object: a curve, or a mesh of edges). The edge is moved onto the curve, the rest of the cage
-    following less and less farther from it, then the cage is fitted to the scan with its edge held to the
-    curve. The cage remembers its trim line: Fit and Refine Cage to Scan keep the edge on it"""
-    bl_idname = "nproto.scan_trim_cage"
-    bl_label = "Trim Cage to Curve"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    show_deviation: BoolProperty(name="Show Deviation", default=True,
-                                 description="Turn on the Scan Deviation overlay (Analyze) afterwards")
-
-    @classmethod
-    def poll(cls, context):
-        return is_subd(context.active_object)
-
-    def draw(self, context):
-        lay = self.layout
-        lay.use_property_split = True
-        lay.prop(self, "offset")
-        lay.prop(self, "drape")
-        lay.prop(self, "smoothness")
-        lay.prop(self, "stiffness")
-        lay.prop(self, "iterations")
-        lay.prop(self, "show_deviation")
-        _draw_report(lay, context)
-
-    def execute(self, context):
-        from . import subd_brep
-        cage = context.active_object
-        sel = [o for o in context.selected_objects if o is not cage]
-        curve = next((o for o in sel if o.type == 'CURVE'), None) or next(
-            (o for o in sel if o.type == 'MESH' and not len(o.data.polygons) and len(o.data.edges)), None)
-        curve = curve or trim_object(cage)
-        if curve is None:
-            self.report({'WARNING'}, "Select the trim line too: a closed curve drawn on the scan (cage active)")
-            return {'CANCELLED'}
-        scans = [o for o in sel if o is not curve and o.type == 'MESH' and len(o.data.polygons)]
-        scan_obj = scans[0] if len(scans) == 1 else pick_scan(context, cage)
-        if scan_obj is None or scan_obj in (cage, curve) or scan_obj.type != 'MESH':
-            self.report({'WARNING'}, "No scan: fit the cage to a scan first (or set it under Analyze > Scan Deviation)")
-            return {'CANCELLED'}
-        if not subd_brep._plain_cage(cage):
-            self.report({'WARNING'}, f"{cage.name}: apply the modifiers above Subdivision (and shape keys) first")
-            return {'CANCELLED'}
-        was_edit = cage.mode == 'EDIT'
-        if was_edit:
-            bpy.ops.object.mode_set(mode='OBJECT')
-        t0 = time.perf_counter()
-        try:
-            scan = scan_for(scan_obj)
-            kw = _fit_kwargs(self)
-            kw.pop("hold_trim")
-            C = trim_target(curve, scan, kw["offset"])
-            V, F, sharp, kc = cage_of(cage)
-            M = np.array(_world(cage))
-            Xw = V @ M[:3, :3].T + M[:3, 3]
-            Xp, _ = place_on_trim(Xw, F, C, scan=scan)
-            r = fit_cage(Xp, F, scan, sharp=sharp, keep_corners=kc, edge_curve=C, **kw)
-        except (ValueError, np.linalg.LinAlgError) as exc:
-            if was_edit:
-                bpy.ops.object.mode_set(mode='EDIT')
-            self.report({'WARNING'}, f"Trim Cage to Curve: {exc}")
-            return {'CANCELLED'}
-        Mi = np.linalg.inv(M)
-        cage.data.vertices.foreach_set("co", (r["X"] @ Mi[:3, :3].T + Mi[:3, 3]).ravel())
-        cage.data.update()
-        if was_edit:
-            bpy.ops.object.mode_set(mode='EDIT')
-        cage["nproto_trim"] = curve.name
-        cage["nproto_scan"] = scan_obj.name
-        info = {k: r[k] for k in ("dev_rms", "dev_p95", "dev_min", "dev_hi", "dev_max", "dev_mean")}
-        info.update(time=time.perf_counter() - t0, verts=len(V), iterations=len(r["history"]),
-                    offset=kw["offset"], edge_max=r.get("edge_max"), edge_along=r.get("edge_along"))
-        LAST_INFO.clear()
-        LAST_INFO.update(info)
-        for o in context.selected_objects:
-            o.select_set(o is cage)
-        context.view_layer.objects.active = cage
-        if self.show_deviation:
-            _show_deviation(context, scan_obj)
-        self.report({'INFO'}, "Trim Cage to Curve: " + "  ·  ".join(_report_lines(context, info)[:3]))
-        return {'FINISHED'}
 
 
 # -- the Scan Deviation overlay -------------------------------------------------
@@ -2270,5 +2163,4 @@ def draw_panel(col, context):
         col.label(text=f"inside {L(st['dev_min'])}  ·  outside {L(st['dev_hi'])}")
 
 
-classes = (NPROTO_OT_scan_fit_cage, NPROTO_OT_scan_tube_cage, NPROTO_OT_scan_refine_cage,
-           NPROTO_OT_scan_trim_cage)
+classes = (NPROTO_OT_scan_fit_cage, NPROTO_OT_scan_tube_cage)

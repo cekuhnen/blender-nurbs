@@ -10,19 +10,22 @@ Each result is a mesh object (its tessellation) that carries the exact B-rep.
 
 The sidebar tab **NURBS Proto** has one collapsible panel per group. Ctrl+click a panel header to open only that one; Blender remembers which are open, per file.
 
+Tools that don't fit the selection are dimmed: select a curve and the tools that work on surfaces dim, select a NURBS surface and the curve tools dim, select a scan mesh and only the drawing tools, primitives, Mesh to BREP, Cage from Scan and Drape Patch to Scan stay lit. The drawing tools and primitives never dim. Dimmed tools still run. Started with nothing that fits selected, a tool asks you to pick its inputs, as Alt+click does. With nothing selected, nothing is dimmed.
+
 | Panel | Contents |
 |---|---|
 | **Active Object** | Shown only when the active object has something to show: CV editing (Done / Cancel), its feature settings and history, its face and edge count |
 | **Create Curves** | CV Curve, Draw Line, Arc, Circle, Ellipse, Rectangle, Polygon, Slot, Profile · between curves: Blend Curve, Fillet · from curves: Offset Curve, Offset on Surface · Helix (the other shapes, placed at the 3D cursor: Shift+A) · from surfaces: Iso Curve, Duplicate Edge, Project Curve, Intersect |
-| **Create Surfaces** | Draw Plane, Cylinder · Plane, Disk, Box, Cylinder, Cone, Sphere, Torus · from curves: Loft, Loft Rails, Curve Network, Sweep, Pipe, Extrude, Revolve, Rail Revolve, Planar · filling a gap: Boundary, Square, Patch, Dome · from surfaces: Offset, Thicken, Flange (and draft surface), Convert Blender Surface |
+| **Create Surfaces** | Draw Plane, Cylinder, **Primitive** ▾ (Plane, Disk, Box, Cylinder, Cone, Sphere, Torus) · from curves: Loft, Loft Rails, Curve Network, Sweep, Pipe, Extrude, Revolve, Rail Revolve, Planar · filling a gap: Boundary, Square, Patch, Dome · from surfaces: Offset, Thicken, Flange (and draft surface), Convert Blender Surface |
 | **Curve Edit** | Join / Unjoin Curves, Trim / Split Curves, Rebuild / Extend Curve, Align Curve |
 | **Surface Edit** | Edit CVs, Flip Normal, Rebuild Surface, Extend Surface, Surface Align, Match Surface, Refit to Trim, Merge Patches · Trim, Split, Untrim, Join, Unjoin, Detach at Isoparm · Surface Fillet, Edge Fillet · solids: Union, Difference, Intersection, Boundary Fill |
-| **Convert** (closed at first) | BREP to Mesh, Mesh to BREP, SubD to BREP (all also in Object › Convert) · fit to a scan: Tube Cage from Scan, Fit Cage to Scan, Refine Cage to Scan, Trim Cage to Curve, Drape Patch to Scan |
+| **Convert** (closed at first) | BREP to Mesh, Mesh to BREP, SubD to BREP (all also in Object › Convert) |
+| **Scan** (closed at first) | Fitting surfaces to a scan: Cage from Scan, Fit Cage to Scan (with Add Loops, and Trim to Curve when a curve is selected), Drape Patch to Scan |
 | **Analyze** (closed at first) | Measure, Continuity Check and the overlays (also in the viewport header's Analyze popover) |
 | **Display** | **Edges**, **CVs / Hulls**, **Spans**, **Feature Labels** and **Fine Grid** on / off (also as icons in the 3D view header, next to the Analyze button, so they are always at hand); **CVs / Hulls** also draws the CV hulls of selected curves (NURBS and Poly CVs, Bezier points with their handles) outside Edit mode, where Blender draws its own; **Spans** draws the knot lines (isoparms) of every face of the visible NURBS surfaces, clipped to their trims, so you see each surface's layout at a glance; **Fine Grid** draws the floor grid's finer levels (mm, cm, 10 cm; inches) in a perspective or turned orthographic view, where Blender's floor grid stops at 1 m (1 ft); right under them how finely surfaces are meshed for display: **Quality** *Fast / Medium / Fine* sets the four values below at once (Fast: angle 10°, chord 0.001, edges 3°, max edge 1/20; Medium, the defaults: 5°, 0.0005, 2°, 1/30; Fine: 2.5°, 0.0002, 1°, 1/50), one retessellation of every body; it reads *Custom* once a value is set by hand: Chord / Angle Tolerance, Edge Angle, Max Edge. The display mesh is rebuilt after every edit, so Fast makes editing quicker (a 38-face SubD body: 0.16 s Fast, 0.37 s Medium, 1.2 s Fine, 12k / 40k / 144k triangles). The analysis overlays (zebra, curvature map) don't use it: they have their own mesh and quality. **Clip Start warning:** a 3D view's depth buffer spreads its precision between Clip Start and Clip End, so a tiny Clip Start (say 1 µm) leaves depth steps of about 8 mm at 0.37 m. Surfaces, edges and Face / Edge highlights then flicker against each other (blotchy fills, dashed edges). When the steps exceed 0.05 % of the view distance, the Display panel says so and a red ⚠ appears in the header: one click sets Clip Start to about a thousandth of the view distance. |
 | **History** (closed at first) | Construction History, Live Update, Pause Rebuild, Delete History, Collect Inputs, Rebuild / Re-tessellate |
 
-The same five tool groups are in the viewport header's **NURBS Proto** menu (Object Mode), so every tool is reachable without the sidebar and **F3** finds each one by name. **Add** (Shift+A) has **NURBS Curves** and **NURBS Surfaces**, the two Create groups. STEP import and export are under File > Import / Export. One table in `toolgroups.py` drives the panels and the menus, so they always list the same tools.
+The same six tool groups are in the viewport header's **NURBS Proto** menu (Object Mode), so every tool is reachable without the sidebar and **F3** finds each one by name. **Add** (Shift+A) has **NURBS Curves** and **NURBS Surfaces**, the two Create groups. STEP import and export are under File > Import / Export. One table in `toolgroups.py` drives the panels and the menus, so they always list the same tools.
 
 ### Key hints (every interactive tool)
 
@@ -725,7 +728,7 @@ before its Subdivision Surface modifier), with **one face per cage face**.
 * Modifiers other than the Subdivision Surface count (a Mirror, for instance). Creases below 1.0 are treated as smooth.
 * Not yet: partial creases (below 1.0).
 
-### Fit to Scan (Tube Cage from Scan, Fit Cage to Scan, Refine Cage to Scan, Trim Cage to Curve, Drape Patch to Scan)
+### Fit to Scan (the Scan panel: Cage from Scan, Fit Cage to Scan, Drape Patch to Scan)
 
 Turn a scan (a residual limb, a body part, a product or car part) into exact NURBS that match it: a SubD cage is
 fitted so its smooth surface lies on the scan, then **SubD to BREP** makes the NURBS body. Use it to drape a
@@ -736,7 +739,7 @@ from its cage: inside it on bulges, outside it in hollows. On a residual-limb sc
 surface of a cage whose vertices sit on the scan is about 4 mm inside it on average. Fit Cage to Scan solves for the
 cage whose *surface* lies on the scan instead.
 
-**Tube Cage from Scan** (active object: the scan) builds a starting cage for limb-like shapes: **Rings** along the
+**Cage from Scan** (active object: the scan) builds a starting cage for limb-like shapes: **Rings** along the
 scan's main axis, **Around** vertices per ring (a multiple of 4), from the closed end up to just below the scan's
 open rim (**Length** sets it), the closed end capped with a quad grid (4 star points of valence 3). The rim is the
 scan's longest open border: small holes (at a tip, say) don't count, and a large n-gon closing the cut (a lid)
@@ -758,15 +761,15 @@ from, or the **Scan** under Analyze › Scan Deviation) works on any cage you mo
 * The report gives the area-weighted RMS distance, the distance 95 % of the surface stays within, and the most inside /
   outside (less the offset).
 
-**Refine Cage to Scan** (active object: a SubD cage) adds edge loops where the surface misses the scan, one at a
-time with a fit after each, up to **Loops**; faces whose surface stays within **Tolerance** of the scan get none, and
+**Add Loops** (in Fit Cage to Scan; 0, the default, fits the cage as it is) adds edge loops where the surface misses
+the scan, one at a time with a fit after each, up to that many; faces whose surface stays within **Tolerance** of the scan get none, and
 it stops early once every face does. Each loop is a full loop cut through an edge ring, so the cage stays all quads
 with no new star points; a ring stops at an open border, and a triangle or n-gon at its end just gets the new
 vertex on its edge. Which ring and which way: after a fit, the deviation left inside a face is what the cage can't
 bend to. The part of it that varies along one of the face's directions (each row's straight-line trend taken out)
 needs the face cut across that direction; a ring scores the sum over its faces, each in the direction the ring
 cuts it. So a ridge running along a limb gets a loop along it, next to the ridge, and a round bump gets loops both
-ways. The fit settings are Fit Cage to Scan's; with **Drape** only the places where the surface dips into the scan
+ways. With **Drape** only the places where the surface dips into the scan
 count. In Edit Mode only the selected faces are looked at and the unselected vertices stay where they are (the new
 loop's vertices still move to the scan, also where the loop runs on past the selection).
 
@@ -774,22 +777,24 @@ On the residual-limb scan, a 10 × 12 tube cage refined with 8 loops (264 vertic
 evenly spaced 22 × 28 cage (652 vertices), 0.40 mm RMS, and its worst spot is 2.9 mm inside instead of 4.5 mm; with
 12 loops (394 vertices), 0.29 mm RMS, as close as a 30 × 36 cage (1144 vertices). Four loops take about 10–15 s.
 
-**Trim Cage to Curve** puts the cage's open edge on a trim line: where a housing or socket ends. Draw a closed
+**Trim to Curve** puts the cage's open edge on a trim line: where a housing or socket ends. Draw a closed
 curve on or near the scan (Blender's curve Draw tool with Surface depth projects strokes onto it; any curve, set to
-Cyclic, or a mesh of edges only works), select it, then the SubD cage, active. The edge nearest the curve is
+Cyclic, or a mesh of edges only works), select it, then the SubD cage, active, and run Fit Cage to Scan: with a
+curve selected it trims to it (**Trim to Curve**, on by default; in Edit Mode a new trim line moves the whole cage).
+The edge nearest the curve is
 moved onto it and the rest of the cage follows, less and less farther from the edge, each vertex keeping its
 distance from the scan (so rings moved down a tapering limb come in with it); then the cage is fitted with its edge
 held to the line, both ways (the edge onto the line, the whole line reached by the edge), free to slide along it.
 Each column of a tube cage goes to the line at its own angle around the limb, so the columns stay upright however
 far the line dips. The line is the curve projected onto the scan (out by **Offset**, with a clearance), smoothed
 over about 0.5 % of the scan's size: on skin it would otherwise pick up wrinkles (a millimetre over a centimetre)
-that a housing's edge should not follow. The cage remembers its trim line: Fit Cage to Scan and Refine Cage to Scan
-keep the edge on it (**Hold Trim Line**), and Refine also cuts loops where the edge runs off the line. The report
+that a housing's edge should not follow. The cage remembers its trim line: later fits keep the edge on it (**Hold Trim Line**,
+shown when no curve is selected), and Add Loops also cuts loops where the edge runs off the line. The report
 says how closely the edge keeps to the line along the scan (where on the skin it runs) and in all (that includes
 the surface's own distance from the scan there).
 
 On the residual-limb scan, with a line dipping 6.6 cm front to back: the 10 × 12 tube cage trimmed to it fits the
-scan at 0.66 mm RMS with its edge on the line within 0.93 mm along the skin; 6 loops of Refine (232 vertices) take
+scan at 0.66 mm RMS with its edge on the line within 0.93 mm along the skin; 6 more loops (232 vertices) take
 that to 0.36 mm RMS and 0.73 mm. On a smooth synthetic scan the edge keeps within 0.05 mm.
 
 **Drape Patch to Scan** lays one NURBS patch straight down onto a scan, for Class-A style surfacing on a car or
@@ -840,7 +845,7 @@ round instead of shrinking). On a 124-vertex cage and a 92k-triangle scan a fit 
 
 Measured on a residual-limb scan (38 cm, 92k triangles), 10 rings × 12: the NURBS body is 1.2 mm RMS from the scan,
 95 % within 2 mm; the lower half within 0.2–0.7 mm RMS. Larger misses are features a 12-around cage can't follow
-(a muscle ridge, a round bump): Refine Cage to Scan adds loops there, or model the cage around them.
+(a muscle ridge, a round bump): Add Loops cuts loops there, or model the cage around them.
 
 * Not yet: open trim lines (an edge of a patch held to part of a curve), symmetry, and cages with modifiers above
   the Subdivision (apply them first); for Drape Patch, splitting a patch where one span can't follow the scan, and

@@ -5222,7 +5222,8 @@ for _cls in _tg.classes:
             _drawn[_cls.__name__] = _draw(_cls, group=getattr(_cls, "group", ""))
     except Exception as _e:
         _ui_err.append(f"{_cls.__name__}: {_e!r}")
-_in_panels = [e["op"] for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r if "op" in e]
+_DROPS = {d.menu for d in _tg.dropdowns()}        # a panel's dropdown menus: their tools are the panel's
+_in_panels = [e["op"] for n, r in _drawn.items() if n.startswith("VIEW3D_PT") or n in _DROPS for e in r if "op" in e]
 _missing = []
 for _op in set(_in_panels):
     try:
@@ -5243,7 +5244,7 @@ _tool_ops = [o_ for o_ in _in_panels if o_ not in ("nproto.add_primitive", "npro
     ["nproto.boolean"]                              # (one button per operation)
 _bool_ops = sorted(e["props"].get("operation") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r
                    if e.get("op") == "nproto.boolean")
-_kinds = [e["props"].get("kind") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r
+_kinds = [e["props"].get("kind") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") or n in _DROPS for e in r
           if e.get("op") == "nproto.add_primitive"]
 check("UI: every tool is in exactly one group panel and all operators exist",
       not _ui_err and not _missing and sorted(_tool_ops) == sorted(_all_tools)
@@ -5252,17 +5253,76 @@ check("UI: every tool is in exactly one group panel and all operators exist",
       f"bool={_bool_ops} err={_ui_err} missing={_missing} extra={sorted(set(_tool_ops) - _all_tools)} "
       f"absent={sorted(_all_tools - set(_tool_ops))} dup={sorted({o for o in _tool_ops if _tool_ops.count(o) > 1})}")
 _menu_ops = sorted(e["op"] for n, r in _drawn.items() if n.startswith("VIEW3D_MT") and n != "VIEW3D_MT_nproto_tools"
-                   for e in r if "op" in e)
+                   and n not in _DROPS for e in r if "op" in e)
 _subs = [e["menu"] for e in _drawn["VIEW3D_MT_nproto_tools"] if "menu" in e]
 _menu_kinds = sorted(e["props"].get("kind") for n, r in _drawn.items() if n.startswith("VIEW3D_MT")
-                     and n != "VIEW3D_MT_nproto_tools" for e in r if e.get("op") == "nproto.add_primitive")
-check("UI: header menu holds the five groups, the same tools as the panels, and every shape (the curve shapes "
+                     and n != "VIEW3D_MT_nproto_tools" and n not in _DROPS for e in r
+                     if e.get("op") == "nproto.add_primitive")
+check("UI: header menu holds the six groups, the same tools as the panels, and every shape (the curve shapes "
       "only there: the panel draws them)",
       sorted(set(_menu_ops)) == sorted(set(_in_panels))
       and _menu_kinds == sorted(list(_prims.CURVE_KINDS) + list(_prims.SURFACE_KINDS))
       and _subs == ["VIEW3D_MT_nproto_curves", "VIEW3D_MT_nproto_surfaces",
                     "VIEW3D_MT_nproto_curve_edit", "VIEW3D_MT_nproto_surface_edit",
-                    "VIEW3D_MT_nproto_convert"], f"{_subs} {_menu_kinds}")
+                    "VIEW3D_MT_nproto_convert", "VIEW3D_MT_nproto_scan"], f"{_subs} {_menu_kinds}")
+_prim_btn = [e["menu"] for e in _drawn["VIEW3D_PT_nproto_surfaces"] if "menu" in e]
+check("UI: the surface primitives are one Primitive dropdown in Create Surfaces (not seven buttons)",
+      _prim_btn == ["VIEW3D_MT_nproto_primitives"]
+      and not any(e.get("op") == "nproto.add_primitive" for e in _drawn["VIEW3D_PT_nproto_surfaces"]), str(_prim_btn))
+_scan_ops = [e["op"] for e in _drawn["VIEW3D_PT_nproto_scan"] if "op" in e]
+check("UI: the Scan panel holds the three scan tools; Convert none of them",
+      _scan_ops == ["nproto.scan_tube_cage", "nproto.scan_fit_cage", "nproto.scan_drape_patch"]
+      and not any("scan_" in e.get("op", "") for e in _drawn["VIEW3D_PT_nproto_convert"]), str(_scan_ops))
+_sel0 = [o_ for o_ in ctx.view_layer.objects if o_.select_get()]
+_act0 = ctx.view_layer.objects.active
+_cd = bpy.data.curves.new("DimCurve", 'CURVE')
+_cv = bpy.data.objects.new("DimCurve", _cd)
+ctx.collection.objects.link(_cv)
+for o_ in _sel0:
+    o_.select_set(False)
+ctx.view_layer.objects.active = None
+_none_sel = _tg.selected_kinds(ctx)
+_cv.select_set(True)
+ctx.view_layer.objects.active = _cv
+_have = _tg.selected_kinds(ctx)
+
+
+class _ActLay:
+    """Records each row's `active` and the operators drawn in it."""
+    def __init__(self, rows, cur=None):
+        object.__setattr__(self, "rows", rows)
+        object.__setattr__(self, "cur", cur)
+    def __setattr__(self, k, v):
+        if k == "active" and self.cur is not None:
+            self.cur["active"] = v
+    def row(self, **k):
+        r = {"active": True, "ops": []}
+        self.rows.append(r)
+        return _ActLay(self.rows, r)
+    def column(self, **k):
+        return self
+    def separator(self, **k):
+        pass
+    def operator(self, op, **k):
+        self.cur["ops"].append(op)
+        return _FakeProps({})
+    def menu(self, m, **k):
+        self.cur["ops"].append(m)
+
+
+_rows = []
+_tg.draw_panel(_ActLay(_rows), "SURFACE_EDIT", ctx)
+_rows_c = []
+_tg.draw_panel(_ActLay(_rows_c), "CURVE_EDIT", ctx)
+check("UI: a curve selected dims Surface Edit (still clickable) but not Curve Edit; nothing selected dims nothing",
+      _none_sel is None and _have == {"CURVE"} and _tg.fits({"NURBS"}, None)
+      and _rows and not any(r_["active"] for r_ in _rows) and all(r_["active"] for r_ in _rows_c),
+      f"{_have} {[r_['active'] for r_ in _rows]}")
+bpy.data.objects.remove(_cv)
+bpy.data.curves.remove(_cd)
+for o_ in _sel0:
+    o_.select_set(True)
+ctx.view_layer.objects.active = _act0
 _act = ctx.view_layer.objects.active
 try:
     _shown = _ui.VIEW3D_PT_nproto_active.poll(ctx)
