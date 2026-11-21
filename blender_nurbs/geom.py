@@ -902,8 +902,10 @@ class EdgeSample:
         return self._pass_ddd(out, c)
 
 
-def sample_surface_edge(surface, which, matrix, n):
+def sample_surface_edge(surface, which, matrix, n, share=None):
+    """EdgeSample along an iso edge; share: only lo..hi of it (shares of its domain)."""
     (u0, u1), (v0, v1) = surface.u_domain(), surface.v_domain()
+    s_lo, s_hi = share if share is not None else (0.0, 1.0)
     M = np.array(matrix)
     R = M[:3, :3]
     T = M[:3, 3]
@@ -912,7 +914,7 @@ def sample_surface_edge(surface, which, matrix, n):
     span = (u1 - u0) if along_v else (v1 - v0)
     h = 1e-4 * span
     for i in range(n):
-        s = i / (n - 1)
+        s = s_lo + (s_hi - s_lo) * i / (n - 1)
         if along_v:
             u = u0 if which == "U0" else u1
             v = v0 + (v1 - v0) * s

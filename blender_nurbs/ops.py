@@ -868,6 +868,16 @@ class NPROTO_OT_loft(SolidBody, PickMixin, bpy.types.Operator):
                              description="Bezier Spans: degree along the sides")
     span_faces: BoolProperty(name="Split into Faces", default=False,
                              description="Bezier Spans: one Bezier patch per span, joined into one body")
+    a_from: FloatProperty(name="From A", default=0.0, min=0.0, max=1.0, subtype='FACTOR',
+                          description="Slide the loft's start along side A (share of its length): the loft "
+                                      "spans only From..To of the edge and still holds G0 - G3 along that stretch")
+    a_to: FloatProperty(name="To A", default=1.0, min=0.0, max=1.0, subtype='FACTOR',
+                        description="Slide the loft's end along side A (share of its length)")
+    b_from: FloatProperty(name="From B", default=0.0, min=0.0, max=1.0, subtype='FACTOR',
+                          description="Slide the loft's start along side B (share of its length, counted from "
+                                      "the same end as side A)")
+    b_to: FloatProperty(name="To B", default=1.0, min=0.0, max=1.0, subtype='FACTOR',
+                        description="Slide the loft's end along side B (share of its length)")
     edges_a: EnumProperty(name="Edges A", items=EDGE_ITEMS, default="EDGES",
                           description="G1 / G2: which way the loft leaves side A")
     edges_b: EnumProperty(name="Edges B", items=EDGE_ITEMS, default="EDGES",
@@ -1030,6 +1040,8 @@ class NPROTO_OT_loft(SolidBody, PickMixin, bpy.types.Operator):
         counts = self._side_counts()
         if counts and (any(c > 1 for c in counts) or self.rails):
             p["sides"] = counts
+        if (self.a_from, self.a_to, self.b_from, self.b_to) != (0.0, 1.0, 0.0, 1.0) and not self.rails:
+            p.update({k: getattr(self, k) for k in features.SLIDE_KEYS})
         if self.rails:
             p.update({"rails": int(self.rails), "cont_ra": self.cont_ra, "cont_rb": self.cont_rb,
                       "tan_ra": self.tan_ra, "tan_rb": self.tan_rb, "corner_ease": self.corner_ease,
@@ -1098,6 +1110,9 @@ class NPROTO_OT_loft(SolidBody, PickMixin, bpy.types.Operator):
             row.prop(self, f"tan_{side}", text="Weight" if nr else "Tangent")
             if not nr:
                 row.prop(self, f"cur_{side}", text="Curvature")
+                row = box.row(align=True)          # slide the ends along the side (curves too)
+                row.prop(self, f"{side}_from", text="From", slider=True)
+                row.prop(self, f"{side}_to", text="To", slider=True)
         for j in range(nr):
             i0, k = firsts[nprof + j], counts[nprof + j]
             ref = refs[i0]

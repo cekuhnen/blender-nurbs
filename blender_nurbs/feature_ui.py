@@ -23,7 +23,7 @@ DIR_ITEMS = [("NORMAL", "Curve Normal", "")] + AXIS_ITEMS + [("VECTOR", "Vector"
 # which settings each feature shows (in this order)
 FIELDS = {
     "loft": ["closed", "cont_a", "tan_a", "cur_a", "cont_b", "tan_b", "cur_b", "auto_align", "flip_b", "ruled", "samples",
-             "edges_a", "edges_b", "fit", "span_degree", "span_faces", "cont_ra", "tan_ra", "cont_rb", "tan_rb", "corner_ease", "even_net",
+             "a_from", "a_to", "b_from", "b_to", "edges_a", "edges_b", "fit", "span_degree", "span_faces", "cont_ra", "tan_ra", "cont_rb", "tan_rb", "corner_ease", "even_net",
              "flip_normal", "caps"],
     "blend_curve": ["cont_a", "w_a", "c_a", "d_a", "flip_a", "cont_b", "w_b", "c_b", "d_b", "flip_b"],
     "extrude": ["distance", "direction", "dir_vec", "tilt", "tilt_azimuth", "draft", "draft_flip", "symmetric", "caps"],
@@ -73,7 +73,7 @@ FIELDS = {
 }
 
 # what a feature made before a setting existed was built with (shown when its history lacks it)
-MISSING = {"fl_corner": "OPEN"}
+MISSING = {"fl_corner": "OPEN", "a_from": 0.0, "a_to": 1.0, "b_from": 0.0, "b_to": 1.0}
 LABELS = {"tan_a": "Tangent A", "tan_b": "Tangent B", "cur_a": "Curvature A", "cur_b": "Curvature B",
           "w_a": "Weight A", "w_b": "Weight B", "c_a": "Curvature A", "c_b": "Curvature B",
           "d_a": "Rate A", "d_b": "Rate B",
@@ -313,6 +313,14 @@ class NprotoFeature(bpy.types.PropertyGroup):
     d_b: FloatProperty(name="Rate B", soft_min=-2.0, soft_max=2.0, **_F())
     flip_a: BoolProperty(name="Flip A", **_F())
     flip_b: BoolProperty(name="Flip B", **_F())
+    a_from: FloatProperty(name="From A", min=0.0, max=1.0, subtype='FACTOR',
+                          description="Where along side A the loft starts (share of its length)", **_F())
+    a_to: FloatProperty(name="To A", min=0.0, max=1.0, subtype='FACTOR',
+                        description="Where along side A the loft ends (share of its length)", **_F())
+    b_from: FloatProperty(name="From B", min=0.0, max=1.0, subtype='FACTOR',
+                          description="Where along side B the loft starts (from the same end as A)", **_F())
+    b_to: FloatProperty(name="To B", min=0.0, max=1.0, subtype='FACTOR',
+                        description="Where along side B the loft ends (share of its length)", **_F())
     auto_align: BoolProperty(name="Auto Align", **_F())
     edges_a: EnumProperty(name="Edges A", items=[("FREE", "Free Edges", "Square to the side"),
                                                  ("EDGES", "Align Edges", "Carry on the surface's edges at the corners"),
@@ -661,6 +669,16 @@ def draw_feature(layout, context):
                         if name in ("cont_ra", "tan_ra", "cont_rb", "tan_rb", "corner_ease") and nr_ != 2 or \
                                 name == "even_net" and not nr_:
                             continue                     # no rails (one rail is a guide: position only)
+                        if name in features.SLIDE_KEYS and (nr_ or h["params"].get("closed") or
+                                                            len(features.loft_sides(h["inputs"], h["params"])) != 2):
+                            continue                     # slid ends: a two-sided loft only
+                        if name in ("a_from", "b_from"):
+                            r_ = col.row(align=True)
+                            r_.prop(pg, name, text=f"Side {name[0].upper()} From", slider=True)
+                            r_.prop(pg, name[0] + "_to", text="To", slider=True)
+                            continue
+                        if name in ("a_to", "b_to"):
+                            continue
                         if nr_ and name in ("edges_a", "edges_b", "fit", "span_degree", "cur_a",
                                             "cur_b", "auto_align", "flip_b", "ruled", "closed"):
                             continue                     # the rails' solver: not used

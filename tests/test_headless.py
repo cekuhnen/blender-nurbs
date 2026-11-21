@@ -5235,7 +5235,7 @@ for _op in set(_in_panels):
         getattr(bpy.ops.nproto, _op.split(".")[1]).get_rna_type()
     except Exception:
         _missing.append(_op)
-_not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cycle_continuity", "delete_history", "collect_inputs", "export_step",
+_not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cycle_continuity", "loft_slide", "delete_history", "collect_inputs", "export_step",
               "import_step", "open_step", "history_focus", "history_toggle_hide", "tree_step", "step_unfocus", "mute_step", "patch_add_guides",
               "patch_auto_corners", "patch_corner", "patch_remove_guide", "rebuild", "rebuild_waiting", "remove_step",
               "restore_inputs", "sync_feature", "tab_edit", "continuity", "continuity_clear", "section_add", "section_orient",

@@ -182,7 +182,7 @@ def sample_side(obj, ref, m, brep=None, M=None):
         edge = brep.edges()[int(ref[1:])]
         face = edge.faces()[0]
         surf = face.surface()
-        t0, t1 = edge.parameter_range()
+        t0, t1 = features.edge_range(obj, ref) or edge.parameter_range()     # a loft's slid end: its stretch
         tt = _by_arclength(lambda t: np.array(edge.point_at(t)), t0, t1, m)
         Pl = np.array([edge.point_at(t) for t in tt], float)
         uv, prev = [], None
@@ -237,15 +237,16 @@ def sample_side(obj, ref, m, brep=None, M=None):
         face = brep.faces()[0]
         surf = face.surface()
         (u0, u1), (v0, v1) = surf.u_domain(), surf.v_domain()
+        rng = features.edge_range(obj, ref)                 # a loft's slid end: its stretch only
         if ref in ("U0", "U1"):
             uc = u0 if ref == "U0" else u1
             f = lambda s: np.array(surf.evaluate(uc, s))
-            tt = _by_arclength(f, v0, v1, m)
+            tt = _by_arclength(f, *(rng or (v0, v1)), m)
             uv = [(uc, s) for s in tt]
         else:
             vc = v0 if ref == "V0" else v1
             f = lambda s: np.array(surf.evaluate(s, vc))
-            tt = _by_arclength(f, u0, u1, m)
+            tt = _by_arclength(f, *(rng or (u0, u1)), m)
             uv = [(s, vc) for s in tt]
         Pl = np.array([surf.evaluate(u, v) for u, v in uv], float)
     Md = np.array(M, dtype=float)          # double precision (mathutils is float32)

@@ -16,12 +16,13 @@ import bpy
 from bpy.app.handlers import persistent
 
 from . import (anamesh, blendedit, brep_mesh, contlabels, cvnudge, cvs, curvejoin, curveoffset, diagnostics, draw,
-               drawtools, extend, feature_ui, flow, pattern, features, hints, history, isocombs, isodetach, loft_rails, merge, ops, patch, refit,
+               drawtools, extend, feature_ui, flow, pattern, features, hints, history, isocombs, isodetach, loft_rails, loftslide, merge, ops, patch, refit,
                scanfit, scanpatch, sections, snapping, square, steps, store, subd_brep, subsel, surfoffset, flange, network, railrevolve, measure, sweeps,
                unroll, workplanes)
 
 # overlays and tool flags with a fixed shape: put back to how they start
 _SHAPED = (cvnudge.overlay, draw.pick_overlay, draw.sketch_overlay, draw.ghost, contlabels.hover, ops.GIZMO,
+           loftslide.hover, loftslide.DRAG, features.EDGE_RANGES,
            measure.OVERLAY)
 _DEFAULTS = [copy.deepcopy(d) for d in _SHAPED]
 
@@ -39,7 +40,7 @@ def _emptied():
         feature_ui._resyncing, workplanes._anims, subd_brep._LAST,
         # caches of the old file's objects
         store._cache, store._disp_cache, draw._label_cache, draw._topo_cache, draw._span_cache,
-        contlabels._cache, contlabels._marks, contlabels._base_cache, isocombs._cache,
+        contlabels._cache, contlabels._marks, contlabels._base_cache, loftslide._cache, isocombs._cache,
         sections._cache, sections._breps, sections._kref_cache, anamesh._prep, patch._corner_cache,
         steps._split_cache, diagnostics._comb_cache, diagnostics._zebra_cache, diagnostics._curv_cache,
         diagnostics._sag_cache, diagnostics._curv_batches, diagnostics._value_batches,
