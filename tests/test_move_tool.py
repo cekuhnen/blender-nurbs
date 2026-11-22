@@ -147,11 +147,113 @@ check("edit curve: point and handles moved", (bp.co - c0 - Vector((0, 0, 1))).le
 check("edit curve: others stay", (cv.data.splines[0].bezier_points[1].co - other).length < 1e-6)
 check("edit: no copies made", len([o for o in bpy.data.objects if o.type == 'CURVE']) == 1)
 
+# -- Rotate: pure helpers -------------------------------------------------------------
+import math
+check("angle 90", movetool.parse_angle("90") == 90.0)
+check("angle 90/4", abs(movetool.parse_angle("90/4") - 22.5) < 1e-12)
+check("angle -30°", movetool.parse_angle("-30°") == -30.0)
+check("angle junk", movetool.parse_angle("abc") is None and movetool.parse_angle("") is None)
+z = np.array([0.0, 0.0, 1.0])
+check("signed +90", abs(movetool.signed_angle((1, 0, 0), (0, 1, 0), z) - 90) < 1e-9)
+check("signed -90", abs(movetool.signed_angle((0, 1, 0), (1, 0, 0), z) + 90) < 1e-9)
+check("signed seen in the plane", abs(movetool.signed_angle((1, 0, 5), (0, 2, -3), z) - 90) < 1e-9)
+check("signed along the axis", movetool.signed_angle((0, 0, 1), (1, 0, 0), z) is None)
+check("copies *3 @90", np.allclose(movetool.copy_angles(90, "ARRAY", 3), [90, 180, 270]))
+check("copies *4 @90 skip the full turn", np.allclose(movetool.copy_angles(90, "ARRAY", 4), [90, 180, 270]))
+check("copies /3 @90", np.allclose(movetool.copy_angles(90, "DIVIDE", 3), [30, 60, 90]))
+check("copies /4 @360", np.allclose(movetool.copy_angles(360, "DIVIDE", 4), [90, 180, 270]))
+T = movetool.rotation_matrix((1, 0, 0), z, 90)
+check("rotation about a point", np.allclose(T @ [2, 0, 0, 1], [1, 1, 0, 1]))
+# the circular pattern makes exactly copy_angles' turns
+for deg, mode, n in ((90, "ARRAY", 3), (90, "ARRAY", 4), (-40, "DIVIDE", 4), (360, "DIVIDE", 6), (30, "ARRAY", 2)):
+    p = movetool.circular_params((1, 2, 0), z, deg, mode, n)
+    got = [pattern.copy_transform(p, None, k) for k in range(1, pattern.total_count(p))]
+    want = [movetool.rotation_matrix((1, 2, 0), z, a) for a in movetool.copy_angles(deg, mode, n)]
+    check(f"pattern = copy angles {deg} {mode} {n}", len(got) == len(want)
+          and all(np.allclose(g, w) for g, w in zip(got, want)), (len(got), len(want)))
+
+# -- Rotate: objects ------------------------------------------------------------------
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+bpy.ops.mesh.primitive_cube_add(size=1.0, location=(3, 0, 0))
+cube = ctx.active_object
+select(cube)
+M0 = W(cube)
+r = bpy.ops.nproto.rotate(center=(1, 0, 0), axis=(0, 0, 1), angle=math.radians(90))
+ctx.view_layer.update()
+check("rotate finished", r == {'FINISHED'}, r)
+check("rotate: about the centre", np.allclose(W(cube), movetool.rotation_matrix((1, 0, 0), z, 90) @ M0, atol=1e-6), W(cube)[:3, 3])
+check("rotate: zero turn cancels", bpy.ops.nproto.rotate(angle=0.0) == {'CANCELLED'})
+
+select(cube)
+M0 = W(cube)
+r = bpy.ops.nproto.rotate(center=(0, 0, 0), axis=(1, 0, 0), angle=math.radians(45), copies="ARRAY", count=2)
+new = [o for o in bpy.data.objects if o is not cube]
+check("rotate: mesh copies", r == {'FINISHED'} and len(new) == 2, len(new))
+want = [movetool.rotation_matrix((0, 0, 0), (1, 0, 0), a) @ M0 for a in (45, 90)]
+check("rotate: mesh copies turned", all(any(np.allclose(W(o), w, atol=1e-6) for o in new) for w in want))
+check("rotate: original stays", np.allclose(W(cube), M0))
+for o in new:
+    bpy.data.objects.remove(o)
+
+select(cube)
+P0 = np.array([tuple(cube.matrix_world @ v.co) for v in cube.data.vertices])
+r = bpy.ops.nproto.rotate(center=(5, 0, 0), axis=(0, 0, 1), angle=math.radians(180), set_pivot=True)
+ctx.view_layer.update()
+P1 = np.array([tuple(cube.matrix_world @ v.co) for v in cube.data.vertices])
+R180 = movetool.rotation_matrix((5, 0, 0), z, 180)
+check("rotate pivot: origin on the centre", np.allclose(W(cube)[:3, 3], (5, 0, 0)), W(cube)[:3, 3])
+check("rotate pivot: geometry turned about the centre", np.allclose(P1, P0 @ R180[:3, :3].T + R180[:3, 3]))
+
+bpy.ops.nproto.add_primitive(kind="BOX", width=1.0, depth=0.5, height=0.4)
+box = ctx.active_object
+box.location = (2.0, 0.0, 0.0)
+ctx.view_layer.update()
+select(box)
+Mb = W(box)
+r = bpy.ops.nproto.rotate(center=(0, 0, 0), axis=(0, 0, 1), angle=math.radians(90), copies="ARRAY", count=4)
+cps = [o for o in bpy.data.objects if o.get("nproto_in_0") is box and pattern.pattern_of(o) is not None]
+check("rotate *4 @90: three nurbs copies (none on the original)", r == {'FINISHED'} and len(cps) == 3, len(cps))
+want = [movetool.rotation_matrix((0, 0, 0), z, a) @ Mb for a in (90, 180, 270)]
+check("rotate: nurbs copies turned", all(any(np.allclose(W(o), w, atol=1e-6) for o in cps) for w in want))
+p = pattern.pattern_of(cps[0])[1]
+check("rotate: a circular pattern", p["mode"] == "CIRCULAR" and p["count"] == 4 and abs(p["angle"] - 360) < 1e-9, p)
+for o in cps:
+    bpy.data.objects.remove(o)
+select(box)
+r = bpy.ops.nproto.rotate(center=(0, 0, 0), axis=(0, 0, 1), angle=math.radians(-120), copies="DIVIDE", count=2)
+cps = [o for o in bpy.data.objects if o.get("nproto_in_0") is box and pattern.pattern_of(o) is not None]
+want = [movetool.rotation_matrix((0, 0, 0), z, a) @ Mb for a in (-60, -120)]
+check("rotate /2 @-120: copies at -60 and -120", len(cps) == 2
+      and all(any(np.allclose(W(o), w, atol=1e-6) for o in cps) for w in want), len(cps))
+for o in cps:
+    bpy.data.objects.remove(o)
+
+# -- Rotate: Edit Mode --------------------------------------------------------------------
+bpy.ops.object.select_all(action='DESELECT')
+bpy.ops.mesh.primitive_plane_add(size=2.0, location=(1, 0, 0))
+pl = ctx.active_object
+pl.scale = (2.0, 1.0, 1.0)
+ctx.view_layer.update()
+Pw0 = np.array([tuple(pl.matrix_world @ v.co) for v in pl.data.vertices])
+bpy.ops.object.mode_set(mode='EDIT')
+bpy.ops.mesh.select_all(action='SELECT')
+r = bpy.ops.nproto.rotate(center=(0, 0, 0), axis=(0, 0, 1), angle=math.radians(90))
+bpy.ops.object.mode_set(mode='OBJECT')
+Pw = np.array([tuple(pl.matrix_world @ v.co) for v in pl.data.vertices])
+R90 = movetool.rotation_matrix((0, 0, 0), z, 90)
+check("rotate edit mesh: points turned in world", r == {'FINISHED'}
+      and np.allclose(Pw, Pw0 @ R90[:3, :3].T + R90[:3, 3], atol=1e-6))
+check("rotate edit mesh: object stays", np.allclose(W(pl)[:3, 3], (1, 0, 0)))
+
 # -- the hold key ------------------------------------------------------------------
 kc = ctx.window_manager.keyconfigs.addon
 items = [(km.name, k.idname) for km, k in movetool._keymaps]
-check("hold G bound in object / edit keymaps", {n for n, _ in items} == set(movetool.KEYMAPS)
-      and all(i == "nproto.transform_hold" for _, i in items), items)
+check("hold G / R bound in object / edit keymaps", {n for n, _ in items} == set(movetool.KEYMAPS)
+      and all(i == "nproto.transform_hold" for _, i in items)
+      and sorted((km.name, k.type, k.properties.kind) for km, k in movetool._keymaps)
+      == sorted((n, key, kind) for n in movetool.KEYMAPS for kind, (key, _a, _b) in movetool.HOLD_TOOLS.items()),
+      items)
 check("hold default", movetool.hold_ms() == 300 and movetool.hold_enabled())
 
 print("ALL PASS" if ok else "SOME FAILED")
