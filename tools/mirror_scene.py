@@ -91,9 +91,13 @@ def make_symmetric(o, **kw):
 
 
 def fender(y0):
-    """A 4 x 4 patch from the plane outwards: one edge on x = 0, a bulge, a dip at the far edge."""
+    """A 4 x 4 patch from the plane outwards: one edge on x = 0, a bulge, a dip at the far edge.
+    It leaves the plane square (the second CV row only steps away along the normal), so it
+    runs on into its mirror image smoothly: G1, and G2 by symmetry. A surface that meets the
+    plane at an angle mirrors to a crease."""
     G = np.array([[(x, y0 + y, 0.55 * np.cos(0.6 * y) * np.sin(0.9 * x + 0.5) + 0.12 * x * y)
                    for y in np.linspace(-1.5, 1.5, 5)] for x in np.linspace(0.0, 3.0, 5)], float)
+    G[1, :, 1:] = G[0, :, 1:]
     return G
 
 
@@ -102,7 +106,7 @@ LX = 4.4       # labels above the stations (the copies land below, y < 0)
 # ---------------- Mirror Copy (y > 0) ----------------
 label("MIRROR COPY", (6.2, 12.5, 0), 0.6)
 f1 = surface("Fender (try Mirror Copy)", fender(20.0))
-label("Try: Mirror (Pattern group),\nOutput Copy, plane y = 0, Enter.\nThe seam meets, normals agree", (LX, 20.6, 0))
+label("Try: Mirror (Pattern group),\nOutput Copy, plane y = 0, Enter.\nIt meets the plane square:\nthe seam is smooth (G2)", (LX, 20.6, 0))
 
 f2 = surface("Fender", fender(15.0))
 c2 = mirror_copy(f2, "Fender (mirror copy)")
@@ -122,7 +126,8 @@ ctx.view_layer.update()
 c4 = mirror_copy(dk, "Disk (mirror copy)")
 label("Done: a trimmed sheet,\nturned over to face\nthe way its source does", (LX, 5.9, 0))
 
-hc = curve("Half Profile (try Mirror Copy)", [(0.0, 1.0, 0.4), (0.0, 1.9, 1.3), (1.2, 2.4, 1.8), (2.4, 2.1, 1.0), (2.9, 1.2, 0.4)])
+# it leaves the plane square too: a curve that starts along the plane mirrors to a cusp
+hc = curve("Half Profile (try Mirror Copy)", [(0.0, 1.6, 1.7), (0.9, 1.6, 1.7), (1.9, 2.1, 1.5), (2.6, 2.0, 0.9), (2.9, 1.4, 0.4)])
 label("Try: a curve half. Mirror Copy,\ndrag the arrow: the plane\nmoves (offset)", (LX, 1.8, 0))
 
 # ---------------- Make Symmetric (y < 0) ----------------
@@ -180,6 +185,24 @@ for o in (sc, rg):
     report[o.name] = float(np.abs(P[tw] - symmetry.reflect(s, P)).max())
 report[ss.name] = symmetry.sym_of(ss).get("dir")
 report["objects"] = len(bpy.data.objects)
+def seam_normals(o):
+    """World unit normals along the surface edge lying on y = 0."""
+    M = W(o); s = list(store.get_brep(o).faces())[0].surface()
+    (u0, u1), (v0, v1) = s.u_domain(), s.v_domain()
+    for u in (u0, u1):
+        P = np.array([M[:3, :3] @ np.array(s.evaluate(u, v)) + M[:3, 3] for v in np.linspace(v0, v1, 9)])
+        if np.abs(P[:, 1]).max() < 1e-9:
+            N = []
+            for v in np.linspace(v0, v1, 9):
+                e = 1e-6
+                su = (np.array(s.evaluate(min(u + e, u1), v)) - np.array(s.evaluate(max(u - e, u0), v)))
+                sv = (np.array(s.evaluate(u, min(v + e, v1))) - np.array(s.evaluate(u, max(v - e, v0))))
+                n = M[:3, :3] @ np.cross(su, sv); N.append(n / np.linalg.norm(n))
+            return P, np.array(N)
+P1, N1 = seam_normals(f2); P2, N2 = seam_normals(c2)
+order = np.argsort(P1[:, 0]); order2 = np.argsort(P2[:, 0])
+ang = np.degrees(np.arccos(np.clip(np.abs(np.sum(N1[order] * N2[order2], axis=1)), -1, 1)))
+report["fender seam: largest normal angle (deg)"] = round(float(ang.max()), 6)
 class _Stub: pass
 for name, outp in (("Fender (try Mirror Copy)", "COPY"), ("Half Profile (try Mirror Copy)", "COPY"),
                    ("Lopsided Curve (try Make Symmetric)", "SYMMETRIC"), ("Lopsided Surface (try Make Symmetric)", "SYMMETRIC")):
