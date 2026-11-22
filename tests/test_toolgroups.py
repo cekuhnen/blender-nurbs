@@ -64,7 +64,7 @@ rows = [[t[0].split(".")[1] for t in row] for sec in tg.GROUP["SURFACES"][2][1:]
 check("Create Surfaces rows", rows == [
     ["loft", "loft_rails", "network"], ["revolve", "rail_revolve"], ["sweep", "pipe"],
     ["extrude", "flange"], ["planar", "dome"], ["boundary", "patch"],
-    ["offset", "thicken"], ["pattern"], ["unroll", "flow"], ["from_blender_surface"]], rows)
+    ["offset", "thicken"], ["pattern", "mirror"], ["unroll", "flow"], ["from_blender_surface"]], rows)
 
 rows = [[t[0].split(".")[1] for t in row] for sec in tg.GROUP["CURVE_EDIT"][2] for row in sec[1]]
 check("Curve Edit rows, in Surface Edit's order (shape, trim, join)", rows == [

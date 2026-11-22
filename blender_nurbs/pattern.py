@@ -58,7 +58,12 @@ ARROW_PX = 90.0             # an unused arrow / the ring: this long on screen
 
 MODE_ITEMS = [("LINEAR", "Linear", "Copies along the widget's X, Y and Z: a row, a grid or a block"),
               ("CIRCULAR", "Circular", "Copies turned about the widget's Z axis"),
-              ("PATH", "Path", "Copies along a curve or a surface edge")]
+              ("PATH", "Path", "Copies along a curve or a surface edge"),
+              ("MIRROR", "Mirror", "A mirror image across the widget's plane (its Z the normal): a linked copy, "
+                                   "or the object made symmetric (the Mirror tool)")]
+OUTPUT_ITEMS = [("COPY", "Mirror Copy", "A mirrored copy that follows the original (construction history)"),
+                ("SYMMETRIC", "Make Symmetric", "One object: its CVs paired across the plane, the master half "
+                                                "copied onto the other; in Edit Mode twins move together")]
 SPACE_ITEMS = [("SPACING", "Spacing", "The distance from one copy to the next"),
                ("EXTENT", "Length", "The distance from the first copy to the last")]
 AXES = "xyz"
@@ -177,7 +182,40 @@ def counts(p):
     return tuple(max(int(p.get("count_" + a, 1)), 1) for a in AXES)
 
 
+def mirror_plane(p):
+    """(point, unit normal) of a mirror pattern's plane: through the widget's
+    centre moved by mirror_offset along its Z, Z the normal."""
+    z = frame_axes(p)[2]
+    return np.asarray(p.get("center_point", (0.0, 0.0, 0.0)), float) + float(p.get("mirror_offset", 0.0)) * z, z
+
+
+def mirror_matrix(O, n):
+    """World 4x4: the mirror across the plane through O with normal n."""
+    n = _unit(n)
+    T = np.eye(4)
+    T[:3, :3] = np.eye(3) - 2.0 * np.outer(n, n)
+    T[:3, 3] = 2.0 * float(np.asarray(O, float) @ n) * n
+    return T
+
+
+def local_flip(src, T):
+    """A copy turned over by the mirror T keeps a proper matrix: F = T M S,
+    S mirroring the copy's own space along the local axis nearest the plane
+    normal (its geometry is the source's under S). -> S (4x4)."""
+    M = world_matrix(src)
+    R = T[:3, :3]
+    w, V = np.linalg.eigh(0.5 * (R + R.T))
+    n = V[:, int(np.argmin(w))]                     # the mirror's normal: R n = -n
+    cols = np.linalg.norm(M[:3, :3], axis=0)
+    a = int(np.argmax(np.abs(M[:3, :3].T @ n) / np.where(cols > 1e-12, cols, 1.0)))
+    S = np.eye(4)
+    S[a, a] = -1.0
+    return S
+
+
 def total_count(p):
+    if p.get("mode", "LINEAR") == "MIRROR":
+        return 2
     if p.get("mode", "LINEAR") == "LINEAR":
         nx, ny, nz = counts(p)
         return nx * ny * nz
@@ -467,6 +505,8 @@ def copy_transform(p, src, index, path=None, cache=None, surfaces=None):
             if i_a:
                 v = v + i_a * step(float(p.get("distance_" + a, 0.0)), n_a, space) * d
         return _translation(v)
+    if mode == "MIRROR":
+        return mirror_matrix(*mirror_plane(p)) if index == 1 else None
     n = max(int(p.get("count", 2)), 1)
     if not 0 < index < n:
         return None
@@ -613,11 +653,32 @@ def build_pattern(inputs, p):
         return ("inplace", lambda obj: _write_curve(obj, src, features.placement(obj), W))
     if not store.is_nurbs(src):
         raise RuntimeError(f"{src.name} is not a NURBS object")
+    turn = np.linalg.det(W[:3, :3]) < 0.0          # a mirror: turned over too, so it faces out as the source does
     if store.is_natural(src) and store.get_brep(src).face_count() == 1:
-        return _moved_surface(store.get_surfaces(src)[0], W)   # an untrimmed surface stays one (Edge mode, CVs)
-    b = store.brep_from_text(src[store.PROP_BREP])
-    store.transform(b, W)
-    return ("brep_text", store.brep_to_text(b))
+        s = _moved_surface(store.get_surfaces(src)[0], W)   # an untrimmed surface stays one (Edge mode, CVs)
+        if turn:
+            from .square import reverse_u
+            s = reverse_u(s)
+        return s
+    return ("brep_text", _moved_text(src[store.PROP_BREP], W))
+
+
+def _moved_text(text, A):
+    """B-rep text moved by A; a mirror (det < 0) also turns its faces over
+    so they face out as before -- a closed solid needs no turning: the
+    kernel takes its faces' outward side from the solid itself."""
+    b = store.brep_from_text(text)
+    store.transform(b, A)
+    out = store.brep_to_text(b)
+    if np.linalg.det(np.asarray(A, float)[:3, :3]) < 0.0:
+        try:
+            solid = bool(b.is_manifold_solid())
+        except Exception:
+            solid = False
+        if not solid:
+            from .steps import flip_text
+            out = flip_text(out)
+    return out
 
 
 def _moved_surface(surf, W):
@@ -757,10 +818,16 @@ def make_pattern(context, sources, p, group=None, path=None, surfaces=None):
             continue
         for k, T in moves:
             F = T @ M
+            S = None
+            if np.linalg.det(T[:3, :3]) < 0.0:      # a mirror: the copy's own space mirrored, its matrix proper
+                S = local_flip(src, T)
+                F = F @ S
             obj = existing.pop((src.name, k), None)
             try:
                 if obj is None:
                     obj = _new_copy(context, src, F, k)
+                    if S is not None:
+                        _rewrite_plain(obj, src, context, S)
                     fresh = True
                 else:
                     _ensure_matrix(obj, F)
@@ -773,7 +840,7 @@ def make_pattern(context, sources, p, group=None, path=None, surfaces=None):
                     else:
                         features.rebuild(obj, context, force=True)
                 elif not fresh:
-                    _rewrite_plain(obj, src, context)
+                    _rewrite_plain(obj, src, context, S)
                 made.append(obj)
             except Exception as exc:
                 errors.append(f"{src.name} copy {k}: {exc}")
@@ -782,13 +849,28 @@ def make_pattern(context, sources, p, group=None, path=None, surfaces=None):
     return made, errors
 
 
-def _rewrite_plain(obj, src, context):
-    """A copy without history given src's geometry again (in its local space)."""
+def _rewrite_plain(obj, src, context, S=None):
+    """A copy given src's geometry again (in its local space; S: mirrored by
+    it, turned over so it faces out as src does)."""
     if src.type == 'CURVE':
-        _write_curve(obj, src, None, np.eye(4))
-    else:
+        _write_curve(obj, src, None, np.eye(4) if S is None else S)
+        return
+    if S is None:
         store.set_geometry_text(obj, src[store.PROP_BREP], context, keep_untrimmed=False)
         obj[store.PROP_NATURAL] = 1 if store.is_natural(src) else 0
+        return
+    from .pivot import remember
+    store.set_geometry_text(obj, _moved_text(src[store.PROP_BREP], S), context, keep_untrimmed=False)
+    obj[store.PROP_NATURAL] = 1 if store.is_natural(src) else 0
+    for k in (store.PROP_UNTRIM, store.PROP_UNTRIM + "_natural"):
+        if k in obj:
+            del obj[k]
+    if isinstance(src.get(store.PROP_UNTRIM), str):
+        obj[store.PROP_UNTRIM] = _moved_text(src[store.PROP_UNTRIM], S)
+        if store.PROP_UNTRIM + "_natural" in src:
+            obj[store.PROP_UNTRIM + "_natural"] = src[store.PROP_UNTRIM + "_natural"]
+    if obj.type == 'MESH':
+        remember(obj)
 
 
 def _remove(obj):
@@ -821,7 +903,9 @@ def selected_path(context):
 def start_mode(context, last):
     """The mode the one Pattern button starts in: path for a curve active with
     something else selected, else the one used last."""
-    return "PATH" if selected_path(context) is not None else last
+    if selected_path(context) is not None:
+        return "PATH"
+    return last if last != "MIRROR" else "LINEAR"        # (Mirror is its own tool)
 
 
 def _snapper_class():
@@ -837,14 +921,8 @@ def _snapper_class():
     return _Snapper
 
 
-class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
-    """Copies of the selected NURBS objects and curves in a row, a grid, a
-    block, around an axis or along a path -- real NURBS objects (Blender's
-    Array copies only the mesh). From the UI a widget shows the pattern: drag
-    its centre (it snaps), its arrows, its ring; number keys give the count,
-    Tab types the spacing or angle; click away or Enter to make it"""
-    bl_idname = "nproto.pattern"
-    bl_label = "Pattern"
+class _PatternTool(ValueDrag):
+    """Pattern and Mirror: one tool body (properties, widget, stage), two operators."""
     bl_options = {'REGISTER', 'UNDO'}
 
     mode: EnumProperty(name="Pattern", items=MODE_ITEMS, default="LINEAR")
@@ -877,6 +955,13 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
         ("PATH", "Path", "Each copy turns with the path alone (a rotation-minimising frame)")])
     surfaces: StringProperty(options={'HIDDEN', 'SKIP_SAVE'},
                              description="JSON list of the NURBS objects the path lies on (empty: look for them)")
+    # mirror
+    mirror_offset: FloatProperty(name="Plane Offset", default=0.0, unit='LENGTH',
+                                 description="The mirror plane moved along its normal from the widget's centre")
+    mirror_output: EnumProperty(name="Output", items=OUTPUT_ITEMS, default="COPY")
+    flip_master: BoolProperty(name="Flip Master Side", default=False,
+                              description="Make Symmetric: keep the other half (the curve's end, the last rows) "
+                                          "and mirror it onto the start")
     # the widget (world)
     center_point: FloatVectorProperty(name="Center", size=3, subtype='XYZ', unit='LENGTH',
                                       options={'SKIP_SAVE'}, description="The widget's centre: the axis of a "
@@ -905,6 +990,8 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
             return ("angle",)
         if self.mode == "PATH":
             return ("distance",)
+        if self.mode == "MIRROR":
+            return ("mirror_offset",)
         return ("distance_x", "distance_y", "distance_z", "turn")
 
     def params(self):
@@ -919,6 +1006,8 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
                 p["distance_" + a] = d
         elif self.mode == "CIRCULAR":
             p.update(count=self.count, angle=self.angle, rotate=self.rotate)
+        elif self.mode == "MIRROR":
+            p.update(mirror_offset=self.mirror_offset)
         else:
             p.update(count=self.count, distance=self.distance, rotate=self.rotate, path_ref=self.path_ref,
                      orient=self.orient)
@@ -928,7 +1017,7 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
         """The operator's settings from a pattern's params (Edit Pattern)."""
         p = normalize(p, src)
         for k in ("mode", "space", "count_x", "count_y", "count_z", "distance_x", "distance_y", "distance_z",
-                  "turn", "count", "angle", "distance", "rotate", "path_ref"):
+                  "turn", "count", "angle", "distance", "rotate", "path_ref", "mirror_offset"):
             if k in p:
                 setattr(self, k, p[k])
         self.orient = p.get("orient", "PATH")       # (patterns made before it: turned with the path)
@@ -985,6 +1074,9 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
         (circular: the 3D cursor), lined up with the active work plane."""
         from . import workplanes
         wf = workplanes.active_frame(context.scene)
+        if self.mode == "MIRROR":
+            self._mirror_widget(wf, srcs)
+            return
         if wf is not None:
             self.frame_x, self.frame_z = tuple(map(float, wf[1])), tuple(map(float, wf[3]))
         else:
@@ -992,6 +1084,40 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
         self.turn = 0.0
         self.center_point = tuple(map(float, context.scene.cursor.location)) if self.mode == "CIRCULAR" \
             else tuple(map(float, _middle(srcs)))
+
+    def _mirror_widget(self, wf, srcs):
+        """The mirror plane a new Mirror starts with: one of the work plane's
+        (or the world's) three planes through its origin -- for a copy the one
+        the objects come nearest to touching (a half model's middle), to make
+        them symmetric the one they are most centred on. The widget sits where
+        the objects' middle falls on it."""
+        if wf is not None:
+            O0 = np.asarray(wf[0], float)
+            axes = [np.asarray(a, float) for a in (wf[1], wf[2], wf[3])]
+        else:
+            O0, axes = np.zeros(3), list(np.eye(3))
+        B = _world_points(srcs)
+        size = float(np.ptp(B, axis=0).max()) or 1.0
+        best = None
+        for rank, i in enumerate((1, 0, 2)):               # ties: Y first (Alias's default plane), X, Z
+            h = (B - O0) @ axes[i]
+            lo, hi = float(h.min()), float(h.max())
+            if hi - lo < 1e-6 * size:
+                continue                                   # flat across it: its mirror is itself
+            ext = hi - lo
+            score = (min(abs(lo), abs(hi)) if self.mirror_output == "COPY" else abs(lo + hi) * 0.5) / ext
+            score += 1e-3 * rank
+            if best is None or score < best[0]:
+                best = (score, i)
+        if best is None:
+            best = (0.0, 1)
+        z = axes[best[1]]
+        x = axes[(best[1] + 1) % 3]
+        mid = 0.5 * (B.min(axis=0) + B.max(axis=0))
+        C = mid - float((mid - O0) @ z) * z
+        self.frame_z, self.frame_x, self.turn = tuple(map(float, z)), tuple(map(float, x)), 0.0
+        self.center_point = tuple(map(float, C))
+        self.mirror_offset = 0.0
 
     # -- start ---------------------------------------------------------------
     def invoke(self, context, event):
@@ -1030,7 +1156,8 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
             self._default_widget(context, srcs)
             if self.mode == "PATH" and not self.surfaces:
                 self._find_surfaces(context)
-        self._keep ={f: getattr(self, f) for f in ("distance_x", "distance_y", "distance_z", "distance")} \
+        self._keep ={f: getattr(self, f) for f in ("distance_x", "distance_y", "distance_z", "distance",
+                                                   "mirror_offset")} \
             if self.group else None         # an edit starts from the pattern as it is
         return self.ask(context)
 
@@ -1065,6 +1192,8 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
             self.report({'ERROR'}, "Pattern along a path: pick the path (A in the tool)")
             return {'CANCELLED'}
         p = self.params()
+        if self.mode == "MIRROR" and self.mirror_output == "SYMMETRIC":
+            return self._make_symmetric(context, srcs, p)
         n = total_count(p) - 1
         if n * len(srcs) > MAX_COPIES:
             self.report({'ERROR'}, f"{n * len(srcs)} copies: at most {MAX_COPIES} in one pattern")
@@ -1090,13 +1219,54 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
                 pass
         keep = act if (self.group and act in made) else srcs[0]
         context.view_layer.objects.active = keep
-        self.report({'INFO'}, f"Pattern: {len(made)} cop{'y' if len(made) == 1 else 'ies'}")
+        if self.mode == "MIRROR":
+            self.report({'INFO'}, f"Mirror: {len(made)} mirrored cop{'y' if len(made) == 1 else 'ies'}")
+        else:
+            self.report({'INFO'}, f"Pattern: {len(made)} cop{'y' if len(made) == 1 else 'ies'}")
+        return {'FINISHED'}
+
+    def _make_symmetric(self, context, srcs, p):
+        from . import symmetry
+        O, n = mirror_plane(p)
+        done, errors, notes = [], [], []
+        for src in srcs:
+            try:
+                moved, nt = symmetry.make_symmetric(context, src, O, n, self.flip_master)
+            except Exception as exc:
+                errors.append(f"{src.name}: {exc}")
+                continue
+            done.append(src)
+            notes += [f"{src.name}: {t}" for t in nt]
+        for e in errors:
+            self.report({'ERROR'}, "Make Symmetric: " + e)
+        for t in notes:
+            self.report({'WARNING'}, "Make Symmetric: " + t)
+        if not done:
+            return {'CANCELLED'}
+        for o in context.selected_objects:
+            o.select_set(False)
+        for o in done:
+            try:
+                o.select_set(True)
+            except RuntimeError:
+                pass
+        context.view_layer.objects.active = done[0]
+        self.report({'INFO'}, f"Make Symmetric: {len(done)} object{'s' if len(done) > 1 else ''} -- "
+                              "in Edit Mode (Tab) its CVs move in mirrored pairs")
         return {'FINISHED'}
 
     def draw(self, context):
         lay = self.layout
         lay.use_property_split = True
         lay.use_property_decorate = False
+        if self.mode == "MIRROR":
+            lay.row().prop(self, "mirror_output", expand=True)
+            lay.prop(self, "center_point")
+            lay.prop(self, "frame_z", text="Plane Normal")
+            lay.prop(self, "mirror_offset")
+            if self.mirror_output == "SYMMETRIC":
+                lay.prop(self, "flip_master")
+            return
         lay.row().prop(self, "mode", expand=True)
         if self.mode == "LINEAR":
             lay.row().prop(self, "space", expand=True)
@@ -1147,6 +1317,8 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
             return f"{axis}{n}× {word}"
         if name == "angle":
             return f"{self.count}× over"
+        if name == "mirror_offset":
+            return "plane offset"
         return super()._label(name)
 
     def _too_short(self, context):
@@ -1194,9 +1366,20 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
         x, _, _ = self._frame()
         return self._screen_len(C, x, 0.55 * ARROW_PX)
 
+    def _mirror_arrow(self):
+        """The plane's arrow: from the plane along its normal, a fixed length on screen."""
+        C = self._center()
+        z = self._frame()[2]
+        return C, z, self._screen_len(C + self.mirror_offset * z, z, 0.6 * ARROW_PX)
+
     def drag_handles(self):
         p = self.params()
         C = self._center()
+        if self.mode == "MIRROR":
+            C, z, L0 = self._mirror_arrow()
+            return [{"field": "mirror_offset", "kind": "arrow", "origin": C, "dir": z,
+                     "param": self.mirror_offset + L0, "base": C + self.mirror_offset * z,
+                     "to_value": (lambda t, L0=L0: t - L0)}]
         if self.mode == "LINEAR":
             out = []
             x, y, z = self._frame()
@@ -1277,8 +1460,35 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
             return None
         return B[int(np.argmax(rad))]
 
+    def _symmetric_preview(self, p):
+        """Make Symmetric: each source's master half and its mirror image."""
+        from . import symmetry
+        O, n = mirror_plane(p)
+        T = mirror_matrix(O, n)
+        R, t = T[:3, :3], T[:3, 3]
+        lines, tris = [], []
+        for src, L, Tw, box in self._pv:
+            try:
+                sym = symmetry.plane_from_world(world_matrix(src), O, n)
+                sign = symmetry.master_side(src, sym, self.flip_master)
+            except Exception as exc:
+                print("NURBS mirror preview:", exc)
+                sign = 1.0
+            for P in L:
+                for q in _clip_side(np.asarray(P, float), O, sign * n):
+                    lines += [q, q @ R.T + t]
+            if len(Tw):
+                Tw3 = np.asarray(Tw, float).reshape(-1, 3, 3)
+                keep = ((Tw3.mean(axis=1) - O) @ (sign * n)) >= 0.0
+                K = Tw3[keep].reshape(-1, 3)
+                if len(K):
+                    tris += [K, K @ R.T + t]
+        return {"lines": lines, "tris": np.vstack(tris) if tris else np.zeros((0, 3)), "guides": []}
+
     def drag_preview(self):
         p = self.params()
+        if self.mode == "MIRROR" and self.mirror_output == "SYMMETRIC":
+            return self._symmetric_preview(p)
         path = self._path()
         lines, tris, guides = [], [], []
         k_all = max(total_count(p) - 1, 0)
@@ -1312,6 +1522,22 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
         their colours, the ring, and for a circular pattern the axis line."""
         ov = draw.sketch_overlay
         refs = []
+        if self.mode == "MIRROR":
+            from .symmetry import plane_outline, COL_PLANE
+            V = lambda q: Vector(tuple(map(float, q)))
+            O, n = mirror_plane(self.params())
+            B = np.vstack([b for _, _, _, b in self._pv]) if self._pv else O[None]
+            refs.append(([V(q) for q in plane_outline(O, n, np.vstack([B, B @ mirror_matrix(O, n)[:3, :3].T
+                                                                       + mirror_matrix(O, n)[:3, 3]]))],
+                         COL_PLANE, 2.0))
+            C, z, L0 = self._mirror_arrow()
+            refs.append(([V(C), V(O)], (*AX_COL[2][:3], 0.45), 1.5))       # centre -> plane (an offset)
+            refs.append(([V(O), V(O + L0 * z)], AX_COL[2], 3.0))
+            ov["cursor"] = V(C)
+            ov["refs"] = refs
+            if self._cdrag is None:
+                ov["snap"], ov["snap_label"] = None, None
+            return
         if self.mode != "PATH":
             C = self._center()
             x, y, z = self._frame()
@@ -1364,6 +1590,14 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
                                    face_pts=[])
 
     def drag_check(self):
+        if self.mode == "MIRROR":
+            if self.mirror_output == "SYMMETRIC":
+                from . import symmetry
+                for src, _, _, _ in self._pv:
+                    why = symmetry.surface_reason(src) if src.type != 'CURVE' else None
+                    if why:
+                        return f"{src.name} can't be made symmetric: {why}"
+            return ""
         if self.mode == "LINEAR":
             p = self.params()
             if all(p["count_" + a] < 2 for a in AXES):
@@ -1388,7 +1622,29 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
             self._field = self.drag_fields.index(name)
             self._cbuf = ""
 
+    def _mirror_key(self, context, ch):
+        if ch in AXES:
+            self._axis_to(context, ch.upper())          # the plane's normal along that axis
+            self._moved_center = True
+        elif ch == "s":
+            self.mirror_output = "SYMMETRIC" if self.mirror_output == "COPY" else "COPY"
+            if not getattr(self, "_moved_center", False):
+                self._default_widget(context, [s for s, _, _, _ in self._pv])
+        elif ch == "f":
+            self.flip_master = not self.flip_master
+        elif ch in "cwb":
+            P = {"c": lambda: np.array(context.scene.cursor.location, float), "w": lambda: np.zeros(3),
+                 "b": self._anchor}[ch]()
+            self.center_point = tuple(map(float, P))
+            self.mirror_offset = 0.0
+            self._moved_center = True
+        else:
+            return bool(ch) and ch in "mae"             # (the pattern's other keys: nothing here)
+        return True
+
     def drag_key(self, context, event, ch):
+        if self.mode == "MIRROR":
+            return self._mirror_key(context, ch)
         if ch in AXES:
             if self.mode == "LINEAR":
                 self._set_field("distance_" + ch)        # that arrow takes the count / value keys
@@ -1521,7 +1777,7 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
         sn = self._snapper
         sn._plane = sn._view_plane(context, self._center())        # a free point stays at the widget's depth
         self._cdrag = {"c": tuple(self.center_point), "x": tuple(self.frame_x), "z": tuple(self.frame_z),
-                       "turn": self.turn}
+                       "turn": self.turn, "off": self.mirror_offset}
         return {'RUNNING_MODAL'}
 
     def _center_modal(self, context, event):
@@ -1537,6 +1793,7 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
         if et in {'ESC', 'RIGHTMOUSE'} and ev == 'PRESS':
             d = self._cdrag
             self.center_point, self.frame_x, self.frame_z, self.turn = d["c"], d["x"], d["z"], d["turn"]
+            self.mirror_offset = d.get("off", self.mirror_offset)
             self._cdrag = None
             self._drag_refresh(context)
             return {'RUNNING_MODAL'}
@@ -1553,6 +1810,8 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
             return
         P = np.asarray(P, float)
         self.center_point = tuple(map(float, P))
+        if self.mode == "MIRROR":
+            self.mirror_offset = 0.0            # the plane goes through the point (onto a face: that face's plane)
         d = self._cdrag
         face = None
         if not getattr(event, "alt", False):
@@ -1642,6 +1901,18 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
     def _state(self, context):
         f = self._field_name()
         out = []
+        if self.mode == "MIRROR":
+            _, n = mirror_plane(self.params())
+            ax = next((a.upper() for a, e in zip(AXES, np.eye(3)) if abs(abs(float(n @ e)) - 1.0) < 1e-9), None)
+            out.append("Mirror Copy" if self.mirror_output == "COPY" else "Make Symmetric")
+            out.append(f"plane normal {ax}" if ax else "plane normal ({:.2f}, {:.2f}, {:.2f})".format(*n))
+            if abs(self.mirror_offset) > 0.0:
+                out.append("offset " + self._fmt(context, "mirror_offset"))
+            if self.mirror_output == "SYMMETRIC":
+                out.append("master: " + ("the end" if self.flip_master else "the start"))
+            if self._value_mode or self._typed:
+                out.append("typing the offset" + (f": {self._typed}|" if self._typed else ""))
+            return out
         if self.mode == "LINEAR":
             for a in AXES:
                 n = getattr(self, "count_" + a)
@@ -1673,8 +1944,28 @@ class NPROTO_OT_pattern(ValueDrag, bpy.types.Operator):
                        (f": {self._typed}|" if self._typed else ""))
         return out
 
+    def _mirror_rows(self):
+        sym = self.mirror_output == "SYMMETRIC"
+        rows = [("Output", [hints.cycle("S", ["mirror copy", "make symmetric"],
+                                        "make symmetric" if sym else "mirror copy")]
+                 + ([hints.toggle("F", "flip master side", self.flip_master)] if sym else []))]
+        rows.append(("Plane", [hints.key("LMB drag", "the centre: move it (snaps; on a face: that face's plane)"),
+                               hints.key("LMB drag", "the arrow: move the plane along its normal"),
+                               hints.key("X Y Z", "normal along that axis"),
+                               hints.key("C W B", "through cursor / world origin / middle"),
+                               hints.key("Tab", "type the offset")]))
+        rows.append(("Snap", [hints.key("Ctrl", "grid"), hints.key("Alt", "no snapping")]))
+        last = self._last_text(self._ctx)
+        if last:
+            rows.append(("", [hints.key("L", f"reuse {last}")]))
+        rows.append(("", [hints.note("click away from the widget or Enter: " +
+                                     ("make it symmetric" if sym else "make the copy"))]))
+        return rows
+
     def _rows(self):
         f = self._field_name()
+        if self.mode == "MIRROR":
+            return self._mirror_rows()
         what = {"LINEAR": "the active arrow's count", "CIRCULAR": "the count", "PATH": "the count"}[self.mode]
         value = {"LINEAR": "spacing", "CIRCULAR": "angle", "PATH": "distance"}[self.mode]
         if f == "turn":
@@ -1729,6 +2020,40 @@ def _path_pick(pd, s0, ray_o, ray_d):
     if pd.closed and s < s0:
         s += pd.length
     return s - s0
+
+
+def _world_points(objs):
+    """Corners of the objects' boxes (world), stacked."""
+    out = []
+    for o in objs:
+        M = world_matrix(o)
+        P = _local_points(o)
+        if P is None or not len(P):
+            P = np.array([tuple(c) for c in o.bound_box], float)
+        lo, hi = P.min(axis=0), P.max(axis=0)
+        C = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
+        out.append(C @ M[:3, :3].T + M[:3, 3])
+    return np.vstack(out) if out else np.zeros((1, 3))
+
+
+def _clip_side(P, O, n):
+    """The parts of polyline P on the side of the plane (O, n) n points to."""
+    h = (P - O) @ n
+    out, cur = [], []
+    for i in range(len(P)):
+        if h[i] >= 0.0:
+            if i and h[i - 1] < 0.0 and not cur:
+                t = h[i - 1] / (h[i - 1] - h[i])
+                cur.append(P[i - 1] + t * (P[i] - P[i - 1]))
+            cur.append(P[i])
+        elif cur:
+            t = h[i - 1] / (h[i - 1] - h[i])
+            cur.append(P[i - 1] + t * (P[i] - P[i - 1]))
+            out.append(np.array(cur))
+            cur = []
+    if len(cur) > 1:
+        out.append(np.array(cur))
+    return out
 
 
 def _middle(objs):
@@ -1834,6 +2159,11 @@ def summary(p):
     ctx = bpy.context
     p = normalize(p)
     mode = p.get("mode", "LINEAR")
+    if mode == "MIRROR":
+        O, n = mirror_plane(p)
+        ax = next((a.upper() for a, e in zip(AXES, np.eye(3)) if abs(abs(float(n @ e)) - 1.0) < 1e-9), None)
+        return "Mirror · " + (f"normal {ax}" if ax else "normal ({:.2f}, {:.2f}, {:.2f})".format(*n)) + \
+            " · through ({})".format(", ".join(fmt_length(ctx, float(c)) for c in O))
     if mode == "CIRCULAR":
         txt = f"Circular · {int(p.get('count', 2))} over {float(p.get('angle', 360.0)):g}°"
         return txt + ("" if p.get("rotate", True) else " · not rotated")
@@ -1858,11 +2188,15 @@ def draw_feature(box, context, obj, h):
     """The Feature panel's part for a pattern copy (feature_ui.draw_feature)."""
     p = h["params"]
     col = box.column(align=True)
-    col.label(text=summary(p), icon='MOD_ARRAY')
+    mirror = p.get("mode") == "MIRROR"
+    col.label(text=summary(p), icon='MOD_MIRROR' if mirror else 'MOD_ARRAY')
     copies = group_copies(p.get("group", ""), context.scene.objects)
-    col.label(text=f"Copy {int(p.get('index', 0))} · {len(copies)} copies in the pattern", icon='LINKED')
+    if mirror:
+        col.label(text="Mirrored copy: follows its original", icon='LINKED')
+    else:
+        col.label(text=f"Copy {int(p.get('index', 0))} · {len(copies)} copies in the pattern", icon='LINKED')
     row = box.row(align=True)
-    op = row.operator("nproto.pattern", text="Edit Pattern", icon='MODIFIER')
+    op = row.operator(_edit_op(p), text="Edit Mirror" if mirror else "Edit Pattern", icon='MODIFIER')
     op.group = p.get("group", "")
     row.operator("nproto.pattern_select", text="Select All", icon='RESTRICT_SELECT_OFF').group = p.get("group", "")
 
@@ -1895,8 +2229,51 @@ def draw_patterns_of(layout, context, obj):
         col = box.column(align=True)
         col.label(text=f"{summary(p)} · {n} cop{'y' if n == 1 else 'ies'}")
         row = col.row(align=True)
-        row.operator("nproto.pattern", text="Edit Pattern", icon='MODIFIER').group = g
+        mirror = p.get("mode") == "MIRROR"
+        row.operator(_edit_op(p), text="Edit Mirror" if mirror else "Edit Pattern", icon='MODIFIER').group = g
         row.operator("nproto.pattern_select", text="Select All", icon='RESTRICT_SELECT_OFF').group = g
 
 
-classes = (NPROTO_OT_pattern, NPROTO_OT_pattern_select)
+def _edit_op(p):
+    return "nproto.mirror" if p.get("mode") == "MIRROR" else "nproto.pattern"
+
+
+class NPROTO_OT_pattern(_PatternTool, bpy.types.Operator):
+    """Copies of the selected NURBS objects and curves in a row, a grid, a
+    block, around an axis or along a path -- real NURBS objects (Blender's
+    Array copies only the mesh). From the UI a widget shows the pattern: drag
+    its centre (it snaps), its arrows, its ring; number keys give the count,
+    Tab types the spacing or angle; click away or Enter to make it"""
+    bl_idname = "nproto.pattern"
+    bl_label = "Pattern"
+    bl_options = {'REGISTER', 'UNDO'}
+
+
+class NPROTO_OT_mirror(_PatternTool, bpy.types.Operator):
+    """A mirror image of the selected NURBS objects and curves across a plane:
+    Mirror Copy makes a copy that follows the original; Make Symmetric pairs
+    each object's CVs across the plane, copies the master half onto the other,
+    and keeps the pairs moving together in Edit Mode (as Alias's Symmetric
+    Modeling). Drag the widget's centre (it snaps; on a flat face it takes
+    the face's plane) or its arrow; X Y Z: the normal; S: the output"""
+    bl_idname = "nproto.mirror"
+    bl_label = "Mirror"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: EnumProperty(name="Pattern", items=MODE_ITEMS, default="MIRROR", options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        self.mode = "MIRROR"
+        self.auto = False
+        return super().invoke(context, event)
+
+    def execute(self, context):
+        self.mode = "MIRROR"
+        return super().execute(context)
+
+    def _fallback(self, context):
+        return context.window_manager.invoke_props_dialog(self, width=360, title=self.bl_label,
+                                                          confirm_text="Mirror")
+
+
+classes = (NPROTO_OT_pattern, NPROTO_OT_pattern_select, NPROTO_OT_mirror)

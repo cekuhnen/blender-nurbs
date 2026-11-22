@@ -595,6 +595,12 @@ def _draw():
     if so.get("cursor") is not None:     # where the next point / CV lands
         _draw_points([so["cursor"]], (0.0, 0.0, 0.0, 1.0), 10.0)
         _draw_points([so["cursor"]], COL_CURSOR, 7.0)
+    try:
+        from . import symmetry          # a symmetric object's plane; in Edit Mode the selected CVs' twins
+        gpu.state.depth_test_set('NONE')
+        symmetry.draw(ctx, _draw_lines, _draw_points, _lines_from_polylines, _IDENT)
+    except Exception as exc:
+        print("NURBS symmetry overlay:", exc)
     gpu.state.depth_test_set('NONE')
     gpu.state.blend_set('NONE')
 

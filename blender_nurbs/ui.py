@@ -625,6 +625,8 @@ class VIEW3D_PT_nproto_active(_SidePanel, bpy.types.Panel):
         _fui.draw_feature(lay, context)
 
         obj = context.view_layer.objects.active
+        from . import symmetry as _sym
+        _sym.draw_panel(lay, context, obj)
         if obj is not None and obj.type == 'CURVE':
             from .curvetools import draw_curve_info
             draw_curve_info(lay, context, obj)

@@ -152,6 +152,98 @@ r, fil = fillet(a, b, shape="BLEND", continuity="2", radius=0.09, end_radius=0.0
 rr = law(0.09, 0.0, start_y(fil)) if fil else None
 dev = max(max(on_edges(a, (rr(y), y, 0)), on_edges(b, (0, y, rr(y)))) for y in np.linspace(0, W, 9)) if fil else 1
 check("blend G2 0.09 -> 0: rails at r(y), tapering to the crossing", r == {'FINISHED'} and dev < 1e-7, dev)
+
+# --- the Feature panel: Radius A is the start radius; both trims follow ----------
+from blender_nurbs import feature_ui
+
+
+class Stub:                 # a layout that records the props and labels drawn
+    drawn = []
+    def __getattr__(self, n):
+        def f(*a_, **k_):
+            if n == "prop" and len(a_) > 1:
+                Stub.drawn.append(a_[1])
+            if n == "label":
+                Stub.drawn.append(k_.get("text", ""))
+            return Stub()
+        return f
+    def __setattr__(self, n, v): pass
+
+
+def panel(obj):
+    Stub.drawn = []
+    for o in ctx.view_layer.objects:
+        o.select_set(False)
+    obj.select_set(True); ctx.view_layer.objects.active = obj
+    feature_ui.draw_feature(Stub(), ctx)
+    return Stub.drawn
+
+
+for r_new in (0.06, 0.0):
+    a, b = corner()
+    a0 = A(a)
+    r, fil = fillet(a, b, shape="CIRCULAR", radius=0.1, end_radius=0.03)
+    feature_ui.sync_from_history(fil)
+    drawn = panel(fil)
+    pg = fil.nproto_feature
+    shown = ("sf_start" in drawn and "radius_a" not in drawn and "radius_b" not in drawn
+             and abs(pg.sf_start - 0.1) < 1e-6 and any(t.startswith("Variable Radius:") for t in drawn))
+    pg.sf_start = r_new                     # the update rebuilds the fillet and both trimmed sheets
+    rr = law(r_new, 0.03, start_y(fil))
+    ys = np.linspace(0.0, W, 9)
+    dev = max(max(on_edges(a, (rr(y), y, 0)), on_edges(b, (0, y, rr(y))), on_edges(fil, (rr(y), y, 0)))
+              for y in ys)
+    lost = W * (r_new + 0.03) / 2
+    p_ = features.history(fil)["params"]
+    check(f"panel: Start Radius (not Radius A / B) for a variable fillet; set to {r_new:g}, the fillet and both "
+          "trimmed sheets follow the new law",
+          shown and dev < 1e-7 and abs(A(a) - (a0 - lost)) < 1e-6 and abs(A(b) - (a0 - lost)) < 1e-6
+          and abs(p_["radii"][0] - r_new) < 1e-7 and abs(abs(p_["radius_a"]) - max(r_new, 0.03)) < 1e-7
+          and np.allclose(features.stack(a)[-1]["params"]["radii"], p_["radii"]),
+          (shown, dev, A(a), a0 - lost, p_["radii"]))
+
+
+# --- a constant fillet's Radius A / B edited: both trimmed sheets follow too -------
+def const_fillet(a, b, rad):
+    r = bpy.ops.nproto.fillet(surf_a=a.name, surf_b=b.name, shape="CIRCULAR", radius=rad)
+    return r, (ctx.active_object if r == {'FINISHED'} else None)
+
+
+def set_radius(fil, rad):
+    """Radius A then Radius B, as the panel edits them (each keeps its sign: the side)."""
+    pg = fil.nproto_feature
+    feature_ui.sync_from_history(fil)
+    pg.radius_a = math.copysign(rad, pg.radius_a)
+    pg.radius_b = math.copysign(rad, pg.radius_b)
+
+
+a, b = corner()
+a0 = A(a)
+r, fil = const_fillet(a, b, 0.1)
+set_radius(fil, 0.06)
+dev = max(max(on_edges(a, (0.06, y, 0)), on_edges(b, (0, y, 0.06)), on_edges(fil, (0.06, y, 0)))
+          for y in np.linspace(0.0, W, 9))
+st = features.stack(a)[-1]["params"]
+check("panel: a constant fillet's Radius A / B set to 0.06, the fillet and both trimmed sheets follow",
+      r == {'FINISHED'} and dev < 1e-7 and abs(A(a) - (a0 - W * 0.06)) < 1e-6 and abs(A(b) - (a0 - W * 0.06)) < 1e-6
+      and abs(abs(st["radius_a"]) - 0.06) < 1e-7 and abs(abs(features.stack(b)[-1]["params"]["radius_b"]) - 0.06) < 1e-7,
+      (dev, A(a), a0 - W * 0.06, A(b)))
+
+# a floor filleted to two walls with the same settings: an edit of one fillet re-trims
+# the floor only where that fillet is (its step is told apart by its partner wall)
+a, b = corner()
+c = sheet("Wall2", (L, 0, 0), (L, 0, L))
+a0 = A(a)
+r1, fil1 = const_fillet(a, b, 0.1)
+r2, fil2 = const_fillet(a, c, 0.1)
+set_radius(fil1, 0.06)
+ys = np.linspace(0.0, W, 9)
+dev = max(max(on_edges(a, (0.06, y, 0)), on_edges(a, (L - 0.1, y, 0)), on_edges(c, (L, y, 0.1)))
+          for y in ys)
+check("panel: a floor with two equal fillets, one edited to 0.06: only its side of the floor moves",
+      r1 == r2 == {'FINISHED'} and dev < 1e-7 and abs(A(a) - (a0 - W * 0.16)) < 1e-6
+      and abs(abs(features.stack(a)[1]["params"]["radius_a"]) - 0.1) < 1e-7,
+      (dev, A(a), a0 - W * 0.16))
 ctx.scene.nproto_settings.construction_history = False
 
 # --- the preview: two arrows, rails as the worker's law -------------------------
