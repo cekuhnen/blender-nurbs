@@ -174,6 +174,9 @@ class _ProjFace:
         tp = np.einsum("ij,ij->i", X - B, N) / np.where(np.abs(dn) > 1e-6, dn, 1.0)
         t = np.where(dom, t, tp)
         line = np.linalg.norm((X - B) - ((X - B) @ n)[:, None] * n, axis=1)
+        # a face running nearly along the lines (a box's top seen from the front) carries
+        # them on only when no other face can: its tangent plane meets them far off or never
+        line = np.where(np.abs(dn) > 0.2, line, 1e6 + line)
         inside = np.ones(len(B), bool) if self.natural else np.zeros(len(B), bool)
         if not self.natural and dom.any():
             inside[dom] = _in_loops(self.loops, uv[dom])
@@ -305,6 +308,37 @@ def _prism(profiles, d, lo, hi):
     return store.brep_from_text(g[1])
 
 
+def crossing_outlines(curves, n, size):
+    """The first pair (i, j) of profile curves whose outlines cross or touch
+    (kerned letters: a W running into the A after it), else None. They can't
+    be one region's outline and hole, nor two regions side by side."""
+    a = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    e1 = _unit(a - (a @ n) * n)
+    e2 = np.cross(n, e1)
+    polys = []
+    for c in curves:
+        P = geom.sample_curve(c, 193)
+        polys.append(np.stack([P @ e1, P @ e2], 1))
+    gap = 1e-5 * size
+
+    def orient(p, q, r):
+        return (q[..., 0] - p[..., 0]) * (r[..., 1] - p[..., 1]) - (q[..., 1] - p[..., 1]) * (r[..., 0] - p[..., 0])
+    for i in range(len(polys)):
+        for j in range(i + 1, len(polys)):
+            A, B = polys[i], polys[j]
+            if np.any(A.max(axis=0) < B.min(axis=0) - gap) or np.any(B.max(axis=0) < A.min(axis=0) - gap):
+                continue
+            a0, a1 = A[:-1, None], A[1:, None]
+            b0, b1 = B[None, :-1], B[None, 1:]
+            d1, d2 = orient(a0, a1, b0), orient(a0, a1, b1)
+            d3, d4 = orient(b0, b1, a0), orient(b0, b1, a1)
+            if np.any((d1 * d2 < 0) & (d3 * d4 < 0)):
+                return i, j
+            if float(np.linalg.norm(A[:, None] - B[None], axis=2).min()) <= gap:
+                return i, j
+    return None
+
+
 def emboss_tool(inputs, p):
     """The prism laid onto the body (world Brep), and how: (Brep, info)."""
     body, face, base, profiles = split_inputs(inputs)
@@ -326,6 +360,11 @@ def emboss_tool(inputs, p):
     if open_:
         raise RuntimeError("Emboss needs closed profiles: " + ", ".join(open_) + features._is_are(open_).rstrip())
     c, n_plane, psize = profile_plane(curves)
+    hit = crossing_outlines(curves, n_plane, psize)
+    if hit is not None:
+        names = sorted({groups[k][0][0].name for k in hit})
+        raise RuntimeError(f"two outlines of {' and '.join(names)} cross or touch (kerned letters?): space them "
+                           "apart (Letter Spacing) or join them into one outline first")
     tb = flow.world_brep(body)
     if not tb.is_manifold_solid():
         raise RuntimeError(f"{body.name} is not a closed solid")
@@ -358,7 +397,11 @@ def emboss_tool(inputs, p):
         store.transform(prism, A)
         out = prism
     else:
-        out, err = flow.flow_brep(prism, fmap)
+        try:
+            out, err = flow.flow_brep(prism, fmap)
+        except Exception as exc:
+            raise RuntimeError("the lettering could not be laid on: it crosses a step or an edge of the body "
+                               f"where the surface under it jumps ({exc})") from exc
         info["fit"] = err / fmap.size
     if not out.is_manifold_solid():
         raise RuntimeError("the laid-on profiles came out open (try a larger Overlap, or Place for small ones)")

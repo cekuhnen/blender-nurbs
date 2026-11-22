@@ -4085,6 +4085,22 @@ def job_flip(job):
     return {"faces": b.face_count()}
 
 
+def _to_origin(b):
+    """Move b (in place) so its box is centred on the origin; returns the
+    move back. The kernel's offsets fit their surfaces finer the farther the
+    part is from the origin: a lofted dome's offset had 20 x 15 CVs at the
+    origin, 45 x 156 six units out (and Thicken took 57 s instead of 0.2)."""
+    lo, hi = b.bounding_box()
+    c = tuple(0.5 * (float(a) + float(z)) for a, z in zip(lo, hi))
+    if max(abs(v) for v in c) > 0.0:
+        sm.translate(b, tuple(-v for v in c))
+    return c
+
+
+def _from_origin(r, c):
+    return sm.translate(r, c) if r is not None and max(abs(v) for v in c) > 0.0 else r
+
+
 def job_offset(job):
     """Offset every face of a (joined) sheet or solid by `distance` along its
     normals; corners between faces extended until they meet. World space in,
@@ -4093,7 +4109,8 @@ def job_offset(job):
     d = float(job["distance"])
     if abs(d) <= 0:
         raise RuntimeError("the distance is zero")
-    r = sm.offset_brep(b, d, extended_offset=True, self_intersection=True)
+    c = _to_origin(b)
+    r = _from_origin(sm.offset_brep(b, d, extended_offset=True, self_intersection=True), c)
     if r is None or r.face_count() == 0:
         raise RuntimeError("no offset (the distance may be bigger than a concave radius)")
     save(to_local(r, job.get("xforms", {}).get("target")), job["out"]["result"])
@@ -4113,9 +4130,10 @@ def job_thicken(job):
         solid = False
     if solid:
         raise RuntimeError("this is already a closed solid -- Thicken works on open surfaces (use Offset)")
+    c = _to_origin(b)
     if job.get("symmetric"):
         b = sm.offset_brep(b, -0.5 * d, extended_offset=True, self_intersection=True)
-    r = sm.shell_brep(b, d, extended_offset=True, self_intersection=True, create_solid=True)
+    r = _from_origin(sm.shell_brep(b, d, extended_offset=True, self_intersection=True, create_solid=True), c)
     if r is None or r.face_count() == 0:
         raise RuntimeError("no solid (the thickness may be bigger than a concave radius)")
     volume = 0.0

@@ -158,6 +158,25 @@ for hist in (True, False):
         check(f"[{tag}] box: stands out of the face it was thrown at", abs(rhi[1] - (hi[1] + H)) < 1e-6
               and abs(rlo[1] - lo[1]) < 1e-9, f"y {rlo[1]:.4f}..{rhi[1]:.4f}")
 
+    # a word (Blender text as curves) onto the front face: its letters' caps share one plane that
+    # runs past the face's top and bottom edges -- the box's top and bottom, along the lines,
+    # must not catch it
+    cu = bpy.data.curves.new("Word", 'FONT'); cu.body = "LOGO"; cu.size = 0.55
+    cu.align_x = 'CENTER'; cu.align_y = 'CENTER'
+    wo = bpy.data.objects.new("Word", cu); ctx.collection.objects.link(wo)
+    wo.location = (0.5 * (lo[0] + hi[0]), lo[1] - 1.5, 0.5 * (lo[2] + hi[2])); wo.rotation_euler = (math.pi / 2, 0, 0)
+    select([wo], wo)
+    bpy.ops.object.convert(target='CURVE')
+    wo = ctx.active_object; wo.data.dimensions = '3D'
+    prof = emboss.profile_inputs([wo])
+    A = abs(emboss._prism(prof, np.array([0.0, 1.0, 0.0]), 0.0, 1.0).volume(1e-7))
+    box2 = res if (good and not hist) else box
+    V0 = vol(box2)
+    r, res2, dt = emboss_op([wo], box2, operation="DEBOSS")
+    good2 = r == {'FINISHED'} and store.is_nurbs(res2)
+    check(f"[{tag}] a word debossed into the box's face", good2 and solid(res2)
+          and abs(V0 - vol(res2) - A * H) < 2e-3 * A * H, f"{V0 - vol(res2) if good2 else 0:.6f} vs {A * H:.6f}")
+
     # -- Wrap: fold back from the body's unrolled sheet -------------------------------------
     clear()
     body = dome_body()
@@ -204,6 +223,15 @@ for hist in (True, False):
     good = r == {'FINISHED'} and store.is_nurbs(res)
     check(f"[{tag}] project a disc near the sphere's pole", good and solid(res)
           and abs(vol(res) - V0 - A * H) < 2e-3 * A * H, f"{vol(res) - V0 if good else 0:.6f} vs {A * H:.6f}")
+    # outlines that cross (kerned letters) are refused with a reason, the body left as it was
+    clear()
+    bpy.ops.nproto.add_primitive(kind="SPHERE", radius=1.0)
+    sph = ctx.active_object
+    c1, c2 = circle("C1", 0.2, (-0.12, 0.0, 3.0)), circle("C2", 0.2, (0.12, 0.0, 3.0))
+    r, res, dt = emboss_op([c1, c2], sph)
+    check(f"[{tag}] crossing outlines refused", r == {'CANCELLED'} and store.get_brep(sph).face_count() == 1
+          and emboss.crossing_outlines([features.input_curve(c1, "S0"), features.input_curve(c2, "S0")],
+                                       np.array([0.0, 0.0, 1.0]), 0.6) == (0, 1))
     # an open profile is refused with a reason
     clear()
     bpy.ops.nproto.add_primitive(kind="SPHERE", radius=1.0)
