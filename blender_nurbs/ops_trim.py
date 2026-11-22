@@ -957,6 +957,16 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         th = np.pi - np.arccos(np.clip(np.sum(D1 * D2, axis=1), -0.9999, 0.9999))
         return 2.0 * np.sin(0.5 * np.maximum(th, np.radians(1.0)))
 
+    def drag_label_more(self, context, field):
+        """Chord: the ball radius it gives, from smallest to largest along the
+        crossing (it changes where the angle between the surfaces does)."""
+        if self.rail_type != "CHORD" or field != "radius" or self.shape == "SOFT" or self.radius <= 0:
+            return ""
+        from .valuedrag import fmt_length
+        r = np.concatenate([self.radius / self._chord_k(P, NA, NB) for P, NA, NB in self._sf])
+        lo, hi = fmt_length(context, float(r.min())), fmt_length(context, float(r.max()))
+        return f" · Radius {lo}" if lo == hi else f" · Radius {lo}–{hi}"
+
     def _radii(self, P, NA, NB, i=0):
         if self.rail_type == "CHORD":
             r = self.radius / self._chord_k(P, NA, NB)

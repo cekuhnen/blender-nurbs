@@ -224,6 +224,42 @@ lab = arrow_labels(op)
 check("chamfer preview: one radius, its one arrow labelled", lab is not None and len(lab) == 1
       and lab[0][1].startswith("Radius "), lab)
 
+# --- Chord: the label adds the ball radius it gives, smallest to largest ---------
+# at 90 deg the rails a chord c apart need a ball c / sqrt(2); with the wall leaning
+# 30 deg out (120 deg between the sheets) the ball's turn is 60 deg: radius c itself
+from blender_nurbs.valuedrag import fmt_length
+C_ = 0.1
+
+
+def chord_op(wall_end):
+    clear()
+    a, b = sheet("Floor", (0, 0, 0), (L, 0, 0)), sheet("Wall", (0, 0, 0), wall_end)
+    op = type("PlainFillet", (vd.ValueDrag,), body)()
+    for k, v in dict(surf_a=a.name, surf_b=b.name, flip_a=False, flip_b=False, rail_type="CHORD", same_radius=True,
+                     radius=C_, radius_b=C_, shape="CIRCULAR", continuity="2", ends="NOTCH", variable=False,
+                     end_radius=0.0, _msg="").items():
+        setattr(op, k, v)
+    op.drag_setup(ctx, None)
+    return op
+
+
+op90 = chord_op((0, 0, L))
+lab = arrow_labels(op90)
+r90 = C_ / math.sqrt(2)
+check("chord label: 90 deg corner, Chord 10 cm and the one ball radius c / sqrt(2)",
+      lab is not None and len(lab) == 1 and lab[0][1] == f"Chord {fmt_length(ctx, C_)} · Radius {fmt_length(ctx, r90)}",
+      lab)
+op120 = chord_op((-L * 0.5, 0, L * math.sqrt(3) / 2))
+lab = arrow_labels(op120)
+check("chord label: 120 deg between the sheets, the ball radius is the chord",
+      lab is not None and lab[0][1] == f"Chord {fmt_length(ctx, C_)} · Radius {fmt_length(ctx, C_)}", lab)
+op120._sf = op90._sf + op120._sf        # one run over both angles: the radius changes along it
+more = op120.drag_label_more(ctx, "radius")
+check("chord label: where the angle changes along the run, the range smallest to largest",
+      more == f" · Radius {fmt_length(ctx, r90)}–{fmt_length(ctx, C_)}", more)
+op120.rail_type = "RADIUS"
+check("chord label: a rolling ball radius adds nothing", op120.drag_label_more(ctx, "radius") == "")
+
 ctx.scene.nproto_settings.construction_history = False
 print("ALL PASS" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)
