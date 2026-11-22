@@ -210,6 +210,7 @@ def surface_from_net(C, U, p, V, q):
 # --------------------------------------------------------------------------
 
 EDGE_SAMPLES = 64
+BREP_TOL = 1e-5        # a rebuilt face's own tolerance, a share of the size (the stitch's)
 
 
 def edge_samples(e, n=9):
@@ -282,7 +283,13 @@ def trimmed_face(face, S, make_surface, uv_to_world, size):
     the face's edges taken through uv_to_world ((m, 2) parameters of S ->
     (m, 3) world points), one curve per edge so that edges shared with other
     rebuilt faces meet edge to edge. make_surface is called for every try
-    (the kernel takes the surface and curves it trims with)."""
+    (the kernel takes the surface and curves it trims with).
+
+    The face's own tolerance follows size (BREP_TOL), not the kernel's
+    default 0.01 model units: the faces are stitched together again by
+    their vertices, and two corners closer than twice that tolerance (a
+    polygon ring of short edges) were merged into one, the wrong edges
+    paired and the body left open."""
     sm, ext = store._k()
     loops = [lp for lp in face.boundary_loops() if lp]
     recipes = [[uv_to_world(uv) for uv, _ in loop_uvs(S, lp)] for lp in loops]
@@ -291,7 +298,8 @@ def trimmed_face(face, S, make_surface, uv_to_world, size):
     for tol in (1e-7, 1e-5, 1e-4):
         try:
             curves = [curve_through(X, size) for lp in recipes for X in lp]
-            b = ext.trim_surface_with_3d_curves_tol(make_surface(), sizes, curves, tol * size, 0.01)
+            b = ext.trim_surface_with_3d_curves_tol(make_surface(), sizes, curves, tol * size,
+                                                    max(BREP_TOL, 10.0 * tol) * size)
             if b is not None and b.face_count():
                 return b
         except Exception as exc:

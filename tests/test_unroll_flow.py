@@ -283,6 +283,31 @@ for hist in (True, False):
         check(f"[{tag}] rigid keeps the shape", np.abs(d0 - d1).max() < 1e-6, f"{np.abs(d0 - d1).max():.1e}")
     else:
         check(f"[{tag}] rigid keeps the shape", False)
+    # a ring of 48 short edges (0.01 apart, under the kernel's default face
+    # tolerance) extruded into a solid: flowed it is still one closed body
+    ring = lambda rad: [(1.0 + rad * math.cos(a), 0.2 + rad * math.sin(a), -0.02)
+                        for a in np.linspace(0, 2 * math.pi, 49)[:-1]]
+    ro, ri = poly("RingOut", ring(0.15)), poly("RingIn", ring(0.08))
+    bpy.ops.nproto.extrude(inputs=json.dumps([[ro.name, "S0"], [ri.name, "S0"]]), distance=0.1,
+                           direction="Z", body="NEW")
+    rs = ctx.active_object
+    r = run(bpy.ops.nproto.flow, base=plane.name, target=cyl.name, objects=json.dumps([rs.name]))
+    out = ctx.active_object
+    ok_ring = r == {'FINISHED'} and store.is_nurbs(out) and out is not rs
+    check(f"[{tag}] 48-gon ring solid flows closed", ok_ring and wbrep(out).is_manifold_solid(),
+          f"{wbrep(out).face_count() if ok_ring else r} faces")
+    if ok_ring:
+        # the same ring of true circles, flowed the same way: the same volume
+        cs = []
+        for rad in (0.15, 0.08):
+            bpy.ops.curve.primitive_nurbs_circle_add(radius=rad, location=(1.0, 0.2, -0.02))
+            cs.append(ctx.active_object)
+        bpy.ops.nproto.extrude(inputs=json.dumps([[c.name, "S0"] for c in cs]), distance=0.1,
+                               direction="Z", body="NEW")
+        r = run(bpy.ops.nproto.flow, base=plane.name, target=cyl.name, objects=json.dumps([ctx.active_object.name]))
+        v0, v1 = abs(wbrep(ctx.active_object).volume(1e-6)), abs(wbrep(out).volume(1e-6))
+        check(f"[{tag}] flowed 48-gon ring = flowed circle ring", r == {'FINISHED'} and abs(v1 - v0) < 0.01 * v0,
+              f"{v1:.6f} vs {v0:.6f}")
 
     # -- not developable: reported, relaxed --------------------------------------
     clear()
