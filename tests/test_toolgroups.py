@@ -78,7 +78,7 @@ check("Surface Edit rows (Edit CVs only in the menus: Tab does it)", rows == [
     ["rebuild_surface", "extend"], ["surface_align", "match_surface"], ["refit_trim", "merge_patches"],
     ["flip_normal"], ["trim", "split"], ["untrim", "untrim_region"], ["detach_iso"], ["join", "unjoin"],
     ["fillet", "edge_fillet"], ["boolean", "boolean", "boolean"], ["push_pull", "rotate_face"],
-    ["replace_face"], ["boundary_fill", "emboss"]], rows)
+    ["move_face", "replace_face"], ["boundary_fill", "emboss"]], rows)
 menu = []
 class _M:
     def separator(self, **k): pass

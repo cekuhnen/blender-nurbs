@@ -15,7 +15,12 @@ place.
 Rotate Face turns faces about a hinge (a straight edge, usually one of the
 face's own): the face keeps its shape, its neighbours keep their surfaces
 (extended or cut back to meet it), as a draft on a single face. The worker's
-rotate_face job; history step rotate_face."""
+rotate_face job; history step rotate_face.
+
+Move Face slides a feature (a hole, pocket, boss or slot: the faces inside an
+inner loop of the face they sit in, kernel/featregion.py) along that face:
+the feature moves rigidly and the face is trimmed again round it. The
+worker's move_face job; history step move_face."""
 
 import json
 
@@ -1063,4 +1068,346 @@ class NPROTO_OT_rotate_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operato
         return {'FINISHED'}
 
 
-classes = (NPROTO_OT_push_pull, NPROTO_OT_replace_face, NPROTO_OT_rotate_face)
+_features = {}      # (object, rev, picked face indices) -> feature_of's answer
+
+
+def feature_of(o, idxs):
+    """(feature face indices, seat face indices, {seat index: the feature's
+    centre on its rim in that seat (local)}) of the faces idxs of body o, or
+    None when they are no feature
+    (kernel/featregion.py: the faces inside an inner loop of the face they
+    sit in)."""
+    key = (o.session_uid, o.get(store.PROP_REV, 0), tuple(sorted(idxs)))
+    if key in _features:
+        return _features[key]
+    if len(_features) > 64:
+        _features.clear()
+    from .kernel.featregion import feature_region
+    b = store.get_brep(o)
+    faces = b.faces()
+    reg = feature_region(b, [faces[i] for i in idxs])
+    out = None
+    if reg is not None:
+        region, seats, rim = reg
+        centres = {}
+        for k, S in enumerate(faces):
+            if S not in seats:
+                continue
+            pts = []
+            for e in rim:
+                if S in e.faces():
+                    t0, t1 = e.parameter_range()
+                    pts += [np.array(e.point_at(float(t)), float) for t in np.linspace(t0, t1, 9)[:-1]]
+            centres[k] = np.mean(pts, axis=0)
+        out = (sorted(i for i, f in enumerate(faces) if f in region), sorted(centres), centres)
+    _features[key] = out
+    return out
+
+
+def _plane_axes(n):
+    """Two unit axes in the plane across n: the world axes most across it,
+    flattened into it (a plate on XY: X and Y)."""
+    n = np.asarray(n, float)
+    W = np.eye(3)
+    order = np.argsort(np.abs(W @ n))
+    a = W[order[0]] - (W[order[0]] @ n) * n
+    a /= np.linalg.norm(a)
+    b = np.cross(n, a)
+    if float(b @ W[order[1]]) < 0.0:          # keep the second near its world axis's sign
+        b = -b
+    return a, b
+
+
+class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator):
+    """Move a feature along the face it sits in: click a face of a hole,
+    pocket, boss or slot (the whole feature lights up), drag the arrows or
+    type the distances. The feature moves rigidly; the face around it is
+    trimmed again"""
+    bl_idname = "nproto.move_face"
+    bl_label = "Move Face"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    faces: StringProperty(options={'HIDDEN', 'SKIP_SAVE'},
+                          description="The faces: [[body name, a point on the face (local)], ...]")
+    axis_x: FloatVectorProperty(size=3, options={'HIDDEN', 'SKIP_SAVE'},
+                                description="The first move direction (world, in the face the feature sits in)")
+    axis_y: FloatVectorProperty(size=3, options={'HIDDEN', 'SKIP_SAVE'},
+                                description="The second move direction (world)")
+    move_x: FloatProperty(name="X", default=0.0, unit='LENGTH', description="Along the first direction")
+    move_y: FloatProperty(name="Y", default=0.0, unit='LENGTH', description="Along the second direction")
+
+    drag_fields = ("move_x", "move_y")
+    fit_view = "none"
+    start_value = 0.0
+
+    # -- the faces ------------------------------------------------------------
+    def _items(self):
+        return NPROTO_OT_push_pull._items(self)
+
+    def _check(self, items):
+        why = NPROTO_OT_push_pull._check(self, items)
+        if why:
+            return why
+        for o, idxs in self._by_obj(items).values():
+            if feature_of(o, idxs) is None:
+                return (f"{o.name}: not part of a feature sitting inside a face (a hole, pocket, boss or "
+                        "slot); Push / Pull or Rotate Face move a face of the body itself")
+        return ""
+
+    @staticmethod
+    def _by_obj(items):
+        out = {}
+        for o, p in items:
+            out.setdefault(o.name, (o, []))[1].append(_face_index(o, p))
+        return out
+
+    def _take_picks(self, context):
+        NPROTO_OT_push_pull._take_picks(self, context)
+
+    def _has_axes(self):
+        return float(np.linalg.norm(np.array(self.axis_x, float))) > 1e-12
+
+    def _seat(self, context, o, feat):
+        """(seat index, its world normal): the feature's seat facing the view
+        (a through hole has two: its top and bottom), else the one facing up."""
+        view = None
+        if context is not None:
+            _, rv3d = self._win(context)
+            if rv3d is not None:
+                view = np.array(rv3d.view_rotation @ Vector((0.0, 0.0, 1.0)), float)    # toward the viewer
+        best = None
+        for s in feat[1]:
+            nw = face_frame(o, s)[2]
+            score = float(nw @ view) if view is not None else float(nw[2])
+            if best is None or score > best[0]:
+                best = (score, s, nw)
+        return best[1], best[2]
+
+    def _set_axes(self, context=None):
+        """The move's two directions: in the plane of the feature's seat."""
+        o, idxs = next(iter(self._by_obj(self._items()).values()))
+        a, b = _plane_axes(self._seat(context, o, feature_of(o, idxs))[1])
+        self.axis_x, self.axis_y = [float(x) for x in a], [float(x) for x in b]
+
+    def _vector(self):
+        return self.move_x * np.array(self.axis_x, float) + self.move_y * np.array(self.axis_y, float)
+
+    def invoke(self, context, event):
+        if not _kernel_ok(self):
+            return {'CANCELLED'}
+        self._start_event = (event.mouse_x, event.mouse_y, event.type, event.value)
+        self._take_picks(context)
+        if self.faces:
+            try:
+                why = self._check(self._items())
+            except Exception as exc:
+                why = str(exc)
+            if why:
+                self.report({'WARNING'}, why)
+                return {'CANCELLED'}
+            if not self._has_axes():
+                self._set_axes(context)
+            return self.ask(context)
+        if bpy.app.background:
+            self.report({'WARNING'}, "Pick a face of a hole, pocket or boss (Face mode)")
+            return {'CANCELLED'}
+        self._dragging = False
+        self._hover = None
+        context.window_manager.modal_handler_add(self)
+        self._pick_hints(context)
+        return {'RUNNING_MODAL'}
+
+    # -- picking ------------------------------------------------------------------
+    def _pick_hints(self, context, msg=""):
+        hints.show(context, self.bl_label, ["click a face of a hole, pocket, boss or slot"] + ([msg] if msg else []),
+                   [("", [hints.note("the whole feature lights up; or pick its faces in Face mode first")])],
+                   [("MOUSE_LMB", "Pick"), ("EVENT_ESC", "Cancel")])
+
+    def _show_feature(self, hit):
+        """The feature under the mouse lit (all its faces); a face that is no
+        feature: only its outline, and the hint says so."""
+        if hit == self._hover:
+            return
+        self._hover = hit
+        pv = None
+        if hit is not None:
+            o, i = hit
+            try:
+                if _is_solid(o):
+                    feat = feature_of(o, [i])
+                    idxs = feat[0] if feat is not None else [i]
+                    pv = {"lines": [], "tris": []}
+                    for k in idxs:
+                        h = face_highlight(o, k, self.MAX_FILL)
+                        pv["lines"] += h["lines"]
+                        if feat is not None:
+                            pv["tris"].append(h["tris"])
+                    pv["tris"] = np.vstack(pv["tris"]) if pv["tris"] else np.zeros((0, 3))
+            except Exception as exc:
+                print("NURBS move face hover:", exc)
+        draw.pick_overlay["preview"] = pv
+
+    def modal(self, context, event):
+        if getattr(self, "_dragging", False):
+            return ValueDrag.modal(self, context, event)
+        if event.type in NAV or event.type == 'INBETWEEN_MOUSEMOVE':     # (gizmo drags need the in-between moves)
+            return {'PASS_THROUGH'}
+        if event.type == 'MOUSEMOVE':
+            self._show_feature(self._hit(context, event))
+            context.area.tag_redraw()
+            return {'PASS_THROUGH'}
+        if event.type in ('ESC', 'RIGHTMOUSE') and event.value == 'PRESS':
+            self._end_pick(context)
+            return {'CANCELLED'}
+        if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            hit = self._hit(context, event)
+            if hit is None:
+                self._pick_hints(context, "no face there")
+                return {'RUNNING_MODAL'}
+            o, i = hit
+            p = face_frame(o, i)[0]
+            why = self._check([(o, p)])
+            if why:
+                self._pick_hints(context, why.split(": ", 1)[-1].split(";")[0])
+                return {'RUNNING_MODAL'}
+            self._end_pick(context)
+            for x in context.selected_objects:
+                x.select_set(False)
+            o.select_set(True)
+            context.view_layer.objects.active = o
+            bpy.ops.nproto.move_face('INVOKE_DEFAULT', faces=_faces_json([(o, p)]))
+            return {'CANCELLED'}
+        return {'RUNNING_MODAL'}
+
+    # -- the value stage (valuedrag.py) -----------------------------------------
+    def drag_setup(self, context, mouse):
+        """The feature's faces (world outlines and fill) and its centre: the
+        preview moves them by the vector."""
+        if not self._has_axes():
+            self._set_axes(context)
+        self._frames = []
+        C, ext_ = [], []
+        for o, idxs in self._by_obj(self._items()).values():
+            feat = feature_of(o, idxs)
+            if feat is None:
+                return False
+            M = np.array(geom.world_matrix(o))
+            for k in feat[0]:
+                pts, tris, polys = subsel.face_tris(o, k)
+                if not len(tris) or len(pts) > self.MAX_FILL:
+                    pts, tris = np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
+                W = [_world(M, P) for P in polys]
+                self._frames.append({"polys": W, "pts": _world(M, pts) if len(pts) else pts, "tris": tris})
+                ext_ += W
+            C.append(_world(M, feat[2][self._seat(context, o, feat)[0]][None])[0])
+        if not self._frames:
+            return False
+        self._C = np.mean(C, axis=0)
+        span = float(np.linalg.norm(np.ptp(np.vstack(ext_), axis=0))) or 1.0
+        self._L0 = 0.6 * span                     # the arrows' length past the moved centre
+        self._lift = 2e-3 * span
+        self.move_x = self.move_y = 0.0
+        self._base_at_mouse = False
+        return True
+
+    def drag_handles(self):
+        ax, ay = np.array(self.axis_x, float), np.array(self.axis_y, float)
+        moved = self._C + self._vector()
+        L0 = self._L0
+        return [{"field": "move_x", "kind": "arrow", "origin": self._C + self.move_y * ay, "dir": ax,
+                 "param": self.move_x + L0, "base": moved, "to_value": lambda t: t - L0},
+                {"field": "move_y", "kind": "arrow", "origin": self._C + self.move_x * ax, "dir": ay,
+                 "param": self.move_y + L0, "base": moved, "to_value": lambda t: t - L0}]
+
+    def drag_preview(self):
+        d = self._vector()
+        n = np.cross(np.array(self.axis_x, float), np.array(self.axis_y, float))
+        lines, tris = [], []
+        for fr in self._frames:
+            lines += [P + d for P in fr["polys"]]
+            if len(fr["pts"]):
+                tris.append((fr["pts"] + d + self._lift * n)[fr["tris"]].reshape(-1, 3))
+        guide = np.array([self._C, self._C + d])
+        return {"lines": lines, "tris": np.vstack(tris) if tris else np.zeros((0, 3)),
+                "guides": [(guide, HINGE_RGBA)] if np.linalg.norm(d) > 0 else []}
+
+    def drag_check(self):
+        if np.linalg.norm(self._vector()) <= 0.0:
+            return "No move yet: drag an arrow along the face, or type a distance (Tab: the other direction)"
+        return ""
+
+    def drag_rows(self):
+        return [("", [hints.note("the feature slides along the face it sits in")])]
+
+    def drag_handle_hints(self):
+        return [hints.key("LMB drag", "an arrow (the two directions in the face)")]
+
+    # -- making it --------------------------------------------------------------
+    def execute(self, context):
+        if not _kernel_ok(self):
+            return {'CANCELLED'}
+        self._take_picks(context)
+        try:
+            items = self._items()
+        except (ValueError, TypeError) as exc:
+            self.report({'ERROR'}, f"Move Face: {exc}")
+            return {'CANCELLED'}
+        if not items:
+            self.report({'WARNING'}, "Pick a face of a hole, pocket or boss (Face mode, or click it)")
+            return {'CANCELLED'}
+        why = self._check(items)
+        if why:
+            self.report({'WARNING'}, why)
+            return {'CANCELLED'}
+        if not self._has_axes():
+            self._set_axes(context)
+        d = self._vector()
+        if np.linalg.norm(d) <= 0.0:
+            self.report({'WARNING'}, "Move Face: the move is 0")
+            return {'CANCELLED'}
+        hist = features.history_enabled(context)
+        done = []
+        for o, pts in [(o, [p for oo, p in items if oo == o]) for o in {o for o, _ in items}]:
+            M = geom.world_matrix(o)
+            Mi = M.inverted()
+            frames = [face_frame(o, _face_index(o, p)) for p in pts]
+            feat = feature_of(o, [_face_index(o, p) for p in pts])
+            had_picks = bool(subsel.picks(o, "FACE")) or "FACE" in subsel.kinds(context)
+            try:
+                info, breps = jobs.run("move_face", {"target": o}, ["result"],
+                                       face_pts=[[float(x) for x in f[1]] for f in frames],
+                                       vector=[float(x) for x in d], into="target")
+            except jobs.JobError as exc:
+                self.report({'ERROR'}, f"Move Face on {o.name} failed: {exc}")
+                continue
+            pre = o[store.PROP_BREP]
+            if not hist and features.has_history(o):
+                features.clear_history(o)
+                self.report({'INFO'}, f"{o.name}: construction history removed")
+            # where the feature's faces will be (local), for the picks
+            moved = [Mi @ Vector(np.array(M @ Vector(face_frame(o, k)[0]), float) + d) for k in feat[0]] \
+                if had_picks and feat is not None else []
+            store.set_geometry_text(o, breps["result"], context, keep_untrimmed=False)
+            if hist:
+                L3 = M.to_3x3().inverted()
+                features.push_step(o, "move_face", [], {
+                    "faces_local": [[float(x) for x in f[0]] for f in frames],
+                    "axis_x_local": [float(x) for x in L3 @ Vector(self.axis_x)],
+                    "axis_y_local": [float(x) for x in L3 @ Vector(self.axis_y)],
+                    "move_x": float(self.move_x), "move_y": float(self.move_y)}, base_text=pre)
+            if moved:
+                try:
+                    subsel.set_picks(o, "FACE", sorted({_face_index(o, q) for q in moved}))
+                except Exception as exc:
+                    print("NURBS move face picks:", exc)
+            done.append(o)
+            self.report({'INFO'}, f"{o.name}: a feature of {info.get('feature', 0)} face"
+                                  f"{'s' if info.get('feature', 0) != 1 else ''} moved "
+                                  f"{float(np.linalg.norm(d)):.4g} · volume {info.get('volume', 0):.6g}")
+        if not done:
+            return {'CANCELLED'}
+        _select_only(context, done)
+        return {'FINISHED'}
+
+
+classes = (NPROTO_OT_push_pull, NPROTO_OT_replace_face, NPROTO_OT_rotate_face, NPROTO_OT_move_face)

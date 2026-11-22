@@ -3222,6 +3222,132 @@ def job_rotate_face(job):
     return {"faces": body.face_count(), "volume": volume, "change": volume - V0, "how": hows, "lean": lean}
 
 
+def _loop_polygon(loop, k=24):
+    """Points along a face loop in its own order (each edge sampled k times)."""
+    np = _np()
+    out = []
+    for e, fw in loop:
+        t0, t1 = e.parameter_range()
+        ts = np.linspace(t0, t1, k + 1)[:-1] if fw else np.linspace(t1, t0, k + 1)[:-1]
+        out += [np.array(e.point_at(float(t)), float) for t in ts]
+    return np.array(out)
+
+
+def _inside_2d(P, poly):
+    """For each 2D point of P: inside the closed polygon poly (even-odd rule)?"""
+    np = _np()
+    x, y = P[:, 0][:, None], P[:, 1][:, None]
+    a, b = poly, np.roll(poly, -1, axis=0)
+    cross = (a[:, 1] > y) != (b[:, 1] > y)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        xs = a[:, 0] + (y - a[:, 1]) * (b[:, 0] - a[:, 0]) / (b[:, 1] - a[:, 1])
+    return (np.count_nonzero(cross & (x < xs), axis=1) % 2) == 1
+
+
+def _moved_curve(c, d):
+    deg, pts, U, w = _cv_tuple(ext.curve_cvs(c))
+    return ext.curve_from_cvs(deg, [tuple(float(a + b) for a, b in zip(q, d)) for q in pts], U, w)
+
+
+def job_move_face(job):
+    """Move Face (world space): the feature holding the faces at
+    job['face_pts'] -- the faces enclosed by an inner loop of the face(s) it
+    sits in (featregion: a hole, pocket, boss, slot, letter) -- slid by
+    job['vector'] along those seat faces. The feature moves rigidly (its faces
+    translated), each seat keeps its surface and is trimmed again with that
+    loop moved: exact, the volume stays. The seats must be flat and contain the
+    move; the moved loop must stay inside its seat, clear of its other holes.
+    Written in the local space of job['into']."""
+    np = _np()
+    from featregion import feature_region
+    from trimext import brep_tol
+    body = world_brep(job, "target")
+    if not bool(body.is_manifold_solid()):
+        raise RuntimeError("Move Face needs a closed solid (all edges shared by two faces)")
+    d = np.asarray(job["vector"], float)
+    lo, hi = (np.array(v, float) for v in body.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    tol = 1e-6 * size
+    if np.linalg.norm(d) <= tol:
+        raise RuntimeError("the move is 0")
+    faces = body.faces()
+    start = {_face_at(body, p) for p in job["face_pts"]}
+    reg = feature_region(body, start)
+    if reg is None:
+        raise RuntimeError("the face is not part of a feature sitting inside a face (a hole, pocket, boss "
+                           "or slot): Push / Pull or Rotate Face move a face of the body itself")
+    region, seats, rim_edges = reg
+    for S in seats:
+        if not S.surface().is_planar():
+            raise RuntimeError("the feature sits in a curved face: only a flat one can take the move")
+        n = _face_normal(S, np.array(S.interior_point(), float))
+        if abs(float(n @ d)) > 1e-6 * np.linalg.norm(d):
+            raise RuntimeError("the move leaves the face the feature sits in: slide it along that face "
+                               "(Push / Pull lifts or sinks a face)")
+    # the seats again, their loops round the feature moved
+    btol = brep_tol(1e-5, size)
+    built = []
+    for S in seats:
+        n = _face_normal(S, np.array(S.interior_point(), float))
+        a = np.cross(n, [1.0, 0.0, 0.0])
+        if np.linalg.norm(a) < 0.1:
+            a = np.cross(n, [0.0, 1.0, 0.0])
+        a /= np.linalg.norm(a)
+        b2 = np.cross(n, a)
+        o = np.array(S.interior_point(), float)
+        flat = lambda P: np.c_[(P - o) @ a, (P - o) @ b2]
+        outer = {e for e, _ in S.boundary_outer_loop()}
+        loops, moved, still = [], [], []
+        for loop in S.boundary_loops():
+            mine = all(e in rim_edges for e, _ in loop)
+            if mine and any(e in outer for e, _ in loop):
+                raise RuntimeError("the feature runs out to the edge of the face it sits in")
+            cs = [(_moved_curve(_edge_copy(e), d) if mine else _edge_copy(e)) for e, _ in loop
+                  if e.length() > tol]
+            ch = _chain(cs, 1e3 * tol)
+            if ch is None:
+                raise RuntimeError("a loop of the face the feature sits in does not close")
+            poly = flat(_loop_polygon(loop)) + (flat(o + d)[0] - flat(o)[0] if mine else 0.0)
+            (moved if mine else still).append((poly, any(e in outer for e, _ in loop)))
+            loops.insert(0, ch) if any(e in outer for e, _ in loop) else loops.append(ch)
+        for P, _ in moved:
+            for Q, is_outer in still:
+                if is_outer:
+                    if not _inside_2d(P, Q).all():
+                        raise RuntimeError("the feature would leave the face it sits in")
+                elif _inside_2d(P, Q).any() or _inside_2d(Q, P).any():
+                    raise RuntimeError("the feature would run into another hole or feature in that face")
+        srf = ext.surface_from_cvs(*_srf_tuple(ext.surface_cvs(S.surface())))
+        built.append(ext.trim_surface_with_3d_curves_tol(srf, [len(l) for l in loops],
+                                                        [c for l in loops for c in l], 10 * tol, btol))
+    # the feature's faces, translated
+    idx = [i for i, f in enumerate(faces) if f in region]
+    sheet = body.copy()
+    sf = sheet.faces()
+    ext.delete_faces(sheet, [sf[i] for i in range(len(sf)) if i not in set(idx)])
+    sheet = sm.translate(sheet, tuple(map(float, d)))
+    gone = set(idx) | {i for i, f in enumerate(faces) if f in seats}
+    b = body.copy()
+    bf = b.faces()
+    keep_pts = [np.array(bf[i].interior_point(), float) for i in range(len(bf)) if i not in gone]
+    ext.delete_faces(b, [bf[i] for i in gone])
+    for nb in built + [sheet]:
+        ext.append_brep(b, nb)
+    b = sm.stitch_advanced(b, 10 * tol, squeeze_small_edges=False, making_manifold_solid=True)[0]
+    try:
+        sm.unify_normals(b, _face_at(b, keep_pts[0]), 100)
+    except Exception:
+        pass
+    if not b.is_manifold_solid():
+        raise RuntimeError("the moved feature and its face do not close into a solid")
+    V0, V1 = _vol(body), _vol(b)
+    if abs(V1 - V0) > 1e-4 * abs(V0) + tol:
+        raise RuntimeError(f"the move changed the volume ({V0:.6g} to {V1:.6g}): the feature runs into "
+                           "something")
+    save(to_local(b, job.get("xforms", {}).get(job.get("into"))), job["out"]["result"])
+    return {"faces": b.face_count(), "volume": _volume(b, 1e-3), "feature": len(region), "seats": len(seats)}
+
+
 def job_boolean(job):
     """Union / difference / intersection of closed solids (world space): the
     target job['order'][0] combined with each tool in turn. Written in the local
@@ -4608,7 +4734,7 @@ def job_mesh_to_brep(job):
             "filleted": done, "failed": failed}
 
 
-JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "untrim_region": job_untrim_region, "untrim_preview": job_untrim_preview, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean, "push_pull": job_push_pull, "rotate_face": job_rotate_face, "replace_face": job_replace_face, "extrude_face": job_extrude_face,
+JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "untrim_region": job_untrim_region, "untrim_preview": job_untrim_preview, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean, "push_pull": job_push_pull, "rotate_face": job_rotate_face, "move_face": job_move_face, "replace_face": job_replace_face, "extrude_face": job_extrude_face,
         "flip": job_flip, "cap_solid": job_cap_solid, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken,
         "mesh_to_brep": job_mesh_to_brep}
 
