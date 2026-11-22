@@ -246,18 +246,54 @@ def build_sweep(inputs, p):
         qn, qb = q[:, 1].copy(), q[:, 2].copy()
         q[:, 1] = c * qn - s * qb
         q[:, 2] = s * qn + c * qb
-    scale_end = float(p.get("scale_end", 1.0))
+    law = sweep_scale_law(p)
     twist = math.radians(float(p.get("twist", 0.0))) if not tangent else 0.0
-    rows = []
-    for k in range(n):
-        f = k / (n - 1)
-        sc = 1.0 + (scale_end - 1.0) * f
+
+    def row(Pk, Tk, Nk, Bk, f):
+        sc = float(law(f))
         th = twist * f
         c, s = math.cos(th), math.sin(th)
-        nk = c * N[k] + s * B[k]
-        bk = -s * N[k] + c * B[k]
-        rows.append(P[k] + sc * (np.outer(q[:, 0], T[k]) + np.outer(q[:, 1], nk) + np.outer(q[:, 2], bk)))
-    return _surface_from_rows(rows, prof)
+        nk = c * Nk + s * Bk
+        bk = -s * Nk + c * Bk
+        return Pk + sc * (np.outer(q[:, 0], Tk) + np.outer(q[:, 1], nk) + np.outer(q[:, 2], bk))
+
+    cuts = [float(x) for x in law.f[1:-1]] if law.taper == "LINEAR" else []
+    if not cuts:
+        return _surface_from_rows([row(P[k], T[k], N[k], B[k], k / (n - 1)) for k in range(n)], prof)
+    # Linear scale points: the scale turns at each one (a crease), which one fit
+    # along the rail would round off -- built in pieces cut there, sharing their rows
+    F = np.linspace(0.0, 1.0, n)
+    fine = np.linspace(0.0, 1.0, max(401, 8 * n))
+    Pf, Tf, Nf, Bf = (np.stack([np.interp(fine, F, A[:, i]) for i in range(3)], axis=1) for A in (P, T, N, B))
+    pieces, bounds = [], [0.0] + cuts + [1.0]
+    for a_, b_ in zip(bounds[:-1], bounds[1:]):
+        m = max(6, int(round(n * (b_ - a_))) + 2)
+        rows = []
+        for f in np.linspace(a_, b_, m):
+            Pk, Tk, Nk, Bk = (np.array([np.interp(f, fine, A[:, i]) for i in range(3)]) for A in (Pf, Tf, Nf, Bf))
+            Tk /= np.linalg.norm(Tk)
+            Nk -= float(Nk @ Tk) * Tk
+            Nk /= np.linalg.norm(Nk)
+            Bk = np.cross(Tk, Nk) * (1.0 if float(np.cross(Tk, Nk) @ Bk) >= 0 else -1.0)
+            rows.append(row(Pk, Tk, Nk, Bk, f))
+        pieces.append(_surface_from_rows(rows, prof))
+    # facing: as run() turns a one-piece sweep (towards the surfaces its edges come from; Flip Normal)
+    flip = features.edge_vote(pieces[0], inputs) < 0
+    if p.get("flip_normal"):
+        flip = not flip
+    if flip:
+        from .square import reverse_u
+        pieces = [reverse_u(sf) for sf in pieces]
+    return _joined(pieces)
+
+
+def sweep_scale_law(p):
+    """The profile's scale along the rail (share f of its length): 1 at the
+    start, End Scale at the end, through Scale Points [[f, scale]] -- Linear
+    (straight between them, as End Scale always was) or Smooth (RadiusLaw's
+    monotone cubic)."""
+    return RadiusLaw(1.0, float(p.get("scale_end", 1.0)), str(p.get("scale_taper", "LINEAR")).upper(), 1.0,
+                     p.get("scale_points", ()))
 
 
 def _sweep_two_rails(inputs, p, prof, n):

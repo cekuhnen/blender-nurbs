@@ -778,6 +778,10 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
                            "and the longer surface is cut back only along the fillet (a step at the end)"),
         ("EXTEND", "Extend", "Where one surface ends along the crossing before the other, it is extended "
                              "(naturally, exactly) to the other's end first: the fillet runs the whole edge"),
+        ("SETBACK", "Set Back", "Surfaces meeting edge to edge: both are cut back along their whole edges by the "
+                                "fillet's setback and a light Loft edge blend joins the new edges (circular and "
+                                "soft: G2, blend: its continuity, chamfer: straight); a shorter surface gives an "
+                                "S-curve end. Neither surface is grown or notched"),
     ], default="NOTCH")
 
     def invoke(self, context, event):
@@ -917,7 +921,8 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         if not self._sf:
             return False               # surfaces that do not cross: the dialog
         self._sf, self._frac = surface_fillet_chain(self._sf)
-        self._uneven = surface_fillet_uneven(a, b)
+        self._uneven = surface_fillet_uneven(a, b) or _edge_to_edge(a, b)
+        self._sb = None                 # Set Back preview: the meeting edges' samples (found on first use)
         try:
             self._fits = surface_fillet_sides(a, b, self._sf, part_size([a, b]))
         except Exception as exc:
@@ -963,6 +968,11 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
     def drag_preview(self):
         sa, sb = self._sides()
         lines, tris = [], []
+        if getattr(self, "ends", "NOTCH") == "SETBACK":
+            X = self._setback_preview()
+            if X is not None:
+                L, T = ruled_preview(list(X), ribs=2)
+                return {"lines": L, "tris": T}
         for i, (P, NA, NB) in enumerate(self._sf):
             ra, rb = self._radii(P, NA, NB, i)
             if self.shape == "SOFT":
@@ -975,6 +985,43 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
             lines += L
             tris.append(T)
         return {"lines": lines, "tris": np.vstack(tris)}
+
+    SETBACK_DEG = {"G0": 1, "G1": 3, "G2": 5, "G3": 7}
+
+    def _setback_cont(self):
+        """The Set Back blend's continuity: a blend's own, a chamfer straight, else G2."""
+        if self.shape == "BLEND":
+            return "G" + self.continuity
+        return "G0" if self.shape == "CHAMFER" else "G2"
+
+    def _setback_dists(self):
+        """(da, db): how far the fillet's rails sit from the crossing, at its
+        middle -- how far each surface is cut back."""
+        sa, sb = self._sides()
+        P, NA, NB = self._sf[0]
+        j = len(P) // 2
+        ra, rb = self._radii(P, NA, NB, 0)
+        if self.shape == "SOFT":
+            ca, cb, A, B = surface_fillet_rails(P, NA, NB, sa, sb)
+            X = soft_sections(P, _unit(ca - A + cb), _unit(ca + cb - B), self.radius, self.smoothing,
+                              self._soft_cont())
+        else:
+            X = surface_fillet_sections(P, NA, NB, ra, rb, sa, sb, self.shape, continuity=self.continuity)
+        return float(np.linalg.norm(X[j][0] - P[j])), float(np.linalg.norm(X[j][-1] - P[j]))
+
+    def _setback_preview(self):
+        from . import filletsetback
+        if getattr(self, "_sb", None) is None:
+            a, b = bpy.data.objects.get(self.surf_a), bpy.data.objects.get(self.surf_b)
+            try:
+                self._sb = filletsetback.preview_samples(a, b) or False
+            except Exception as exc:
+                print("NURBS fillet set back preview:", exc)
+                self._sb = False
+        if not self._sb:
+            return None
+        da, db = self._setback_dists()
+        return filletsetback.preview_sections(self._sb, da, db, self.SETBACK_DEG[self._setback_cont()])
 
     def _handle(self, field, i=0, j=None):
         P, NA, NB = self._sf[i]
@@ -1049,7 +1096,7 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         elif ch == "t":
             self.trim_bases = not self.trim_bases
         elif ch == "e" and getattr(self, "_uneven", False):
-            self.ends = "EXTEND" if self.ends == "NOTCH" else "NOTCH"
+            self.ends = {"NOTCH": "EXTEND", "EXTEND": "SETBACK"}.get(self.ends, "NOTCH")
             a, b = bpy.data.objects.get(self.surf_a), bpy.data.objects.get(self.surf_b)
             try:
                 sf = surface_fillet_frames(a, b, self.ends)
@@ -1080,7 +1127,8 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
                  + ([hints.cycle("G", ["G2", "G3"], "G%d" % self._soft_cont())] if self.shape == "SOFT" else [])),
                 ("Side", [hints.key("A", "other side of A"), hints.key("B", "other side of B"),
                           hints.toggle("T", "trim the surfaces", self.trim_bases)]
-                 + ([hints.cycle("E", ["notch", "extend"], self.ends.lower(), "ends")]
+                 + ([hints.cycle("E", ["notch", "extend", "set back"],
+                                {"SETBACK": "set back"}.get(self.ends, self.ends.lower()), "ends")]
                     if getattr(self, "_uneven", False) else []))]
         return rows
 
@@ -1130,6 +1178,24 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
             sf, _ = surface_fillet_chain(surface_fillet_frames(a, b, self.ends) or [])
         return [float(x) for x in sf[0][0][0]] if sf else None
 
+    def _execute_setback(self, context, a, b):
+        """Ends: Set Back -- both surfaces cut back along their whole meeting
+        edges, a Loft edge blend between (filletsetback.py)."""
+        from . import filletsetback
+        if getattr(self, "_sf", None) is None and not self.drag_setup(context, None):
+            self.report({'ERROR'}, "Fillet: the surfaces do not meet")
+            return {'CANCELLED'}
+        try:
+            da, db = self._setback_dists()
+            lo = filletsetback.build(context, a, b, da, db, self._setback_cont())
+        except Exception as exc:
+            self.report({'ERROR'}, f"Fillet, Set Back: {exc}")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Set back {da:.4g} m on {a.name}, {db:.4g} m on {b.name}; "
+                              f"{self._setback_cont()} blend (a Loft: edit it in its panel)")
+        _select_only(context, [lo])
+        return {'FINISHED'}
+
     def execute(self, context):
         if not _kernel_ok(self):
             return {'CANCELLED'}
@@ -1142,6 +1208,8 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         if (max(self.radius, self.end_radius) if self._variable() else self.radius) <= 0:
             self.report({'ERROR'}, "Fillet: the radius is 0")
             return {'CANCELLED'}
+        if self.ends == "SETBACK":
+            return self._execute_setback(context, a, b)
         order = [(self.flip_a, self.flip_b)]
         if self.auto_flip:
             order += [(fa, fb) for fa in (False, True) for fb in (False, True) if (fa, fb) != order[0]]
@@ -2168,6 +2236,15 @@ def fillet_sections(P, D1, D2, r, shape="CIRCULAR", k=9, fullness=1.0):
     wa = np.sin((1 - w[..., 0]) * om[:, None]) / so[:, None]
     wb = np.sin(w[..., 0] * om[:, None]) / so[:, None]
     return C[:, None] + r[:, None, None] * (wa[..., None] * a[:, None] + wb[..., None] * b[:, None])
+
+
+def _edge_to_edge(a, b):
+    """Do the surfaces meet along their edges? (Ends: Set Back applies)"""
+    from . import filletsetback
+    try:
+        return filletsetback.crossing_edges(a, b) is not None
+    except Exception:
+        return False
 
 
 def surface_fillet_uneven(a, b):

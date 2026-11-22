@@ -47,7 +47,8 @@ FIELDS = {
     "network": ["nw_cont", "nw_degree", "nw_spans_u", "nw_spans_v"],
     "flange": ["fl_mode", "fl_length", "angle", "draft_angle", "pull_flip", "measure", "flip", "both_sides",
                "fl_corner", "tolerance"],
-    "sweep": ["samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height", "flip_normal", "caps"],
+    "sweep": ["samples", "tangent", "flip_tangent", "scale_end", "scale_taper", "twist", "keep_height", "flip_normal",
+              "caps"],
     "pipe": ["radius", "variable", "radius_end", "taper", "cap_style", "corner_style", "bend", "samples", "caps"],
     "patch": ["pt_cvs", "pt_cvs_v", "pt_auto_cvs", "pt_degree", "pt_fair", "pt_surface_fair", "pt_quad",
               "pt_quad_ease", "pt_even", "pt_quad_degree", "pt_quad_spans_u", "pt_quad_spans_v"],
@@ -315,6 +316,34 @@ class NprotoPipePoint(bpy.types.PropertyGroup):
                           description="The pipe's radius there")
 
 
+def _on_sweep_point(self, context):
+    """A scale point changed in the Feature panel: into the sweep's list."""
+    obj = self.id_data
+    if _syncing[0] or not isinstance(obj, bpy.types.Object):
+        return
+    h = features.history(obj)
+    if h is None or h["op"] != "sweep":
+        return
+    raw = json.loads(obj[features.PROP_HIST])
+    raw["params"]["scale_points"] = sweep_points_param(obj.nproto_feature.sweep_points)
+    _patch_write(obj, raw, context)
+
+
+def sweep_points_param(points):
+    """The scale points of a collection as the history's scale_points: [[at, scale]] along the rail."""
+    return sorted([[float(p.at), float(p.scale)] for p in points if not getattr(p, "remove", False)],
+                  key=lambda x: x[0])
+
+
+class NprotoScalePoint(bpy.types.PropertyGroup):
+    """A scale point along a Sweep's rail (Feature panel, and the Sweep operator)."""
+    at: FloatProperty(name="At", min=0.0, max=1.0, subtype='FACTOR', default=0.5, update=_on_sweep_point,
+                      description="Where along the rail (share of its length from the start)")
+    scale: FloatProperty(name="Scale", min=0.01, soft_max=5.0, default=1.0, update=_on_sweep_point,
+                         description="The profile's scale there (1: as drawn)")
+    remove: BoolProperty(name="Remove", default=False, description="Remove this scale point")
+
+
 class NprotoFeature(bpy.types.PropertyGroup):
     dome_layout: EnumProperty(name="Layout", items=[("POLAR", "Polar", "Rows from the rim to one top point (a round rim: an exact revolution)"),
                               ("DRAPED", "Draped", "One even four-sided surface over the opening, trimmed "
@@ -455,6 +484,10 @@ class NprotoFeature(bpy.types.PropertyGroup):
                               "every edge still holds its continuity", **_F())
     pt_edges: CollectionProperty(type=NprotoPatchEdge)
     pipe_points: CollectionProperty(type=NprotoPipePoint)
+    sweep_points: CollectionProperty(type=NprotoScalePoint)
+    scale_taper: EnumProperty(name="Scale Taper", items=[("LINEAR", "Linear", "Straight from point to point"),
+                                                         ("SMOOTH", "Smooth", "A smooth curve through the points, "
+                                                                              "level at both ends")], **_F())
     pt_cont_all: EnumProperty(name="All Edges", items=PATCH_ALL, default="MIXED", update=_on_patch_all,
                               description="Continuity of every edge at once")
     pt_tension_all: FloatProperty(name="Tension", min=0.25, max=4.0, soft_min=0.5, soft_max=2.0, default=1.0,
@@ -557,6 +590,12 @@ def sync_from_history(obj):
             for at_, r_ in params.get("radius_points", []):
                 it = pg.pipe_points.add()
                 it.at, it.radius = float(at_), float(r_)
+        if h["op"] == "sweep":                   # older sweeps: End Scale alone, straight
+            params.setdefault("scale_taper", "LINEAR")
+            pg.sweep_points.clear()
+            for at_, sc_ in params.get("scale_points", []):
+                it = pg.sweep_points.add()
+                it.at, it.scale = float(at_), float(sc_)
         if h["op"] == "loft":                    # older lofts: square to the side, or the Match Edges switch
             old = "EDGES" if params.get("match_edges") else "FREE"
             params.setdefault("edges_a", old)
@@ -716,6 +755,8 @@ def draw_feature(layout, context):
                     _draw_pattern(box, context, obj, h)
                 elif op == "pipe" and h["params"].get("variable"):
                     _draw_pipe_points(box, obj, pg, h)
+                elif op == "sweep" and len(h["inputs"]) < 3:
+                    _draw_sweep_points(box, obj, pg, h)
                 for name in FIELDS.get(op, []) if op != "patch" else []:
                     if op == "square" and name[0] in "ew" and name[1:].isdigit():
                         if name[0] == "e":
@@ -853,6 +894,25 @@ def _defer_sync(name):
     bpy.app.timers.register(run, first_interval=0.0)
 
 
+def _draw_sweep_points(box, obj, pg, h):
+    """A row per scale point along the rail (where, scale, remove), and Add."""
+    pts = h["params"].get("scale_points", [])
+    if len(pg.sweep_points) != len(pts):
+        _defer_sync(obj.name)
+    col = box.column(align=True)
+    col.label(text="Scale Points" if len(pg.sweep_points) else "Scale Points: none (1 to End Scale)",
+              icon='FULLSCREEN_ENTER')
+    order = sorted(range(len(pg.sweep_points)), key=lambda i: pg.sweep_points[i].at)
+    for n, i in enumerate(order):
+        it = pg.sweep_points[i]
+        row = col.row(align=True)
+        row.prop(it, "at", text=f"{n + 1}  At", slider=True)
+        row.prop(it, "scale", text="×")
+        op = row.operator("nproto.pipe_point_remove", text="", icon='X')
+        op.name, op.index = obj.name, i
+    box.operator("nproto.pipe_point_add", text="Add Scale Point", icon='ADD').name = obj.name
+
+
 def _draw_pipe_points(box, obj, pg, h):
     """A row per radius point along the rail (where, its radius, remove), and Add."""
     pts = h["params"].get("radius_points", [])
@@ -873,8 +933,9 @@ def _draw_pipe_points(box, obj, pg, h):
 
 
 class NPROTO_OT_pipe_point_add(bpy.types.Operator):
-    """Add a radius point to this Pipe, in the middle of the longest stretch
-    between its points (the radius it has there now): set where and how big"""
+    """Add a point to this Pipe (a radius point) or Sweep (a scale point), in
+    the middle of the longest stretch between its points, at the radius /
+    scale it has there now: then set where and how big"""
     bl_idname = "nproto.pipe_point_add"
     bl_label = "Add Radius Point"
     bl_options = {'REGISTER', 'UNDO'}
@@ -884,25 +945,28 @@ class NPROTO_OT_pipe_point_add(bpy.types.Operator):
     def execute(self, context):
         obj = bpy.data.objects.get(self.name)
         h = features.history(obj) if obj is not None else None
-        if h is None or h["op"] != "pipe":
+        if h is None or h["op"] not in ("pipe", "sweep"):
             return {'CANCELLED'}
         from . import sweeps
         raw = json.loads(obj[features.PROP_HIST])
         p = raw["params"]
-        pts = sorted(p.get("radius_points", []))
+        key = "radius_points" if h["op"] == "pipe" else "scale_points"
+        pts = sorted(p.get(key, []))
         fs = [0.0] + [a for a, _ in pts] + [1.0]
         k = max(range(len(fs) - 1), key=lambda i: fs[i + 1] - fs[i])
         at = 0.5 * (fs[k] + fs[k + 1])
-        law = sweeps.pipe_radius_law(dict(p, variable=True), 1.0)
-        p["radius_points"] = sorted(pts + [[at, float(law(at))]])
-        p["variable"] = True
+        law = (sweeps.pipe_radius_law(dict(p, variable=True), 1.0) if h["op"] == "pipe"
+               else sweeps.sweep_scale_law(p))
+        p[key] = sorted(pts + [[at, float(law(at))]])
+        if h["op"] == "pipe":
+            p["variable"] = True
         _patch_write(obj, raw, context)
         sync_from_history(obj)
         return {'FINISHED'}
 
 
 class NPROTO_OT_pipe_point_remove(bpy.types.Operator):
-    """Remove this radius point from the Pipe"""
+    """Remove this point from the Pipe (radius point) or Sweep (scale point)"""
     bl_idname = "nproto.pipe_point_remove"
     bl_label = "Remove Radius Point"
     bl_options = {'REGISTER', 'UNDO'}
@@ -915,11 +979,16 @@ class NPROTO_OT_pipe_point_remove(bpy.types.Operator):
         if obj is None or features.history(obj) is None:
             return {'CANCELLED'}
         pg = obj.nproto_feature
-        if not 0 <= self.index < len(pg.pipe_points):
+        sweep = features.history(obj)["op"] == "sweep"
+        rows = pg.sweep_points if sweep else pg.pipe_points
+        if not 0 <= self.index < len(rows):
             return {'CANCELLED'}
         raw = json.loads(obj[features.PROP_HIST])
-        keep = [x for i, x in enumerate(pg.pipe_points) if i != self.index]
-        raw["params"]["radius_points"] = pipe_points_param(keep)
+        keep = [x for i, x in enumerate(rows) if i != self.index]
+        if sweep:
+            raw["params"]["scale_points"] = sweep_points_param(keep)
+        else:
+            raw["params"]["radius_points"] = pipe_points_param(keep)
         _patch_write(obj, raw, context)
         sync_from_history(obj)
         return {'FINISHED'}
@@ -1170,7 +1239,7 @@ class NPROTO_OT_add_primitive(bpy.types.Operator):
                 col.prop(self, n)
 
 
-classes = (NprotoPatchEdge, NprotoPipePoint, NprotoFeature, NPROTO_OT_pipe_point_add, NPROTO_OT_pipe_point_remove, NPROTO_OT_sync_feature, NPROTO_OT_remove_step, NPROTO_OT_add_primitive)
+classes = (NprotoPatchEdge, NprotoPipePoint, NprotoScalePoint, NprotoFeature, NPROTO_OT_pipe_point_add, NPROTO_OT_pipe_point_remove, NPROTO_OT_sync_feature, NPROTO_OT_remove_step, NPROTO_OT_add_primitive)
 
 
 def register():

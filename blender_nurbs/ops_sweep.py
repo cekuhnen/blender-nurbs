@@ -14,7 +14,7 @@ from . import hints
 from .kernel import load as load_kernel
 from .ops import (CHAIN_ITEMS, AskValue, PickMixin, SolidBody, _curve_inputs, _decode_inputs, _encode_inputs,
                   _kernel_ok, _make_result, _select_only, tangent_chain)
-from .feature_ui import NprotoPipePoint, pipe_points_param
+from .feature_ui import NprotoPipePoint, NprotoScalePoint, pipe_points_param, sweep_points_param
 from .valuedrag import BASE_PX, ValueDrag, fmt_length, ruled_preview
 
 
@@ -42,6 +42,10 @@ def _new_curves(context, name, op, inputs, params):
 # Sweep
 # --------------------------------------------------------------------------
 
+SCALE_TAPER_ITEMS = [("LINEAR", "Linear", "The scale runs straight from point to point (a crease at each point)"),
+                     ("SMOOTH", "Smooth", "A smooth curve through the points, level at both ends")]
+
+
 class NPROTO_OT_sweep(SolidBody, PickMixin, bpy.types.Operator):
     """Sweep a profile along one rail, two rails (Shift+click the 1st rail), or a
     surface edge (tangent to that surface). Select the profile, then the path
@@ -60,6 +64,13 @@ class NPROTO_OT_sweep(SolidBody, PickMixin, bpy.types.Operator):
                           description="Rail is a surface edge: make the sweep G1 to that surface")
     flip_tangent: BoolProperty(name="Flip Tangent", default=False)
     scale_end: FloatProperty(name="End Scale", default=1.0, min=0.01, soft_max=5.0)
+    scale_points: CollectionProperty(type=NprotoScalePoint, options={'SKIP_SAVE'},
+                                     description="The profile's scale at points along the rail")
+    scale_taper: EnumProperty(name="Scale Taper", items=SCALE_TAPER_ITEMS, default="LINEAR",
+                              description="How the scale runs from point to point: straight (a crease at each "
+                                          "point) or a smooth curve, level at both ends")
+    add_scale_point: BoolProperty(name="Add Scale Point", default=False, options={'SKIP_SAVE'},
+                                  description="A scale point in the middle of the longest stretch between points")
     twist: FloatProperty(name="Twist", default=0.0, soft_min=-720.0, soft_max=720.0)
     keep_height: BoolProperty(name="Keep Height (2 rails)", default=False,
                               description="Stretch the profile between the rails without scaling its height")
@@ -84,18 +95,39 @@ class NPROTO_OT_sweep(SolidBody, PickMixin, bpy.types.Operator):
                 "click the second rail"][min(n, 2)]
 
     def _params(self):
-        return {k: getattr(self, k) for k in ("samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height")}
+        p = {k: getattr(self, k) for k in ("samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height")}
+        if len(self.scale_points) or self.scale_taper != "LINEAR":
+            p.update(scale_points=sweep_points_param(self.scale_points), scale_taper=self.scale_taper)
+        return p
+
+    def _edit_points(self):
+        """The redo panel's buttons: rows marked Remove go, Add puts one in the
+        middle of the longest stretch between points (at the scale there)."""
+        for i in reversed(range(len(self.scale_points))):
+            if self.scale_points[i].remove:
+                self.scale_points.remove(i)
+        if self.add_scale_point:
+            self.add_scale_point = False
+            pts = sweep_points_param(self.scale_points)
+            fs = [0.0] + [a for a, _ in pts] + [1.0]
+            k = max(range(len(fs) - 1), key=lambda i: fs[i + 1] - fs[i])
+            at = 0.5 * (fs[k] + fs[k + 1])
+            law = sweeps.sweep_scale_law({"scale_end": self.scale_end, "scale_taper": self.scale_taper,
+                                          "scale_points": pts})
+            it = self.scale_points.add()
+            it.at, it.scale = at, float(law(at))
 
     def execute(self, context):
         if not _kernel_ok(self):
             return {'CANCELLED'}
+        self._edit_points()
         try:
             inputs = _decode_inputs(self.inputs)
             if len(inputs) < 2:
                 raise ValueError("pick a profile and a rail (Shift+click for a second rail)")
             if self.body != "SURFACE":
                 return self.execute_solid(context, inputs, self._params())
-            obj = _new_surface(context, "Sweep", "sweep", inputs, self._params())
+            obj = _make_result(context, "Sweep", "sweep", inputs, self._params())   # a surface, or pieces joined
         except Exception as exc:
             self.report({'ERROR'}, f"Sweep failed: {exc}")
             return {'CANCELLED'}
@@ -112,6 +144,20 @@ class NPROTO_OT_sweep(SolidBody, PickMixin, bpy.types.Operator):
         col = lay.column()
         for k in ("samples", "tangent", "flip_tangent", "scale_end", "twist", "keep_height"):
             col.prop(self, k)
+        two_rails = len(_decode_inputs(self.inputs)) >= 3 if self.inputs else False
+        box = lay.box()
+        box.active = not two_rails
+        row = box.row(align=True)
+        row.label(text="Scale" + ("  (two rails: set by the rails)" if two_rails else ""))
+        row.prop(self, "scale_taper", expand=True)
+        pc = box.column(align=True)
+        for n, i in enumerate(sorted(range(len(self.scale_points)), key=lambda i: self.scale_points[i].at)):
+            it = self.scale_points[i]
+            r = pc.row(align=True)
+            r.prop(it, "at", text=f"{n + 1}  At", slider=True)
+            r.prop(it, "scale", text="×")
+            r.prop(it, "remove", text="", icon='X', toggle=True)
+        box.prop(self, "add_scale_point", icon='ADD', toggle=True)
 
 
 def sweep_profile(crv, act):

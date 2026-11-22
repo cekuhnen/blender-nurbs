@@ -116,6 +116,59 @@ check("extend without trimming: the slope is grown, the floor untouched, the fil
       r == {'FINISHED'} and abs(A(a) - a0) < 1e-9 and abs(A(b) - b0 / LB * LA) < 1e-6
       and abs(Y.max() - LA) < 1e-6, (A(a), A(b), Y.max()))
 
+# --- Set Back: both edges moved back whole, a light Loft edge blend between ------
+from blender_nurbs import contlabels
+from blender_nurbs.kernel import load as _load
+
+
+def cv_count(o):
+    d = _load().blender_ext.surface_cvs(store.get_brep(o).faces()[0].surface())
+    return d["count_u"] * d["count_v"]
+
+
+for shape, cont, want in (("CIRCULAR", "2", "G2"), ("BLEND", "3", "G3"), ("BLEND", "1", "G1")):
+    a, b = tent()
+    a0, b0 = A(a), A(b)
+    r, lo = fillet(a, b, shape=shape, continuity=cont, ends="SETBACK")
+    labs = contlabels.labels(lo) if lo else []
+    check(f"set back {shape} {want}: floor and slope each cut back by the setback along their WHOLE edges",
+          r == {'FINISHED'} and abs(A(a) - (a0 - SETBACK * LA)) < 1e-6 and abs(A(b) - (b0 - SETBACK * LB)) < 1e-6
+          and store.get_brep(a).face_count() == 1 and len(store.get_brep(a).edges()) == 4
+          and store.get_brep(b).face_count() == 1, (r, A(a), a0 - SETBACK * LA, A(b), b0 - SETBACK * LB))
+    E = edge_pts(lo) if lo else np.full((1, 3), np.nan)
+    check(f"set back {shape} {want}: one light patch from the floor's whole edge to the slope's, labels hold {want}",
+          lo is not None and store.get_brep(lo).face_count() == 1 and cv_count(lo) <= 48
+          and abs(E[:, 1].max() - LA) < 1e-6 and len(labs) == 2 and all(L["check"]["ok"] for L in labs)
+          and all(want in L["check"]["text"] or L.get("kind", want) == want for L in labs),
+          (cv_count(lo) if lo else None, [L["check"]["text"] for L in labs]))
+
+a, b = tent()
+r, lo = fillet(a, b, shape="CHAMFER", ends="SETBACK")
+check("set back chamfer: a straight blend", r == {'FINISHED'} and lo is not None
+      and _load().blender_ext.surface_cvs(store.get_brep(lo).faces()[0].surface())["degree_v"] in (1,)
+      or _load().blender_ext.surface_cvs(store.get_brep(lo).faces()[0].surface())["degree_u"] in (1,), r)
+
+clear()
+a = sheet("Plate", (-0.4, 0, 0), (0.4, 0, 0), 0.6)
+fin_ln = poly("Fin_ln", [(0, 0.1, -0.1), (0, 0.1, 0.2)])
+bpy.ops.nproto.extrude(inputs=json.dumps([[fin_ln.name, "S0"]]), distance=0.3, direction="Y")
+fin = ctx.active_object
+try:
+    r = bpy.ops.nproto.fillet(surf_a=a.name, surf_b=fin.name, radius=0.02, ends="SETBACK")
+except RuntimeError as exc:
+    r = str(exc)
+check("set back: surfaces that cross through each other are refused (no edges to move back)",
+      r != {'FINISHED'} and "edge to edge" in str(r), str(r)[:120])
+
+from blender_nurbs import filletsetback as _fsb
+a, b = tent()
+_smp = _fsb.preview_samples(a, b)
+_X = _fsb.preview_sections(_smp, SETBACK, SETBACK, 5) if _smp else None
+check("set back preview: sections from the floor's cut-back edge (whole length) to the slope's",
+      _X is not None and np.allclose(_X[0, 0], [-SETBACK, 0, 0], atol=1e-6)
+      and np.allclose(_X[-1, 0], [-SETBACK, LA, 0], atol=1e-6) and abs(_X[-1, -1][1] - LB) < 1e-6,
+      None if _X is None else (_X[0, 0], _X[-1, 0], _X[-1, -1]))
+
 # --- the preview follows Ends ---------------------------------------------------
 from blender_nurbs.ops_trim import surface_fillet_frames, surface_fillet_uneven
 a, b = tent()
@@ -150,6 +203,18 @@ for o in (fil, a, b):
     features.rebuild(o, ctx, force=True)
 after = [A(o) for o in (a, b, fil)]
 check("history: the notch replays", max(abs(x - y) for x, y in zip(before, after)) < 1e-7, (before, after))
+
+a, b = tent()
+r, lo = fillet(a, b, shape="CIRCULAR", ends="SETBACK")
+before = [A(o) for o in (a, b, lo)]
+for o in (a, b, lo):
+    features.rebuild(o, ctx, force=True)
+after = [A(o) for o in (a, b, lo)]
+hidden = [o for o in bpy.data.objects if o.name.endswith("_setback")]
+check("history: set back gives trim steps and a Loft that rebuild the same; the cut-back curves are kept hidden",
+      features.stack(a)[-1]["op"] == "trim" and features.stack(b)[-1]["op"] == "trim"
+      and features.history(lo)["op"] == "loft" and max(abs(x - y) for x, y in zip(before, after)) < 1e-7
+      and len(hidden) == 2 and all(o.hide_get() for o in hidden), (before, after, [o.name for o in hidden]))
 ctx.scene.nproto_settings.construction_history = False
 
 # --- the crossing ending inside both: refused, not slotted ----------------------
