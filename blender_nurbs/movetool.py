@@ -1605,24 +1605,35 @@ class NPROTO_OT_scale(_PointsTool, bpy.types.Operator):
 # Hold the key: Blender's tool on a tap, this one on a hold
 # --------------------------------------------------------------------------
 
+# kind: (key, Blender's operator on a tap, ours on a hold); an operator is
+# its id or (id, {property: value}). "." is Blender's Pivot Point pie.
 HOLD_TOOLS = {"MOVE": ('G', "transform.translate", NPROTO_OT_move.bl_idname),
               "ROTATE": ('R', "transform.rotate", NPROTO_OT_rotate.bl_idname),
-              "SCALE": ('S', "transform.resize", NPROTO_OT_scale.bl_idname)}
+              "SCALE": ('S', "transform.resize", NPROTO_OT_scale.bl_idname),
+              "PIVOT": ('PERIOD', ("wm.call_menu_pie", {"name": "VIEW3D_MT_pivot_pie"}), "nproto.move_pivot")}
+
+
+def _op(idname):
+    idname, props = (idname, {}) if isinstance(idname, str) else idname
+    mod, name = idname.split(".")
+    return getattr(getattr(bpy.ops, mod), name), props
 
 
 def _run(idname):
-    mod, name = idname.split(".")
-    return getattr(getattr(bpy.ops, mod), name)('INVOKE_DEFAULT')
+    op, props = _op(idname)
+    return op('INVOKE_DEFAULT', **props)
 
 
 class NPROTO_OT_transform_hold(bpy.types.Operator):
-    """Tap: Blender's own Move / Rotate / Scale. Hold: Move / Rotate / Scale by
-    Points (picked points, copies) -- the add-on's Hold Time preference sets how long"""
+    """Tap: Blender's own Move / Rotate / Scale (or the Pivot Point pie on ".").
+    Hold: Move / Rotate / Scale by Points (picked points, copies), or Move Pivot
+    on "." -- the add-on's Hold Time preference sets how long"""
     bl_idname = "nproto.transform_hold"
     bl_label = "Blender's Tool (tap) / By Points (hold)"
     bl_options = {'INTERNAL'}
 
-    kind: EnumProperty(items=[("MOVE", "Move", ""), ("ROTATE", "Rotate", ""), ("SCALE", "Scale", "")], default="MOVE",
+    kind: EnumProperty(items=[("MOVE", "Move", ""), ("ROTATE", "Rotate", ""), ("SCALE", "Scale", ""),
+                              ("PIVOT", "Move Pivot", "")], default="MOVE",
                        options={'HIDDEN'})
 
     def _native(self):
@@ -1640,9 +1651,7 @@ class NPROTO_OT_transform_hold(bpy.types.Operator):
     def invoke(self, context, event):
         if event.is_repeat:
             return {'CANCELLED'}
-        ours = HOLD_TOOLS[self.kind][2]
-        mod, name = ours.split(".")
-        if not hold_enabled() or not getattr(getattr(bpy.ops, mod), name).poll():
+        if not hold_enabled() or not _op(HOLD_TOOLS[self.kind][2])[0].poll():
             return self._native()
         self._key = event.type
         self._t0 = time.monotonic()
@@ -1682,7 +1691,7 @@ def menu_transform(self, context):
 
 
 MENUS = ("VIEW3D_MT_transform_object", "VIEW3D_MT_transform")
-KEYMAPS = ("Object Mode", "Mesh", "Curve", "Lattice")       # where Blender binds G / R / S
+KEYMAPS = ("Object Mode", "Mesh", "Curve", "Lattice")       # where Blender binds G / R / S (before "3D View"'s ".")
 
 classes = (NPROTO_OT_move, NPROTO_OT_rotate, NPROTO_OT_scale, NPROTO_OT_transform_hold)
 _keymaps = []

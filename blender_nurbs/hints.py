@@ -334,12 +334,13 @@ class NPROTO_AP_preferences(bpy.types.AddonPreferences):
         description="How sized tools take their values when started from the UI. Tools without handles "
                     "always use the dialog; scripts and the Adjust Last Operation panel use neither")
 
-    hold_transform: BoolProperty(name="Hold G / R / S for the By Points Tools", default=True,
+    hold_transform: BoolProperty(name="Hold G / R / S / . for the Add-on's Tools", default=True,
                                  description="Tap G, R or S for Blender's Move, Rotate or Scale; hold it "
                                              "for the add-on's by Points tool (picked points, *n / /n "
-                                             "copies). Off: G, R and S are always Blender's")
+                                             "copies). Tap . for Blender's Pivot Point pie, hold it for "
+                                             "Move Pivot. Off: the keys are always Blender's")
     hold_ms: IntProperty(name="Hold Time (ms)", default=300, min=120, max=1500,
-                         description="How long (milliseconds) G, R or S is held before the By Points tool starts")
+                         description="How long (milliseconds) G, R, S or . is held before the add-on's tool starts")
 
     def draw(self, context):
         self.layout.prop(self, "value_input")

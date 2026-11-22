@@ -337,6 +337,25 @@ check("hold G / R bound in object / edit keymaps", {n for n, _ in items} == set(
       == sorted((n, key, kind) for n in movetool.KEYMAPS for kind, (key, _a, _b) in movetool.HOLD_TOOLS.items()),
       items)
 check("hold default", movetool.hold_ms() == 300 and movetool.hold_enabled())
+check("hold . : tap is Blender's Pivot Point pie, hold is Move Pivot",
+      movetool.HOLD_TOOLS["PIVOT"] == ('PERIOD', ("wm.call_menu_pie", {"name": "VIEW3D_MT_pivot_pie"}),
+                                       "nproto.move_pivot"))
+
+# -- Move Pivot: toolbar tool and right-click menus ------------------------------
+from bl_ui.space_toolsystem_common import ToolSelectPanelHelper
+from blender_nurbs import pivottool
+_tb = ToolSelectPanelHelper._tool_class_from_space_type('VIEW_3D')
+_ids = lambda m: [getattr(i, "idname", None) for i in _tb.tools_from_context(ctx, mode=m)]
+_places = {m: (_ids(m).index(pivottool.TOOL_ID) - _ids(m).index("builtin.transform")
+               if pivottool.TOOL_ID in _ids(m) else None) for m in pivottool.TOOL_MODES}
+check("Move Pivot tool in the toolbar right after Transform, Object and Edit Modes",
+      all(v == 1 for v in _places.values()), _places)
+check("Move Pivot in the right-click menus",
+      all(pivottool.menu_transform in getattr(bpy.types, m).draw._draw_funcs
+          for m in ("VIEW3D_MT_object_context_menu", "VIEW3D_MT_edit_mesh_context_menu",
+                    "VIEW3D_MT_edit_curve_context_menu")))
+check("F3 finds Move Pivot by 'origin' too", "Origin" in bpy.types.NPROTO_OT_move_pivot.bl_label)
+check("Move Pivot icon file exists", os.path.isfile(pivottool.ICON + ".dat"))
 
 print("ALL PASS" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)
