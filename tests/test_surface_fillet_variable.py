@@ -152,6 +152,55 @@ r, fil = fillet(a, b, shape="BLEND", continuity="2", radius=0.09, end_radius=0.0
 rr = law(0.09, 0.0, start_y(fil)) if fil else None
 dev = max(max(on_edges(a, (rr(y), y, 0)), on_edges(b, (0, y, rr(y)))) for y in np.linspace(0, W, 9)) if fil else 1
 check("blend G2 0.09 -> 0: rails at r(y), tapering to the crossing", r == {'FINISHED'} and dev < 1e-7, dev)
+
+# --- the Feature panel: Radius A is the start radius; both trims follow ----------
+from blender_nurbs import feature_ui
+
+
+class Stub:                 # a layout that records the props and labels drawn
+    drawn = []
+    def __getattr__(self, n):
+        def f(*a_, **k_):
+            if n == "prop" and len(a_) > 1:
+                Stub.drawn.append(a_[1])
+            if n == "label":
+                Stub.drawn.append(k_.get("text", ""))
+            return Stub()
+        return f
+    def __setattr__(self, n, v): pass
+
+
+def panel(obj):
+    Stub.drawn = []
+    for o in ctx.view_layer.objects:
+        o.select_set(False)
+    obj.select_set(True); ctx.view_layer.objects.active = obj
+    feature_ui.draw_feature(Stub(), ctx)
+    return Stub.drawn
+
+
+for r_new in (0.06, 0.0):
+    a, b = corner()
+    a0 = A(a)
+    r, fil = fillet(a, b, shape="CIRCULAR", radius=0.1, end_radius=0.03)
+    feature_ui.sync_from_history(fil)
+    drawn = panel(fil)
+    pg = fil.nproto_feature
+    shown = ("sf_start" in drawn and "radius_a" not in drawn and "radius_b" not in drawn
+             and abs(pg.sf_start - 0.1) < 1e-6 and any(t.startswith("Variable Radius:") for t in drawn))
+    pg.sf_start = r_new                     # the update rebuilds the fillet and both trimmed sheets
+    rr = law(r_new, 0.03, start_y(fil))
+    ys = np.linspace(0.0, W, 9)
+    dev = max(max(on_edges(a, (rr(y), y, 0)), on_edges(b, (0, y, rr(y))), on_edges(fil, (rr(y), y, 0)))
+              for y in ys)
+    lost = W * (r_new + 0.03) / 2
+    p_ = features.history(fil)["params"]
+    check(f"panel: Start Radius (not Radius A / B) for a variable fillet; set to {r_new:g}, the fillet and both "
+          "trimmed sheets follow the new law",
+          shown and dev < 1e-7 and abs(A(a) - (a0 - lost)) < 1e-6 and abs(A(b) - (a0 - lost)) < 1e-6
+          and abs(p_["radii"][0] - r_new) < 1e-7 and abs(abs(p_["radius_a"]) - max(r_new, 0.03)) < 1e-7
+          and np.allclose(features.stack(a)[-1]["params"]["radii"], p_["radii"]),
+          (shown, dev, A(a), a0 - lost, p_["radii"]))
 ctx.scene.nproto_settings.construction_history = False
 
 # --- the preview: two arrows, rails as the worker's law -------------------------

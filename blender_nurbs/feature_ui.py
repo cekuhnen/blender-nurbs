@@ -91,6 +91,52 @@ PRETTY = {"patch": "Patch", "dome": "Dome", "square": "Square", "sweep": "Sweep"
           "flow": "Flow Along Surface"}
 
 
+def _on_sf_start(self, context):
+    """A variable Surface Fillet's Start Radius edited: into the fillet's
+    radii and into its two partners' trim steps (theirs carry their own copy),
+    then all three rebuilt. The sides stay the signs of radius_a / radius_b,
+    whose size is the larger radius."""
+    if _syncing[0]:
+        return
+    from .steps import fillet_radii
+    obj = self.id_data
+    h = features.history(obj)
+    if h is None or h["op"] != "surface_fillet" or not fillet_radii(h["params"]):
+        return
+    raw = json.loads(obj[features.PROP_HIST])
+    p = raw["params"]
+    old = (p.get("radii"), p.get("start_point"))
+    radii = [float(self.sf_start), fillet_radii(p)["radii"][1]]
+    m = max(radii)
+    if m <= 0:                          # both 0: no fillet (and no sides left in the signs)
+        sync_from_history(obj)
+        return
+    new = {"radii": radii, "radius_a": m if float(p["radius_a"]) >= 0 else -m,
+           "radius_b": m if float(p["radius_b"]) >= 0 else -m}
+    p.update(new)
+    obj[features.PROP_HIST] = json.dumps(raw)
+    obj["nproto_feature_synced"] = obj[features.PROP_HIST]
+    partners = []
+    for src, _ in h["inputs"]:
+        if features.PROP_STACK not in src:
+            continue
+        st = json.loads(src[features.PROP_STACK])
+        hit = False
+        for e in st:
+            q = e["params"]
+            if e["op"] == "fillet_trim" and (q.get("radii"), q.get("start_point")) == old:
+                q.update(new)
+                hit = True
+        if hit:
+            src[features.PROP_STACK] = json.dumps(st)
+            partners.append(src)
+    for o in [obj] + partners:
+        try:
+            features.edit_rebuild(o, context)
+        except Exception as exc:
+            print(f"NURBS feature edit ({o.name}): {exc}")
+
+
 def _on_change(self, context):
     if _syncing[0]:
         return
@@ -466,6 +512,9 @@ class NprotoFeature(bpy.types.PropertyGroup):
     tolerance: FloatProperty(name="Tolerance", min=1e-6, soft_max=0.1, precision=5, unit='LENGTH', **_F())
     radius_a: FloatProperty(name="Radius A (signed: side)", unit='LENGTH', **_F())
     radius_b: FloatProperty(name="Radius B (signed: side)", unit='LENGTH', **_F())
+    sf_start: FloatProperty(name="Start Radius", min=0.0, unit='LENGTH', update=lambda s, c: _on_sf_start(s, c),
+                            description="A variable Surface Fillet's radius at the crossing's start (0: it tapers "
+                                        "from nothing); both trimmed surfaces follow")
     e0: EnumProperty(name="Edge 1", items=[("FREE", "Free", ""), ("G0", "G0", ""), ("G1", "G1", ""), ("G2", "G2", "")], **_F())
     e1: EnumProperty(name="Edge 2", items=[("FREE", "Free", ""), ("G0", "G0", ""), ("G1", "G1", ""), ("G2", "G2", "")], **_F())
     e2: EnumProperty(name="Edge 3", items=[("FREE", "Free", ""), ("G0", "G0", ""), ("G1", "G1", ""), ("G2", "G2", "")], **_F())
@@ -640,6 +689,11 @@ def sync_from_history(obj):
                                                     "pt_quad_degree") else v)
             except (TypeError, ValueError):
                 pass
+        if h["op"] == "surface_fillet":         # a variable one: its start radius (as history replays it)
+            from .steps import fillet_radii
+            var = fillet_radii(params).get("radii")
+            if var:
+                pg.sf_start = var[0]
     finally:
         _syncing[0] = False
     obj["nproto_feature_synced"] = obj.get(features.PROP_HIST, "")
@@ -740,7 +794,7 @@ def draw_feature(layout, context):
                 if var:
                     from .valuedrag import fmt_length
                     box.label(text=f"Variable Radius: {fmt_length(context, var[0])} → "
-                                   f"{fmt_length(context, var[1])} (Radius A scales both)", icon='DRIVER_DISTANCE')
+                                   f"{fmt_length(context, var[1])}", icon='DRIVER_DISTANCE')
             from .ui import draw_pause
             draw_pause(box, context)
             if obj.get("nproto_feature_synced") != obj.get(features.PROP_HIST):
@@ -758,6 +812,11 @@ def draw_feature(layout, context):
                 elif op == "sweep" and len(h["inputs"]) < 3:
                     _draw_sweep_points(box, obj, pg, h)
                 for name in FIELDS.get(op, []) if op != "patch" else []:
+                    if op == "surface_fillet" and h["params"].get("radii") and not h["params"].get("chord") \
+                            and h["params"].get("soft") is None:
+                        if name == "radius_a":           # variable: Radius A is the start radius
+                            col.prop(pg, "sf_start")
+                        continue                         # (radius_b: the same ball from both)
                     if op == "square" and name[0] in "ew" and name[1:].isdigit():
                         if name[0] == "e":
                             r_ = col.row(align=True)
