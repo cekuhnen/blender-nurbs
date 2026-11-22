@@ -91,7 +91,7 @@ everything built from it rebuilds.
 - **Trim and split:** Trim, Split, Untrim, Untrim Region, Detach at Isoparm
 - **Join:** Join, Unjoin
 - **Fillets:** Surface Fillet, Edge Fillet (circular, chamfer, blends G1 to G3, or soft: curvature-ramped G2 / G3 with an exact minimum radius, box corners filled G2)
-- **Solids:** Union, Difference, Intersection, Push / Pull, Replace Face, Boundary Fill
+- **Solids:** Union, Difference, Intersection, Push / Pull, Rotate Face, Replace Face, Boundary Fill
 
 ### Analyze
 

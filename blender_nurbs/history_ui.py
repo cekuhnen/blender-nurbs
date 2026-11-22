@@ -24,6 +24,7 @@ STEP_FIELDS = {
     "rebuild_surface": ["degree_u", "degree_v", "spans_u", "spans_v"],
     "extend_surface": ["distance"],
     "push_pull": ["distance"],
+    "rotate_face": ["angle"],
     "refit_trim": ["refit_degree", "refit_spans_u", "refit_spans_v"],
     "merge_patches": ["merge_mode", "merge_tolerance", "merge_degree", "merge_spans_u", "merge_spans_v",
                       "merge_cont_u0", "merge_cont_u1", "merge_cont_v0", "merge_cont_v1", "merge_edge_tolerance",
@@ -118,6 +119,7 @@ class NprotoStep(bpy.types.PropertyGroup):
     spans_u: IntProperty(name="Spans U", min=1, max=64, **_S())
     spans_v: IntProperty(name="Spans V", min=1, max=64, **_S())
     distance: FloatProperty(name="Distance", soft_min=-10.0, soft_max=10.0, unit='LENGTH', **_S())
+    angle: FloatProperty(name="Angle", min=-179.0, max=179.0, **_S())
     refit_degree: IntProperty(name="Degree", min=1, max=7, **_S())
     refit_spans_u: IntProperty(name="Spans U (0 auto)", min=0, max=32, **_S())
     refit_spans_v: IntProperty(name="Spans V (0 auto)", min=0, max=32, **_S())
@@ -433,7 +435,7 @@ def draw_steps(box, obj, only=None, bare=False):
                 inner.label(text=pg.error, icon='ERROR')
 
 
-STEP_ICON = {"replace_face": 'FACE_MAPS', "push_pull": 'FACESEL', "untrim_region": 'SELECT_SUBTRACT', "untrim": 'LOOP_BACK', "edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
+STEP_ICON = {"replace_face": 'FACE_MAPS', "push_pull": 'FACESEL', "rotate_face": 'DRIVER_ROTATIONAL_DIFFERENCE', "untrim_region": 'SELECT_SUBTRACT', "untrim": 'LOOP_BACK', "edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
              "flip_normal": 'NORMALS_FACE', "surface_align": 'SNAP_EDGE', "match_surface": 'SNAP_FACE', "extend_surface": 'FULLSCREEN_ENTER',
              "rebuild_surface": 'MOD_REMESH', "refit_trim": 'MOD_LATTICE', "merge_patches": 'MESH_GRID'}
 

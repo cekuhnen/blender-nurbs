@@ -238,6 +238,9 @@ jobs:
           "$BLENDER" -b --factory-startup --python tests/test_replace_face.py 2>&1 | tee replace.log
           grep -E "^FAIL" replace.log || true
           grep -q "^ALL OK" replace.log
+          "$BLENDER" -b --factory-startup --python tests/test_rotate_face.py 2>&1 | tee rotface.log
+          grep -E "^FAIL" rotface.log || true
+          grep -q "^ALL OK" rotface.log
           "$BLENDER" -b --factory-startup --python tests/test_unroll_flow.py 2>&1 | tee unroll.log
           grep -E "^FAIL" unroll.log || true
           grep -q "^ALL OK" unroll.log

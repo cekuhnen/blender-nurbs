@@ -10,18 +10,23 @@ drag it out or through the face, type a value, click away or Enter.
 
 With history the move is a step on the body (push_pull, replayed on rebuilds,
 the faces found again by a point on each); without it the body changes in
-place."""
+place.
+
+Rotate Face turns faces about a hinge (a straight edge, usually one of the
+face's own): the face keeps its shape, its neighbours keep their surfaces
+(extended or cut back to meet it), as a draft on a single face. The worker's
+rotate_face job; history step rotate_face."""
 
 import json
 
 import bpy
 import numpy as np
-from bpy.props import FloatProperty, StringProperty
+from bpy.props import FloatProperty, FloatVectorProperty, StringProperty
 from mathutils import Vector
 
 from . import draw, features, geom, hints, jobs, store, subsel
 from .ops import AskValue, _is_solid, _kernel_ok, _select_only
-from .valuedrag import NAV, ValueDrag, ruled_preview
+from .valuedrag import NAV, ValueDrag, angle_pick, rotate_points, ruled_preview
 
 
 def _uvxy(uv):
@@ -610,4 +615,452 @@ class NPROTO_OT_replace_face(_FacePicking, bpy.types.Operator):
         return {'FINISHED'}
 
 
-classes = (NPROTO_OT_push_pull, NPROTO_OT_replace_face)
+HINGE_RGBA = (0.55, 0.85, 1.0, 0.95)        # the hinge (axis) line
+NOT_HINGE_RGBA = (1.0, 0.45, 0.35, 0.9)      # an edge under the mouse that can't be one (curved)
+
+
+def _rot3(z, deg):
+    """3x3: deg degrees about unit z, right-handed (as valuedrag.rotate_points)."""
+    z = np.asarray(z, float)
+    a = np.radians(deg)
+    K = np.array([[0.0, -z[2], z[1]], [z[2], 0.0, -z[0]], [-z[1], z[0], 0.0]])
+    return np.eye(3) + np.sin(a) * K + (1.0 - np.cos(a)) * (K @ K)
+
+
+def straight_edge(ob, i):
+    """(A, B) world end points of edge i of body ob when it is straight, else None."""
+    P = subsel._edge_polys(ob)[i]
+    if P is None or len(P) < 2:
+        return None
+    W = _world(np.array(geom.world_matrix(ob)), P)
+    A, B = W[0], W[-1]
+    L = float(np.linalg.norm(B - A))
+    if L <= 1e-12:
+        return None
+    t = (B - A) / L
+    rel = W - A
+    off = rel - np.outer(rel @ t, t)
+    if float(np.linalg.norm(off, axis=1).max()) > 1e-4 * L:
+        return None
+    return A, B
+
+
+def hinge_axis(face_world, normal_world, A, B):
+    """(point, unit direction) of the hinge through A, B, turned so that a
+    positive angle swings the face out (its middle along its outward normal)."""
+    A, B = np.asarray(A, float), np.asarray(B, float)
+    z = (B - A) / (np.linalg.norm(B - A) or 1.0)
+    r = np.asarray(face_world, float) - A
+    r = r - (r @ z) * z
+    if float(np.cross(z, r) @ np.asarray(normal_world, float)) < 0.0:
+        z = -z
+    return A, z
+
+
+def hinge_on_face(o, i, O, z):
+    """Is the hinge (world line through O along z) one of face i's own edges?
+    Then a rebuild that moves the face takes its hinge edge along."""
+    f = store.get_brep(o).faces()[i]
+    Mi = geom.world_matrix(o).inverted()
+    size = subsel._size(o)
+    s = 1e-2 * size
+    d = lambda q: f.closest_point(tuple(map(float, Mi @ Vector(q))))[1]
+    tol = 1e-6 * size
+    return bool(d(O) <= tol and (d(O + s * z) <= tol or d(O - s * z) <= tol))
+
+
+class NPROTO_OT_rotate_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator):
+    """Turn faces of a solid about a hinge: click the face, then a straight
+    edge (one of its own tilts it like a draft); drag the angle or type it.
+    The neighbours keep their own surfaces, extended or cut back to meet the
+    turned face"""
+    bl_idname = "nproto.rotate_face"
+    bl_label = "Rotate Face"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    faces: StringProperty(options={'HIDDEN', 'SKIP_SAVE'},
+                          description="The faces: [[body name, a point on the face (local)], ...]")
+    axis_point: FloatVectorProperty(size=3, options={'HIDDEN', 'SKIP_SAVE'},
+                                    description="A point of the hinge (world)")
+    axis_dir: FloatVectorProperty(size=3, options={'HIDDEN', 'SKIP_SAVE'},
+                                  description="The hinge's direction (world): a positive angle turns right-handed "
+                                              "about it")
+    angle: FloatProperty(name="Angle", default=0.0, min=-179.0, max=179.0,
+                         description="Degrees about the hinge: positive swings the face out (adds material when "
+                                     "it is hinged on its own edge), negative in")
+
+    drag_fields = ("angle",)
+    angle_fields = ("angle",)
+    fit_view = "none"
+
+    # -- the faces and the hinge ------------------------------------------------
+    def _items(self):
+        return NPROTO_OT_push_pull._items(self)
+
+    def _check(self, items):
+        return NPROTO_OT_push_pull._check(self, items)
+
+    def _has_axis(self):
+        return float(np.linalg.norm(np.array(self.axis_dir, float))) > 1e-12
+
+    def _set_axis(self, A, B):
+        o, p = self._items()[0]
+        _, pw, nw, _ = face_frame(o, _face_index(o, p))
+        O, z = hinge_axis(pw, nw, A, B)
+        self.axis_point, self.axis_dir = [float(x) for x in O], [float(x) for x in z]
+
+    def _take_picks(self, context):
+        """Faces picked in Face mode on the selected bodies; one picked straight
+        edge (Edge mode) as the hinge."""
+        NPROTO_OT_push_pull._take_picks(self, context)
+        if not self.faces or self._has_axis():
+            return
+        edges = [(o, i) for o in context.selected_objects if store.is_nurbs(o) for i in subsel.picks(o, "EDGE")]
+        if len(edges) == 1:
+            ab = straight_edge(*edges[0])
+            if ab is not None:
+                self._set_axis(*ab)
+
+    def invoke(self, context, event):
+        if not _kernel_ok(self):
+            return {'CANCELLED'}
+        self._start_event = (event.mouse_x, event.mouse_y, event.type, event.value)
+        self._take_picks(context)
+        if self.faces:
+            try:
+                why = self._check(self._items())
+            except Exception as exc:
+                why = str(exc)
+            if why:
+                self.report({'WARNING'}, why)
+                return {'CANCELLED'}
+            if self._has_axis():
+                return self.ask(context)
+        if bpy.app.background:
+            self.report({'WARNING'}, "Pick a face of a solid (Face mode) and a straight edge as the hinge")
+            return {'CANCELLED'}
+        self._stage = "HINGE" if self.faces else "FACE"
+        self._dragging = False
+        self._hover = None
+        self._hinge_hover = None
+        context.window_manager.modal_handler_add(self)
+        self._stage_hints(context)
+        if self._stage == "HINGE":
+            self._show_hinge(None)
+            context.area.tag_redraw()
+        return {'RUNNING_MODAL'}
+
+    # -- picking ------------------------------------------------------------------
+    def _stage_hints(self, context, msg=""):
+        if self._stage == "FACE":
+            step = ["click the face to turn (a face of a solid)"]
+            more = [hints.note("or pick faces in Face mode first: they all turn about one hinge")]
+        else:
+            step = ["click the hinge: a straight edge (the face's own edge tilts it)"]
+            more = [hints.note("or pick the edge in Edge mode with the face")]
+        hints.show(context, self.bl_label, step + ([msg] if msg else []), [("", more)],
+                   [("MOUSE_LMB", "Pick"), ("EVENT_ESC", "Cancel")])
+
+    def _edge_hit(self, context, event):
+        region, _ = ValueDrag._win(context)
+        if region is None:
+            return None
+        xy = (event.mouse_x - region.x, event.mouse_y - region.y)
+        if not (0 <= xy[0] < region.width and 0 <= xy[1] < region.height):
+            return None
+        with context.temp_override(region=region):
+            try:
+                return subsel.edge_under(bpy.context, xy)
+            except Exception as exc:
+                print("NURBS rotate face pick:", exc)
+                return None
+
+    def _show_hinge(self, hit):
+        """The picked faces lit, and the edge under the mouse: blue when it can
+        be the hinge, red when it is curved."""
+        pv = {"lines": [], "tris": np.zeros((0, 3)), "guides": []}
+        tris = []
+        for o, p in self._items():
+            try:
+                h = face_highlight(o, _face_index(o, p), self.MAX_FILL)
+                pv["lines"] += h["lines"]
+                tris.append(h["tris"])
+            except Exception as exc:
+                print("NURBS rotate face hover:", exc)
+        if tris:
+            pv["tris"] = np.vstack(tris)
+        if hit is not None:
+            ob, i = hit
+            P = subsel._edge_polys(ob)[i]
+            if P is not None:
+                ab = straight_edge(ob, i)
+                if ab is not None:                 # the hinge axis: past both ends, as in the value stage
+                    A, B = ab
+                    pv["guides"].append((np.array([A - 0.25 * (B - A), B + 0.25 * (B - A)]), HINGE_RGBA))
+                else:
+                    pv["guides"].append((_world(np.array(geom.world_matrix(ob)), P), NOT_HINGE_RGBA))
+        draw.pick_overlay["preview"] = pv
+
+    def modal(self, context, event):
+        if getattr(self, "_dragging", False):
+            return ValueDrag.modal(self, context, event)
+        if event.type in NAV or event.type == 'INBETWEEN_MOUSEMOVE':     # (gizmo drags need the in-between moves)
+            return {'PASS_THROUGH'}
+        if event.type == 'MOUSEMOVE':
+            if self._stage == "FACE":
+                self._show_face(self._hit(context, event))
+            else:
+                hit = self._edge_hit(context, event)
+                if hit != self._hinge_hover:
+                    self._hinge_hover = hit
+                    self._show_hinge(hit)
+            context.area.tag_redraw()
+            return {'PASS_THROUGH'}
+        if event.type in ('ESC', 'RIGHTMOUSE') and event.value == 'PRESS':
+            self._end_pick(context)
+            return {'CANCELLED'}
+        if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            if self._stage == "FACE":
+                hit = self._hit(context, event)
+                if hit is None:
+                    self._stage_hints(context, "no face there")
+                    return {'RUNNING_MODAL'}
+                o, i = hit
+                p = face_frame(o, i)[0]
+                why = self._check([(o, p)])
+                if why:
+                    self._stage_hints(context, why)
+                    return {'RUNNING_MODAL'}
+                self.faces = _faces_json([(o, p)])
+                self._stage = "HINGE"
+                self._hinge_hover = None
+                self._show_hinge(None)
+                self._stage_hints(context)
+                context.area.tag_redraw()
+                return {'RUNNING_MODAL'}
+            hit = self._edge_hit(context, event)
+            if hit is None:
+                self._stage_hints(context, "no edge there")
+                return {'RUNNING_MODAL'}
+            ab = straight_edge(*hit)
+            if ab is None:
+                self._stage_hints(context, "that edge is curved: the hinge must be straight")
+                return {'RUNNING_MODAL'}
+            self._set_axis(*ab)
+            self._end_pick(context)
+            bodies = {o for o, _ in self._items()}
+            for x in context.selected_objects:
+                x.select_set(False)
+            for o in bodies:
+                o.select_set(True)
+            context.view_layer.objects.active = next(iter(bodies))
+            # a value stage can't start inside this loop: start the command again
+            bpy.ops.nproto.rotate_face('INVOKE_DEFAULT', faces=self.faces, axis_point=self.axis_point,
+                                       axis_dir=self.axis_dir)
+            return {'CANCELLED'}
+        return {'RUNNING_MODAL'}
+
+    # -- the value stage (valuedrag.py) -----------------------------------------
+    def _axis(self):
+        z = np.array(self.axis_dir, float)
+        return np.array(self.axis_point, float), z / (np.linalg.norm(z) or 1.0)
+
+    def drag_setup(self, context, mouse):
+        """Each face's outline and fill (world), with the way each outline
+        point slides on its neighbour (rim_moves): the preview meets the
+        turned plane along those."""
+        if not self._has_axis():
+            return False
+        O, z = self._axis()
+        self._frames = []
+        for o, p in self._items():
+            i = _face_index(o, p)
+            _, pw, nw, flat = face_frame(o, i)
+            pts, tris, polys = subsel.face_tris(o, i)
+            M = np.array(geom.world_matrix(o))
+            if not len(tris) or len(pts) > self.MAX_FILL:
+                pts, tris = np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
+            try:
+                Np = rim_moves(o, i, polys)
+            except Exception as exc:
+                print("NURBS rotate face preview:", exc)
+                Np = [np.broadcast_to(nw, P.shape) for P in polys]
+            W = [_world(M, P) for P in polys]
+            self._frames.append({"P": pw, "n": nw, "flat": flat, "polys": W, "Np": Np,
+                                 "pts": _world(M, pts) if len(pts) else pts, "tris": tris})
+        if not self._frames:
+            return False
+        # the handle: the middle of the outline's part farthest from the hinge
+        # (a straight edge across from it: its middle; it lies on the face's surface)
+        Q = np.vstack([q for fr in self._frames for q in fr["polys"]])
+        rel = Q - O
+        r = np.linalg.norm(rel - np.outer(rel @ z, z), axis=1)
+        if r.max() <= 1e-12:
+            return False
+        self._far = Q[r >= r.max() * (1.0 - 1e-3)].mean(axis=0)
+        self._lift = 2e-3 * float(np.linalg.norm(np.ptp(Q, axis=0)) or 1.0)
+        h = (Q - O) @ z
+        pad = 0.15 * float(np.ptp(h) or r.max())
+        self._axis_line = np.array([O + z * (h.min() - pad), O + z * (h.max() + pad)])
+        self.angle = 0.0
+        self._base_at_mouse = False
+        return True
+
+    def drag_handles(self):
+        O, z = self._axis()
+        P = self._far
+        C = O + z * float((P - O) @ z)
+        x = P - C
+        rho = float(np.linalg.norm(x))
+        if rho < 1e-12:
+            return []
+        x /= rho
+        y = np.cross(z, x)
+        a = self.angle
+        n = max(2, int(abs(a) / 3.0) + 1)
+        path = np.vstack([rotate_points(P[None], O, z, a * i / (n - 1)) for i in range(n)])
+        back = a - np.copysign(min(6.0, abs(a) * 0.5), a) if abs(a) > 1e-9 else 0.0
+        return [{"field": "angle", "kind": "arrow", "pos": rotate_points(P[None], O, z, a)[0], "param": a,
+                 "origin": C, "dir": None, "path": path, "head_from": rotate_points(P[None], O, z, back)[0],
+                 "pick": lambda o, r, prev: angle_pick(C, x, y, z, o, r, prev),
+                 "to_value": lambda t: max(-179.0, min(179.0, t)), "snap": (5.0, 1.0)}]
+
+    def drag_preview(self):
+        O, z = self._axis()
+        a = self.angle
+        R = _rot3(z, a)
+        lines, tris = [], []
+        for fr in self._frames:
+            g0, gn = O + R @ (fr["P"] - O), R @ fr["n"]
+            for P, N in zip(fr["polys"], fr["Np"]):
+                if fr["flat"]:
+                    # each outline point slides on its neighbour until it meets the turned plane
+                    den = np.asarray(N, float) @ gn
+                    ok = np.abs(den) > 1e-6
+                    s = np.where(ok, ((g0 - P) @ gn) / np.where(ok, den, 1.0), 0.0)
+                    Q = np.where(ok[:, None], P + s[:, None] * N, rotate_points(P, O, z, a))
+                else:
+                    Q = rotate_points(P, O, z, a)
+                lines.append(Q)
+                L, T = ruled_preview([P, Q], ribs=4)
+                lines += L[2:]
+                tris.append(T)
+            if len(fr["pts"]):
+                X = fr["pts"]
+                if fr["flat"]:                 # the fill dropped onto the turned plane along the normal
+                    den = float(fr["n"] @ gn)
+                    X = X + np.outer(((g0 - X) @ gn) / den, fr["n"]) if abs(den) > 1e-6 else \
+                        rotate_points(X, O, z, a)
+                    X = X + self._lift * gn         # a hair off the face: no z-fighting at small angles
+                else:
+                    X = rotate_points(X, O, z, a)
+                tris.append(X[fr["tris"]].reshape(-1, 3))
+        return {"lines": lines, "tris": np.vstack(tris) if tris else np.zeros((0, 3)),
+                "guides": [(self._axis_line, HINGE_RGBA)]}
+
+    def drag_check(self):
+        if abs(self.angle) <= 0.0:
+            return "Angle 0: drag the arrow round the hinge, or type a value"
+        return ""
+
+    def drag_key(self, context, event, ch):
+        if ch == "f":
+            self.angle = -self.angle
+            return True
+        return False
+
+    def drag_rows(self):
+        return [("Direction", [hints.key("F", "the other way")])]
+
+    def drag_state(self):
+        if abs(self.angle) <= 0.0:
+            return []
+        return ["out" if self.angle > 0 else "in"]
+
+    def drag_handle_hints(self):
+        return [hints.key("LMB drag", "the arrow round the hinge")]
+
+    # -- making it --------------------------------------------------------------
+    def execute(self, context):
+        if not _kernel_ok(self):
+            return {'CANCELLED'}
+        self._take_picks(context)
+        try:
+            items = self._items()
+        except (ValueError, TypeError) as exc:
+            self.report({'ERROR'}, f"Rotate Face: {exc}")
+            return {'CANCELLED'}
+        if not items:
+            self.report({'WARNING'}, "Pick a face of a solid (Face mode, or click it)")
+            return {'CANCELLED'}
+        if not self._has_axis():
+            self.report({'WARNING'}, "Rotate Face: pick a straight edge as the hinge")
+            return {'CANCELLED'}
+        if abs(self.angle) <= 0.0:
+            self.report({'WARNING'}, "Rotate Face: the angle is 0")
+            return {'CANCELLED'}
+        why = self._check(items)
+        if why:
+            self.report({'WARNING'}, why)
+            return {'CANCELLED'}
+        O, z = self._axis()
+        R = _rot3(z, self.angle)
+        by_obj = {}
+        for o, p in items:
+            by_obj.setdefault(o.name, (o, []))[1].append(p)
+        hist = features.history_enabled(context)
+        done = []
+        for o, pts in by_obj.values():
+            M = geom.world_matrix(o)
+            Mi = M.inverted()
+            frames = [face_frame(o, _face_index(o, p)) for p in pts]
+            own = [hinge_on_face(o, _face_index(o, p), O, z) for p in pts]
+            had_picks = bool(subsel.picks(o, "FACE")) or "FACE" in subsel.kinds(context)
+            try:
+                info, breps = jobs.run("rotate_face", {"target": o}, ["result"],
+                                       face_pts=[[float(x) for x in f[1]] for f in frames],
+                                       face_normals=[[float(x) for x in f[2]] for f in frames],
+                                       face_flat=[bool(f[3]) for f in frames],
+                                       axis_point=[float(x) for x in O], axis_dir=[float(x) for x in z],
+                                       hinge_on_face=own, angle=float(self.angle), into="target")
+            except jobs.JobError as exc:
+                self.report({'ERROR'}, f"Rotate Face on {o.name} failed: {exc}")
+                continue
+            pre = o[store.PROP_BREP]
+            if not hist and features.has_history(o):
+                features.clear_history(o)
+                self.report({'INFO'}, f"{o.name}: construction history removed")
+            store.set_geometry_text(o, breps["result"], context, keep_untrimmed=False)
+            if hist:
+                L3 = M.to_3x3()
+                features.push_step(o, "rotate_face", [], {
+                    "faces_local": [[float(x) for x in f[0]] for f in frames],
+                    "normals_local": [[float(x) for x in (L3.transposed() @ Vector(f[2])).normalized()]
+                                      for f in frames],
+                    "flat": [bool(f[3]) for f in frames],
+                    "axis_point_local": [float(x) for x in Mi @ Vector(O)],
+                    "axis_dir_local": [float(x) for x in (L3.inverted() @ Vector(z)).normalized()],
+                    "hinge_on_face": own,
+                    "angle": float(self.angle)}, base_text=pre)
+            # the turned faces stay picked (Face mode): a point of each, turned with it
+            if had_picks:
+                moved = [Mi @ Vector(O + R @ (f[1] - O)) for f in frames]
+                try:
+                    subsel.set_picks(o, "FACE", [_face_index(o, q) for q in moved])
+                except Exception as exc:
+                    print("NURBS rotate face picks:", exc)
+            done.append(o)
+            self.report({'INFO'}, f"{o.name}: {len(pts)} face{'s' if len(pts) > 1 else ''} turned "
+                                  f"{self.angle:.4g}° · volume {info.get('volume', 0):.6g}")
+            lean = float(info.get("lean", 0.0))
+            if any(h != "exact" for h in info.get("how", [])) and lean > 0.5:
+                self.report({'WARNING'}, f"{o.name}: a neighbour meets the face {lean:.0f}° from square and "
+                                         "could not be extended on its own surface; the walls go along the "
+                                         "face's normal, so a small step is left along that edge")
+        if not done:
+            return {'CANCELLED'}
+        _select_only(context, done)
+        return {'FINISHED'}
+
+
+classes = (NPROTO_OT_push_pull, NPROTO_OT_replace_face, NPROTO_OT_rotate_face)
