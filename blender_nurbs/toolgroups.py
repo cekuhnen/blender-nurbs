@@ -98,7 +98,8 @@ GROUPS = (
         ), EDGES),
         ("From Surfaces", (
             (_t("nproto.offset", icon='MOD_OFFSET'), _t("nproto.thicken", icon='MOD_SOLIDIFY')),
-            (("nproto.pattern", "Pattern", 'MOD_ARRAY', {"auto": True}, frozenset(EDGES)),),  # linear / circular / path: M
+            (("nproto.pattern", "Pattern", 'MOD_ARRAY', {"auto": True}, frozenset(EDGES)),  # linear / circular / path: M
+             ("nproto.mirror", "Mirror", 'MOD_MIRROR', None, frozenset(EDGES))),            # mirror copy / make symmetric: S
             (_t("nproto.unroll", "Unroll", 'UV'), _t("nproto.flow", "Flow", 'MOD_SIMPLEDEFORM', needs=EDGES)),
             (_t("nproto.from_blender_surface", icon='SURFACE_NSURFACE', needs={SURFACE}),),
         ), {NURBS}),

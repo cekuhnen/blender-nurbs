@@ -5243,6 +5243,7 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cy
               "section_targets", "section_curves", "section_remove", "subsel_picker", "bake_feature", "delete_feature",
               "curve_degree", "fix_clip_start", "delete_faces", "move_pivot", "cv_nudge", "pattern_select",
               "measure",    # Measure: in the Analyze panel / header popover, with Continuity Check
+              "remove_symmetry",    # Mirror's Make Symmetric: the Active Object panel's button
               "square"}     # Square: merged into Patch (Quad Sided); kept for older files, off the menus
 _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto)
               if n not in _not_tools and not n.startswith("workplane_")}   # the Work Planes panel's own
