@@ -198,12 +198,81 @@ def _profile(kc):
 def build_sweep(inputs, p):
     """inputs: profile, rail [, rail2]. Rails may be curves or surface edges."""
     n = int(p.get("samples", 32))
+    if len(inputs) >= 3:
+        prof_obj, prof_ref = inputs[0]
+        return _sweep_two_rails(inputs, p, _profile(features.input_curve(prof_obj, prof_ref)), n)
+    sr = sweep_rail(inputs, p, n)
+    P, T, N, B, prof = sr["P"], sr["T"], sr["N"], sr["B"], sr["prof"]
+    q = sweep_local(sr, prof["points"])
+    law = sweep_scale_law(p)
+
+    def row(Pk, Tk, Nk, Bk, f):
+        return sweep_row(sr, q, law, Pk, Tk, Nk, Bk, f)
+
+    cuts = [float(x) for x in law.f[1:-1]] if law.taper == "LINEAR" else []
+    if not cuts:
+        return _surface_from_rows([row(P[k], T[k], N[k], B[k], k / (n - 1)) for k in range(n)], prof)
+    # Linear scale points: the scale turns at each one (a crease), which one fit
+    # along the rail would round off -- built in pieces cut there, sharing their rows
+    F = np.linspace(0.0, 1.0, n)
+    fine = np.linspace(0.0, 1.0, max(401, 8 * n))
+    fr = {k: np.stack([np.interp(fine, F, sr[k][:, i]) for i in range(3)], axis=1) for k in "PTNB"}
+    pieces, bounds = [], [0.0] + cuts + [1.0]
+    for a_, b_ in zip(bounds[:-1], bounds[1:]):
+        m = max(6, int(round(n * (b_ - a_))) + 2)
+        pieces.append(_surface_from_rows([row(*sweep_frame_at(fr, f), f) for f in np.linspace(a_, b_, m)], prof))
+    # facing: as run() turns a one-piece sweep (towards the surfaces its edges come from; Flip Normal)
+    flip = features.edge_vote(pieces[0], inputs) < 0
+    if p.get("flip_normal"):
+        flip = not flip
+    if flip:
+        from .square import reverse_u
+        pieces = [reverse_u(sf) for sf in pieces]
+    return _joined(pieces)
+
+
+def sweep_frame_at(fr, f):
+    """(P, T, N, B) at share f of the rail, from frames fr {"P","T","N","B"}
+    sampled evenly along it: interpolated, then squared up again."""
+    F = np.linspace(0.0, 1.0, len(fr["P"]))
+    Pk, Tk, Nk, Bk = (np.array([np.interp(f, F, fr[k][:, i]) for i in range(3)]) for k in "PTNB")
+    Tk /= np.linalg.norm(Tk)
+    Nk -= float(Nk @ Tk) * Tk
+    Nk /= np.linalg.norm(Nk)
+    Bk = np.cross(Tk, Nk) * (1.0 if float(np.cross(Tk, Nk) @ Bk) >= 0 else -1.0)
+    return Pk, Tk, Nk, Bk
+
+
+def sweep_local(sr, X):
+    """Points X (world, as the profile's) in the rail's start frame (t, n, b):
+    where a sweep carries them along the rail (sweep_row)."""
+    q = (np.asarray(X, float) - sr["origin"]) @ sr["F0"].T
+    if sr["rot"] is not None:
+        c, s = sr["rot"]
+        qn, qb = q[:, 1].copy(), q[:, 2].copy()
+        q[:, 1] = c * qn - s * qb
+        q[:, 2] = s * qn + c * qb
+    return q
+
+
+def sweep_row(sr, q, law, Pk, Tk, Nk, Bk, f):
+    """Local points q placed on the frame at share f of the rail: scaled by the law, turned by the twist."""
+    sc = float(law(f))
+    th = sr["twist"] * f
+    c, s = math.cos(th), math.sin(th)
+    nk = c * Nk + s * Bk
+    bk = -s * Nk + c * Bk
+    return Pk + sc * (np.outer(q[:, 0], Tk) + np.outer(q[:, 1], nk) + np.outer(q[:, 2], bk))
+
+
+def sweep_rail(inputs, p, n):
+    """A one-rail sweep's frames and the profile's place on them: n frames P,
+    T, N, B by arc length (from the end the profile stands on), the profile
+    (its CVs, prof) and how its points go into the start frame (sweep_local)."""
     prof_obj, prof_ref = inputs[0]
     prof_k = features.input_curve(prof_obj, prof_ref)
     prof = _profile(prof_k)
     Q = prof["points"]
-    if len(inputs) >= 3:
-        return _sweep_two_rails(inputs, p, prof, n)
     rail_obj, rail_ref = inputs[1]
     tangent = bool(p.get("tangent", True)) and (features.is_edge_ref(rail_ref) or features.is_brep_edge_ref(rail_ref))
     psize = float(np.linalg.norm(np.ptp(Q, axis=0))) or 1.0
@@ -231,7 +300,9 @@ def build_sweep(inputs, p):
     closed = np.linalg.norm(ends[0] - ends[1]) <= 1e-6 * psize
     attach = tangent or (not closed and np.linalg.norm(ends[e] - P[0]) <= 0.1 * psize)
     F0 = np.array([T[0], N[0], B[0]])      # rows = axes
-    q = (Q - (ends[e] if attach else P[0])) @ F0.T
+    sr = {"P": P, "T": T, "N": N, "B": B, "prof": prof, "prof_k": prof_k, "tangent": tangent,
+          "origin": ends[e] if attach else P[0], "F0": F0, "rot": None,
+          "twist": math.radians(float(p.get("twist", 0.0))) if not tangent else 0.0}
     if tangent:
         # rotate the profile about T so its start tangent lies in the surface's
         # tangent plane, pointing off the edge -> G1 to the surface along the rail
@@ -242,49 +313,8 @@ def build_sweep(inputs, p):
         phi = math.atan2(lt[1], lt[2])      # angle of the tangent in the (n, b) plane, from +b
         if p.get("flip_tangent"):
             phi += math.pi
-        c, s = math.cos(phi), math.sin(phi)     # (sin phi, cos phi) -> (0, 1): tangent onto +b
-        qn, qb = q[:, 1].copy(), q[:, 2].copy()
-        q[:, 1] = c * qn - s * qb
-        q[:, 2] = s * qn + c * qb
-    law = sweep_scale_law(p)
-    twist = math.radians(float(p.get("twist", 0.0))) if not tangent else 0.0
-
-    def row(Pk, Tk, Nk, Bk, f):
-        sc = float(law(f))
-        th = twist * f
-        c, s = math.cos(th), math.sin(th)
-        nk = c * Nk + s * Bk
-        bk = -s * Nk + c * Bk
-        return Pk + sc * (np.outer(q[:, 0], Tk) + np.outer(q[:, 1], nk) + np.outer(q[:, 2], bk))
-
-    cuts = [float(x) for x in law.f[1:-1]] if law.taper == "LINEAR" else []
-    if not cuts:
-        return _surface_from_rows([row(P[k], T[k], N[k], B[k], k / (n - 1)) for k in range(n)], prof)
-    # Linear scale points: the scale turns at each one (a crease), which one fit
-    # along the rail would round off -- built in pieces cut there, sharing their rows
-    F = np.linspace(0.0, 1.0, n)
-    fine = np.linspace(0.0, 1.0, max(401, 8 * n))
-    Pf, Tf, Nf, Bf = (np.stack([np.interp(fine, F, A[:, i]) for i in range(3)], axis=1) for A in (P, T, N, B))
-    pieces, bounds = [], [0.0] + cuts + [1.0]
-    for a_, b_ in zip(bounds[:-1], bounds[1:]):
-        m = max(6, int(round(n * (b_ - a_))) + 2)
-        rows = []
-        for f in np.linspace(a_, b_, m):
-            Pk, Tk, Nk, Bk = (np.array([np.interp(f, fine, A[:, i]) for i in range(3)]) for A in (Pf, Tf, Nf, Bf))
-            Tk /= np.linalg.norm(Tk)
-            Nk -= float(Nk @ Tk) * Tk
-            Nk /= np.linalg.norm(Nk)
-            Bk = np.cross(Tk, Nk) * (1.0 if float(np.cross(Tk, Nk) @ Bk) >= 0 else -1.0)
-            rows.append(row(Pk, Tk, Nk, Bk, f))
-        pieces.append(_surface_from_rows(rows, prof))
-    # facing: as run() turns a one-piece sweep (towards the surfaces its edges come from; Flip Normal)
-    flip = features.edge_vote(pieces[0], inputs) < 0
-    if p.get("flip_normal"):
-        flip = not flip
-    if flip:
-        from .square import reverse_u
-        pieces = [reverse_u(sf) for sf in pieces]
-    return _joined(pieces)
+        sr["rot"] = (math.cos(phi), math.sin(phi))     # (sin phi, cos phi) -> (0, 1): tangent onto +b
+    return sr
 
 
 def sweep_scale_law(p):

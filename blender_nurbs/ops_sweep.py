@@ -45,11 +45,117 @@ def _new_curves(context, name, op, inputs, params):
 SCALE_TAPER_ITEMS = [("LINEAR", "Linear", "The scale runs straight from point to point (a crease at each point)"),
                      ("SMOOTH", "Smooth", "A smooth curve through the points, level at both ends")]
 
+RAIL_MAX_POINTS = 32       # points along a rail in a value stage (each has its own drag fields)
 
-class NPROTO_OT_sweep(SolidBody, PickMixin, bpy.types.Operator):
+
+class RailPoints:
+    """Points along a rail in a value stage (Pipe's radius points, Sweep's
+    scale points): each has a size arrow and a diamond sliding it along the
+    rail. A press on the rail away from the handles adds a point there and
+    takes its arrow; X or Delete over a point's arrow or diamond removes it.
+    A tool sets point_coll (its collection's name), point_attr (the size
+    attribute of an item) and point_prefix (the size and the where fields'
+    prefixes, 3 letters each: field i is prefix + i), and gives _rail_s()
+    ({"g": rail length at each sample, "P", "total"}), _points_live() and
+    _point_value(f) (the size a new point at share f starts with)."""
+
+    point_coll = "points"
+    point_attr = "radius"
+    point_prefix = ("pr_", "pa_")
+
+    def _rail_points(self):
+        return getattr(self, self.point_coll)
+
+    def _point_fields(self):
+        out = ()
+        for i in range(min(len(self._rail_points()), RAIL_MAX_POINTS)):
+            out += (f"{self.point_prefix[0]}{i}", f"{self.point_prefix[1]}{i}")
+        return out
+
+    def _point_n(self, i):
+        """Point i's number along the rail (1 = nearest the start)."""
+        pts = self._rail_points()
+        return 1 + sorted(range(len(pts)), key=lambda j: pts[j].at).index(i)
+
+    def _rail_share(self, ray_o, ray_d):
+        """The share of the rail's length nearest the mouse ray."""
+        rs = self._rail_s()
+        d = ray_d / (np.linalg.norm(ray_d) or 1.0)
+        rel = rs["P"] - ray_o
+        off = rel - np.outer(rel @ d, d)
+        k = int(np.argmin(np.linalg.norm(off, axis=1)))
+        return float(rs["g"][k]) / (rs["total"] or 1.0)
+
+    def _at_handle(self, i, C, T):
+        """The diamond sliding point i along the rail (C, T: the rail there)."""
+        return {"field": f"{self.point_prefix[1]}{i}", "kind": "draft", "origin": C, "dir": T,
+                "param": self._rail_points()[i].at, "pos": C, "pick": lambda o, r, prev: self._rail_share(o, r),
+                "to_value": lambda t: min(0.995, max(0.005, t)), "snap": (0.05, 0.01)}
+
+    def _points_hook(self, context, event):
+        if not self._points_live():
+            return None
+        if event.type == 'DEL' and event.value == 'PRESS':
+            return self._remove_hot(context)
+        if event.type != 'LEFTMOUSE' or event.value != 'PRESS' or self._grab is not None:
+            return None
+        if not PickMixin._in_view(context, event):
+            return None
+        m = self._mouse(context, event)
+        if self._handle_at(context, m) is not None:
+            return None
+        if not self._near_screen(context, self._rail_s()["P"], m):
+            return None
+        pts = self._rail_points()
+        if len(pts) >= RAIL_MAX_POINTS:
+            self._msg = f"at most {RAIL_MAX_POINTS} points"
+            self._drag_refresh(context)
+            return {'RUNNING_MODAL'}
+        region, rv3d = self._win(context)
+        from bpy_extras import view3d_utils
+        o = np.array(view3d_utils.region_2d_to_origin_3d(region, rv3d, m), float)
+        r = np.array(view3d_utils.region_2d_to_vector_3d(region, rv3d, m), float)
+        f = min(0.995, max(0.005, self._rail_share(o, r)))
+        value = self._point_value(f)
+        pt = pts.add()
+        pt.at = f
+        setattr(pt, self.point_attr, value)
+        name = f"{self.point_prefix[0]}{len(pts) - 1}"
+        hi = next(j for j, h in enumerate(self.drag_handles()) if h["field"] == name)
+        self._start_grab(context, hi, m)
+        self._drag_refresh(context)
+        return {'RUNNING_MODAL'}
+
+    def _remove_hot(self, context):
+        hs = self.drag_handles()
+        if self._hot is None or self._hot >= len(hs) or not hs[self._hot]["field"].startswith(self.point_prefix):
+            return None
+        self._rail_points().remove(int(hs[self._hot]["field"][3:]))
+        self._hot, self._field, self._typed = None, 0, ""
+        self._drag_refresh(context)
+        return {'RUNNING_MODAL'}
+
+    def _point_label(self, name, size_word):
+        n = self._point_n(int(name[3:]))
+        return f"Point {n} At" if name.startswith(self.point_prefix[1]) else f"{size_word} {n}"
+
+
+def _point_at(i, coll):
+    def get(self):
+        return getattr(self, coll)[i].at
+
+    def set_(self, v):
+        getattr(self, coll)[i].at = min(0.995, max(0.005, float(v)))
+    return property(get, set_)
+
+
+class NPROTO_OT_sweep(SolidBody, RailPoints, ValueDrag, AskValue, PickMixin, bpy.types.Operator):
     """Sweep a profile along one rail, two rails (Shift+click the 1st rail), or a
     surface edge (tangent to that surface). Select the profile, then the path
-    (last); or with nothing selected click the profile, then the path"""
+    (last); or with nothing selected click the profile, then the path. From
+    the UI one rail gives a live preview: drag the arrow at the end for End
+    Scale, click the rail to add a scale point (T: linear / smooth, X: remove
+    a point); click away or Enter to make it"""
     bl_idname = "nproto.sweep"
     bl_label = "Sweep"
     bl_options = {'REGISTER', 'UNDO'}
@@ -57,6 +163,10 @@ class NPROTO_OT_sweep(SolidBody, PickMixin, bpy.types.Operator):
 
     pick_min = 2
     pick_max = 3
+    ask_dialog = False      # no preview (two rails, Value Input = Dialog): made at once, as it always was
+    point_coll = "scale_points"
+    point_attr = "scale"
+    point_prefix = ("ss_", "sa_")
 
     inputs: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     samples: IntProperty(name="Samples", default=32, min=6, max=300, description="Frames along the rail")
@@ -78,7 +188,10 @@ class NPROTO_OT_sweep(SolidBody, PickMixin, bpy.types.Operator):
     def invoke(self, context, event):
         if not _kernel_ok(self):
             return {'CANCELLED'}
+        self._start_event = (event.mouse_x, event.mouse_y, event.type, event.value)
         self.body_prefer(context)
+        if self.inputs:                     # picked already (see PickMixin._finish)
+            return self.ask(context)
         crv = [o for o in context.selected_objects if o.type == 'CURVE']
         act = context.active_object
         if len(crv) in (2, 3) and act in crv and not event.alt:
@@ -86,7 +199,7 @@ class NPROTO_OT_sweep(SolidBody, PickMixin, bpy.types.Operator):
             rails = [o for o in crv if o != prof]
             rails.sort(key=lambda o: o == act)          # the path selected last
             self.inputs = _encode_inputs([(prof, "S0")] + [(o, "S0") for o in rails])
-            return self.execute(context)
+            return self.ask(context)
         return self.start_picking(context, event)
 
     def pick_state(self):
@@ -159,6 +272,135 @@ class NPROTO_OT_sweep(SolidBody, PickMixin, bpy.types.Operator):
             r.prop(it, "remove", text="", icon='X', toggle=True)
         box.prop(self, "add_scale_point", icon='ADD', toggle=True)
 
+    # -- the live value stage (valuedrag.py): one rail ---------------------------
+    PREVIEW_ROWS = 49           # sections along the rail
+    PREVIEW_RING = 49           # points along the profile
+
+    @property
+    def drag_fields(self):
+        return ("scale_end",) + self._point_fields()
+
+    @property
+    def ratio_fields(self):
+        return self.drag_fields
+
+    def _label(self, name):
+        if name.startswith(self.point_prefix):
+            return self._point_label(name, "Scale")
+        return ValueDrag._label(self, name)
+
+    def _fmt(self, context, name):
+        if name.startswith(self.point_prefix[1]):
+            return f"{100.0 * getattr(self, name):.3g} %"
+        return ValueDrag._fmt(self, context, name)
+
+    def drag_setup(self, context, mouse):
+        """The rail's frames and the profile on them (as the sweep places it),
+        and the profile's point farthest from the rail: the scale arrows
+        stand on it."""
+        ins = _decode_inputs(self.inputs)
+        if len(ins) != 2:
+            return False                # two rails set the scale: made at once
+        sr = sweeps.sweep_rail(ins, self._params(), 64)
+        q = sweeps.sweep_local(sr, geom.sample_curve(sr["prof_k"], self.PREVIEW_RING))
+        d = np.linalg.norm(q, axis=1)
+        k = int(np.argmax(d))
+        if d[k] < 1e-9:
+            return False
+        self._sr, self._q, self._tip, self._tip_len = sr, q, q[k], float(d[k])
+        total = float(np.sum(np.linalg.norm(np.diff(sr["P"], axis=0), axis=1)))
+        self._rs = {"P": sr["P"], "g": np.linspace(0.0, total, len(sr["P"])), "total": total}
+        return True
+
+    def _rail_s(self):
+        return self._rs
+
+    def _points_live(self):
+        return getattr(self, "_rs", None) is not None
+
+    def _law(self):
+        return sweeps.sweep_scale_law(self._params())
+
+    def _point_value(self, f):
+        return max(0.01, float(self._law()(f)))
+
+    def _tip_at(self, f):
+        """(rail point, rail tangent, unit direction to the far profile point) at share f."""
+        Pk, Tk, Nk, Bk = sweeps.sweep_frame_at(self._sr, f)
+        d = sweeps.sweep_row(self._sr, self._tip[None], lambda _f: 1.0, Pk, Tk, Nk, Bk, f)[0] - Pk
+        return Pk, Tk, d / (np.linalg.norm(d) or 1.0)
+
+    def drag_modal_hook(self, context, event):
+        return self._points_hook(context, event)
+
+    def drag_handles(self):
+        L = self._tip_len
+
+        def scale_of(t, L=L):
+            return max(0.01, abs(t) / L)
+        C, _, d = self._tip_at(1.0)
+        out = [{"field": "scale_end", "kind": "arrow", "origin": C, "dir": d, "param": self.scale_end * L,
+                "base": C, "to_value": scale_of, "snap": (0.1, 0.01)}]
+        for i in range(min(len(self.scale_points), RAIL_MAX_POINTS)):
+            pt = self.scale_points[i]
+            C, T, d = self._tip_at(pt.at)
+            out.append({"field": f"ss_{i}", "kind": "arrow", "origin": C, "dir": d, "param": pt.scale * L,
+                        "base": C, "to_value": scale_of, "snap": (0.1, 0.01)})
+            out.append(self._at_handle(i, C, T))
+        return out
+
+    def drag_preview(self):
+        law = self._law()
+        cuts = [float(x) for x in law.f[1:-1]] if law.taper == "LINEAR" else []
+        fs = sorted(set(np.linspace(0.0, 1.0, self.PREVIEW_ROWS).tolist()) | set(cuts))
+        rows = [sweeps.sweep_row(self._sr, self._q, law, *sweeps.sweep_frame_at(self._sr, f), f) for f in fs]
+        lines, tris = ruled_preview(rows, ribs=8, row_every=4)
+        # the rows at the points, so a crease shows where it is
+        lines += [rows[fs.index(f)] for f in cuts]
+        return {"lines": lines, "tris": tris, "guides": []}
+
+    def drag_key(self, context, event, ch):
+        if ch == "t":
+            self.scale_taper = "SMOOTH" if self.scale_taper == "LINEAR" else "LINEAR"
+        elif ch == "x":
+            return self._remove_hot(context) is not None
+        elif ch == "f" and self._sr["tangent"]:
+            self.flip_tangent = not self.flip_tangent
+            self.drag_setup(context, None)
+        elif not self.body_key(ch):
+            return False
+        return True
+
+    def drag_handle_hints(self):
+        return [hints.key("LMB drag", "arrows: end / point scale"),
+                hints.key("LMB drag", "diamond on the rail: slide a point"),
+                hints.key("LMB", "on the rail: add a scale point"),
+                hints.key("X", "remove the point under the mouse")]
+
+    def drag_rows(self):
+        rows = [("Scale", [hints.cycle("T", ["linear", "smooth"], self.scale_taper.lower())])]
+        if self._sr["tangent"]:
+            rows.append(("Surface", [hints.toggle("F", "flip tangent", self.flip_tangent)]))
+        return rows + [self.body_row()]
+
+    def drag_state(self):
+        n = len(self.scale_points)
+        return ([f"{n} scale point{'s' if n > 1 else ''}"] if n else []) + self.body_state()
+
+
+def _scale_size(i):
+    def get(self):
+        return self.scale_points[i].scale
+
+    def set_(self, v):
+        self.scale_points[i].scale = max(0.01, float(v))
+    return property(get, set_)
+
+
+for _i in range(RAIL_MAX_POINTS):          # the value stage's fields for scale point i: ss_i (scale), sa_i (where)
+    setattr(NPROTO_OT_sweep, f"ss_{_i}", _scale_size(_i))
+    setattr(NPROTO_OT_sweep, f"sa_{_i}", _point_at(_i, "scale_points"))
+
 
 def sweep_profile(crv, act):
     """The profile among selected curves, the path selected last (active):
@@ -179,7 +421,7 @@ def sweep_profile(crv, act):
 PIPE_CORNER_ITEMS = [("MITRE", "Mitre", "Sharp corners of the rail: the tubes cut on the plane halving the turn"),
                      ("ROUND", "Round", "Sharp corners of the rail: an exact torus elbow, G1 to straight legs")]
 
-PIPE_MAX_POINTS = 32       # radius points along a rail (each has its own drag fields pr_i / pa_i)
+PIPE_MAX_POINTS = RAIL_MAX_POINTS       # radius points along a rail (each has its own drag fields pr_i / pa_i)
 
 PIPE_TAPER_ITEMS = [("LINEAR", "Linear", "The radius changes evenly along the rail (a cone on a line)"),
                     ("SMOOTH", "Smooth", "The radius eases out of the start and into the end (level at both ends)")]
@@ -189,7 +431,7 @@ PIPE_CAP_ITEMS = [("NONE", "None", "Open ends (a solid gets flat caps)"),
                   ("ROUND", "Round", "Half spheres close the ends, tangent to the tube: a closed body")]
 
 
-class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operator):
+class NPROTO_OT_pipe(SolidBody, RailPoints, ValueDrag, AskValue, PickMixin, bpy.types.Operator):
     """Sweep an exact circle along curves or surface edges (selected, or pick
     them: a click takes a tangent chain, Shift+click keeps picking). Pieces
     that touch end to end make one pipe. From the UI the radius has an arrow
@@ -372,24 +614,16 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
         size = "diameter" if self.use_diameter else "radius"
         out = (size,) + ((size + "_end",) if self.use_variable else ())
         if self.use_variable:
-            for i in range(min(len(self.points), PIPE_MAX_POINTS)):
-                out += (f"pr_{i}", f"pa_{i}")
+            out += self._point_fields()
         return out + (("bend",) if self.corner_style == "ROUND" and getattr(self, "_corner", None) else ())
 
     @property
     def ratio_fields(self):
         return ("bend",) + tuple(f"pa_{i}" for i in range(min(len(self.points), PIPE_MAX_POINTS)))
 
-    def _point_n(self, i):
-        """Point i's number along the rail (1 = nearest the start)."""
-        return 1 + sorted(range(len(self.points)), key=lambda j: self.points[j].at).index(i)
-
     def _label(self, name):
-        if name.startswith(("pr_", "pa_")):
-            n = self._point_n(int(name[3:]))
-            if name.startswith("pa_"):
-                return f"Point {n} At"
-            return f"{'Diameter' if self.use_diameter else 'Radius'} {n}"
+        if name.startswith(self.point_prefix):
+            return self._point_label(name, "Diameter" if self.use_diameter else "Radius")
         return ValueDrag._label(self, name)
 
     def _fmt(self, context, name):
@@ -438,7 +672,7 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
                 G.append(sp["g"] if sp["track"] is None else sp["s0"] + sp["track"]["s"])
                 Rp.append(sp["P"]), Rt.append(sp["T"]), Rn.append(sp["N"]), Rb.append(sp["B"])
             rail_s = {"g": np.concatenate(G), "P": np.vstack(Rp), "T": np.vstack(Rt), "N": np.vstack(Rn),
-                      "B": np.vstack(Rb)}
+                      "B": np.vstack(Rb), "total": total}
             self._pp.append({"spans": spans, "ends": ends, "limit": limit, "inputs": g, "total": total,
                              "closed": closed, "rail": rail_s})
         if not self._pp:
@@ -480,14 +714,14 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
         k = int(np.argmin(np.abs(rs["g"] - g)))
         return rs["P"][k], rs["T"][k], rs["N"][k], rs["B"][k]
 
-    def _rail_share(self, ray_o, ray_d):
-        """The share of the first rail's length nearest the mouse ray."""
-        rs = self._pp[0]["rail"]
-        d = ray_d / (np.linalg.norm(ray_d) or 1.0)
-        rel = rs["P"] - ray_o
-        off = rel - np.outer(rel @ d, d)
-        k = int(np.argmin(np.linalg.norm(off, axis=1)))
-        return float(rs["g"][k]) / (self._pp[0]["total"] or 1.0)
+    def _rail_s(self):
+        return self._pp[0]["rail"]
+
+    def _points_live(self):
+        return self.use_variable and bool(getattr(self, "_pp", None)) and bool(self._pp[0]["ends"])
+
+    def _point_value(self, f):
+        return max(1e-4, float(self._law(self._pp[0])(f * self._pp[0]["total"])))
 
     def _point_handles(self, k):
         out = []
@@ -498,55 +732,12 @@ class NPROTO_OT_pipe(SolidBody, ValueDrag, AskValue, PickMixin, bpy.types.Operat
             d = self._side(N, B, T)
             out.append({"field": f"pr_{i}", "kind": "arrow", "origin": C, "dir": d, "param": pt.radius,
                         "base": C, "to_value": lambda t, k=k: max(1e-4 * k, abs(t) * k)})
-            out.append({"field": f"pa_{i}", "kind": "draft", "origin": C, "dir": T, "param": pt.at,
-                        "pos": C, "pick": lambda o, r, prev: self._rail_share(o, r),
-                        "to_value": lambda t: min(0.995, max(0.005, t)), "snap": (0.05, 0.01)})
+            out.append(self._at_handle(i, C, T))
         return out
 
     def drag_modal_hook(self, context, event):
-        """Variable radius: a press on the rail (away from the handles) adds a
-        radius point there and takes its arrow, to pull the radius out; X or
-        Delete over a point's arrow or diamond removes the point."""
-        if not (self.use_variable and getattr(self, "_pp", None) and self._pp[0]["ends"]):
-            return None
-        if event.type == 'DEL' and event.value == 'PRESS':
-            return self._remove_hot(context)
-        if event.type != 'LEFTMOUSE' or event.value != 'PRESS' or self._grab is not None:
-            return None
-        from .ops import PickMixin
-        if not PickMixin._in_view(context, event):
-            return None
-        m = self._mouse(context, event)
-        if self._handle_at(context, m) is not None:
-            return None
-        if not self._near_screen(context, self._pp[0]["rail"]["P"], m):
-            return None
-        if len(self.points) >= PIPE_MAX_POINTS:
-            self._msg = f"at most {PIPE_MAX_POINTS} radius points"
-            self._drag_refresh(context)
-            return {'RUNNING_MODAL'}
-        region, rv3d = self._win(context)
-        from bpy_extras import view3d_utils
-        o = np.array(view3d_utils.region_2d_to_origin_3d(region, rv3d, m), float)
-        r = np.array(view3d_utils.region_2d_to_vector_3d(region, rv3d, m), float)
-        f = min(0.995, max(0.005, self._rail_share(o, r)))
-        pt = self.points.add()
-        pt.at, pt.radius = f, max(1e-4, float(self._law(self._pp[0])(f * self._pp[0]["total"])))
-        i = len(self.points) - 1
-        hs = self.drag_handles()
-        hi = next(j for j, h in enumerate(hs) if h["field"] == f"pr_{i}")
-        self._start_grab(context, hi, m)
-        self._drag_refresh(context)
-        return {'RUNNING_MODAL'}
-
-    def _remove_hot(self, context):
-        hs = self.drag_handles()
-        if self._hot is None or self._hot >= len(hs) or not hs[self._hot]["field"].startswith(("pr_", "pa_")):
-            return None
-        self.points.remove(int(hs[self._hot]["field"][3:]))
-        self._hot, self._field, self._typed = None, 0, ""
-        self._drag_refresh(context)
-        return {'RUNNING_MODAL'}
+        """Variable radius: a press on the rail adds a radius point (RailPoints)."""
+        return self._points_hook(context, event)
 
     def _arrow_dir(self, context):
         """Out of the rail at the arrow's foot, square to it: of the frame's
@@ -772,18 +963,9 @@ def _point_size(i):
     return property(get, set_)
 
 
-def _point_at(i):
-    def get(self):
-        return self.points[i].at
-
-    def set_(self, v):
-        self.points[i].at = min(0.995, max(0.005, float(v)))
-    return property(get, set_)
-
-
 for _i in range(PIPE_MAX_POINTS):          # the value stage's fields for radius point i: pr_i (size), pa_i (where)
     setattr(NPROTO_OT_pipe, f"pr_{_i}", _point_size(_i))
-    setattr(NPROTO_OT_pipe, f"pa_{_i}", _point_at(_i))
+    setattr(NPROTO_OT_pipe, f"pa_{_i}", _point_at(_i, "points"))
 
 
 BD_DEG = [("0", "Auto", "Auto: exact edges keep the curves' own degree; a fit uses 3")] + \
