@@ -91,6 +91,34 @@ PRETTY = {"patch": "Patch", "dome": "Dome", "square": "Square", "sweep": "Sweep"
           "flow": "Flow Along Surface"}
 
 
+_FILLET_KEYS = ("radius_a", "radius_b", "radii", "start_point", "xsect", "chord", "soft", "blend", "ends")
+
+
+def _fillet_partners(h, old, new):
+    """A Surface Fillet's edited settings into its two surfaces' fillet_trim
+    steps (each carries its own copy of the fillet's settings, plus its role):
+    the steps whose settings still match the fillet's before the edit (old)
+    get new. Returns the surfaces whose stack changed, to rebuild."""
+    partners = []
+    ins = [src for src, _ in h["inputs"]]
+    for (src, _), role, other in zip(h["inputs"], "ab", reversed(ins)):
+        if features.PROP_STACK not in src:
+            continue
+        st = json.loads(src[features.PROP_STACK])
+        hit = False
+        for k, e in enumerate(st):
+            q = e["params"]
+            if e["op"] == "fillet_trim" and q.get("role", "a") == role \
+                    and src.get(f"nproto_sin_{k}_0") == other \
+                    and all(q.get(k_) == old.get(k_) for k_ in _FILLET_KEYS):
+                q.update(new)
+                hit = True
+        if hit:
+            src[features.PROP_STACK] = json.dumps(st)
+            partners.append(src)
+    return partners
+
+
 def _on_sf_start(self, context):
     """A variable Surface Fillet's Start Radius edited: into the fillet's
     radii and into its two partners' trim steps (theirs carry their own copy),
@@ -105,7 +133,7 @@ def _on_sf_start(self, context):
         return
     raw = json.loads(obj[features.PROP_HIST])
     p = raw["params"]
-    old = (p.get("radii"), p.get("start_point"))
+    old = dict(p)
     radii = [float(self.sf_start), fillet_radii(p)["radii"][1]]
     m = max(radii)
     if m <= 0:                          # both 0: no fillet (and no sides left in the signs)
@@ -116,21 +144,7 @@ def _on_sf_start(self, context):
     p.update(new)
     obj[features.PROP_HIST] = json.dumps(raw)
     obj["nproto_feature_synced"] = obj[features.PROP_HIST]
-    partners = []
-    for src, _ in h["inputs"]:
-        if features.PROP_STACK not in src:
-            continue
-        st = json.loads(src[features.PROP_STACK])
-        hit = False
-        for e in st:
-            q = e["params"]
-            if e["op"] == "fillet_trim" and (q.get("radii"), q.get("start_point")) == old:
-                q.update(new)
-                hit = True
-        if hit:
-            src[features.PROP_STACK] = json.dumps(st)
-            partners.append(src)
-    for o in [obj] + partners:
+    for o in [obj] + _fillet_partners(h, old, new):
         try:
             features.edit_rebuild(o, context)
         except Exception as exc:
@@ -156,10 +170,14 @@ def _on_change(self, context):
     raw["params"] = params
     obj[features.PROP_HIST] = json.dumps(raw)
     obj["nproto_feature_synced"] = obj[features.PROP_HIST]
-    try:
-        features.edit_rebuild(obj, context)
-    except Exception as exc:
-        print(f"NURBS feature edit ({obj.name}): {exc}")
+    partners = []
+    if h["op"] == "surface_fillet":     # its two surfaces' trims follow (they keep their own copy)
+        partners = _fillet_partners(h, h["params"], {k: params[k] for k in FIELDS["surface_fillet"]})
+    for o in [obj] + partners:
+        try:
+            features.edit_rebuild(o, context)
+        except Exception as exc:
+            print(f"NURBS feature edit ({o.name}): {exc}")
 
 
 # numbered (an items callback's enum keeps its value by number): G0 - G2, and G3 for a Loft

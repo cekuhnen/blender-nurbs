@@ -201,6 +201,49 @@ for r_new in (0.06, 0.0):
           and abs(p_["radii"][0] - r_new) < 1e-7 and abs(abs(p_["radius_a"]) - max(r_new, 0.03)) < 1e-7
           and np.allclose(features.stack(a)[-1]["params"]["radii"], p_["radii"]),
           (shown, dev, A(a), a0 - lost, p_["radii"]))
+
+
+# --- a constant fillet's Radius A / B edited: both trimmed sheets follow too -------
+def const_fillet(a, b, rad):
+    r = bpy.ops.nproto.fillet(surf_a=a.name, surf_b=b.name, shape="CIRCULAR", radius=rad)
+    return r, (ctx.active_object if r == {'FINISHED'} else None)
+
+
+def set_radius(fil, rad):
+    """Radius A then Radius B, as the panel edits them (each keeps its sign: the side)."""
+    pg = fil.nproto_feature
+    feature_ui.sync_from_history(fil)
+    pg.radius_a = math.copysign(rad, pg.radius_a)
+    pg.radius_b = math.copysign(rad, pg.radius_b)
+
+
+a, b = corner()
+a0 = A(a)
+r, fil = const_fillet(a, b, 0.1)
+set_radius(fil, 0.06)
+dev = max(max(on_edges(a, (0.06, y, 0)), on_edges(b, (0, y, 0.06)), on_edges(fil, (0.06, y, 0)))
+          for y in np.linspace(0.0, W, 9))
+st = features.stack(a)[-1]["params"]
+check("panel: a constant fillet's Radius A / B set to 0.06, the fillet and both trimmed sheets follow",
+      r == {'FINISHED'} and dev < 1e-7 and abs(A(a) - (a0 - W * 0.06)) < 1e-6 and abs(A(b) - (a0 - W * 0.06)) < 1e-6
+      and abs(abs(st["radius_a"]) - 0.06) < 1e-7 and abs(abs(features.stack(b)[-1]["params"]["radius_b"]) - 0.06) < 1e-7,
+      (dev, A(a), a0 - W * 0.06, A(b)))
+
+# a floor filleted to two walls with the same settings: an edit of one fillet re-trims
+# the floor only where that fillet is (its step is told apart by its partner wall)
+a, b = corner()
+c = sheet("Wall2", (L, 0, 0), (L, 0, L))
+a0 = A(a)
+r1, fil1 = const_fillet(a, b, 0.1)
+r2, fil2 = const_fillet(a, c, 0.1)
+set_radius(fil1, 0.06)
+ys = np.linspace(0.0, W, 9)
+dev = max(max(on_edges(a, (0.06, y, 0)), on_edges(a, (L - 0.1, y, 0)), on_edges(c, (L, y, 0.1)))
+          for y in ys)
+check("panel: a floor with two equal fillets, one edited to 0.06: only its side of the floor moves",
+      r1 == r2 == {'FINISHED'} and dev < 1e-7 and abs(A(a) - (a0 - W * 0.16)) < 1e-6
+      and abs(abs(features.stack(a)[1]["params"]["radius_a"]) - 0.1) < 1e-7,
+      (dev, A(a), a0 - W * 0.16))
 ctx.scene.nproto_settings.construction_history = False
 
 # --- the preview: two arrows, rails as the worker's law -------------------------
