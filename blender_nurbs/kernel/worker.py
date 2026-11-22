@@ -606,7 +606,13 @@ def heal_cut_seams(b, original):
     ext.delete_faces(out, [of[i] for i in drop])
     for m in merged:
         ext.append_brep(out, m)
-    before_open = _open_edge_count(b) - 2 * len(seams)
+    # b's open edges but the seams that go: a seam between two faces counts
+    # once per edge left open (two when the cut left it unstitched, none when
+    # it is one shared edge -- on a solid it is, and counting two there asked
+    # for a closed result); a slit (one face both ways) is not counted open
+    open_seams = sum(1 for e in b.edges() if len(e.faces()) < 2 and key(e) in seams
+                     and uses[key(e)][0][0] != uses[key(e)][1][0])
+    before_open = _open_edge_count(b) - open_seams
     for t in (tol / 10, tol, 10 * tol):
         st = sm.stitch_advanced(out.copy(), t, squeeze_small_edges=False, making_manifold_solid=False)[0]
         if _open_edge_count(st) <= max(before_open, 0) and st.face_count() == out.face_count():

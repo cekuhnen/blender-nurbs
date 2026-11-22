@@ -130,5 +130,21 @@ for dist, tag in ((0.1, "extended"), (-0.05, "cut back")):
     check(f"extend trimmed ({tag}): the holed plane joins the hole's plug, either one active (48 edges stitched)",
           all(out), str(out))
 
+# --- Trim (worker heal_cut_seams): a circle projected through a 48-gon-holed plate, the top disc
+# removed; the bottom face the circle only imprinted is one face again (stitched back to its walls)
+ro = poly("PlateOut", square(5.0, 0.2))
+ri = poly("PlateIn", ngon((5.0, 0, 0), 0.08))
+bpy.ops.nproto.extrude(inputs=ins((ro, "S0"), (ri, "S0")), distance=0.1, direction="Z", body="NEW"); plate = ctx.active_object
+n0 = store.get_brep(plate).face_count()
+bpy.ops.curve.primitive_bezier_circle_add(radius=0.04, location=(5.12, 0.12, 0.3)); cc = ctx.active_object
+r = bpy.ops.nproto.trim(target=plate.name, cutters=ins((cc, "S0")), ref_point=(5.12, 0.12, 0.1), normal=(0, 0, 1),
+                        view_dir=(0, 0, -1), action="DELETE", scope="PICKED")
+b = store.get_brep(plate)
+bottom = [f for f in b.faces() if abs(f.interior_point()[2]) < 1e-6]
+s = stats(b)
+check("trim: the bottom of a 48-gon-holed plate keeps no seam from the cut; only the new hole is open",
+      r == {'FINISHED'} and len(bottom) == 1 and b.face_count() == n0 and s[1] == 1,
+      f"faces {b.face_count()} ({n0}), bottom faces {len(bottom)} (1), open {s[1]} (1)")
+
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)
