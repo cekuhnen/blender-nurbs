@@ -3,9 +3,9 @@ NVIDIA's USD BRep (SMLib) kernel."""
 
 import bpy
 
-from . import align, blendedit, brep_mesh, mesh_brep, subd_brep, dome, drawshapes, fillet, hints, snapping, subsel, contcheck, contlabels, isocombs, isodetach, loftslide, sections, patch, pivot, pivottool, curvejoin, curveoffset, surfoffset, flange, network, railrevolve, measure, curvetools, curvetrim, drawtools, cvs, cvnudge, loft_rails, diagnostics, draw, extend, feature_ui, fileload, history, history_ui, ops, ops_sweep, ops_trim, pattern, pushpull, unroll, flow, refit, merge, salign, scanfit, scanpatch, match, square, step_export, step_import, sweeps, symmetry, toolgroups, ui, workplanes  # noqa: F401 (sweeps registers builders)
+from . import align, blendedit, brep_mesh, mesh_brep, subd_brep, dome, drawshapes, fillet, hints, snapping, subsel, contcheck, contlabels, isocombs, isodetach, loftslide, sections, patch, pivot, pivottool, movetool, curvejoin, curveoffset, surfoffset, flange, network, railrevolve, measure, curvetools, curvetrim, drawtools, cvs, cvnudge, loft_rails, diagnostics, draw, extend, feature_ui, fileload, history, history_ui, ops, ops_sweep, ops_trim, pattern, pushpull, unroll, flow, refit, merge, salign, scanfit, scanpatch, match, square, step_export, step_import, sweeps, symmetry, toolgroups, ui, workplanes  # noqa: F401 (sweeps registers builders)
 
-_classes = hints.classes + feature_ui.classes + history_ui.classes + ui.classes + toolgroups.classes + ops.classes + ops_trim.classes + isodetach.classes + cvs.classes + cvnudge.classes + ops_sweep.classes + step_export.classes + step_import.classes + curvejoin.classes + curveoffset.classes + surfoffset.classes + flange.classes + network.classes + railrevolve.classes + measure.classes + curvetrim.classes + curvetools.classes + drawtools.classes + drawshapes.classes + fillet.classes + loft_rails.classes + contlabels.classes + loftslide.classes + contcheck.classes + sections.classes + salign.classes + match.classes + patch.classes + subsel.classes + dome.classes + brep_mesh.classes + mesh_brep.classes + subd_brep.classes + scanfit.classes + scanpatch.classes + workplanes.classes + pivottool.classes + pattern.classes + symmetry.classes + pushpull.classes + unroll.classes + flow.classes
+_classes = hints.classes + feature_ui.classes + history_ui.classes + ui.classes + toolgroups.classes + ops.classes + ops_trim.classes + isodetach.classes + cvs.classes + cvnudge.classes + ops_sweep.classes + step_export.classes + step_import.classes + curvejoin.classes + curveoffset.classes + surfoffset.classes + flange.classes + network.classes + railrevolve.classes + measure.classes + curvetrim.classes + curvetools.classes + drawtools.classes + drawshapes.classes + fillet.classes + loft_rails.classes + contlabels.classes + loftslide.classes + contcheck.classes + sections.classes + salign.classes + match.classes + patch.classes + subsel.classes + dome.classes + brep_mesh.classes + mesh_brep.classes + subd_brep.classes + scanfit.classes + scanpatch.classes + workplanes.classes + pivottool.classes + movetool.classes + pattern.classes + symmetry.classes + pushpull.classes + unroll.classes + flow.classes
 
 
 def register():
@@ -24,6 +24,7 @@ def register():
     history.register()
     pivot.register()
     pivottool.register()
+    movetool.register()
     cvs.register()
     blendedit.register()
     symmetry.register()
@@ -47,6 +48,7 @@ def unregister():
     symmetry.unregister()
     blendedit.unregister()
     cvs.unregister()
+    movetool.unregister()
     pivottool.unregister()
     pivot.unregister()
     history.unregister()

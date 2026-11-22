@@ -1,0 +1,158 @@
+"""Move by Points (hold G):  blender -b --factory-startup --python tests/test_move_tool.py"""
+import os, sys
+import bpy
+import numpy as np
+from mathutils import Vector
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+import blender_nurbs
+blender_nurbs.register()
+from blender_nurbs import features, geom, movetool, pattern, store
+
+ok = True
+def check(name, cond, extra=""):
+    global ok
+    print(("PASS " if cond else "FAIL ") + name, extra)
+    ok &= bool(cond)
+
+ctx = bpy.context
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+
+def W(o):
+    return np.array(geom.world_matrix(o), float)
+
+def select(*objs):
+    bpy.ops.object.select_all(action='DESELECT')
+    for o in objs:
+        o.select_set(True)
+    ctx.view_layer.objects.active = objs[0]
+
+# -- typed copies ---------------------------------------------------------------
+check("parse *5", movetool.parse_copies("*5") == ("ARRAY", 5))
+check("parse /4", movetool.parse_copies("/ 4") == ("DIVIDE", 4))
+for t in ("*", "/", "*0", "5", "*x", "", "10*2"):
+    check(f"parse {t!r} is none", movetool.parse_copies(t) is None)
+d = np.array([3.0, 0.0, 0.0])
+check("array offsets", np.allclose(movetool.copy_offsets(d, "ARRAY", 3), [d, 2 * d, 3 * d]))
+check("divide offsets", np.allclose(movetool.copy_offsets(d, "DIVIDE", 3), [d / 3, 2 * d / 3, d]))
+check("no offsets", movetool.copy_offsets(d, "NONE", 3) == [])
+
+# -- plain move: objects, parents -----------------------------------------------
+bpy.ops.mesh.primitive_cube_add(size=1.0, location=(1, 2, 3))
+cube = ctx.active_object
+bpy.ops.mesh.primitive_uv_sphere_add(radius=0.3, location=(4, 0, 0))
+ball = ctx.active_object
+ball.parent = cube
+ball.matrix_parent_inverse = cube.matrix_world.inverted()
+ctx.view_layer.update()
+b0 = W(ball)[:3, 3].copy()
+select(cube, ball)
+r = bpy.ops.nproto.move(base=(1, 2, 3), offset=(0.5, -1.0, 2.0))
+ctx.view_layer.update()
+check("move finished", r == {'FINISHED'}, r)
+check("cube moved", np.allclose(W(cube)[:3, 3], (1.5, 1.0, 5.0)), W(cube)[:3, 3])
+check("child moved once, with its parent", np.allclose(W(ball)[:3, 3], b0 + (0.5, -1.0, 2.0)), W(ball)[:3, 3])
+check("roots skip the child", movetool.roots([cube, ball]) == [cube])
+check("zero move cancels", bpy.ops.nproto.move(offset=(0, 0, 0)) == {'CANCELLED'})
+
+# -- pivot to the base point ------------------------------------------------------
+bpy.data.objects.remove(ball)
+select(cube)
+P0 = np.array([tuple(cube.matrix_world @ v.co) for v in cube.data.vertices])
+r = bpy.ops.nproto.move(base=(2.0, 1.5, 5.5), offset=(1.0, 0.0, 0.0), set_pivot=True)
+ctx.view_layer.update()
+P1 = np.array([tuple(cube.matrix_world @ v.co) for v in cube.data.vertices])
+check("pivot: origin ends on the target", np.allclose(W(cube)[:3, 3], (3.0, 1.5, 5.5)), W(cube)[:3, 3])
+check("pivot: geometry moved by the offset only", np.allclose(P1, P0 + (1.0, 0.0, 0.0)))
+
+# -- plain mesh copies --------------------------------------------------------------
+select(cube)
+n0 = len(bpy.data.objects)
+M0 = W(cube)
+r = bpy.ops.nproto.move(base=(0, 0, 0), offset=(0, 2, 0), copies="ARRAY", count=3)
+new = [o for o in bpy.data.objects if o.name.startswith("Cube") and o is not cube]
+check("mesh copies made", r == {'FINISHED'} and len(bpy.data.objects) == n0 + 3, len(bpy.data.objects) - n0)
+ys = sorted(round(W(o)[1, 3] - M0[1, 3], 6) for o in new)
+check("mesh copies one move apart", np.allclose(ys, [2, 4, 6]), ys)
+check("original stays", np.allclose(W(cube), M0))
+check("copies own their mesh", all(o.data is not cube.data for o in new))
+for o in new:
+    bpy.data.objects.remove(o)
+
+# -- NURBS copies: a linear Pattern ----------------------------------------------------
+bpy.ops.nproto.add_primitive(kind="BOX", width=1.0, depth=0.5, height=0.4)
+box = ctx.active_object
+check("box is nurbs", store.is_nurbs(box))
+select(box)
+Mb = W(box)
+r = bpy.ops.nproto.move(base=tuple(Mb[:3, 3]), offset=(3.0, 1.0, 0.0), copies="DIVIDE", count=4)
+cps = [o for o in bpy.data.objects if o.get("nproto_in_0") is box and pattern.pattern_of(o) is not None]
+check("divide: 4 pattern copies", r == {'FINISHED'} and len(cps) == 4, len(cps))
+offs = sorted([tuple(np.round(W(o)[:3, 3] - Mb[:3, 3], 6)) for o in cps])
+want = sorted([tuple(np.round(np.array([3.0, 1.0, 0.0]) * k / 4, 6)) for k in (1, 2, 3, 4)])
+check("divide: copies spread to the target", np.allclose(offs, want), offs)
+p = pattern.pattern_of(cps[0])[1]
+check("divide: pattern by length", p["space"] == "EXTENT" and p["count_x"] == 5
+      and abs(p["distance_x"] - np.hypot(3, 1)) < 1e-9, p)
+check("copies selected with the source", box.select_get() and all(o.select_get() for o in cps))
+check("copies carry the b-rep", all(store.is_nurbs(o) for o in cps))
+grp = p["group"]
+check("one group", all(pattern.pattern_of(o)[1]["group"] == grp for o in cps))
+for o in cps:
+    bpy.data.objects.remove(o)
+
+select(box)
+r = bpy.ops.nproto.move(base=(0, 0, 0), offset=(0.0, 0.0, 1.5), copies="ARRAY", count=2)
+cps = [o for o in bpy.data.objects if o.get("nproto_in_0") is box and pattern.pattern_of(o) is not None]
+zs = sorted(round(W(o)[2, 3] - Mb[2, 3], 6) for o in cps)
+check("array: copies one move apart", np.allclose(zs, [1.5, 3.0]), zs)
+check("array: pattern by spacing", pattern.pattern_of(cps[0])[1]["space"] == "SPACING")
+# the source changes: the copies follow (history)
+if features.history_enabled(ctx):
+    box.location.x += 0.0          # (placement only: the copies keep their offset to the source's b-rep)
+check("array: source not moved", np.allclose(W(box), Mb))
+
+# -- Edit Mode: the selected points move ---------------------------------------------
+bpy.ops.object.select_all(action='DESELECT')
+bpy.ops.mesh.primitive_plane_add(size=2.0, location=(0, 0, 0))
+pl = ctx.active_object
+pl.scale = (2.0, 1.0, 1.0)
+ctx.view_layer.update()
+bpy.ops.object.mode_set(mode='EDIT')
+bpy.ops.mesh.select_all(action='SELECT')
+r = bpy.ops.nproto.move(offset=(1.0, 0.0, 0.5))
+bpy.ops.object.mode_set(mode='OBJECT')
+Pw = np.array([tuple(pl.matrix_world @ v.co) for v in pl.data.vertices])
+check("edit mesh: points moved in world", r == {'FINISHED'} and np.allclose(Pw.mean(axis=0), (1.0, 0.0, 0.5)),
+      Pw.mean(axis=0))
+check("edit mesh: size kept", np.allclose(np.ptp(Pw, axis=0), (4.0, 2.0, 0.0)), np.ptp(Pw, axis=0))
+check("edit mesh: object stays", np.allclose(W(pl)[:3, 3], 0))
+
+bpy.ops.curve.primitive_bezier_curve_add(location=(0, 0, 0))
+cv = ctx.active_object
+bpy.ops.object.mode_set(mode='EDIT')
+bpy.ops.curve.select_all(action='DESELECT')
+bp = cv.data.splines[0].bezier_points[0]
+bp.select_control_point = True
+bp.handle_left_type = bp.handle_right_type = 'FREE'     # (auto handles are recomputed on leaving Edit Mode)
+h0, c0 = Vector(bp.handle_left), Vector(bp.co)
+other = Vector(cv.data.splines[0].bezier_points[1].co)
+r = bpy.ops.nproto.move(offset=(0.0, 0.0, 1.0), copies="ARRAY", count=2)
+bpy.ops.object.mode_set(mode='OBJECT')
+bp = cv.data.splines[0].bezier_points[0]
+check("edit curve: point and handles moved", (bp.co - c0 - Vector((0, 0, 1))).length < 1e-6
+      and (bp.handle_left - h0 - Vector((0, 0, 1))).length < 1e-6)
+check("edit curve: others stay", (cv.data.splines[0].bezier_points[1].co - other).length < 1e-6)
+check("edit: no copies made", len([o for o in bpy.data.objects if o.type == 'CURVE']) == 1)
+
+# -- the hold key ------------------------------------------------------------------
+kc = ctx.window_manager.keyconfigs.addon
+items = [(km.name, k.idname) for km, k in movetool._keymaps]
+check("hold G bound in object / edit keymaps", {n for n, _ in items} == set(movetool.KEYMAPS)
+      and all(i == "nproto.transform_hold" for _, i in items), items)
+check("hold default", movetool.hold_ms() == 300 and movetool.hold_enabled())
+
+print("ALL PASS" if ok else "SOME FAILED")
+sys.exit(0 if ok else 1)
