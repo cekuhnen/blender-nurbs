@@ -2409,13 +2409,16 @@ def surface_fillet_sections(P, NA, NB, ra, rb, sa, sb, shape="CIRCULAR", k=9, co
         cv = [T1 + i * h * ta for i in range(k)] + [T2 + i * h * tb for i in range(k)][::-1]
         from math import comb
         return sum(comb(deg, i) * w ** i * (1 - w) ** (deg - i) * c[:, None] for i, c in enumerate(cv))
+    # the worker's conic (secfillet.conic): rational quadratic tangent at both
+    # rails; equal radii the ball's arc, Radius A != B the conic between the feet
     a, b = -A, -B                                    # centre -> rails, unit
-    om = np.arccos(np.clip(np.sum(a * b, axis=1), -1.0, 1.0))
-    so = np.where(np.sin(om) < 1e-9, 1.0, np.sin(om))
-    wa = np.sin((1 - w[..., 0]) * om[:, None]) / so[:, None]
-    wb = np.sin(w[..., 0] * om[:, None]) / so[:, None]
-    rr = ra[:, None] + (rb - ra)[:, None] * w[..., 0]          # equal radii: the ball's arc
-    return C[:, None] + rr[..., None] * (wa[..., None] * a[:, None] + wb[..., None] * b[:, None])
+    c = np.clip(np.sum(a * b, axis=1), -1.0, 1.0)[:, None]
+    s = np.maximum(1.0 - c * c, 1e-18)
+    W = C + a * (ra[:, None] - c * rb[:, None]) / s + b * (rb[:, None] - c * ra[:, None]) / s
+    wt = np.maximum(np.sqrt(0.5 * (1.0 + c)), 1e-9)[:, None]
+    t = w
+    num = (1 - t) ** 2 * T1[:, None] + 2 * t * (1 - t) * wt * W[:, None] + t ** 2 * T2[:, None]
+    return num / ((1 - t) ** 2 + 2 * t * (1 - t) * wt + t ** 2)
 
 
 def _unit(X):

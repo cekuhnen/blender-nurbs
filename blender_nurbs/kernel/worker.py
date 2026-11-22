@@ -990,11 +990,16 @@ def _job_fillet(job, A, B):
             res["note"] = info["note"]
         return res
     radii = None if chord else job.get("radii")
-    if chord or blend or radii:
+    # the kernel's circular fillet takes only one radius (Radius A != B fails
+    # in it: SM_ERR_NULL_POINTER); its chamfer takes two
+    two = int(job["xsect"]) != 0 and abs(abs(float(job["radius_a"])) - abs(float(job["radius_b"]))) > \
+        1e-9 * max(abs(float(job["radius_a"])), abs(float(job["radius_b"])))
+    if chord or blend or radii or two:
         # our own sections (secfillet.py): the kernel's fillet has one ball
         # radius, a chord or a variable radius (job['radii'] = start, end;
         # start at the crossing's end nearer job['start_point']) needs one
-        # per section; a blend is built between the rails directly (no
+        # per section; Radius A != B: the conic between the ball's feet
+        # (secfillet.conic); a blend is built between the rails directly (no
         # circular fillet, trim and loft between its edges)
         import secfillet
         sa = 1.0 if float(job["radius_a"]) >= 0 else -1.0

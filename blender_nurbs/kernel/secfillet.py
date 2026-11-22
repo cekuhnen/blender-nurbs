@@ -17,6 +17,9 @@ peaks at exactly 1 / R in the middle; each section's ball is sized from its
 own angle so the rails sit where that span needs them. A variable radius
 (radius_law): each section's ball its own radius, linear in length along
 the crossing; a 0 section is the crossing's point (the rails meet there).
+Radius A != B (circular): the ball's centre r_A from A and r_B from B, and
+between its feet the conic tangent to both (conic(); at 90 deg a quarter
+ellipse) -- the kernel's circular fillet takes only one radius.
 
 The sections are skinned through, in homogeneous coordinates (rational arcs
 stay exact), periodic round a closed crossing; a section is added halfway
@@ -522,6 +525,21 @@ class Solver:
 # Section curves (homogeneous rows) and the skin
 # ---------------------------------------------------------------------------
 
+def conic(C, pa, pb):
+    """The circular section's control points and weights: the rational
+    quadratic from rail pa to rail pb, tangent at each square to its radius
+    (C - pa, C - pb: the surface's normal there), weight cos(om / 2) with om
+    the angle the radii turn through. Equal radii: the ball's arc exactly;
+    Radius A != B: the conic through the same tangents (at 90 deg the quarter
+    ellipse about C with semi-axes the two radii)."""
+    ra, rb = float(np.linalg.norm(pa - C)), float(np.linalg.norm(pb - C))
+    a, b = (pa - C) / (ra or 1.0), (pb - C) / (rb or 1.0)
+    c = max(-1.0, min(1.0, float(a @ b)))
+    s = max(1.0 - c * c, 1e-18)
+    W = C + a * (ra - c * rb) / s + b * (rb - c * ra) / s     # where the two tangents meet
+    return (pa, W, pb), (1.0, max(math.sqrt(0.5 * (1.0 + c)), 1e-9), 1.0)
+
+
 def _across(x, base, p, n, other):
     """Unit direction tangent to the surface at p (normal n), toward the other rail."""
     d = other - p
@@ -551,15 +569,7 @@ def section_rows(x, shape, A, B, soft=None):
     if shape == "LINEAR":
         return 1, np.array([h1(pa), h1(pb)])
     if shape == "CIRCULAR":
-        a, b = pa - x.C, pb - x.C
-        cosw = float(a @ b) / ((np.linalg.norm(a) * np.linalg.norm(b)) or 1.0)
-        om = math.acos(max(-1.0, min(1.0, cosw)))
-        w = math.cos(0.5 * om)
-        r = 0.5 * (np.linalg.norm(a) + np.linalg.norm(b))
-        m = a + b
-        m = m / (np.linalg.norm(m) or 1.0)
-        W = x.C + m * r / max(w, 1e-9)
-        return 2, np.array([h1(pa), h1(W, w), h1(pb)])
+        return 2, np.array([h1(q, w) for q, w in zip(*conic(x.C, pa, pb))])
     ta = _across(x, A, pa, x.na, pb)
     tb = _across(x, B, pb, x.nb, pa)
     d = float(np.linalg.norm(pa - pb))
