@@ -477,7 +477,11 @@ def _trim(sm, ext, carrier, groups, size):
     """The carrier trimmed with each group of loops ([curve recipes] per loop,
     the outer first): a Brep, one face per group. The UV trim curves are
     fitted as tightly as the kernel manages (an edge's UV curve is what the
-    face's area and later edits go by)."""
+    face's area and later edits go by). Each piece's own tolerance follows
+    the size (surfmap.BREP_TOL), not the kernel's default 0.01 model units:
+    joined back, a strip narrower than about twice that had its corners
+    merged and nothing stitched."""
+    from .surfmap import BREP_TOL
     out = None
     for loops in groups:
         sizes = [len(c) for c in loops]
@@ -486,7 +490,8 @@ def _trim(sm, ext, carrier, groups, size):
             try:
                 curves = [make() for c in loops for make in c]
                 if tol is not None:
-                    b = ext.trim_surface_with_3d_curves_tol(copy(carrier), sizes, curves, tol * size, 0.01)
+                    b = ext.trim_surface_with_3d_curves_tol(copy(carrier), sizes, curves, tol * size,
+                                                            max(BREP_TOL, 10.0 * tol) * size)
                 else:
                     b = sm.trim_surface_with_3d_curves(copy(carrier), sizes, curves)
             except Exception:

@@ -420,6 +420,8 @@ def heal_cut_seams(b, original):
     lo, hi = (np.array(v) for v in original.bounding_box())
     size = float(np.linalg.norm(hi - lo)) or 1.0
     tol = 1e-5 * size
+    from trimext import brep_tol
+    btol = brep_tol(1e-5, size)      # not the kernel's 0.01: stitched below, short edges stay apart
     on_original = _near_edges(original, 10 * tol)
 
     def key(e):
@@ -578,7 +580,7 @@ def heal_cut_seams(b, original):
                     if "knots_u" in sd else carrier
                 try:
                     if tight and hasattr(ext, "trim_surface_with_3d_curves_tol"):
-                        cand = ext.trim_surface_with_3d_curves_tol(surf, sizes, curves, tol, 0.01)
+                        cand = ext.trim_surface_with_3d_curves_tol(surf, sizes, curves, tol, btol)
                     else:
                         cand = sm.trim_surface_with_3d_curves(surf, sizes, curves)
                 except Exception:

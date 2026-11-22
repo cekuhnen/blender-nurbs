@@ -2147,8 +2147,14 @@ def trim_to_loop(sm, ext, make_surface, curves, size):
     model units, so on a small part a UV curve strayed up to 0.5 mm from its
     edge, and Edit CVs (which re-lifts edges from the UV curves) pulled the
     edge off its neighbour. Falls back to the kernel's trim (an older kernel
-    module without the call, or a failure)."""
+    module without the call, or a failure).
+
+    The face's own tolerance follows the size too (surfmap.BREP_TOL), not the
+    kernel's default 0.01 model units: joined to its walls, two corners closer
+    than about twice that (a short side) were merged and the side left open."""
+    from .surfmap import BREP_TOL
     tol = max(TRIM_FIT_REL * (size or 1.0), 1e-9)
+    btol = max(BREP_TOL * (size or 1.0), 10.0 * tol)
     attempts = []
     if hasattr(ext, "trim_surface_with_3d_curves_tol"):
         attempts += [(True, False), (True, True)]
@@ -2159,7 +2165,7 @@ def trim_to_loop(sm, ext, make_surface, curves, size):
         cs = [_reverse(ext, c) for c in curves[::-1]] if reverse else [_copy_curve(ext, c) for c in curves]
         try:
             if tight:
-                return ext.trim_surface_with_3d_curves_tol(make_surface(), [len(cs)], cs, tol, 0.01)
+                return ext.trim_surface_with_3d_curves_tol(make_surface(), [len(cs)], cs, tol, btol)
             return sm.trim_surface_with_3d_curves(make_surface(), [len(cs)], cs)
         except Exception as exc:
             last = exc

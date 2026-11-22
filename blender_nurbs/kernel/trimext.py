@@ -25,6 +25,17 @@ except ImportError:          # the worker imports the kernel folder's modules to
     from natext import deboor, end_curve, extend_u_end, flip, span
 
 EDGES = ("U0", "U1", "V0", "V1")
+FIT_REL = 1e-4          # UV trim curves within this share of the surface size of their edges
+BREP_TOL = 1e-5         # as surfmap.BREP_TOL: a trimmed face's own tolerance, a share of the size
+
+
+def brep_tol(fit_rel, size):
+    """The tolerance a face trimmed with UV curves within fit_rel x size gets
+    (surfmap.trimmed_face's rule), not the kernel's default 0.01 model units:
+    a face joined (stitched) with others merges its vertices closer than about
+    twice its tolerance, so a hole or a strip with edges under ~0.02 paired
+    the wrong edges and stitched nothing."""
+    return max(BREP_TOL, 10.0 * fit_rel) * size
 
 
 def _k():
@@ -395,7 +406,8 @@ def _grow(brep, iso, at, distance, to=None):
             sizes.append(len(lp))
         band = _band_area(big, iso, c_old, c_new, ta, tb)
         if tight:
-            out = ext.trim_surface_with_3d_curves_tol(big, sizes, curves, 1e-4 * size, 0.01)
+            out = ext.trim_surface_with_3d_curves_tol(big, sizes, curves, FIT_REL * size,
+                                                      brep_tol(FIT_REL, size))
         else:
             out = sm.trim_surface_with_3d_curves(big, sizes, curves)
         if out is None or out.face_count() != 1:
@@ -569,7 +581,8 @@ def _shrink(brep, iso, at, distance):
                 curves += [_edge_curve(e, fw) for e, fw in lp]
                 sizes.append(len(lp))
             if tight:
-                b = ext.trim_surface_with_3d_curves_tol(big, sizes, curves, 1e-4 * size, 0.01)
+                b = ext.trim_surface_with_3d_curves_tol(big, sizes, curves, FIT_REL * size,
+                                                        brep_tol(FIT_REL, size))
             else:
                 b = sm.trim_surface_with_3d_curves(big, sizes, curves)
             return b if b is not None and b.face_count() == 1 and 0 < b.area(1e-6) < area0 * (1 + 1e-4) else None
