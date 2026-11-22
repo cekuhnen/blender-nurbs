@@ -2716,8 +2716,9 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
 
     def drag_handles(self):
         P0 = self._ef[0][0]
-        hs = [self._handle("radius", 0, len(P0) // 2 if len(self._ef) == 1 or not self.variable else 1)]
-        if "end_radius" in self.drag_fields:
+        variable = "end_radius" in self.drag_fields       # Radius at the start, End Radius at the end
+        hs = [self._handle("radius", 0, 1 if variable else len(P0) // 2)]
+        if variable:
             Pl = self._ef[-1][0]
             hs.append(self._handle("end_radius", len(self._ef) - 1, len(Pl) - 2))
         return hs
