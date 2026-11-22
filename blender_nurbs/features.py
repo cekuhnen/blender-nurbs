@@ -2202,7 +2202,7 @@ def record(obj, op, inputs, params):
 HISTORY_COLL = "NURBS History"
 PROP_HOME = "nproto_home"      # JSON list: the collections an input was in before it was kept
 KEEP_OPS = ("join", "join_curves", "boolean", "thicken", "boundary_fill", "split_region", "iso_detach",
-            "extrude_face")   # results that keep their inputs
+            "extrude_face", "emboss")   # results that keep their inputs
 
 
 def history_collection(context, create=True):

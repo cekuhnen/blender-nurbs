@@ -33,6 +33,7 @@ FIELDS = {
     "offset": ["distance"],
     "unroll": ["ur_place", "ur_relax"],
     "flow": ["fw_rigid", "fw_fold", "fw_flip_u", "fw_flip_v", "fw_swap"],
+    "emboss": ["em_op", "em_mode", "em_height", "em_overlap", "em_far", "fw_flip_u", "fw_flip_v", "fw_swap"],
     "thicken": ["distance", "symmetric"],
     "planar": [],
     "join": ["tolerance"],
@@ -88,7 +89,7 @@ PRETTY = {"patch": "Patch", "dome": "Dome", "square": "Square", "sweep": "Sweep"
           "join": "Join", "split_region": "Split", "iso_detach": "Detach at Isoparm", "boolean": "Boolean", "boundary_fill": "Boundary Fill", "join_curves": "Join Curves", "offset_curve": "Offset Curve", "offset_on_surface": "Offset on Surface", "flange": "Flange", "network": "Curve Network", "rail_revolve": "Rail Revolve", "loft_rails": "Loft Rails", "surface_fillet": "Surface Fillet", "loft": "Loft", "blend_curve": "Blend Curve", "extrude": "Extrude", "extrude_face": "Extrude Face", "revolve": "Revolve",
           "offset": "Offset", "thicken": "Thicken", "planar": "Planar", "perp_profile": "Profile",
           "subd_to_brep": "SubD to BREP", "pattern": "Pattern", "unroll": "Unroll Surface",
-          "flow": "Flow Along Surface"}
+          "flow": "Flow Along Surface", "emboss": "Emboss"}
 
 
 _FILLET_KEYS = ("radius_a", "radius_b", "radii", "start_point", "xsect", "chord", "soft", "blend", "ends")
@@ -621,6 +622,14 @@ class NprotoFeature(bpy.types.PropertyGroup):
     fw_flip_u: BoolProperty(name="Flip U", **_F())
     fw_flip_v: BoolProperty(name="Flip V", **_F())
     fw_swap: BoolProperty(name="Swap UV", **_F())
+    em_op: EnumProperty(name="Operation", items=[("EMBOSS", "Emboss", "Raised: joined to the body"),
+                                                 ("DEBOSS", "Deboss", "Sunk: cut into the body")], **_F())
+    em_mode: EnumProperty(name="Mode", items=[("WRAP", "Wrap", "Bend from the sheet the profiles lie on"),
+                                              ("PROJECT", "Project", "Along the profiles' plane normal"),
+                                              ("PLACE", "Place", "Moved and turned as a whole")], **_F())
+    em_height: FloatProperty(name="Height", min=0.0, unit='LENGTH', **_F())
+    em_overlap: FloatProperty(name="Overlap", min=0.0, unit='LENGTH', **_F())
+    em_far: BoolProperty(name="Far Side", **_F())
     jc_cvs: IntProperty(name="CVs (Rebuild, 0 auto)", min=0, max=200, **_F())
 
 
@@ -916,7 +925,7 @@ def draw_feature(layout, context):
                     if name in ("degree", "square_degree", "jc_mode", "bool_op", "lr_degree", "lr_mode", "pp_shape",
                                 "dome_cont", "dome_layout", "oc_mode", "oc_corner", "os_corner", "fl_mode", "fl_corner",
                                 "measure",
-                                "nw_cont", "rr_height"):
+                                "nw_cont", "rr_height", "em_op", "em_mode"):
                         col.row().prop(pg, name, expand=True)
                     elif name in ("jc_degree", "jc_cvs") and pg.jc_mode != "REBUILD":
                         continue

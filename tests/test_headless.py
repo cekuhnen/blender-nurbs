@@ -5325,8 +5325,8 @@ _rows = []
 _tg.draw_panel(_ActLay(_rows), "SURFACE_EDIT", ctx)
 _rows_c = []
 _tg.draw_panel(_ActLay(_rows_c), "CURVE_EDIT", ctx)
-_cut = {"nproto.trim", "nproto.split"}             # they take the curve as a cutter
-check("UI: a curve selected dims Surface Edit (still clickable) but Trim / Split and not Curve Edit; "
+_cut = {"nproto.trim", "nproto.split", "nproto.emboss"}   # they take the curve (a cutter, a profile)
+check("UI: a curve selected dims Surface Edit (still clickable) but Trim / Split / Emboss and not Curve Edit; "
       "nothing selected dims nothing",
       _none_sel is None and _have == {"CURVE"} and _tg.fits({"NURBS"}, None)
       and _rows and all(r_["active"] == bool(set(r_["ops"]) & _cut) for r_ in _rows if r_["ops"])
