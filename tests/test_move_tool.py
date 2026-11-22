@@ -246,6 +246,88 @@ check("rotate edit mesh: points turned in world", r == {'FINISHED'}
       and np.allclose(Pw, Pw0 @ R90[:3, :3].T + R90[:3, 3], atol=1e-6))
 check("rotate edit mesh: object stays", np.allclose(W(pl)[:3, 3], (1, 0, 0)))
 
+# -- Scale: pure helpers ------------------------------------------------------------------
+pt = lambda T, p: (T @ np.append(np.asarray(p, float), 1.0))[:3]
+check("scale uniform about C", np.allclose(pt(movetool.scale_matrix((1, 0, 0), 2.0), (2, 1, 1)), (3, 2, 2)))
+check("scale 1D along X", np.allclose(pt(movetool.scale_matrix((1, 0, 0), 2.0, "ONE", (1, 0, 0)), (2, 1, 1)), (3, 1, 1)))
+check("scale 1D along a slant", np.allclose(pt(movetool.scale_matrix((0, 0, 0), 3.0, "ONE", (1, 1, 0)), (1, -1, 0)),
+                                           (1, -1, 0)))
+check("scale 2D square to Z", np.allclose(pt(movetool.scale_matrix((0, 0, 0), 2.0, "TWO", (0, 0, 1)), (2, 1, 1)), (4, 2, 1)))
+check("ref length uniform", abs(movetool.ref_length((0, 0, 0), (3, 4, 0)) - 5) < 1e-12)
+check("ref length 1D signed", abs(movetool.ref_length((1, 0, 0), (-1, 5, 0), "ONE", (1, 0, 0)) + 2) < 1e-12)
+check("ref length 2D", abs(movetool.ref_length((0, 0, 0), (3, 4, 9), "TWO", (0, 0, 1)) - 5) < 1e-12)
+for t, v in (("2", 2.0), ("x2", 2.0), ("2x", 2.0), ("1/4", 0.25), ("×1.5", 1.5)):
+    check(f"factor {t!r}", movetool.parse_factor(t) == v)
+check("factor junk", movetool.parse_factor("x") is None)
+
+# -- Scale: objects ------------------------------------------------------------------------
+for o in list(bpy.data.objects):
+    bpy.data.objects.remove(o)
+bpy.ops.mesh.primitive_cube_add(size=1.0, location=(2, 0, 0))
+cube = ctx.active_object
+select(cube)
+M0 = W(cube)
+r = bpy.ops.nproto.scale(center=(1, 0, 0), factor=3.0)
+ctx.view_layer.update()
+check("scale finished", r == {'FINISHED'}, r)
+check("scale: about the centre", np.allclose(W(cube), movetool.scale_matrix((1, 0, 0), 3.0) @ M0, atol=1e-6),
+      W(cube)[:3, 3])
+check("scale: factor 1 cancels", bpy.ops.nproto.scale(factor=1.0) == {'CANCELLED'})
+check("scale: factor 0 cancels", bpy.ops.nproto.scale(factor=0.0) == {'CANCELLED'})
+
+select(cube)
+M0 = W(cube)
+r = bpy.ops.nproto.scale(center=(0, 0, 0), factor=0.5, mode="ONE", direction=(0, 1, 0))
+ctx.view_layer.update()
+check("scale 1D: along Y only", np.allclose(W(cube), movetool.scale_matrix((0, 0, 0), 0.5, "ONE", (0, 1, 0)) @ M0,
+                                           atol=1e-6), np.array(cube.scale))
+
+select(cube)
+P0 = np.array([tuple(cube.matrix_world @ v.co) for v in cube.data.vertices])
+r = bpy.ops.nproto.scale(center=(4, 0, 0), factor=2.0, set_pivot=True)
+ctx.view_layer.update()
+P1 = np.array([tuple(cube.matrix_world @ v.co) for v in cube.data.vertices])
+S2 = movetool.scale_matrix((4, 0, 0), 2.0)
+check("scale pivot: origin on the centre", np.allclose(W(cube)[:3, 3], (4, 0, 0)), W(cube)[:3, 3])
+check("scale pivot: geometry scaled about the centre", np.allclose(P1, P0 @ S2[:3, :3].T + S2[:3, 3], atol=1e-5))
+
+bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0), rotation=(0, 0, math.radians(30)))
+turned = ctx.active_object
+off = movetool.transform_objects([turned], movetool.scale_matrix((0, 0, 0), 2.0, "ONE", (1, 0, 0)))
+check("scale 1D on a turned object: reported (no shear)", off == [turned.name], off)
+ctx.view_layer.update()
+off = movetool.transform_objects([turned], movetool.scale_matrix((0, 0, 0), 2.0))
+check("uniform on a turned object: exact", off == [], off)
+
+bpy.ops.nproto.add_primitive(kind="BOX", width=1.0, depth=0.5, height=0.4)
+box = ctx.active_object
+box.location = (2.0, 1.0, 0.0)
+ctx.view_layer.update()
+select(box)
+Mb = W(box)
+r = bpy.ops.nproto.scale(center=(0, 0, 0), factor=1.5)
+ctx.view_layer.update()
+check("scale nurbs: matrix", r == {'FINISHED'} and np.allclose(W(box), movetool.scale_matrix((0, 0, 0), 1.5) @ Mb,
+                                                                atol=1e-6))
+check("scale nurbs: still nurbs, no copies", store.is_nurbs(box)
+      and not [o for o in bpy.data.objects if o.get("nproto_in_0") is box])
+
+# -- Scale: Edit Mode ----------------------------------------------------------------------
+bpy.ops.object.select_all(action='DESELECT')
+bpy.ops.mesh.primitive_plane_add(size=2.0, location=(1, 0, 0))
+pl = ctx.active_object
+pl.rotation_euler = (0, 0, math.radians(30))
+ctx.view_layer.update()
+Pw0 = np.array([tuple(pl.matrix_world @ v.co) for v in pl.data.vertices])
+bpy.ops.object.mode_set(mode='EDIT')
+bpy.ops.mesh.select_all(action='SELECT')
+r = bpy.ops.nproto.scale(center=(0, 0, 0), factor=2.0, mode="ONE", direction=(1, 0, 0))
+bpy.ops.object.mode_set(mode='OBJECT')
+Pw = np.array([tuple(pl.matrix_world @ v.co) for v in pl.data.vertices])
+S1 = movetool.scale_matrix((0, 0, 0), 2.0, "ONE", (1, 0, 0))
+check("scale edit mesh: 1D in world on a turned object (sheared points)", r == {'FINISHED'}
+      and np.allclose(Pw, Pw0 @ S1[:3, :3].T + S1[:3, 3], atol=1e-5))
+
 # -- the hold key ------------------------------------------------------------------
 kc = ctx.window_manager.keyconfigs.addon
 items = [(km.name, k.idname) for km, k in movetool._keymaps]

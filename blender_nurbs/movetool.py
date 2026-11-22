@@ -1,4 +1,4 @@
-"""Move and Rotate by points, and copies along the way (hold G, hold R).
+"""Move, Rotate and Scale by points, and copies along the way (hold G, R, S).
 
 Tap G or R and Blender's own Move or Rotate runs, as it always did. Hold the
 key (longer than the preference's Hold Time, 300 ms by default) and the
@@ -18,7 +18,15 @@ when one is active), or V the view direction. Shift snaps the angle to 15°;
 a typed number is the angle in degrees, from the start point (or straight
 after the centre, from the plane's X).
 
-Copies: typed with a leading * or /, as SketchUp and 3ds Max take them.
+Scale: the centre, a first reference point, a second: the first's distance
+from the centre becomes the second's (factor = second / first). Uniform by
+default; X / Y / Z scale along that axis only (1D), Shift+X / Y / Z in the
+plane square to it (2D), M cycles uniform / 1D along the first reference /
+2D in the drawing plane. Shift steps the factor by 0.1. A typed number is
+the factor before the first reference and the second's length after it
+(2x: a factor). Scale makes no copies.
+
+Copies (Move, Rotate): typed with a leading * or /, as SketchUp and 3ds Max take them.
   *n   n copies, each one step further on (the original stays)
   /n   n copies spread evenly up to the target / end (the last on it)
 A copy that would land on the original (a full turn) is left out. NURBS
@@ -173,6 +181,50 @@ def circular_params(C, axis, deg, mode, n):
             "frame_z": [float(c) for c in z], "count": count, "angle": float(total), "rotate": True}
 
 
+SCALE_MODES = [("UNIFORM", "Uniform", "The same in every direction"),
+               ("ONE", "1D", "Along one direction only (the reference's, or X / Y / Z)"),
+               ("TWO", "2D", "In a plane only (the drawing plane, or square to X / Y / Z); "
+                             "unchanged along its normal")]
+FACTOR_SNAP = 0.1               # Shift: the factor in steps of this
+
+
+def scale_matrix(C, f, mode="UNIFORM", d=(0.0, 0.0, 1.0)):
+    """World 4x4: scale by f about C -- uniform, along the unit direction d
+    (ONE), or in the plane square to d (TWO)."""
+    d = np.asarray(d, float)
+    d = d / (np.linalg.norm(d) or 1.0)
+    if mode == "ONE":
+        A = np.eye(3) + (f - 1.0) * np.outer(d, d)
+    elif mode == "TWO":
+        A = f * np.eye(3) + (1.0 - f) * np.outer(d, d)
+    else:
+        A = f * np.eye(3)
+    C = np.asarray(C, float)
+    T = np.eye(4)
+    T[:3, :3] = A
+    T[:3, 3] = C - A @ C
+    return T
+
+
+def ref_length(C, P, mode="UNIFORM", d=(0.0, 0.0, 1.0)):
+    """How far P is from C as the scale measures it: the distance (UNIFORM),
+    along d (ONE, signed), or in the plane square to d (TWO)."""
+    v = np.asarray(P, float) - np.asarray(C, float)
+    d = np.asarray(d, float)
+    d = d / (np.linalg.norm(d) or 1.0)
+    if mode == "ONE":
+        return float(v @ d)
+    if mode == "TWO":
+        return float(np.linalg.norm(v - (v @ d) * d))
+    return float(np.linalg.norm(v))
+
+
+def parse_factor(text):
+    """A typed factor: '2', '1/3', 'x2', '2x' -> the number, or None."""
+    t = (text or "").strip().lower().strip("x×").strip()
+    return parse_angle(t)
+
+
 def roots(objs):
     """The objects none of whose parents is among them (a child moves with its parent)."""
     names = {o.name for o in objs}
@@ -190,10 +242,22 @@ def roots(objs):
 
 
 def transform_objects(objs, T):
-    """Each of objs (roots) moved by the world 4x4 T."""
+    """Each of objs (roots) moved by the world 4x4 T. -> the names of those
+    whose matrix can't hold the result exactly (a scale slanted to a turned
+    object would shear it: Blender keeps the nearest location / rotation /
+    scale)."""
     T = Matrix(np.asarray(T, float).tolist())
+    off = []
     for o in objs:
-        o.matrix_world = T @ o.matrix_world
+        want = T @ o.matrix_world
+        o.matrix_world = want
+        size = max(max(abs(x) for x in row) for row in want)
+        got = o.matrix_basis            # (built from location / rotation / scale; matrix_world reads back
+        if o.parent is not None:        #  the matrix just set until the next update)
+            got = o.parent.matrix_world @ o.matrix_parent_inverse @ got
+        if max(abs(got[i][j] - want[i][j]) for i in range(4) for j in range(4)) > 1e-5 * max(size, 1.0):
+            off.append(o.name)
+    return off
 
 
 def move_objects(objs, d):
@@ -328,6 +392,7 @@ class _PointsTool(SketchMixin):
     face_planes = False         # a free point lies on the drawing plane through the last point
     held_key = 'G'              # the key that started the tool (its release and key repeat are ignored)
     title = "Move"
+    allow_copies = True         # *n / /n typed
 
     copies: EnumProperty(name="Copies", items=COPY_ITEMS, default="NONE")
     count: IntProperty(name="Count", default=1, min=1, soft_max=50, max=pattern.MAX_COPIES,
@@ -388,7 +453,11 @@ class _PointsTool(SketchMixin):
                 except Exception as exc:
                     self.report({'WARNING'}, f"{name}: pivot of {o.name} not moved: {exc}")
         if self.copies == "NONE":
-            transform_objects(objs, self._transform())
+            off = transform_objects(objs, self._transform())
+            if off:
+                self.report({'WARNING'}, f"{name}: {', '.join(off[:3])}{' ...' if len(off) > 3 else ''}: turned "
+                                         "against the scale's direction, it can't be sheared; scaled as near as "
+                                         "an object allows (apply its rotation first, or scale in Edit Mode)")
             self.report({'INFO'}, f"{name}: {len(objs)} object(s), {self._amount_text(context)}")
             return {'FINISHED'}
         mats = self._copy_mats()
@@ -456,7 +525,7 @@ class _PointsTool(SketchMixin):
 
     # -- typing: a value, or (a leading * or /) the copies -------------------------
     def _live_copies(self):
-        if self._edit:
+        if self._edit or not self.allow_copies:
             return None
         if self._buf and self._buf[0] in "*/":
             return parse_copies(self._buf) or self._copy
@@ -471,6 +540,8 @@ class _PointsTool(SketchMixin):
         if (not self._buf and ch in "0123456789.-+*/") \
                 or (self._buf and not copies_typed and (ch in "0123456789.-+*/'\" ()" or ch.isalpha())) \
                 or (copies_typed and ch.isdigit()):
+            if ch in "*/" and not self._buf and not self.allow_copies:
+                return False
             if ch in "*/" and not self._buf and self._edit:
                 self.report({'INFO'}, f"{self.title}: copies are made in Object Mode")
                 return True
@@ -550,6 +621,9 @@ class _PointsTool(SketchMixin):
 
     def _type_hints(self, ready, value_text):
         c = self._live_copies()
+        if not self.allow_copies:
+            return [hints.key("0-9", value_text, on=None if ready else False),
+                    hints.key("Tab", "fix the typed value", on=None if self._buf else False)]
         return [hints.key("0-9", value_text, on=None if ready else False),
                 hints.key("*n", "n copies", on=(True if c and c[0] == "ARRAY" else None)
                           if ready and not self._edit else False),
@@ -1177,11 +1251,363 @@ class NPROTO_OT_rotate(_PointsTool, bpy.types.Operator):
 
 
 # --------------------------------------------------------------------------
+# Scale
+# --------------------------------------------------------------------------
+
+MODE_TEXT = {"UNIFORM": "uniform", "ONE": "1D", "TWO": "2D"}
+MODE_NEXT = {"UNIFORM": "ONE", "ONE": "TWO", "TWO": "UNIFORM"}
+
+
+class NPROTO_OT_scale(_PointsTool, bpy.types.Operator):
+    """Scale about a centre by reference: the first reference point's
+    distance becomes the second's (or a typed length / factor); uniform, 1D
+    or 2D (X / Y / Z, Shift+X / Y / Z). Hold S to start it"""
+    bl_idname = "nproto.scale"
+    bl_label = "Scale by Points"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    held_key = 'S'
+    title = "Scale"
+    allow_copies = False
+
+    center: FloatVectorProperty(name="Centre", size=3, subtype='XYZ', unit='LENGTH',
+                                description="The point that stays (world)")
+    factor: FloatProperty(name="Factor", default=1.0, soft_min=0.01, soft_max=100.0, precision=4,
+                          description="Lengths become this many times as long")
+    mode: EnumProperty(name="Scale", items=SCALE_MODES, default="UNIFORM")
+    direction: FloatVectorProperty(name="Direction", size=3, subtype='DIRECTION', default=(0.0, 0.0, 1.0),
+                                   description="1D: the direction scaled; 2D: the normal of the plane scaled")
+    set_pivot: BoolProperty(name="Pivot to Centre", default=False,
+                            description="Put the objects' origins at the centre first (Move Pivot)")
+
+    def draw(self, context):
+        lay = self.layout
+        lay.prop(self, "factor")
+        lay.prop(self, "mode")
+        lay.prop(self, "center")
+        if self.mode != "UNIFORM":
+            lay.prop(self, "direction")
+        if context.mode == 'OBJECT':
+            lay.prop(self, "set_pivot")
+
+    # -- what it does -------------------------------------------------------------
+    def _transform(self):
+        return scale_matrix(np.array(self.center, float), float(self.factor), self.mode,
+                            np.array(self.direction, float))
+
+    def _copy_mats(self):
+        return []
+
+    def _copy_params(self):
+        return {}
+
+    def _pivot_point(self):
+        return np.array(self.center, float)
+
+    def _amount_text(self, context):
+        return f"scaled ×{self.factor:.4g}" + ("" if self.mode == "UNIFORM" else f" ({MODE_TEXT[self.mode]})")
+
+    def _is_identity(self):
+        return abs(float(self.factor) - 1.0) <= 1e-9
+
+    def execute(self, context):
+        if float(self.factor) <= 1e-9:
+            self.report({'WARNING'}, "Scale: the factor must be above 0")
+            return {'CANCELLED'}
+        self.copies = "NONE"
+        return _PointsTool.execute(self, context)
+
+    # -- starting -------------------------------------------------------------
+    def invoke(self, context, event):
+        if context.area is None or context.area.type != 'VIEW_3D':
+            self.report({'WARNING'}, "Scale: run it in a 3D View")
+            return {'CANCELLED'}
+        if not self._gather(context):
+            return {'CANCELLED'}
+        self._c = None              # the centre
+        self._r1 = None             # the first reference point
+        self._smode = "UNIFORM"
+        self._axis = None           # 'X' / 'Y' / 'Z' chosen with the key, else None
+        self._normal = None         # the drawing plane's normal, fixed at the centre (2D)
+        self._start_common(context)
+        self._plane = self._view_plane(context, self._center)
+        context.window_manager.modal_handler_add(self)
+        self._refresh(context, event)
+        return {'RUNNING_MODAL'}
+
+    # -- the direction ------------------------------------------------------------
+    def _dir(self, context, P=None):
+        """1D: the direction scaled; 2D: the plane's normal; None (1D) until a reference shows it."""
+        if self._axis is not None:
+            a = self._axes(context)[self._axis]
+            return a / (np.linalg.norm(a) or 1.0)
+        if self._smode == "TWO":
+            if self._normal is not None:
+                return self._normal
+            n = self._view_plane(context, self._c if self._c is not None else self._center)[1]
+            return np.asarray(n, float)
+        if self._smode == "ONE":
+            Q = self._r1 if self._r1 is not None else P
+            if Q is not None and self._c is not None and np.linalg.norm(Q - self._c) > EPS:
+                return (Q - self._c) / np.linalg.norm(Q - self._c)
+            return None
+        return np.array([0.0, 0.0, 1.0])
+
+    def _axis_key(self, context, event):
+        """X / Y / Z: 1D along it; Shift: 2D square to it; again: uniform."""
+        mode = "TWO" if event.shift else "ONE"
+        if self._axis == event.type and self._smode == mode:
+            self._axis, self._smode = None, "UNIFORM"
+        else:
+            self._axis, self._smode = event.type, mode
+
+    # -- typing ---------------------------------------------------------------
+    def typing_ready(self):
+        return getattr(self, "_c", None) is not None
+
+    def _parse(self, context, text):
+        """("F", factor) or ("L", length): a factor before the first reference
+        or with an x (2x); after it a length."""
+        t = (text or "").strip()
+        if not t:
+            return None
+        if self._r1 is None or "x" in t.lower() or "×" in t:
+            v = parse_factor(t)
+            return None if v is None else ("F", v)
+        try:
+            return "L", parse_length(context, t)
+        except Exception:
+            return None
+
+    def _live_value(self, context):
+        if self._buf:
+            v = self._parse(context, self._buf)
+            return self._value if v is None else v
+        return self._value
+
+    # -- picking --------------------------------------------------------------
+    def _hover_point(self, context, event):
+        through = self._c if self._c is not None else self._center
+        self._plane = self._view_plane(context, through)
+        P, snap = self.pick_point(context, event, prev=self._c)
+        return (None if P is None else np.asarray(P, float)), snap
+
+    def _factor(self, context, event, P):
+        """The factor the tool would scale by now (or None), and the second
+        reference's length."""
+        typed = self._live_value(context)
+        d = self._dir(context, P)
+        if typed is not None and typed[0] == "F":
+            return typed[1], None
+        if self._c is None or self._r1 is None or (d is None and self._smode == "ONE"):
+            return None, None
+        L1 = ref_length(self._c, self._r1, self._smode, d if d is not None else (0, 0, 1))
+        if abs(L1) <= EPS:
+            return None, None
+        if typed is not None:
+            return typed[1] / L1, typed[1]
+        if P is None:
+            return None, None
+        L2 = ref_length(self._c, P, self._smode, d if d is not None else (0, 0, 1))
+        f = L2 / L1
+        if event is not None and event.shift and not self._axis_shift_event(event):
+            f = round(f / FACTOR_SNAP) * FACTOR_SNAP
+        return f, L2
+
+    @staticmethod
+    def _axis_shift_event(event):
+        return event.type in {'X', 'Y', 'Z'}
+
+    # -- display ----------------------------------------------------------------
+    def _status(self, context, f=None):
+        what, extra = self._state_common(context)
+        step = ("click the centre" if self._c is None else
+                "click the first reference (or type a factor)" if self._r1 is None else
+                "click the second reference (or type its length)")
+        state = [what, step]
+        if f is not None and not self._buf:
+            state.append(f"×{f:.4g}")
+        state += extra
+        state.append(MODE_TEXT[self._smode] + (f" {self._axis}" if self._axis else ""))
+        ready = self._c is not None
+        put = [hints.key("C", "3D cursor"), hints.key("W", "world origin")]
+        if ready:
+            put.append(hints.key("B", "pick the centre again"))
+        ax = self._axis
+        rows = [("Point", put),
+                ("Scale", [hints.cycle("M", ["uniform", "1D", "2D"], MODE_TEXT[self._smode]),
+                           hints.key("X Y Z", "1D along", on=True if ax and self._smode == "ONE" else None),
+                           hints.key("Shift+X/Y/Z", "2D square to", on=True if ax and self._smode == "TWO" else None),
+                           hints.key("Shift", f"steps of {FACTOR_SNAP:g}")]),
+                ("Snap", self.snap_hints()),
+                ("Type", self._type_hints(ready, "factor, then a length (2x: a factor)"))]
+        if not self._edit:
+            rows.append(("Pivot", [hints.toggle("P", "origins to the centre", self._pivot)]))
+        rows.append(("Scale", [hints.key("Backspace", "step back"), hints.key("Enter", "done")]))
+        hints.show(context, "Scale", state, rows,
+                   [("MOUSE_LMB", "Centre / reference / reference"), ("MOUSE_RMB", "Cancel"),
+                    ("EVENT_ESC", "Cancel")])
+
+    def _preview(self, context, event, hover):
+        ov = draw.sketch_overlay
+        P, snap = hover
+        ov["snap"] = Vector(tuple(P)) if P is not None and snap is not None else None
+        ov["snap_label"] = snap[3] if P is not None and snap is not None else None
+        ov["cursor"] = Vector(tuple(P)) if P is not None else None
+        ov["axes"] = []
+        V = lambda p: Vector(tuple(map(float, p)))
+        C = self._c
+        if C is None:
+            ov["refs"], ov["cvs"] = [], []
+            draw.pick_overlay["preview"] = None
+            self._status(context)
+            context.area.tag_redraw()
+            return
+        f, _L2 = self._factor(context, event, P)
+        from .workplanes import marker_size
+        L = marker_size(self._win(context)[1], C)
+        refs = self._cross(context, C, COL_BASE)
+        d = self._dir(context, P)
+        col = AXIS_COL.get(self._axis, COL_AXIS) if self._axis else COL_AXIS
+        if d is not None and self._smode == "ONE":
+            refs.append(([V(C - 3 * L * d), V(C + 3 * L * d)], col, 1.5))     # the direction scaled
+        elif d is not None and self._smode == "TWO":
+            refs.append(([V(C - 0.6 * L * d), V(C + 0.6 * L * d)], col, 2.0))  # the normal that stays
+        if self._r1 is not None:
+            refs.append(([V(C), V(self._r1)], COL_BASE, 1.5))
+            refs += self._cross(context, self._r1, COL_BASE, 0.6)
+        if f is None or abs(f - 1.0) <= 1e-12 or f <= 0:
+            if self._r1 is None and P is not None:
+                refs.append(([V(C), V(P)], COL_BASE, 1.0))
+            ov["refs"], ov["cvs"] = refs, []
+            draw.pick_overlay["preview"] = None
+            self._status(context, None if f is None or f <= 0 else f)
+            context.area.tag_redraw()
+            return
+        T = scale_matrix(C, f, self._smode, d if d is not None else (0, 0, 1))
+        if self._r1 is not None:
+            E = (T @ np.append(self._r1, 1.0))[:3]          # where the first reference ends up
+            refs.append(([V(C), V(E)], COL_LINE, 2.0))
+            at = E
+        else:
+            at = P if P is not None else C
+        self._show_result([T], f"×{f:.4g}", at, refs)
+        self._status(context, f)
+        context.area.tag_redraw()
+
+    def _refresh(self, context, event):
+        h = self._hover_point(context, event)
+        self._preview(context, event, h)
+        return h
+
+    # -- modal ------------------------------------------------------------------
+    def _place(self, context, event, P):
+        """A point picked (a click, C, W): the centre, the first reference, or the second (done)."""
+        if P is None:
+            return None
+        P = np.asarray(P, float)
+        if self._c is None:
+            self._c = P
+            self._normal = np.asarray(self._view_plane(context, P)[1], float)
+            self._refresh(context, event)
+            return None
+        typed = self._live_value(context)
+        if self._r1 is None and not (typed is not None and typed[0] == "F"):
+            d = self._dir(context, P)
+            if abs(ref_length(self._c, P, self._smode, d if d is not None else (0, 0, 1))) <= EPS:
+                self.report({'INFO'}, "Scale: the reference must lie away from the centre")
+                return None
+            self._r1 = P
+            self._refresh(context, event)
+            return None
+        return self._finish(context, event, P)
+
+    def modal(self, context, event):
+        if self.passthrough(context, event):
+            return {'PASS_THROUGH'}
+        if self.hints_key(context, event):
+            return {'RUNNING_MODAL'}
+        et, ev = event.type, event.value
+        if et == self.held_key:
+            return {'RUNNING_MODAL'}
+        if self._typed_key(context, event):
+            self._refresh(context, event)
+            return {'RUNNING_MODAL'}
+        if et in REFRESH_KEYS or self.snap_key(context, event):
+            self._refresh(context, event)
+        elif et == 'LEFTMOUSE' and ev == 'PRESS':
+            P, _ = self._hover_point(context, event)
+            r = self._place(context, event, P)
+            if r is not None:
+                return r
+        elif ev == 'PRESS' and et in {'X', 'Y', 'Z'} and not (event.ctrl or event.alt or event.oskey):
+            self._axis_key(context, event)
+            self._refresh(context, event)
+        elif ev == 'PRESS' and et == 'M' and not (event.ctrl or event.alt or event.oskey):
+            self._smode, self._axis = MODE_NEXT[self._smode], None
+            self._refresh(context, event)
+        elif ev == 'PRESS' and et in {'C', 'W'} and not (event.ctrl or event.alt or event.oskey):
+            P = np.array(context.scene.cursor.location, float) if et == 'C' else np.zeros(3)
+            r = self._place(context, event, P)
+            if r is not None:
+                return r
+        elif ev == 'PRESS' and et == 'B' and self._c is not None:
+            self._c, self._r1, self._normal = None, None, None
+            self._buf, self._value = "", None
+            self._refresh(context, event)
+        elif ev == 'PRESS' and et == 'P' and not self._edit:
+            self._pivot = not self._pivot
+            self._refresh(context, event)
+        elif ev == 'PRESS' and et == 'TAB':
+            if self._fix_buffer(context):
+                self._refresh(context, event)
+        elif ev == 'PRESS' and et == 'BACK_SPACE':
+            if self._buf:
+                self._buf = self._buf[:-1]
+            elif self._value is not None:
+                self._value = None
+            elif self._r1 is not None:
+                self._r1 = None
+            elif self._c is not None:
+                self._c, self._normal = None, None
+            self._refresh(context, event)
+        elif ev == 'PRESS' and et in {'RET', 'NUMPAD_ENTER', 'SPACE'}:
+            if self._c is not None:
+                P, _ = self._hover_point(context, event)
+                f, _ = self._factor(context, event, P)
+                if f is not None:
+                    return self._finish(context, event, P)
+        elif ev == 'PRESS' and et in {'ESC', 'RIGHTMOUSE'}:
+            self._end(context)
+            return {'CANCELLED'}
+        return {'RUNNING_MODAL'}
+
+    def _finish(self, context, event, P):
+        f, _ = self._factor(context, event, P)
+        d = self._dir(context, P)
+        C = self._c
+        self._end(context)
+        if f is None or abs(f - 1.0) <= 1e-12:
+            return {'CANCELLED'}
+        if f <= 0:
+            self.report({'WARNING'}, "Scale: the second reference lies past the centre (the factor would be "
+                                     f"{f:.3g}); nothing scaled")
+            return {'CANCELLED'}
+        self.center = tuple(map(float, C))
+        self.factor = float(f)
+        self.mode = self._smode
+        self.direction = tuple(map(float, d if d is not None else (0.0, 0.0, 1.0)))
+        self.set_pivot = bool(self._pivot)
+        return self.execute(context)
+
+
+# --------------------------------------------------------------------------
 # Hold the key: Blender's tool on a tap, this one on a hold
 # --------------------------------------------------------------------------
 
 HOLD_TOOLS = {"MOVE": ('G', "transform.translate", NPROTO_OT_move.bl_idname),
-              "ROTATE": ('R', "transform.rotate", NPROTO_OT_rotate.bl_idname)}
+              "ROTATE": ('R', "transform.rotate", NPROTO_OT_rotate.bl_idname),
+              "SCALE": ('S', "transform.resize", NPROTO_OT_scale.bl_idname)}
 
 
 def _run(idname):
@@ -1190,13 +1616,13 @@ def _run(idname):
 
 
 class NPROTO_OT_transform_hold(bpy.types.Operator):
-    """Tap: Blender's own Move / Rotate. Hold: Move / Rotate by Points (picked
-    points, copies) -- the add-on's Hold Time preference sets how long"""
+    """Tap: Blender's own Move / Rotate / Scale. Hold: Move / Rotate / Scale by
+    Points (picked points, copies) -- the add-on's Hold Time preference sets how long"""
     bl_idname = "nproto.transform_hold"
     bl_label = "Blender's Tool (tap) / By Points (hold)"
     bl_options = {'INTERNAL'}
 
-    kind: EnumProperty(items=[("MOVE", "Move", ""), ("ROTATE", "Rotate", "")], default="MOVE",
+    kind: EnumProperty(items=[("MOVE", "Move", ""), ("ROTATE", "Rotate", ""), ("SCALE", "Scale", "")], default="MOVE",
                        options={'HIDDEN'})
 
     def _native(self):
@@ -1252,12 +1678,13 @@ class NPROTO_OT_transform_hold(bpy.types.Operator):
 def menu_transform(self, context):
     self.layout.operator(NPROTO_OT_move.bl_idname, icon='EMPTY_ARROWS')
     self.layout.operator(NPROTO_OT_rotate.bl_idname, icon='DRIVER_ROTATIONAL_DIFFERENCE')
+    self.layout.operator(NPROTO_OT_scale.bl_idname, icon='FULLSCREEN_ENTER')
 
 
 MENUS = ("VIEW3D_MT_transform_object", "VIEW3D_MT_transform")
 KEYMAPS = ("Object Mode", "Mesh", "Curve", "Lattice")       # where Blender binds G / R / S
 
-classes = (NPROTO_OT_move, NPROTO_OT_rotate, NPROTO_OT_transform_hold)
+classes = (NPROTO_OT_move, NPROTO_OT_rotate, NPROTO_OT_scale, NPROTO_OT_transform_hold)
 _keymaps = []
 
 
