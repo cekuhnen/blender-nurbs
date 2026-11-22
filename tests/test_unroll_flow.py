@@ -178,6 +178,21 @@ for hist in (True, False):
     check(f"[{tag}] box sheet joined along 5 bends", wbrep(sheet).edge_count() == 19, f"{wbrep(sheet).edge_count()}")
     tab = json.loads(sheet[unroll.PROP_UNROLL])["faces"]
     check(f"[{tag}] box face table", sorted(k for k, _ in tab) == list(range(6)), f"{tab}")
+    # every face lies outside-up: x then y drawn on the sheet (seen from +Z) fold back turning
+    # about the box's outward normal, so lettering drawn on the sheet reads right on the part
+    fmap, mode, _ = flow.build_map(sheet, box)
+    bb, turns = wbrep(box), []
+    for f in wbrep(sheet).faces():
+        S = surfeval.Surf(f.surface())
+        uv = S.feet(np.array(f.centroid(), float)[None])[0]
+        c = S.at([uv[0]], [uv[1]], 0)[0, 0][0]
+        Q = fmap.map(np.array([c, c + [1e-3, 0, 0], c + [0, 1e-3, 0]]))
+        g = min(bb.faces(), key=lambda g_: g_.closest_point(tuple(map(float, Q[0])))[1])
+        Sg = surfeval.Surf(g.surface())
+        w = Sg.feet(Q[:1])[0]
+        turns.append(float(np.cross(Q[1] - Q[0], Q[2] - Q[0]) @ np.array(g.outward_normal_at_uv(*map(float, w)))))
+    check(f"[{tag}] box sheet lies outside-up (lettering reads right)", mode == "fold" and min(turns) > 0,
+          f"{[round(t * 1e6, 2) for t in turns]}")
     # a curve round a vertical edge that the cross cuts open: it comes apart in two
     bw = poly("Round", [(0.5, -0.5, 0.0), (1.0, -0.5, 0.0), (1.0, 0.0, 0.0)], cyclic=False)
     select([box, bw], box)

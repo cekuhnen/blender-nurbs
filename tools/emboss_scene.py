@@ -108,18 +108,6 @@ def run_emboss(tag, objs, body, **kw):
     return res
 
 
-def reads_right(sheet, body, text_obj):
-    """Does lettering seen from +Z on the sheet read the right way round from
-    outside the body after Wrap? (the map's turn at the lettering's centre)"""
-    P = np.vstack([np.array([p.co[:3] for p in sp.bezier_points]) for sp in text_obj.data.splines])
-    c = P.mean(axis=0)
-    fmap, _ = emboss.wrap_map(sheet, body, None, {})
-    e = 1e-3
-    Q = fmap.map(np.array([c, c + [e, 0, 0], c + [0, e, 0]]))
-    _, _, nout = emboss._hit_face(flow.world_brep(body), Q[0])
-    return float(np.cross(Q[1] - Q[0], Q[2] - Q[0]) @ nout) > 0.0
-
-
 def sheet_with(body, face_index):
     """(sheet, face index on it) of Unroll's sheets that holds the body's
     face; the other pieces (caps, sides) are deleted."""
@@ -217,7 +205,6 @@ for (tag, title), x in zip((("try", "WRAP  (try)\nUnroll made the sheet. Select 
     sheet.name = f"Bottle sheet ({tag})"
     c, rot, mir = spot_and_turn(sheet, fi, cyl)
     tw = lettering(f"Lettering ({tag} wrap)", "WRAP", (c[0], c[1], c[2]), 0.5, rot=rot, mirror=mir)
-    report[f"wrap {tag}: reads right"] = reads_right(sheet, cyl, tw) != mir
     report[f"wrap {tag}: sheet seen from inside"] = mir
     if tag == "done":
         run_emboss("wrap cylinder", [tw, sheet], cyl, mode="WRAP", height=0.05, overlap=0.015)
