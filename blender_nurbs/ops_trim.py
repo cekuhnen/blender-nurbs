@@ -1069,9 +1069,16 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
 
     def drag_handles(self):
         if self._variable():            # at the crossing's start and its end, on the rails there
-            return [self._handle("radius", 0, 0), self._handle("end_radius", len(self._sf) - 1,
-                                                                len(self._sf[-1][0]) - 1)]
-        return [self._handle(f) for f in self.drag_fields]
+            hs = [self._handle("radius", 0, 0), self._handle("end_radius", len(self._sf) - 1,
+                                                              len(self._sf[-1][0]) - 1)]
+            for h in hs:
+                h["label"] = True       # both values shown: they sit at opposite ends of the run
+            return hs
+        hs = [self._handle(f) for f in self.drag_fields]
+        if len(hs) > 1:                 # Radius A / B: both values shown, each on the rail it moves
+            for h in hs:
+                h["label"] = True
+        return hs
 
     def _too_short(self, context):
         if self._variable() and self.end_radius > 1e-9:

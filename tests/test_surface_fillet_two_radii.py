@@ -184,6 +184,46 @@ op.variable = True
 check("chamfer preview: Variable, Start / End Radius",
       [op._label(f) for f in op.drag_fields] == ["Start Radius", "End Radius"])
 
+
+def arrow_labels(op):
+    """The value labels the live stage draws on the arrows (drag refresh; its
+    later redraw needs a window, which the headless run has not got)."""
+    from blender_nurbs import draw
+    draw.pick_overlay["preview"] = None
+    for k, v in dict(_typed="", _grab=None, _hot=None, _field=0, bl_label="Fillet", trim_bases=True,
+                     auto_flip=True, smoothing=0.5).items():
+        if not hasattr(op, k):
+            setattr(op, k, v)
+    try:
+        op._drag_refresh(ctx)
+    except AttributeError:
+        pass                        # the area redraw (no window)
+    pv = draw.pick_overlay.get("preview")
+    return [(tuple(np.round(p_, 6)), s) for p_, s, _ in pv["labels"]] if pv else None
+
+
+op.end_radius = 0.03
+op.radius = 0.1
+lab = arrow_labels(op)
+want = [(tuple(np.round(vd.ValueDrag._pos(h), 6)), f"{op._label(h['field'])} {op._fmt(ctx, h['field'])}")
+        for h in op.drag_handles()]
+check("chamfer preview: Variable shows both values, each on its own arrow (start and end of the run)",
+      lab == want and len(lab) == 2 and all(any(c.isdigit() for c in s) for _, s in lab), (lab, want))
+op.variable = False
+op.same_radius = False
+op.radius, op.radius_b = RA, RB
+lab = arrow_labels(op)
+want = [(tuple(np.round(vd.ValueDrag._pos(h), 6)), f"{op._label(h['field'])} {op._fmt(ctx, h['field'])}")
+        for h in op.drag_handles()]
+check("chamfer preview: Radius A / B shows both values, each on its own arrow (A's on the wall's rail z = A, "
+      "B's on the floor's x = B)",
+      lab == want and [s.split(" ")[:2] for _, s in lab] == [["Radius", "A"], ["Radius", "B"]]
+      and abs(lab[0][0][2] - RA) < 1e-6 and abs(lab[1][0][0] - RB) < 1e-6, lab)
+op.same_radius = True
+lab = arrow_labels(op)
+check("chamfer preview: one radius, its one arrow labelled", lab is not None and len(lab) == 1
+      and lab[0][1].startswith("Radius "), lab)
+
 ctx.scene.nproto_settings.construction_history = False
 print("ALL PASS" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)
