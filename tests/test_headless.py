@@ -294,7 +294,9 @@ for _kind, _fa, _fb2, _shape, _ra, _rb in ((60, False, False, "CIRCULAR", 0.2, 0
     _f = _plain(_OpSF, _sf=_fr, flip_a=_fa, flip_b=_fb2, rail_type="RADIUS", same_radius=_ra == _rb, radius=_ra,
                 radius_b=_rb, shape=_shape)
     _j = len(_fr[0][0]) // 2
-    for _h, _rail in zip(_f.drag_handles(), (_Xs[0][_j, 0], _Xs[0][_j, -1])):
+    # one radius: on rail A; Radius A / B: each on the rail its value moves (A's on rail B, B's on rail A)
+    _rails = (_Xs[0][_j, 0], _Xs[0][_j, -1]) if _ra == _rb else (_Xs[0][_j, -1], _Xs[0][_j, 0])
+    for _h, _rail in zip(_f.drag_handles(), _rails):
         _sf_arrow.append(max(float(np.linalg.norm(_vd.ValueDrag._pos(_h) - _rail)),
                              abs(_h["to_value"](_h["param"]) - getattr(_f, _h["field"]))))
     r = bpy.ops.nproto.fillet(surf_a=_sa_o.name, surf_b=_sb_o.name, radius=_ra, radius_b=_rb, same_radius=_ra == _rb,

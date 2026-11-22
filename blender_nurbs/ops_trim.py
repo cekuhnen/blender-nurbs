@@ -756,9 +756,11 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         ("CHORD", "Chord", "The size is the distance between the two rails (where the fillet meets the faces)"),
     ], default="RADIUS")
     radius: FloatProperty(name="Radius A", default=0.25, min=0.0, soft_max=10.0, unit='LENGTH',
-                          description="Distance from surface A to its rail (with Variable Radius: the start "
-                                      "radius, 0 allowed)")
-    radius_b: FloatProperty(name="Radius B", default=0.25, min=1e-5, soft_max=10.0, unit='LENGTH')
+                          description="How far the ball's centre sits from surface A (the rails are the "
+                                      "ball's feet; a chamfer runs straight between them). With Variable "
+                                      "Radius: the start radius, 0 allowed")
+    radius_b: FloatProperty(name="Radius B", default=0.25, min=1e-5, soft_max=10.0, unit='LENGTH',
+                            description="How far the ball's centre sits from surface B (Same Radius off)")
     same_radius: BoolProperty(name="Same Radius", default=True)
     variable: BoolProperty(name="Variable Radius", default=False,
                            description="The ball radius runs smoothly (linearly with length) along the crossing "
@@ -901,7 +903,7 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
     def _label(self, name):
         if self.shape == "SOFT":
             return "Min Radius"
-        word = "Distance" if self.shape == "CHAMFER" else "Radius"
+        word = "Radius"                 # a chamfer's too: the ball's radii, its rails the feet
         if self._variable():
             return f"{'Start' if name == 'radius' else 'End'} {word}"
         if name == "radius" and self.rail_type == "CHORD":
@@ -1050,11 +1052,17 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
             elif self.same_radius:
                 to_value, param = (lambda t: t / (al + be)), ra * (al + be)
             else:
+                # Radius A alone: the centre's distance from A, which moves the
+                # rail on B (P + ra ca + rb (cb - B)) -- the rail on A barely (not
+                # at all at 90 deg: it sits Radius B from the crossing there)
+                D = ca + cb - B
+                D /= np.linalg.norm(D) or 1.0
+                al, be = float(ca @ D), float((cb - B) @ D)
                 to_value, param = (lambda t: (t - rb * be) / al), ra * al + rb * be
-        else:                           # the rail on B: P + ra ca + rb (cb - B), along D2
-            D = ca + cb - B
+        else:                           # Radius B: the rail on A, P + ra (ca - A) + rb cb, along D1
+            D = ca - A + cb
             D /= np.linalg.norm(D) or 1.0
-            al, be = float(ca @ D), float((cb - B) @ D)
+            al, be = float((ca - A) @ D), float(cb @ D)
             to_value, param = (lambda t: (t - ra * al) / be), ra * al + rb * be
         return {"field": field, "kind": "arrow", "origin": P[j], "dir": D, "base": P[j], "param": param,
                 "to_value": to_value}
@@ -1283,16 +1291,15 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         elif self.rail_type == "CHORD":
             col.prop(self, "radius", text="Chord")
         elif self.variable:
-            word = "Distance" if self.shape == "CHAMFER" else "Radius"
-            col.prop(self, "radius", text="Start " + word)
-            col.prop(self, "end_radius", text="End " + word)
+            col.prop(self, "radius", text="Start Radius")
+            col.prop(self, "end_radius", text="End Radius")
             col.prop(self, "variable")
         else:
-            col.prop(self, "radius", text="Distance A" if self.shape == "CHAMFER" else "Radius A")
+            col.prop(self, "radius", text="Radius A")       # a chamfer's too (the ball between its rails)
             col.prop(self, "same_radius")
             sub = col.row()
             sub.enabled = not self.same_radius
-            sub.prop(self, "radius_b", text="Distance B" if self.shape == "CHAMFER" else "Radius B")
+            sub.prop(self, "radius_b", text="Radius B")
             col.prop(self, "variable")
         row = lay.row(align=True)
         row.prop(self, "flip_a", toggle=True)

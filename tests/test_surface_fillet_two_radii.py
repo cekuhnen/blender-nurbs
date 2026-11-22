@@ -146,6 +146,44 @@ cx, cz = (S[0][0], S[-1][2]) if abs(S[0][2]) < 1e-12 else (S[-1][0], S[0][2])
 e = max(abs(math.hypot(p[0] - cx, p[2] - cz) - RA) for p in S)
 check("preview: equal radii stay the ball's arc", e < 1e-12, e)
 
+# --- a chamfer's live preview: two arrows labelled Radius A / Radius B ----------
+# (its A / B are the ball's radii, as for a circle: floor A 0.1, wall B 0.05 puts
+# the floor's rail at x = 0.05 and the wall's at z = 0.1, the kernel's chamfer too)
+from blender_nurbs import valuedrag as vd
+from blender_nurbs.ops_trim import NPROTO_OT_fillet
+clear()
+a, b = sheet("Floor", (0, 0, 0), (L, 0, 0)), sheet("Wall", (0, 0, 0), (0, 0, L))
+body = {k: v for k, v in NPROTO_OT_fillet.__dict__.items() if not k.startswith("__") and not k.startswith("bl_")}
+op = type("PlainFillet", (vd.ValueDrag,), body)()
+for k, v in dict(surf_a=a.name, surf_b=b.name, flip_a=False, flip_b=False, rail_type="RADIUS", same_radius=False,
+                 radius=RA, radius_b=RB, shape="CHAMFER", continuity="2", ends="NOTCH", variable=False,
+                 end_radius=0.0, _msg="").items():
+    setattr(op, k, v)
+op.drag_setup(ctx, None)
+hs = op.drag_handles()
+pos = {h["field"]: vd.ValueDrag._pos(h) for h in hs}
+back = max(abs(h["to_value"](h["param"]) - getattr(op, h["field"])) for h in hs)
+X = op.drag_preview()["lines"]
+# each arrow on the rail its value moves: Radius A (the centre's height over the floor)
+# the wall's rail z = A, Radius B the floor's rail x = B; dragging one 0.02 further
+# out makes its value 0.02 bigger (at 90 deg), the other stays
+on = (abs(pos["radius"][0]) + abs(pos["radius"][2] - RA) + abs(pos["radius_b"][0] - RB) + abs(pos["radius_b"][2])
+      if set(pos) == {"radius", "radius_b"} else 1)
+drag = max(abs(h["to_value"](h["param"] + 0.02) - (getattr(op, h["field"]) + 0.02)) for h in hs)
+check("chamfer preview: two arrows labelled Radius A / Radius B, each on the rail its value moves",
+      [op._label(f) for f in op.drag_fields] == ["Radius A", "Radius B"] and on < 1e-7 and back < 1e-9
+      and drag < 1e-9 and len(X), ([op._label(f) for f in op.drag_fields], pos, back, drag))
+X = surface_fillet_sections(*op._sf[0], *op._radii(*op._sf[0], 0), *op._sides(), "CHAMFER")
+ends = max(max(abs(q[0] - RB) + abs(q[2]) for q in X[:, 0]), max(abs(q[0]) + abs(q[2] - RA) for q in X[:, -1]))
+check("chamfer preview: the straight sections run from the floor's rail x = B to the wall's z = A "
+      "(where the kernel's chamfer puts them)", ends < 1e-7, ends)
+op.same_radius = True
+check("chamfer preview: Same Radius, one arrow labelled Radius",
+      [op._label(f) for f in op.drag_fields] == ["Radius"] and len(op.drag_handles()) == 1)
+op.variable = True
+check("chamfer preview: Variable, Start / End Radius",
+      [op._label(f) for f in op.drag_fields] == ["Start Radius", "End Radius"])
+
 ctx.scene.nproto_settings.construction_history = False
 print("ALL PASS" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)
