@@ -247,4 +247,50 @@ for mode in ("MITRE", "BLEND"):
           r == {'FINISHED'} and shared(o) >= 1 and (info["mitre"] if mode == "MITRE" else info["blend"]) == 1
           and spread is not None and spread < 1e-4, f"faces {nf} shared {shared(o)} {info} spread {spread}")
 
+# --- 4. A joined profile extrudes with a face per piece: a trimmed rectangle's
+#        three sides joined to a half circle that meets them tangentially. The
+#        arc gets its own face, its rims are circular edges (their centre snaps).
+from blender_nurbs import snapping
+clear()
+U = nurbs("U", [(-0.15, 0.28, 0), (-0.15, -0.28, 0), (0.15, -0.28, 0), (0.15, 0.28, 0)])
+A = arc(0.15, (0.0, 0.28, 0.0))
+bpy.ops.object.select_all(action='DESELECT')
+for o in (U, A):
+    o.select_set(True)
+ctx.view_layer.objects.active = U
+r = bpy.ops.nproto.join_curves()
+J = ctx.active_object
+bpy.ops.object.select_all(action='DESELECT')
+r2 = bpy.ops.nproto.extrude(inputs=ins((J, "S0")), distance=0.6, direction="Z", body="NEW")
+S = ctx.active_object
+B = store.get_brep(S)
+cens = []
+for e in B.edges():
+    t0, t1 = e.parameter_range()
+    c = snapping.circle_centre([e.point_at(t0 + (t1 - t0) * k / 12) for k in range(13)])
+    if c is not None:
+        cens.append(np.round(c, 6))
+vol = abs(B.volume(1e-6)) if B.is_manifold_solid() else 0.0
+want = (0.3 * 0.56 + 0.5 * math.pi * 0.15 ** 2) * 0.6
+check("joined line + tangent arc: one wall face per piece, the arc's rims circular (centre snaps)",
+      r == {'FINISHED'} and r2 == {'FINISHED'} and B.face_count() == 6 and len(cens) == 2
+      and all(abs(c[0]) < 1e-6 and abs(c[1] - 0.28) < 1e-6 for c in cens) and abs(vol - want) < 1e-6 * want,
+      f"faces {B.face_count()} centres {[c.tolist() for c in cens]} vol {vol} want {want}")
+
+# a slot (one spline: lines into half circles, no join record) splits there too
+clear()
+from blender_nurbs import primitives
+cu = bpy.data.curves.new("Slot", 'CURVE')
+K = bpy.data.objects.new("Slot", cu); ctx.collection.objects.link(K)
+primitives.write_spline_object(K, features.run("prim_slot", [], {"length": 1.0, "width": 0.4})[1])
+bpy.ops.object.select_all(action='DESELECT')
+r = bpy.ops.nproto.extrude(inputs=ins((K, "S0")), distance=0.5, direction="Z", body="NEW")
+B = store.get_brep(ctx.active_object)
+ncirc = sum(1 for e in B.edges() if snapping.circle_centre(
+    [e.point_at(e.parameter_range()[0] + (e.parameter_range()[1] - e.parameter_range()[0]) * k / 12)
+     for k in range(13)]) is not None)
+check("slot: two straight walls, two half-round walls, four circular rims",
+      r == {'FINISHED'} and B.face_count() == 6 and ncirc == 4 and B.is_manifold_solid(),
+      f"faces {B.face_count()} circular edges {ncirc}")
+
 print("ALL OK" if ok else "SOME FAILED")
