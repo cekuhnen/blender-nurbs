@@ -206,12 +206,74 @@ B = extrude([circle(0.3, (0.6, 0.0, 4))], -2.8, body="CUT")
 v0 = vol(B)
 r = move(B, (0.6, 0.0, 1.2), move_x=-1.5)
 check("a pocket slid into another refused", r == {'CANCELLED'} and abs(vol(B) - v0) < 1e-9)
+# --- drafted walls: continued along their own rulings to a far plane ------------------------
+def disc_centre(o, near, r_):
+    """Centre of the flat disc of radius r_ nearest near (a drafted pocket's floor, a boss's top)."""
+    cs = []
+    for f in store.get_brep(o).faces():
+        if f.surface().is_planar() and abs(f.area(1e-6) - math.pi * r_ * r_) < 1e-4:
+            e = f.edges()[0]
+            t0, t1 = e.parameter_range()
+            P = np.array([e.point_at(float(t)) for t in np.linspace(t0, t1, 25)[:-1]], float)
+            cs.append(sx.fit_circle(P, 1e-7, 4.0)[0])
+    return min(cs, key=lambda c: np.linalg.norm(c - np.asarray(near, float))) if cs else None
+
+r_floor = 0.3 - 2.8 * math.tan(math.radians(5.0))
 clear()
 B = bump_box()
 B = extrude([circle(0.3, (0.6, 0.0, 4))], -2.8, body="CUT", draft=5.0)
+n0 = nfaces(B)
+c0 = disc_centre(B, (0.6, 0, 1.2), r_floor)
+idx = face_ids(B, (0.6, 0.0, 1.2))
+R, A, A2 = expected(B, idx, (-0.7, 0.3))
+r = move(B, (0.6, 0.0, 1.2), move_x=-0.7, move_y=0.3)
+c1 = disc_centre(B, R @ (c0 - A) + A2, r_floor)
+check("a drafted (conical) pocket slid by its floor", r == {'FINISHED'} and solid(B) and nfaces(B) == n0
+      and c1 is not None and np.allclose(c1, R @ (c0 - A) + A2, atol=1e-6), f"{c1} vs {R @ (c0 - A) + A2}")
+clear()
+B = bump_box()
+B = extrude([poly("Sq", [(0.3, -0.3, 4), (0.9, -0.3, 4), (0.9, 0.3, 4), (0.3, 0.3, 4)])], -2.8, body="CUT", draft=6.0)
+n0 = nfaces(B)
+fl0 = min(store.get_brep(B).faces(), key=lambda f: f.closest_point((0.6, 0.0, 1.2))[1])
+c0 = np.mean([np.array(v, float) for v in fl0.bounding_box()], axis=0)
+idx = face_ids(B, (0.6, 0.0, 1.2))
+R, A, A2 = expected(B, idx, (-0.8, 0.0))
+r = move(B, (0.6, 0.0, 1.2), move_x=-0.8)
+want = R @ (c0 - A) + A2
+fl = min(store.get_brep(B).faces(), key=lambda f: f.closest_point(tuple(want))[1])
+check("a drafted square pocket slid (flat walls leaning in)", r == {'FINISHED'} and solid(B) and nfaces(B) == n0
+      and fl.closest_point(tuple(want))[1] < 1e-6 and fl.surface().is_planar())
+clear()
+B = bump_box()
+B = extrude([circle(0.25, (-0.8, 0, -1))], 5.0, body="CUT", draft=3.0)
+n0 = nfaces(B)
+r = move(B, (-0.8, 0.0, 1.0), move_x=0.6)
+check("a drafted hole through the bump and the bottom slid", r == {'FINISHED'} and solid(B) and nfaces(B) == n0)
+clear()
+B = bump_box()
+B = extrude([circle(0.3, (0.0, -0.6, 1.5))], 1.8, body="JOIN", draft=-5.0)
+r_top = 0.3 - 1.8 * math.tan(math.radians(5.0))
+n0 = nfaces(B)
+c0 = disc_centre(B, (0.0, -0.6, 3.3), r_top)
+idx = face_ids(B, (0.0, -0.6, 3.3))
+R, A, A2 = expected(B, idx, (0.5, 0.6))
+r = move(B, (0.0, -0.6, 3.3), move_x=0.5, move_y=0.6)
+c1 = disc_centre(B, R @ (c0 - A) + A2, r_top)
+check("a drafted boss slid by its top", r == {'FINISHED'} and solid(B) and nfaces(B) == n0
+      and c1 is not None and np.allclose(c1, R @ (c0 - A) + A2, atol=1e-6), f"{c1}")
+
+# --- rounded walls (a spherical dimple) are refused ---------------------------------------------
+clear()
+B = bump_box()
+ctx.scene.cursor.location = (0.6, 0.0, 2.75)
+bpy.ops.nproto.add_primitive(kind="SPHERE", radius=0.4)
+ctx.scene.cursor.location = (0, 0, 0)
+Sb = ctx.active_object
+bpy.ops.nproto.boolean(operation="DIFFERENCE", names=json.dumps([B.name, Sb.name]))
+B = ctx.active_object
 v0 = vol(B)
-r = move(B, (0.6, 0.0, 1.2), move_x=-0.5)
-check("a pocket with drafted walls refused", r == {'CANCELLED'} and abs(vol(B) - v0) < 1e-9)
+r = move(B, (0.6, 0.0, 2.36), move_x=-0.5)
+check("a rounded (spherical) dimple refused on a free-form face", r == {'CANCELLED'} and abs(vol(B) - v0) < 1e-9)
 
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)

@@ -135,6 +135,18 @@ cs = sorted(float(np.mean([np.array(v, float) for v in f.bounding_box()], axis=0
 check("a hole in the boss moves with it", r == {'FINISHED'} and solid(P) and nfaces(P) == n0
       and abs(vol(P) - v0) < 1e-5 and np.allclose(cs, [3.5, 3.5], atol=1e-6), f"x {cs} vol {vol(P):.6f}")
 
+# --- a drafted pocket slides on a flat face like any other (the rim stays on it)
+clear()
+extrude([poly("R", [(0, 0, 0), (6, 0, 0), (6, 4, 0), (0, 4, 0)])], 1.0)
+bpy.ops.curve.primitive_nurbs_circle_add(radius=0.5, location=(2, 2, 1))
+bpy.ops.nproto.extrude(inputs=ins(ctx.active_object), distance=-0.6, direction="Z", body="CUT", draft=8.0)
+P = ctx.active_object
+v0, n0 = vol(P), nfaces(P)
+r = move(P, [(2, 2, 0.4)], 1.5, 0.5)
+fl = min(store.get_brep(P).faces(), key=lambda f: f.closest_point((3.5, 2.5, 0.4))[1])
+check("a drafted pocket slid on a flat face", r == {'FINISHED'} and solid(P) and nfaces(P) == n0
+      and abs(vol(P) - v0) < 1e-5 and fl.closest_point((3.5, 2.5, 0.4))[1] < 1e-6, f"vol {vol(P):.6f}/{v0:.6f}")
+
 # --- Face mode picks; the directions come from the face it sits in
 clear()
 P = plate_with_hole()

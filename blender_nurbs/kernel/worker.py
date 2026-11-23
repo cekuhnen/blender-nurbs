@@ -3910,6 +3910,137 @@ def _reseat_motion(job, seats):
     return (lambda P: (np.asarray(P, float) - A) @ R.T + A2), rot, A, A2
 
 
+def _profile_normal(region, rim_edges):
+    """The normal of the flat profile a feature's walls were extruded from (with
+    draft): the plane of a ruled wall's CV rows, else of a flat face of the
+    feature away from its rims (a pocket's floor, a boss's top); None."""
+    np = _np()
+    for F in region:
+        if not any(e in rim_edges for e in F.edges()) or F.surface().is_planar():
+            continue
+        rr = _ruled_rows(F.surface())
+        if rr is None:
+            return None
+        P = rr[0][0]
+        if len(P) < 3:
+            continue
+        c = P.mean(axis=0)
+        _, sv, Vt = np.linalg.svd(P - c)
+        if sv[-1] > 1e-7 * (sv[0] or 1.0):
+            return None                           # a row that is not flat
+        return Vt[2]
+    for F in region:
+        if F.surface().is_planar() and not any(e in rim_edges for e in F.edges()):
+            return _face_normal(F, np.array(F.interior_point(), float))
+    return None
+
+
+def _ruled_tool(walls, rims, out, sides, emove, vmove, ext_d, tol, btol):
+    """([new face or None per wall], [caps]) of a drafted feature's tool: each
+    wall at a rim continued along its own rulings to the far plane of that rim
+    (across the profile normal, past the face), its side lines run on to the
+    plane, the rim replaced by the wall's edge on the plane (a line on a flat
+    wall, an iso across the rulings on a ruled one); each rim's far edges
+    closed by a flat cap."""
+    np = _np()
+    from trimext import _edge_curve, _iso_piece
+    plane = {}                                    # rim id -> (unit outward normal, height)
+    for S, (c, _, _) in rims:
+        dv, ev = out[id(c)]
+        P = _loop_polygon(c, 8)
+        plane[id(c)] = (dv, float((P @ dv).max()) + ev)
+    rim_of = {e: id(c) for S, (c, _, _) in rims for e, _ in c}
+    v_rim = {}
+    for S, (c, _, _) in rims:
+        for e, _ in c:
+            for v in e.vertices():
+                v_rim[v] = id(c)
+
+    def on_plane(a, b, key):
+        """Where the line a -> b (on through) meets rim key's far plane."""
+        n, h = plane[key]
+        t = (h - float(a @ n)) / float((b - a) @ n)
+        return a + t * (b - a)
+
+    def side_far(e):
+        a, b = np.array(e.start_vertex().point(), float), np.array(e.end_vertex().point(), float)
+        A_, B_ = a, b
+        if e.start_vertex() in v_rim:
+            A_ = on_plane(b, a, v_rim[e.start_vertex()])
+        if e.end_vertex() in v_rim:
+            B_ = on_plane(a, b, v_rim[e.end_vertex()])
+        return A_, B_
+    far_pt = {}
+    for e in sides:
+        A_, B_ = side_far(e)
+        if e.start_vertex() in v_rim:
+            far_pt[e.start_vertex()] = A_
+        if e.end_vertex() in v_rim:
+            far_pt[e.end_vertex()] = B_
+    built, far_pieces = [], {}
+    for F in walls:
+        if not any(e in emove or e in sides for e in F.edges()):
+            built.append(None)
+            continue
+        Wx = _extended_surface(F.surface(), ext_d, tol)
+        rr = None if F.surface().is_planar() else _ruled_rows(Wx)
+        loops = []
+        for loop in F.boundary_loops():
+            cs = []
+            for e, fw in loop:
+                if e in emove:
+                    key = rim_of[e]
+                    va, vb = (e.start_vertex(), e.end_vertex()) if fw else (e.end_vertex(), e.start_vertex())
+                    if va not in far_pt or vb not in far_pt:
+                        raise RuntimeError("a rim of the feature has no straight side at its ends")
+                    Pa, Pb = far_pt[va], far_pt[vb]
+                    if rr is None:                # a flat wall: the line on the far plane
+                        piece = ext.curve_from_cvs(1, [tuple(map(float, Pa)), tuple(map(float, Pb))],
+                                                   [0.0, 0.0, 1.0, 1.0], None)
+                    else:                         # a ruled wall: the iso across its rulings there
+                        ruling_u = rr[1]
+                        uva = _uvxy(sm.surface_closest_point(Wx, tuple(map(float, Pa)))[1][0])
+                        uvb = _uvxy(sm.surface_closest_point(Wx, tuple(map(float, Pb)))[1][0])
+                        val = uva[0] if ruling_u else uva[1]
+                        qa, qb = (uva[1], uvb[1]) if ruling_u else (uva[0], uvb[0])
+                        lo, hi = Wx.v_domain() if ruling_u else Wx.u_domain()
+                        rim_c = _edge_curve(e, fw)
+                        t0, t1 = rim_c.parameter_range()
+                        Q = [_uvxy(sm.surface_closest_point(Wx, tuple(map(float, rim_c.evaluate(float(t)))))[1][0])
+                             for t in np.linspace(t0, t1, 9)]
+                        qs = [q[1] if ruling_u else q[0] for q in Q]
+                        per = hi - lo                 # which way the rim runs across the rulings (wrapped: a
+                        net = sum((b_ - a_ + per / 2) % per - per / 2 for a_, b_ in zip(qs, qs[1:]))   # seam alias)
+                        up = net > 0
+                        if np.linalg.norm(Pa - Pb) <= 1e3 * tol:      # a closed rim: all the way round
+                            qa, qb = (lo, hi) if up else (hi, lo)
+                        piece = _iso_piece(Wx, ruling_u, val, qa, qb)
+                    n, h = plane[key]
+                    for t in np.linspace(*piece.parameter_range(), 7):
+                        if abs(float(np.array(piece.evaluate(float(t)), float) @ n) - h) > 1e3 * tol:
+                            raise RuntimeError("the feature's walls do not come from one flat profile: on a "
+                                               "free-form face it can't be continued past the face")
+                    far_pieces.setdefault(key, []).append(piece)
+                    cs.append(ext.curve_from_cvs(*_cv_tuple(ext.curve_cvs(piece))))
+                elif e in sides:
+                    A_, B_ = side_far(e)
+                    A_, B_ = (A_, B_) if fw else (B_, A_)
+                    cs.append(ext.curve_from_cvs(1, [tuple(map(float, A_)), tuple(map(float, B_))],
+                                                 [0.0, 0.0, 1.0, 1.0], None))
+                elif e.length() > tol:
+                    cs.append(_edge_curve(e, fw))
+            loops.append(cs)
+        built.append(ext.trim_surface_with_3d_curves_tol(Wx, [len(l) for l in loops], [x for l in loops for x in l],
+                                                         10 * tol, btol))
+    caps = []
+    for key, pieces in far_pieces.items():
+        ch = _chain([ext.curve_from_cvs(*_cv_tuple(ext.curve_cvs(x))) for x in pieces], 1e3 * tol)
+        if ch is None:
+            raise RuntimeError("the feature's far outline does not close")
+        caps.append(sm.create_planar_faces(ch))
+    return built, caps
+
+
 def _move_reseat(job, body, region, seats, rim_edges, rims_all, M, rot, A, A2, size, tol, btol):
     """Move Face on free-form seats: the feature as a closed tool -- its faces,
     the walls continued straight past each rim (their own rulings: an
@@ -3941,16 +4072,38 @@ def _move_reseat(job, body, region, seats, rim_edges, rims_all, M, rot, A, A2, s
                 continue
             a, b = np.array(e.start_vertex().point(), float), np.array(e.end_vertex().point(), float)
             if abs(e.length() - float(np.linalg.norm(b - a))) > 1e-6 * max(e.length(), size):
-                raise RuntimeError("the feature's walls are not straight (drafted or rounded): on a free-form "
-                                   "face only a feature with straight walls (an Extrude's) can move")
-            u = (b - a) / np.linalg.norm(b - a)
-            if d is not None and np.linalg.norm(np.cross(u, d)) > 1e-6:
-                raise RuntimeError("the feature's walls do not run one way: on a free-form face only a "
-                                   "feature with straight walls (an Extrude's) can move")
-            d = u if d is None else d
+                raise RuntimeError("the feature's walls are not ruled straight (rounded): on a free-form face "
+                                   "only a feature with straight or drafted walls (an Extrude's) can move")
             sides.append(e)
-    if d is None:
+    if not sides:
         raise RuntimeError("the feature's walls have no straight side to continue past the face")
+    dirs = []
+    for e in sides:
+        a, b = np.array(e.start_vertex().point(), float), np.array(e.end_vertex().point(), float)
+        dirs.append((b - a) / np.linalg.norm(b - a))
+    d = dirs[0] if all(np.linalg.norm(np.cross(u, dirs[0])) <= 1e-6 for u in dirs) else None
+    if d is not None:                             # one way, but a curved wall must be an extrusion along it (a
+        for F in region:                          # cone's single seam runs one way too)
+            if F.surface().is_planar() or not any(e in rim_edges for e in F.edges()):
+                continue
+            rr = _ruled_rows(F.surface())
+            if rr is None:
+                d = None
+                break
+            D = (rr[0][1] - rr[0][0]).reshape(-1, 3)
+            if float(np.linalg.norm(np.cross(D, d), axis=1).max()) > 1e-6 * float(np.linalg.norm(D, axis=1).max()):
+                d = None
+                break
+    if d is None:                                 # drafted: the walls continue along their own rulings, to a far
+        d = _profile_normal(region, rim_edges)    # plane across the profile they were extruded from
+        if d is None:
+            raise RuntimeError("the feature's walls do not come from one flat profile (an Extrude's, with or "
+                               "without draft): on a free-form face it can't be continued past the face")
+        if any(abs(float(u @ d)) < 0.1 for u in dirs):
+            raise RuntimeError("the feature's walls run along its profile: it can't be continued past the face")
+        drafted = True
+    else:
+        drafted = False
     # each rim: which way is out of the feature (away from its middle), and how far to go
     out = {}
     for S, (c, _, _) in rims:
@@ -3982,7 +4135,7 @@ def _move_reseat(job, body, region, seats, rim_edges, rims_all, M, rot, A, A2, s
             if any(c_ != "inside" for c_ in cls(F1, Q)):
                 raise RuntimeError("the feature would run into another hole or feature in that face")
     # the tool: walls continued straight past their rims, capped
-    ext_d = 4.0 * max(e_ for _, e_ in out.values()) + 10 * tol
+    ext_d = 4.0 * max(e_ for _, e_ in out.values()) + 2.0 * fsize + 10 * tol   # past the far plane, a rim's slope too
     vmove = {}
     for S, (c, _, _) in rims:
         for e, _ in c:
@@ -3991,7 +4144,9 @@ def _move_reseat(job, body, region, seats, rim_edges, rims_all, M, rot, A, A2, s
     emove = {e: out[id(c)] for S, (c, _, _) in rims for e, _ in c}
     idx = [i for i, f in enumerate(faces) if f in region]
     built = []
-    for F in [faces[i] for i in idx]:
+    if drafted:
+        built, caps = _ruled_tool([faces[i] for i in idx], rims, out, sides, emove, vmove, ext_d, tol, btol)
+    for F in ([] if drafted else [faces[i] for i in idx]):
         if not any(e in emove or e in sides for e in F.edges()):
             built.append(None)
             continue
@@ -4032,11 +4187,13 @@ def _move_reseat(job, body, region, seats, rim_edges, rims_all, M, rot, A, A2, s
     for nb in built:
         if nb is not None:
             ext.append_brep(tool, nb)
-    for S, (c, _, _) in rims:
+    for S, (c, _, _) in ([] if drafted else rims):
         dv, ev = out[id(c)]
         G = ext.surface_from_cvs(*_srf_tuple(ext.surface_cvs(S.surface())))
         plug = ext.trim_surface_with_3d_curves_tol(G, [len(c)], [_edge_curve(e, fw) for e, fw in c], 10 * tol, btol)
         ext.append_brep(tool, sm.translate(plug, tuple(map(float, ev * dv))))
+    for cap in (caps if drafted else []):
+        ext.append_brep(tool, cap)
     tool = sm.stitch_advanced(tool, 10 * tol, squeeze_small_edges=False, making_manifold_solid=True)[0]
     if not tool.is_manifold_solid():
         raise RuntimeError("the feature does not close into a solid when continued past the face")

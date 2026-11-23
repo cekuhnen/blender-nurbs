@@ -157,6 +157,19 @@ check("a blind hole turned to the other side", r == {'FINISHED'} and solid(R) an
       and abs(float(np.mean([np.array(v, float) for v in fl[0].bounding_box()], axis=0)[1]) - 0.5) < 1e-6,
       f"vol {vol(R):.6f}/{v0:.6f}")
 
+# --- a drafted blind hole in a rod, turned (rigid: the rim stays on the cylinder)
+clear()
+R = rod()
+R = cross_hole(2.0, depth=1.5)
+v_plain = vol(R)
+clear()
+R = rod()
+R = extrude([circle(0.3, (0, -2, 2.0), normal=(0, 1, 0))], 1.5, body="CUT", direction="Y", draft=6.0)
+v0, n0 = vol(R), nfaces(R)
+r = move(R, (0, -0.75, 2.0), turn=60.0)
+check("a drafted blind hole turned in a rod", r == {'FINISHED'} and solid(R) and nfaces(R) == n0
+      and abs(vol(R) - v0) < 1e-5 and abs(vol(R) - v_plain) > 1e-3, f"vol {vol(R):.6f}/{v0:.6f}")
+
 # --- a boss on a rod, turned by its top ------------------------------------------------
 clear()
 R = rod()
