@@ -2966,12 +2966,17 @@ BOOL_SUFFIX = {"UNION": "union", "DIFFERENCE": "difference", "INTERSECTION": "in
 class NPROTO_OT_boolean(bpy.types.Operator):
     """Union, difference or intersection of closed solids. The active object is
     the target (for Difference, the body that is cut); the other selected solids
-    are the tools. With history the inputs are hidden and the result follows them"""
+    are the tools. With history the inputs are hidden and the result follows them;
+    Keep Tools leaves the tools where they are, shown"""
     bl_idname = "nproto.boolean"
     bl_label = "Boolean"
     bl_options = {'REGISTER', 'UNDO'}
 
     operation: EnumProperty(name="Operation", items=BOOL_ITEMS, default="UNION")
+    keep_tools: BoolProperty(name="Keep Tools", default=False,
+                             description="Keep the tool bodies (the selected solids other than the active one) "
+                                         "shown after the Boolean instead of hiding (history) or deleting them. "
+                                         "With history the result still follows them")
     names: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})   # target first, then the tools
 
     def invoke(self, context, event):
@@ -2993,7 +2998,7 @@ class NPROTO_OT_boolean(bpy.types.Operator):
             self.report({'WARNING'}, "Select two or more closed NURBS solids (the active one is the target)")
             return {'CANCELLED'}
         try:
-            res, msg = combine_solids(context, objs, self.operation, self)
+            res, msg = combine_solids(context, objs, self.operation, self, keep_tools=self.keep_tools)
         except jobs.JobError as exc:
             self.report({'ERROR'}, f"Boolean failed: {exc}")
             return {'CANCELLED'}
@@ -3002,20 +3007,22 @@ class NPROTO_OT_boolean(bpy.types.Operator):
         return {'FINISHED'}
 
 
-def combine_solids(context, objs, operation, op, name=None):
+def combine_solids(context, objs, operation, op, name=None, keep_tools=False):
     """Boolean of closed solids objs (the first is the target) -> (result object,
     message). With history: a new result that keeps the inputs hidden (named
     `name`, else target_union...). Without: the target's geometry is replaced
-    and the tools are removed. Raises jobs.JobError."""
+    and the tools are removed. keep_tools: the tools (objs[1:]) stay where they
+    are, shown (with history still live inputs). Raises jobs.JobError."""
     target = objs[0]
     if features.history_enabled(context):
         g = features.run("boolean", [(o, "SURF") for o in objs], {"bool_op": operation})
         res = store.new_object_text(context, name or f"{target.name}_{BOOL_SUFFIX[operation]}", g[1])
         features.record(res, "boolean", [(o, "SURF") for o in objs], {"bool_op": operation})
-        features.keep_inputs(context, objs)
+        features.keep_inputs(context, objs[:1] if keep_tools else objs)
         features.mark_built(res)
         return res, (f"Boolean {operation.lower()} of {len(objs)} solids "
-                     "(inputs kept hidden: history; Restore Inputs brings them back)")
+                     + ("(target kept hidden, tools kept: history; Restore Inputs brings the target back)"
+                        if keep_tools else "(inputs kept hidden: history; Restore Inputs brings them back)"))
     keys = {f"s{i}": o for i, o in enumerate(objs)}
     info, breps = jobs.run("boolean", keys, ["result"], order=list(keys), into="s0",
                            operation=operation, names={k: o.name for k, o in keys.items()})
@@ -3023,9 +3030,11 @@ def combine_solids(context, objs, operation, op, name=None):
     store.set_geometry_text(target, breps["result"], context, keep_untrimmed=False)
     if store.PROP_UNTRIM in target:
         del target[store.PROP_UNTRIM]
-    for o in objs[1:]:
-        _remove_object(o)
-    return target, f"Boolean {operation.lower()}: {info['faces']} faces, volume {info.get('volume', 0):.4g}"
+    if not keep_tools:
+        for o in objs[1:]:
+            _remove_object(o)
+    return target, (f"Boolean {operation.lower()}: {info['faces']} faces, volume {info.get('volume', 0):.4g}"
+                    + (" (tools kept)" if keep_tools else ""))
 
 
 class NPROTO_OT_boundary_fill(bpy.types.Operator):

@@ -2459,7 +2459,9 @@ def release_inputs(context, objs):
     for o in objs:
         homes = [bpy.data.collections.get(n) if n != context.scene.collection.name else context.scene.collection
                  for n in json.loads(o.get(PROP_HOME, "[]"))]
-        homes = [c for c in homes if c is not None] or [context.collection or context.scene.collection]
+        homes = [c for c in homes if c is not None]
+        if not homes and not any(c is not coll for c in o.users_collection):
+            homes = [context.collection or context.scene.collection]   # an input never stashed stays put
         for c in homes:
             if o.name not in c.objects:
                 c.objects.link(o)
