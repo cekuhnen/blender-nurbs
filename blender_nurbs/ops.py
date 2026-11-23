@@ -1516,7 +1516,7 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
             if cv["degree"] == 1 and not cv.get("weights"):     # a polyline: its corners, exact
                 self._ex.append((obj, curve, np.array(cv["points"], float), False))
             else:
-                self._ex.append((obj, curve, geom.sample_curve(curve, 97), True))
+                self._ex.append((obj, curve, geom.sample_curve_kinks(curve, 97), True))
             self._exf.append(None)
         if not self._ex:
             return False
@@ -1524,7 +1524,7 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
         # the handles stand on the first curve: the arrow where it was clicked
         # (when it was picked by a click), else halfway along it
         obj, curve, P, smooth = self._ex[0]
-        S = P if smooth else geom.sample_curve(curve, 97)
+        S = P if smooth else geom.sample_curve_kinks(curve, 97)
         n = len(S)
         closed = np.linalg.norm(S[0] - S[-1]) < 1e-7 * (np.ptp(S, axis=0).max() or 1.0)
         kb, self._base_at_mouse = n // 2, False
@@ -1753,7 +1753,7 @@ class NPROTO_OT_revolve(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
         self._rv = []
         for obj, ref in _decode_inputs(self.inputs):
             curve = features.input_curve(obj, ref)
-            self._rv.append((obj, geom.sample_curve(curve, 97), ref))
+            self._rv.append((obj, geom.sample_curve_kinks(curve, 97), ref))
         self._rv_all = list(self._rv)
         self._drop_on_axis()
         if not self._rv:

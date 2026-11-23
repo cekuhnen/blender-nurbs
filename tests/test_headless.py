@@ -294,7 +294,9 @@ for _kind, _fa, _fb2, _shape, _ra, _rb in ((60, False, False, "CIRCULAR", 0.2, 0
     _f = _plain(_OpSF, _sf=_fr, flip_a=_fa, flip_b=_fb2, rail_type="RADIUS", same_radius=_ra == _rb, radius=_ra,
                 radius_b=_rb, shape=_shape)
     _j = len(_fr[0][0]) // 2
-    for _h, _rail in zip(_f.drag_handles(), (_Xs[0][_j, 0], _Xs[0][_j, -1])):
+    # one radius: on rail A; Radius A / B: each on the rail its value moves (A's on rail B, B's on rail A)
+    _rails = (_Xs[0][_j, 0], _Xs[0][_j, -1]) if _ra == _rb else (_Xs[0][_j, -1], _Xs[0][_j, 0])
+    for _h, _rail in zip(_f.drag_handles(), _rails):
         _sf_arrow.append(max(float(np.linalg.norm(_vd.ValueDrag._pos(_h) - _rail)),
                              abs(_h["to_value"](_h["param"]) - getattr(_f, _h["field"]))))
     r = bpy.ops.nproto.fillet(surf_a=_sa_o.name, surf_b=_sb_o.name, radius=_ra, radius_b=_rb, same_radius=_ra == _rb,
@@ -5244,6 +5246,7 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cy
               "curve_degree", "fix_clip_start", "delete_faces", "move_pivot", "cv_nudge", "pattern_select",
               "measure",    # Measure: in the Analyze panel / header popover, with Continuity Check
               "remove_symmetry",    # Mirror's Make Symmetric: the Active Object panel's button
+              "move", "rotate", "scale", "transform_hold",   # by Points: hold G / R / S (movetool keymap), no button
               "square"}     # Square: merged into Patch (Quad Sided); kept for older files, off the menus
 _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto)
               if n not in _not_tools and not n.startswith("workplane_")}   # the Work Planes panel's own
@@ -5323,8 +5326,8 @@ _rows = []
 _tg.draw_panel(_ActLay(_rows), "SURFACE_EDIT", ctx)
 _rows_c = []
 _tg.draw_panel(_ActLay(_rows_c), "CURVE_EDIT", ctx)
-_cut = {"nproto.trim", "nproto.split"}             # they take the curve as a cutter
-check("UI: a curve selected dims Surface Edit (still clickable) but Trim / Split and not Curve Edit; "
+_cut = {"nproto.trim", "nproto.split", "nproto.emboss"}   # they take the curve (a cutter, a profile)
+check("UI: a curve selected dims Surface Edit (still clickable) but Trim / Split / Emboss and not Curve Edit; "
       "nothing selected dims nothing",
       _none_sel is None and _have == {"CURVE"} and _tg.fits({"NURBS"}, None)
       and _rows and all(r_["active"] == bool(set(r_["ops"]) & _cut) for r_ in _rows if r_["ops"])

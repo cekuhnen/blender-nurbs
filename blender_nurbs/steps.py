@@ -3,6 +3,7 @@ base geometry (its own feature, or a snapshot). Each applier takes the
 current brep text (object local space) and returns the new text."""
 
 import json
+import math
 
 from mathutils import Matrix, Vector
 
@@ -500,6 +501,34 @@ def apply_push_pull(obj, text, inputs, p):
     return breps["result"]
 
 
+def apply_rotate_face(obj, text, inputs, p):
+    """Rotate Face on rebuild: the faces at the stored points turned again about
+    the stored hinge (local space, so it moves with the body)."""
+    M = _world(obj)
+    pts = [list(M @ Vector(q)) for q in p["faces_local"]]
+    N = M.to_3x3().inverted().transposed()
+    nrm = [list((N @ Vector(n)).normalized()) for n in p["normals_local"]] if p.get("normals_local") else None
+    _, breps = jobs.run("rotate_face", {"target": (text, jobs.xform(obj))}, ["result"], face_pts=pts,
+                        face_normals=nrm, face_flat=p.get("flat"),
+                        axis_point=list(M @ Vector(p["axis_point_local"])),
+                        axis_dir=list((M.to_3x3() @ Vector(p["axis_dir_local"])).normalized()),
+                        hinge_on_face=p.get("hinge_on_face"), angle=float(p["angle"]), into="target")
+    return breps["result"]
+
+
+def apply_move_face(obj, text, inputs, p):
+    """Move Face on rebuild: the feature holding the faces at the stored points
+    slid again by the stored distances along the stored directions (local)."""
+    M = _world(obj)
+    pts = [list(M @ Vector(q)) for q in p["faces_local"]]
+    L = M.to_3x3()
+    v = L @ (float(p.get("move_x", 0.0)) * Vector(p["axis_x_local"])
+             + float(p.get("move_y", 0.0)) * Vector(p["axis_y_local"]))
+    _, breps = jobs.run("move_face", {"target": (text, jobs.xform(obj))}, ["result"], face_pts=pts,
+                        vector=list(v), into="target")
+    return breps["result"]
+
+
 def apply_replace_face(obj, text, inputs, p):
     """Replace Face on rebuild: the faces at the stored points replaced by the
     surface (the step's input) as it is now."""
@@ -512,7 +541,7 @@ def apply_replace_face(obj, text, inputs, p):
     return breps["result"]
 
 
-APPLY = {"replace_face": apply_replace_face, "push_pull": apply_push_pull, "trim": apply_trim, "edge_fillet": apply_edge_fillet, "fillet_trim": apply_fillet_trim,
+APPLY = {"replace_face": apply_replace_face, "push_pull": apply_push_pull, "rotate_face": apply_rotate_face, "move_face": apply_move_face, "trim": apply_trim, "edge_fillet": apply_edge_fillet, "fillet_trim": apply_fillet_trim,
          "flip_normal": apply_flip, "untrim_region": apply_untrim_region, "untrim": apply_untrim}
 LABEL = {
     "trim": lambda p: "Trim · " + {"KEEP": "Keep", "DELETE": "Discard"}.get(p.get("action"), p.get("action", "")),
@@ -525,6 +554,9 @@ LABEL = {
     "untrim": lambda p: "Untrim",
     "replace_face": lambda p: "Replace Face" + (f" · {len(p.get('faces_local', []))} faces"
                                                 if len(p.get("faces_local", [])) > 1 else ""),
+    "move_face": lambda p: f"Move Face · {math.hypot(float(p.get('move_x', 0)), float(p.get('move_y', 0))):.3g}",
+    "rotate_face": lambda p: f"Rotate Face · {float(p.get('angle', 0)):.3g}°"
+                             + (f" · {len(p.get('faces_local', []))} faces" if len(p.get("faces_local", [])) > 1 else ""),
     "push_pull": lambda p: ("Pull" if float(p.get("distance", 0)) > 0 else "Push")
                            + f" · {abs(float(p.get('distance', 0))):.3g}"
                            + (f" · {len(p.get('faces_local', []))} faces" if len(p.get("faces_local", [])) > 1 else ""),
@@ -554,7 +586,7 @@ def _split_job(inputs, p):
     d = view if proj in ("VIEW", "CURVE", "SURFACE") else Vector({"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}[proj])
     kw = {"curves": curves, "cutter_breps": list(others), "direction": list(d.normalized()),
           "extend": bool(p.get("extend", True)), "reach": p.get("reach", "BOTH"),
-          "through": bool(p.get("through", False))}
+          "through": bool(p.get("through", False)), "solids": bool(p.get("solids", False))}
     return {"target": tgt, **others}, kw, others
 
 
@@ -562,6 +594,8 @@ def split_info(inputs, p, notes=None):
     """The split of inputs[0] by the other inputs (surfaces "SURF", curves
     "S<i>" and surface edges), in the worker's region order: {"texts": local
     brep texts, "points": a world point inside each, "areas", "sides"}. With
+    p["solids"] a closed solid comes apart into closed solids ("solid": True,
+    their "volumes" and whether each "closed"). With
     p["extend"] (the default) a cutter whose cut stops inside the body is
     extended until it reaches across; `notes` (a list) receives what was."""
     import hashlib
@@ -571,7 +605,7 @@ def split_info(inputs, p, notes=None):
     for o in [tgt] + list(others.values()):
         h.update(o.get(store.PROP_BREP, "").encode())
         h.update(json.dumps(jobs.xform(o), sort_keys=True).encode())
-    h.update(json.dumps([kw["curves"], kw["direction"], kw["extend"], kw["reach"], kw["through"]],
+    h.update(json.dumps([kw["curves"], kw["direction"], kw["extend"], kw["reach"], kw["through"], kw["solids"]],
                         sort_keys=True).encode())
     key = h.hexdigest()
     if key in _split_cache:
@@ -585,7 +619,8 @@ def split_info(inputs, p, notes=None):
         notes += said
     n = info["regions"]
     out = {"texts": [breps[f"region{i}"] for i in range(n)], "points": info.get("points", []),
-           "areas": info.get("areas", []), "sides": info.get("sides", [])}
+           "areas": info.get("areas", []), "sides": info.get("sides", []), "solid": bool(info.get("solid")),
+           "volumes": info.get("volumes", []), "closed": info.get("closed", [])}
     if len(_split_cache) > 16:
         _split_cache.clear()
     _split_cache[key] = (out, said)
@@ -609,6 +644,9 @@ def merge_regions(inputs, p, keep):
     if len(picked) == 1:
         return out["texts"][picked[0]]
     objs, kw, _ = _split_job(inputs, p)
+    if out.get("solid"):          # pieces of a solid: joined into one closed body by the split job
+        _, breps = jobs.run("split", objs, ["KEEP"], keep=[bool(k) for k in keep], **kw)
+        return breps["KEEP"]
     marks = [[pt, bool(k), sd] for pt, k, sd in zip(out["points"], keep, out["sides"])]
     _, breps = jobs.run("trim", objs, ["KEEP"], ref_point=out["points"][picked[0]], action="KEEP", scope="PICKED",
                         marks=marks, strict=False, **kw)

@@ -1667,7 +1667,7 @@ def profile_curve(inputs):
 @builder("extrude")
 def build_extrude(inputs, p):
     if p.get("caps"):
-        return _solid(inputs, p, _extrude_side)
+        return _solid(inputs, p, _extrude_side, joints=True)
     obj, ref = inputs[0]
     return _extrude_side(obj, profile_curve(inputs), p)
 
@@ -1782,7 +1782,7 @@ def build_extrude_face(inputs, p):
         q.pop("draft_centre", None)
         if not sym:
             q["start"], q["distance"] = a, b - a
-        return _solid(face_loop_inputs(obj, i), q, _extrude_side)
+        return _solid(face_loop_inputs(obj, i), q, _extrude_side, joints=True)
     info, breps = jobs.run("extrude_face", {"target": obj}, ["result"], face_pt=[float(x) for x in pw],
                            dir=[float(x) for x in d], start=a, distance=b, into="_world_")
     return ("brep_text", breps["result"])
@@ -1953,10 +1953,11 @@ def solid_regions(inputs):
     return [regions[i] for i in sorted(regions)]
 
 
-def _solid(inputs, p, side_of, closed_only=True):
+def _solid(inputs, p, side_of, closed_only=True, joints=False):
     """A closed solid: the walls of every profile in inputs (an outline and its
     holes), flat caps on the open ends (in the worker). Holes draft the other
-    way, so the material's walls all lean the same way."""
+    way, so the material's walls all lean the same way. joints: extruded walls
+    get a face per profile piece (split_wall_at_joints)."""
     groups = profile_groups(inputs)
     curves = [profile_curve(g) for g in groups]
     if closed_only:
@@ -1972,8 +1973,143 @@ def _solid(inputs, p, side_of, closed_only=True):
         if depth[i] % 2:
             q["draft_flip"] = not q.get("draft_flip", False)
         w = side_of(g[0][0], c, q)
+        if joints:
+            w = split_wall_at_joints(w, profile_joint_points(g))
         walls += w if isinstance(w, list) else [w]
     return cap_walls(walls)
+
+
+def profile_joint_points(group):
+    """World points where the pieces of one profile meet: the joints a Join
+    Curves recorded on its splines, and the ends of chained inputs."""
+    from . import curvejoin
+    pts = []
+    if len(group) > 1:
+        for o, r in group:
+            pts += list(_curve_ends(input_curve(o, r)))
+    for o, r in group:
+        if o.type != 'CURVE' or not (isinstance(r, str) and r[:1] == "S" and r[1:].isdigit()):
+            continue
+        recs, i = curvejoin.joint_records(o), int(r[1:])
+        rec = recs[i] if i < len(recs) else None
+        if not isinstance(rec, dict):
+            continue
+        try:
+            spans = curvejoin.input_spans(o, r)
+        except Exception:
+            continue
+        if rec.get("nseg") != len(spans):
+            continue                         # the spline was edited since: its record no longer fits
+        pts += [curvejoin._cart(spans[j])[0] for j in rec.get("joints") or [] if 0 < j < len(spans)]
+    return pts
+
+
+def _span_shape(s, tol):
+    """What a rational Bezier span (world) is: ("line", point, unit direction),
+    ("arc", centre, radius) or ("free",)."""
+    from . import curvejoin, snapping
+    X = curvejoin.eval_span(s, np.linspace(0.0, 1.0, 9))
+    C = curvejoin._cart(s)
+    ch = X[-1] - X[0]
+    L = float(np.linalg.norm(ch))
+    if L <= tol:
+        return ("free",)
+    t = ch / L
+    off = (C - X[0]) - np.outer((C - X[0]) @ t, t)
+    if float(np.linalg.norm(off, axis=1).max()) <= tol:
+        return ("line", X[0], t)
+    cen = snapping.circle_centre(X, 1e-5)
+    if cen is not None:
+        return ("arc", cen, float(np.linalg.norm(X[0] - cen)))
+    return ("free",)
+
+
+def _shape_changes(a, b, tol):
+    """Whether two neighbouring spans are different lines / arcs (a line runs
+    into an arc, an arc into another circle's arc ...): not two pieces of one
+    line or one circle, and not free-form on both sides."""
+    if a[0] == "free" and b[0] == "free":
+        return False
+    if a[0] != b[0]:
+        return True
+    if a[0] == "line":
+        d = b[1] - a[1]
+        return (float(np.linalg.norm(np.cross(a[2], b[2]))) > 1e-6
+                or float(np.linalg.norm(d - (d @ a[2]) * a[2])) > tol)
+    return float(np.linalg.norm(a[1] - b[1])) > tol or abs(a[2] - b[2]) > tol
+
+
+def split_wall_at_joints(surf, joint_pts):
+    """An extruded wall (u across the extrusion, degree 1; v along the
+    profile) as pieces split exactly along its C0 profile knots where the
+    profile's pieces meet: at joint_pts (a Join's joints, chained inputs) and
+    where a line runs into an arc or one arc into another. Each piece of the
+    profile then gets a face of its own with its own edges, so an arc's rim is
+    a true circular edge (its centre snaps) even where it joins a line
+    tangentially -- Rhino / Shapr3D give one face per segment the same way.
+    Folds are split later (cap_walls). Anything else is returned as it is."""
+    from . import curvejoin
+    sm, ext = _k()
+    if not isinstance(surf, sm.Surface):
+        return surf
+    try:
+        d = ext.surface_cvs(surf)
+    except Exception:
+        return surf
+    nu, nv, du, dv = d["count_u"], d["count_v"], int(d["degree_u"]), int(d["degree_v"])
+    if du != 1 or dv < 1:
+        return surf
+    Uu, Uv = [float(x) for x in d["knots_u"]], [float(x) for x in d["knots_v"]]
+    P = np.array(d["points"], float).reshape(nu, nv, 3)
+    W = np.array(d["weights"], float).reshape(nu, nv) if d.get("weights") else np.ones((nu, nv))
+    size = float(np.linalg.norm(np.ptp(P.reshape(-1, 3), axis=0))) or 1.0
+    tol = 1e-5 * size
+    lo, hi = Uv[dv], Uv[len(Uv) - dv - 1]
+    ktol = 1e-12 * max(1.0, abs(hi - lo))
+    if abs(Uv[0] - lo) > ktol or abs(Uv[-1] - hi) > ktol:
+        return surf                                    # unclamped (periodic): left whole
+    inner = sorted({u for u in Uv if lo + ktol < u < hi - ktol})   # as curvejoin._clamped_to_spans
+    if not inner:
+        return surf
+    try:
+        spans = curvejoin._clamped_to_spans(dv, P[0], W[0], Uv)
+    except Exception:
+        return surf
+    if len(spans) != len(inner) + 1:
+        return surf
+    shapes = [_span_shape(s, tol) for s in spans]
+    J = np.asarray(joint_pts, float).reshape(-1, 3)
+
+    def near_joint(col):
+        for a, b in zip(col[:-1], col[1:]):           # the knot line: straight between the CV rows
+            ab = b - a
+            L2 = float(ab @ ab) or 1.0
+            t = np.clip((J - a) @ ab / L2, 0.0, 1.0)
+            if len(J) and float(np.linalg.norm(J - (a + t[:, None] * ab), axis=1).min()) <= tol:
+                return True
+        return False
+    cuts = []
+    for i, k in enumerate(inner):
+        idx = [j for j, x in enumerate(Uv) if abs(x - k) <= 1e-9 * (hi - lo or 1.0)]
+        if len(idx) != dv:
+            continue                                   # smoother than C0: one piece of the profile
+        col = P[:, idx[0] - 1]                         # the CVs the knot line passes through
+        if near_joint(col) or _shape_changes(shapes[i], shapes[i + 1], tol):
+            cuts.append(k)
+    if not cuts:
+        return surf
+    pieces, cols = [], [(P.transpose(1, 0, 2), W.T, Uv)]
+    for k in cuts:
+        Pc, Wc, Uc = cols.pop()
+        left, right = store._split_knots(Pc, Wc, Uc, dv, k, 1e-9 * (hi - lo or 1.0))
+        cols += [left, right]
+    for Pc, Wc, Uc in cols:
+        Pq, Wq = Pc.transpose(1, 0, 2), Wc.T
+        rational = bool(np.abs(Wq - 1.0).max() > 1e-12)
+        pieces.append(ext.surface_from_cvs(du, dv, [tuple(map(float, x)) for x in Pq.reshape(-1, 3)], Uu,
+                                           [float(x) for x in Uc],
+                                           [float(w) for w in Wq.ravel()] if rational else None))
+    return pieces
 
 
 def cap_walls(pieces):
@@ -2202,7 +2338,7 @@ def record(obj, op, inputs, params):
 HISTORY_COLL = "NURBS History"
 PROP_HOME = "nproto_home"      # JSON list: the collections an input was in before it was kept
 KEEP_OPS = ("join", "join_curves", "boolean", "thicken", "boundary_fill", "split_region", "iso_detach",
-            "extrude_face")   # results that keep their inputs
+            "extrude_face", "emboss")   # results that keep their inputs
 
 
 def history_collection(context, create=True):

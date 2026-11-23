@@ -23,10 +23,19 @@ Nothing changes until Enter (or Space, right-click): the tool then moves
 every origin at once, one undo step. Backspace takes the last placement
 back, Esc leaves everything as it was. With several objects, T switches
 between moving every origin to the pivot and keeping their offsets.
+
+Where to find it: the toolbar (after Blender's Transform, in Object and
+Edit Mode: its click is the first placement, and when it is done the tool
+before it comes back), hold "." (tap is Blender's Pivot Point pie,
+movetool.HOLD_TOOLS), the right-click menus, Object > Transform and F3
+("pivot" or "origin").
 """
+
+import os
 
 import bmesh
 import bpy
+from bpy.props import BoolProperty
 import numpy as np
 from mathutils import Matrix, Vector
 
@@ -115,8 +124,10 @@ class NPROTO_OT_move_pivot(SketchMixin, bpy.types.Operator):
     and Maya's Move Pivot: click or drag it onto a point, snapping to CVs,
     vertices, ends, middles and edges. Works in Object and Edit Mode"""
     bl_idname = "nproto.move_pivot"
-    bl_label = "Move Pivot"
+    bl_label = "Move Pivot (Origin)"
     bl_options = {'REGISTER'}     # its own undo step (apply_targets): Edit Mode's would hold only the mesh
+
+    from_tool: BoolProperty(options={'HIDDEN', 'SKIP_SAVE'})    # the toolbar tool's click started it
 
     face_planes = False         # a free point lies on the drawing plane through the pivot
 
@@ -179,7 +190,11 @@ class NPROTO_OT_move_pivot(SketchMixin, bpy.types.Operator):
             self._net_pts += [V(p) for p in P]
         self._plane = self._view_plane(context, self._pivot)
         context.window_manager.modal_handler_add(self)
-        self._preview(context, self._hover_pick(context, event))
+        hover = self._hover_pick(context, event)
+        if self.from_tool and event.type == 'LEFTMOUSE' and event.value == 'PRESS' and hover[0] is not None:
+            self._place(hover[0])           # the toolbar tool's click places the pivot (and may drag it)
+            self._drag = True
+        self._preview(context, hover)
         return {'RUNNING_MODAL'}
 
     # -- picking ----------------------------------------------------------------
@@ -345,11 +360,19 @@ class NPROTO_OT_move_pivot(SketchMixin, bpy.types.Operator):
             return self._finish(context)
         elif ev == 'PRESS' and et == 'ESC':
             self.sketch_end(context)
+            self._tool_back(context)
             return {'CANCELLED'}
         return {'RUNNING_MODAL'}
 
+    def _tool_back(self, context):
+        """Started from the toolbar: the tool that was active before comes back
+        (a pivot move is a one-off; the next click should select again)."""
+        if self.from_tool:
+            restore_tool(context)
+
     def _finish(self, context):
         self.sketch_end(context)
+        self._tool_back(context)
         targets = [(o, Q) for (o, Q), S in zip(self._targets(), self._start) if np.linalg.norm(Q - S) > EPS]
         if not targets:
             return {'CANCELLED'}
@@ -397,17 +420,118 @@ def menu_transform(self, context):
     self.layout.operator(NPROTO_OT_move_pivot.bl_idname, icon='OBJECT_ORIGIN')
 
 
-MENUS = ("VIEW3D_MT_transform_object", "VIEW3D_MT_transform")     # Object > Transform, and Edit Mode's Transform
+# Object > Transform and Edit Mode's Transform, and the right-click menus
+# (Object Mode's has Blender's Set Origin; a surface's Edit Mode uses the curve's)
+MENUS = ("VIEW3D_MT_transform_object", "VIEW3D_MT_transform", "VIEW3D_MT_object_context_menu",
+         "VIEW3D_MT_edit_mesh_context_menu", "VIEW3D_MT_edit_curve_context_menu",
+         "VIEW3D_MT_edit_lattice_context_menu")
+
+
+# -- the toolbar tool -------------------------------------------------------------
+# Blender's tools stay on until another is picked; this one hands the toolbar
+# back when its Move Pivot ends. The tool before it is the last other one a
+# 3D View drew with, per mode (_note_tool).
+
+TOOL_ID = "nproto.move_pivot_tool"
+TOOL_MODES = ('OBJECT', 'EDIT_MESH', 'EDIT_CURVE', 'EDIT_SURFACE', 'EDIT_LATTICE')
+ICON = os.path.join(os.path.dirname(__file__), "icons", "ops.nproto.move_pivot")    # tools/make_pivot_icon.py
+_last_tool = {}         # mode -> the tool id that was active before this one
+_draw_handle = None
+
+
+def _active_tool(context):
+    try:
+        t = context.workspace.tools.from_space_view3d_mode(context.mode, create=False)
+    except Exception:
+        return None
+    return t.idname if t is not None else None
+
+
+def _note_tool():
+    ctx = bpy.context
+    t = _active_tool(ctx)
+    if t and t != TOOL_ID:
+        _last_tool[ctx.mode] = t
+
+
+def restore_tool(context):
+    """Put back the tool that was active before the Move Pivot tool (if it still is)."""
+    if _active_tool(context) != TOOL_ID:
+        return
+    prev = _last_tool.get(context.mode, "builtin.select_box")
+    try:
+        bpy.ops.wm.tool_set_by_id(name=prev, space_type='VIEW_3D')
+    except Exception as exc:
+        print("NURBS Move Pivot: tool not put back:", exc)
+
+
+def _tool_class(mode):
+    class Tool(bpy.types.WorkSpaceTool):
+        bl_space_type = 'VIEW_3D'
+        bl_context_mode = mode
+        bl_idname = TOOL_ID
+        bl_label = "Move Pivot (Origin)"
+        bl_description = ("Click where the object's pivot (origin) goes: it snaps to CVs, vertices, ends, middles "
+                          "and edges; the geometry stays. Enter applies, Esc cancels. Also: hold .")
+        bl_icon = ICON
+        bl_keymap = ((NPROTO_OT_move_pivot.bl_idname, {"type": 'LEFTMOUSE', "value": 'PRESS'},
+                      {"properties": [("from_tool", True)]}),)
+
+        def draw_settings(context, layout, tool):
+            layout.label(text="Click where the pivot goes · Enter applies · or hold the . key, any tool",
+                         icon='OBJECT_ORIGIN')
+
+    Tool.__name__ = "NPROTO_TL_move_pivot_" + mode.lower()
+    return Tool
+
+
+TOOLS = tuple(_tool_class(m) for m in TOOL_MODES)
+
+
+def _after_transform(mode):
+    """Move the tool from the toolbar's end to just after Blender's Transform.
+    (register_tool's after= can't: for a tool outside a group it skips along
+    the tool's own fields and lands after the separator that follows.)"""
+    from bl_ui.space_toolsystem_common import ToolSelectPanelHelper
+    tools = ToolSelectPanelHelper._tool_class_from_space_type('VIEW_3D')._tools[mode]
+    mine = next((i for i, it in enumerate(tools) if getattr(it, "idname", None) == TOOL_ID), None)
+    at = next((i for i, it in enumerate(tools) if getattr(it, "idname", None) == "builtin.transform"), None)
+    if mine is None or at is None:
+        return                              # (stays at the end, after its separator)
+    item = tools[mine]
+    del tools[mine - 1:mine + 1]            # it and the separator register_tool put before it
+    tools.insert(at + 1, item)
 
 
 classes = (NPROTO_OT_move_pivot,)
 
 
 def register():
+    global _draw_handle
     for m in MENUS:
-        getattr(bpy.types, m).append(menu_transform)
+        menu = getattr(bpy.types, m, None)
+        if menu is not None:
+            menu.append(menu_transform)
+    for t in TOOLS:
+        try:
+            bpy.utils.register_tool(t, separator=True)
+            _after_transform(t.bl_context_mode)
+        except Exception as exc:
+            print("NURBS Move Pivot tool not in the toolbar:", t.bl_context_mode, exc)
+    _draw_handle = bpy.types.SpaceView3D.draw_handler_add(_note_tool, (), 'WINDOW', 'POST_PIXEL')
 
 
 def unregister():
+    global _draw_handle
+    if _draw_handle is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, 'WINDOW')
+        _draw_handle = None
+    for t in TOOLS:
+        try:
+            bpy.utils.unregister_tool(t)
+        except Exception:
+            pass
     for m in MENUS:
-        getattr(bpy.types, m).remove(menu_transform)
+        menu = getattr(bpy.types, m, None)
+        if menu is not None:
+            menu.remove(menu_transform)

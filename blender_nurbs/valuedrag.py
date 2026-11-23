@@ -622,8 +622,11 @@ class ValueDrag:
                                       "dir": h.get("dir"), "path": h.get("path"),
                                       "head_from": h.get("head_from"), "hot": hot, "active": f == name})
                 val = f"{self._typed}|" if (f == name and self._typed) else self._fmt(context, f)
-                if f == name or hot or self._is_angle(f) and abs(getattr(self, f)) > 1e-9:
-                    pv["labels"].append((pos, f"{self._label(f)} {val}", f == name))
+                # the active field's and the hovered arrow's value; a handle with
+                # "label" shows its value always (a variable fillet's start and end)
+                if f == name or hot or h.get("label") or self._is_angle(f) and abs(getattr(self, f)) > 1e-9:
+                    pv["labels"].append((pos, f"{self._label(f)} {val}{self.drag_label_more(context, f)}",
+                                         f == name))
         draw.pick_overlay["preview"] = pv
         state = []
         for f in self.drag_fields:
@@ -673,6 +676,10 @@ class ValueDrag:
 
     def drag_state(self):
         return []
+
+    def drag_label_more(self, context, field):
+        """Text after an arrow's value in its label (e.g. what the value makes)."""
+        return ""
 
 
 class _Probe:

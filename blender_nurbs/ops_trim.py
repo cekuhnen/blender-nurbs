@@ -756,9 +756,11 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         ("CHORD", "Chord", "The size is the distance between the two rails (where the fillet meets the faces)"),
     ], default="RADIUS")
     radius: FloatProperty(name="Radius A", default=0.25, min=0.0, soft_max=10.0, unit='LENGTH',
-                          description="Distance from surface A to its rail (with Variable Radius: the start "
-                                      "radius, 0 allowed)")
-    radius_b: FloatProperty(name="Radius B", default=0.25, min=1e-5, soft_max=10.0, unit='LENGTH')
+                          description="How far the ball's centre sits from surface A (the rails are the "
+                                      "ball's feet; a chamfer runs straight between them). With Variable "
+                                      "Radius: the start radius, 0 allowed")
+    radius_b: FloatProperty(name="Radius B", default=0.25, min=1e-5, soft_max=10.0, unit='LENGTH',
+                            description="How far the ball's centre sits from surface B (Same Radius off)")
     same_radius: BoolProperty(name="Same Radius", default=True)
     variable: BoolProperty(name="Variable Radius", default=False,
                            description="The ball radius runs smoothly (linearly with length) along the crossing "
@@ -901,7 +903,7 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
     def _label(self, name):
         if self.shape == "SOFT":
             return "Min Radius"
-        word = "Distance" if self.shape == "CHAMFER" else "Radius"
+        word = "Radius"                 # a chamfer's too: the ball's radii, its rails the feet
         if self._variable():
             return f"{'Start' if name == 'radius' else 'End'} {word}"
         if name == "radius" and self.rail_type == "CHORD":
@@ -954,6 +956,16 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         D2 /= np.linalg.norm(D2, axis=1, keepdims=True) + 1e-300
         th = np.pi - np.arccos(np.clip(np.sum(D1 * D2, axis=1), -0.9999, 0.9999))
         return 2.0 * np.sin(0.5 * np.maximum(th, np.radians(1.0)))
+
+    def drag_label_more(self, context, field):
+        """Chord: the ball radius it gives, from smallest to largest along the
+        crossing (it changes where the angle between the surfaces does)."""
+        if self.rail_type != "CHORD" or field != "radius" or self.shape == "SOFT" or self.radius <= 0:
+            return ""
+        from .valuedrag import fmt_length
+        r = np.concatenate([self.radius / self._chord_k(P, NA, NB) for P, NA, NB in self._sf])
+        lo, hi = fmt_length(context, float(r.min())), fmt_length(context, float(r.max()))
+        return f" · Radius {lo}" if lo == hi else f" · Radius {lo}–{hi}"
 
     def _radii(self, P, NA, NB, i=0):
         if self.rail_type == "CHORD":
@@ -1050,20 +1062,33 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
             elif self.same_radius:
                 to_value, param = (lambda t: t / (al + be)), ra * (al + be)
             else:
+                # Radius A alone: the centre's distance from A, which moves the
+                # rail on B (P + ra ca + rb (cb - B)) -- the rail on A barely (not
+                # at all at 90 deg: it sits Radius B from the crossing there)
+                D = ca + cb - B
+                D /= np.linalg.norm(D) or 1.0
+                al, be = float(ca @ D), float((cb - B) @ D)
                 to_value, param = (lambda t: (t - rb * be) / al), ra * al + rb * be
-        else:                           # the rail on B: P + ra ca + rb (cb - B), along D2
-            D = ca + cb - B
+        else:                           # Radius B: the rail on A, P + ra (ca - A) + rb cb, along D1
+            D = ca - A + cb
             D /= np.linalg.norm(D) or 1.0
-            al, be = float(ca @ D), float((cb - B) @ D)
+            al, be = float((ca - A) @ D), float(cb @ D)
             to_value, param = (lambda t: (t - ra * al) / be), ra * al + rb * be
         return {"field": field, "kind": "arrow", "origin": P[j], "dir": D, "base": P[j], "param": param,
                 "to_value": to_value}
 
     def drag_handles(self):
         if self._variable():            # at the crossing's start and its end, on the rails there
-            return [self._handle("radius", 0, 0), self._handle("end_radius", len(self._sf) - 1,
-                                                                len(self._sf[-1][0]) - 1)]
-        return [self._handle(f) for f in self.drag_fields]
+            hs = [self._handle("radius", 0, 0), self._handle("end_radius", len(self._sf) - 1,
+                                                              len(self._sf[-1][0]) - 1)]
+            for h in hs:
+                h["label"] = True       # both values shown: they sit at opposite ends of the run
+            return hs
+        hs = [self._handle(f) for f in self.drag_fields]
+        if len(hs) > 1:                 # Radius A / B: both values shown, each on the rail it moves
+            for h in hs:
+                h["label"] = True
+        return hs
 
     def _too_short(self, context):
         if self._variable() and self.end_radius > 1e-9:
@@ -1283,16 +1308,15 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         elif self.rail_type == "CHORD":
             col.prop(self, "radius", text="Chord")
         elif self.variable:
-            word = "Distance" if self.shape == "CHAMFER" else "Radius"
-            col.prop(self, "radius", text="Start " + word)
-            col.prop(self, "end_radius", text="End " + word)
+            col.prop(self, "radius", text="Start Radius")
+            col.prop(self, "end_radius", text="End Radius")
             col.prop(self, "variable")
         else:
-            col.prop(self, "radius", text="Distance A" if self.shape == "CHAMFER" else "Radius A")
+            col.prop(self, "radius", text="Radius A")       # a chamfer's too (the ball between its rails)
             col.prop(self, "same_radius")
             sub = col.row()
             sub.enabled = not self.same_radius
-            sub.prop(self, "radius_b", text="Distance B" if self.shape == "CHAMFER" else "Radius B")
+            sub.prop(self, "radius_b", text="Radius B")
             col.prop(self, "variable")
         row = lay.row(align=True)
         row.prop(self, "flip_a", toggle=True)
@@ -1332,9 +1356,10 @@ class NPROTO_OT_split(bpy.types.Operator):
     curves, lines and picked edges (projected onto the surface). A cutter that
     stops short is extended until it cuts across. The regions show first, all
     green: each becomes its own object. Click regions to turn them blue: the
-    blue ones are joined into one piece. Enter splits. Nothing is removed. With history the
-    split surfaces are kept as hidden inputs and each piece follows them (and
-    what cut them)"""
+    blue ones are joined into one piece. Enter splits. Nothing is removed. A
+    closed solid comes apart into closed solids, each capped where it was cut
+    (Solid Pieces). With history the split surfaces are kept as hidden inputs
+    and each piece follows them (and what cut them)"""
     bl_idname = "nproto.split"
     bl_label = "Split"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1365,6 +1390,9 @@ class NPROTO_OT_split(bpy.types.Operator):
     targets: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     curves: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     cutter_surfs: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})   # surfaces that only cut (picked as cutters)
+    solids: BoolProperty(name="Solid Pieces", default=True,
+                         description="A closed solid comes apart into closed solids: each piece is capped "
+                                     "where it was cut. Off: its faces are only split, the pieces stay open")
     split_all: BoolProperty(name="Split All", default=False,
                             description="Every region becomes its own object (the marks are ignored)")
     # regions marked in the preview: {surface name: [[world point, stays?, side], ...]}
@@ -1373,7 +1401,7 @@ class NPROTO_OT_split(bpy.types.Operator):
     def _params(self):
         return {"surfaces_cut": bool(self.surfaces_cut), "projection": self.projection,
                 "view_dir": [float(x) for x in self.view_dir], "extend": bool(self.extend), "reach": self.reach,
-                "through": bool(self.through)}
+                "through": bool(self.through), "solids": bool(self.solids)}
 
     def _inputs(self, tgt, surfs, crv_inputs):
         cutters = [bpy.data.objects[n] for n in json.loads(self.cutter_surfs or "[]") if n in bpy.data.objects]
@@ -1688,7 +1716,7 @@ class NPROTO_OT_split(bpy.types.Operator):
     def draw(self, context):
         lay = self.layout
         lay.use_property_split = True
-        for name in ("surfaces_cut", "projection", "reach", "through", "extend", "split_all"):
+        for name in ("surfaces_cut", "projection", "reach", "through", "extend", "solids", "split_all"):
             lay.prop(self, name)
         if self.marks and not self.split_all:
             lay.label(text="Pieces as marked in the viewport")
@@ -1719,6 +1747,9 @@ class NPROTO_OT_split(bpy.types.Operator):
                 info = steps.split_info(inputs, params, notes)
                 if len(info["texts"]) < 2:
                     raise jobs.JobError("the cutters do not split this surface into separate regions")
+                if info.get("solid") and not all(info.get("closed") or [True]):
+                    skipped.append(f"{tgt.name}: {sum(1 for c in info['closed'] if not c)} piece(s) did not "
+                                 "close up into a solid")
                 stays = self._stays(info, all_marks.get(tgt.name))
                 if all(stays):     # every region joined: this surface only cuts the others
                     skipped.append(f"{tgt.name}: every region joined, left as it is")
@@ -2172,6 +2203,7 @@ def fillet_frames(obj, idx, n=15):
     pts = np.array([_v3(e.point_at(t)) for t in np.linspace(t0, t1, 33)])
     eps = 1e-3 * float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))     # a step into a face
     Ps, D1, D2 = [], [], []
+    votes = ([], [])        # per face and sample: +1 / -1 the inside test's sign, 0 undecided
     for t in ts:
         P = _v3(e.point_at(t))
         a, c = _v3(e.point_at(max(t0, t - h))), _v3(e.point_at(min(t1, t + h)))
@@ -2197,12 +2229,25 @@ def fillet_frames(obj, idx, n=15):
                 if not (u0 - tu <= uu <= u1 + tu and v0 - tv <= vv <= v1 + tv):
                     return True
                 return f.classify_uv(uu, vv) == "outside"
-            if out(u + step[0], v + step[1]) and not out(u - step[0], v - step[1]):
-                d = -d
+            o_pos, o_neg = out(u + step[0], v + step[1]), out(u - step[0], v - step[1])
+            votes[len(ds)].append(0 if o_pos == o_neg else (1 if o_neg else -1))
             ds.append(d)
         Ps.append(P)
         D1.append(ds[0])
         D2.append(ds[1])
+    # one side for the whole edge: at a corner (the ends) the step leaves the
+    # trims both ways (or neither), so a sample's own test can't tell and a
+    # lone flipped section sticks out of the preview. Keep the directions
+    # continuous along the edge, then turn them all to the side most decided
+    # samples vote for.
+    for D, vs in ((D1, votes[0]), (D2, votes[1])):
+        sgn = [1.0]
+        for j in range(1, len(D)):
+            sgn.append(sgn[-1] * (1.0 if float(D[j] @ D[j - 1]) >= 0.0 else -1.0))
+        if sum(s * v for s, v in zip(sgn, vs)) < 0:
+            sgn = [-s for s in sgn]
+        for j, s in enumerate(sgn):
+            D[j] = s * D[j]
     P = np.array(Ps) @ M3.T + Mt
     to_w = lambda D: (lambda X: X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-300))(np.array(D) @ M3.T)
     return P, to_w(D1), to_w(D2)
@@ -2409,13 +2454,16 @@ def surface_fillet_sections(P, NA, NB, ra, rb, sa, sb, shape="CIRCULAR", k=9, co
         cv = [T1 + i * h * ta for i in range(k)] + [T2 + i * h * tb for i in range(k)][::-1]
         from math import comb
         return sum(comb(deg, i) * w ** i * (1 - w) ** (deg - i) * c[:, None] for i, c in enumerate(cv))
+    # the worker's conic (secfillet.conic): rational quadratic tangent at both
+    # rails; equal radii the ball's arc, Radius A != B the conic between the feet
     a, b = -A, -B                                    # centre -> rails, unit
-    om = np.arccos(np.clip(np.sum(a * b, axis=1), -1.0, 1.0))
-    so = np.where(np.sin(om) < 1e-9, 1.0, np.sin(om))
-    wa = np.sin((1 - w[..., 0]) * om[:, None]) / so[:, None]
-    wb = np.sin(w[..., 0] * om[:, None]) / so[:, None]
-    rr = ra[:, None] + (rb - ra)[:, None] * w[..., 0]          # equal radii: the ball's arc
-    return C[:, None] + rr[..., None] * (wa[..., None] * a[:, None] + wb[..., None] * b[:, None])
+    c = np.clip(np.sum(a * b, axis=1), -1.0, 1.0)[:, None]
+    s = np.maximum(1.0 - c * c, 1e-18)
+    W = C + a * (ra[:, None] - c * rb[:, None]) / s + b * (rb[:, None] - c * ra[:, None]) / s
+    wt = np.maximum(np.sqrt(0.5 * (1.0 + c)), 1e-9)[:, None]
+    t = w
+    num = (1 - t) ** 2 * T1[:, None] + 2 * t * (1 - t) * wt * W[:, None] + t ** 2 * T2[:, None]
+    return num / ((1 - t) ** 2 + 2 * t * (1 - t) * wt + t ** 2)
 
 
 def _unit(X):
@@ -2689,8 +2737,9 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
 
     def drag_handles(self):
         P0 = self._ef[0][0]
-        hs = [self._handle("radius", 0, len(P0) // 2 if len(self._ef) == 1 or not self.variable else 1)]
-        if "end_radius" in self.drag_fields:
+        variable = "end_radius" in self.drag_fields       # Radius at the start, End Radius at the end
+        hs = [self._handle("radius", 0, 1 if variable else len(P0) // 2)]
+        if variable:
             Pl = self._ef[-1][0]
             hs.append(self._handle("end_radius", len(self._ef) - 1, len(Pl) - 2))
         return hs

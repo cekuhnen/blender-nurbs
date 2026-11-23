@@ -186,6 +186,16 @@ class CurveCutter:
         intersection lose a sliver at a corner (a 0.15 mm gap in a spoon's
         notch, so the loop did not close); a piece's end is a sheet edge,
         which the imprint meets exactly."""
+        for sheet in self.sheet_list(b):
+            b = sm.boolean_with_options(b, sheet, operation=sm.BooleanOp.UNION, imprinting=True,
+                                        keep_other_brep=True)
+            if b is None:
+                return None
+        return b
+
+    def sheet_list(self, b):
+        """The cutting sheets (one per smooth piece of the curve), long enough
+        to pass through b."""
         np = _np()
         lo, hi = (np.array(v) for v in b.bounding_box())
         P = np.array(_poly(curve(self.data), 64))
@@ -193,14 +203,11 @@ class CurveCutter:
         L = 4.0 * (reach or 1.0)
         d = -self.dir if self.reach == "BACK" else self.dir
         start = -0.5 * L if self.reach == "BOTH" else 0.0
+        out = []
         for piece in corner_pieces(self.data):
             c = sm.translate(curve(piece), tuple(start * d)) if start else curve(piece)
-            sheet = ext.brep_from_surface(sm.create_extrude_surface(c, tuple(L * d)))
-            b = sm.boolean_with_options(b, sheet, operation=sm.BooleanOp.UNION, imprinting=True,
-                                        keep_other_brep=True)
-            if b is None:
-                return None
-        return b
+            out.append(ext.brep_from_surface(sm.create_extrude_surface(c, tuple(L * d))))
+        return out
 
     def inside(self, p):
         if not self.closed:
@@ -238,6 +245,9 @@ class SurfaceCutter:
     def split(self, b, ref):
         return sm.boolean_with_options(b, self._brep(), operation=sm.BooleanOp.UNION,
                                        imprinting=True, keep_other_brep=True)
+
+    def sheet_list(self, b):
+        return [self._brep()]
 
     def inside(self, p):
         np = _np()
@@ -420,6 +430,8 @@ def heal_cut_seams(b, original):
     lo, hi = (np.array(v) for v in original.bounding_box())
     size = float(np.linalg.norm(hi - lo)) or 1.0
     tol = 1e-5 * size
+    from trimext import brep_tol
+    btol = brep_tol(1e-5, size)      # not the kernel's 0.01: stitched below, short edges stay apart
     on_original = _near_edges(original, 10 * tol)
 
     def key(e):
@@ -578,7 +590,7 @@ def heal_cut_seams(b, original):
                     if "knots_u" in sd else carrier
                 try:
                     if tight and hasattr(ext, "trim_surface_with_3d_curves_tol"):
-                        cand = ext.trim_surface_with_3d_curves_tol(surf, sizes, curves, tol, 0.01)
+                        cand = ext.trim_surface_with_3d_curves_tol(surf, sizes, curves, tol, btol)
                     else:
                         cand = sm.trim_surface_with_3d_curves(surf, sizes, curves)
                 except Exception:
@@ -604,7 +616,13 @@ def heal_cut_seams(b, original):
     ext.delete_faces(out, [of[i] for i in drop])
     for m in merged:
         ext.append_brep(out, m)
-    before_open = _open_edge_count(b) - 2 * len(seams)
+    # b's open edges but the seams that go: a seam between two faces counts
+    # once per edge left open (two when the cut left it unstitched, none when
+    # it is one shared edge -- on a solid it is, and counting two there asked
+    # for a closed result); a slit (one face both ways) is not counted open
+    open_seams = sum(1 for e in b.edges() if len(e.faces()) < 2 and key(e) in seams
+                     and uses[key(e)][0][0] != uses[key(e)][1][0])
+    before_open = _open_edge_count(b) - open_seams
     for t in (tol / 10, tol, 10 * tol):
         st = sm.stitch_advanced(out.copy(), t, squeeze_small_edges=False, making_manifold_solid=False)[0]
         if _open_edge_count(st) <= max(before_open, 0) and st.face_count() == out.face_count():
@@ -990,11 +1008,16 @@ def _job_fillet(job, A, B):
             res["note"] = info["note"]
         return res
     radii = None if chord else job.get("radii")
-    if chord or blend or radii:
+    # the kernel's circular fillet takes only one radius (Radius A != B fails
+    # in it: SM_ERR_NULL_POINTER); its chamfer takes two
+    two = int(job["xsect"]) != 0 and abs(abs(float(job["radius_a"])) - abs(float(job["radius_b"]))) > \
+        1e-9 * max(abs(float(job["radius_a"])), abs(float(job["radius_b"])))
+    if chord or blend or radii or two:
         # our own sections (secfillet.py): the kernel's fillet has one ball
         # radius, a chord or a variable radius (job['radii'] = start, end;
         # start at the crossing's end nearer job['start_point']) needs one
-        # per section; a blend is built between the rails directly (no
+        # per section; Radius A != B: the conic between the ball's feet
+        # (secfillet.conic); a blend is built between the rails directly (no
         # circular fillet, trim and loft between its edges)
         import secfillet
         sa = 1.0 if float(job["radius_a"]) >= 0 else -1.0
@@ -1401,6 +1424,9 @@ class PullCutter(SurfaceCutter):
                 return None
         return b
 
+    def sheet_list(self, b):
+        return [sh.copy() for sh in self.sheets]
+
 
 def pull_sheets(target, data):
     """The sheets of a curve cut along itself: half height enough to pass
@@ -1612,16 +1638,247 @@ def job_untrim_region(job):
             "restored": float(sum(faces[i].area(1e-6) for gi in back for i in groups[gi]))}
 
 
+def _solid_caps(solid, cutters):
+    """Each cutter sheet cut down to its part inside the solid, split along
+    the other cutters' sheets: the faces that close the pieces of a split."""
+    per = [c.sheet_list(solid) for c in cutters]
+    caps = []
+    for ci, sheets in enumerate(per):
+        for sh in sheets:
+            try:
+                cap = sm.boolean_with_options(sh, solid.copy(), operation=sm.BooleanOp.INTERSECTION)
+            except Exception:
+                cap = None
+            if cap is None or cap.face_count() == 0:
+                continue
+            for cj, others in enumerate(per):
+                if cj == ci:
+                    continue
+                for o in others:
+                    cut = sm.boolean_with_options(cap, o.copy(), operation=sm.BooleanOp.UNION, imprinting=True,
+                                                  keep_other_brep=True)
+                    if cut is not None and cut.face_count():
+                        cap = cut
+            caps.append(cap)
+    return caps
+
+
+def _solid_cells(b, caps, size):
+    """The closed pieces of a solid cut along sheets. b: the solid imprinted
+    along every cut (outward normals); caps: the sheets' parts inside it.
+    Round every edge, the faces meeting there (b's and the caps') are put in
+    angular order; each wedge between two neighbours joins the sides of the
+    two faces that look into it. A b face's outer side is the outside; a
+    group of face sides that never reaches it is a piece. Returns
+    [(b face indices, {cap index: face indices})]; a cap face with the same
+    piece on both sides (a cut that stops inside the body) is left out."""
+    np = _np()
+    F = [(f, None) for f in b.faces()]                 # (face, cap index or None for b)
+    for k, cap in enumerate(caps):
+        F += [(f, k) for f in cap.faces()]
+    nb = b.face_count()
+    delta, near = 2e-3 * size, 1e-4 * size
+    E = []                                             # every face's edges: (face index, edge, polyline)
+    for gi, (f, _) in enumerate(F):
+        for e in f.edges():
+            P = np.array(_edge_poly(e, 24), float)
+            if len(P) >= 2 and e.length() > near:
+                E.append((gi, e, P))
+
+    def normal(gi, q):
+        f, k = F[gi]
+        _, uvs, _ = sm.surface_closest_point(f.surface(), tuple(map(float, q)))
+        u, v = uvs[0].x, uvs[0].y
+        n = np.array(f.outward_normal_at_uv(u, v) if k is None else f.normal_at_uv(u, v), float)
+        return n / (np.linalg.norm(n) or 1.0)
+
+    def into(gi, m, t):
+        """Unit direction from m into face gi, square to the edge (None: both ways, a seam)."""
+        n = normal(gi, m)
+        d = np.cross(n, t)
+        d /= np.linalg.norm(d) or 1.0
+        f = F[gi][0]
+        ins = [f.closest_point(tuple(map(float, m + s * delta * d)))[1] < 0.3 * delta for s in (1.0, -1.0)]
+        if ins[0] == ins[1]:
+            return None, n
+        return (d if ins[0] else -d), n
+
+    OUT = 2 * len(F)
+    parent = list(range(OUT + 1))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, c):
+        parent[find(a)] = find(c)
+
+    def node(gi, side):
+        if F[gi][1] is None and side > 0:
+            return OUT
+        return 2 * gi + (0 if side > 0 else 1)
+
+    for gi, e, P in E:
+        t0, t1 = e.parameter_range()
+        tm = 0.5 * (t0 + t1)
+        m = np.array(e.point_at(tm), float)
+        t = np.array(e.tangent_at(tm), float)
+        t /= np.linalg.norm(t) or 1.0
+        ring = {gi}
+        for gj, e2, P2 in E:
+            if gj in ring or np.min(np.linalg.norm(P2 - m, axis=1)) > 0.5 * float(
+                    np.max(np.linalg.norm(np.diff(P2, axis=0), axis=1))) + near:
+                continue
+            if e2.closest_point(tuple(map(float, m)))[2] <= near:
+                ring.add(gj)
+        ent = []
+        for gj in ring:
+            d, n = into(gj, m, t)
+            if d is not None:
+                ent.append((gj, d, n))
+        if len(ent) < len(ring) or not ent:
+            continue                                   # a seam: the face meets itself
+        a = ent[0][1]
+        c = np.cross(t, a)
+        ent.sort(key=lambda x: float(np.arctan2(x[1] @ c, x[1] @ a)))
+        for i in range(len(ent)):
+            (ga, da, na), (gb, db, nb_) = ent[i], ent[(i + 1) % len(ent)]
+            sa = 1 if float(na @ np.cross(t, da)) > 0 else -1           # the wedge turns on from A ...
+            sb = 1 if float(nb_ @ -np.cross(t, db)) > 0 else -1         # ... and ends at B
+            union(node(ga, sa), node(gb, sb))
+    out_root = find(OUT)
+    cells = {}
+    for gi in range(len(F)):
+        for side in (1, -1):
+            nd = node(gi, side)
+            if nd == OUT or find(nd) == out_root:
+                continue
+            cells.setdefault(find(nd), {}).setdefault(gi, set()).add(side)
+    result = []
+    for members in cells.values():
+        bf = sorted(gi for gi in members if gi < nb)
+        if not bf:
+            continue
+        cf = {}
+        for gi, sides in members.items():
+            if gi >= nb and len(sides) == 1:
+                k = F[gi][1]
+                cf.setdefault(k, []).append(gi - nb - sum(caps[j].face_count() for j in range(k)))
+        result.append((bf, cf))
+    return result
+
+
+def _cell_brep(b, caps, cell, tol):
+    """One piece of a split solid: its faces of b and of the caps stitched
+    into a closed body."""
+    bf, cf = cell
+    part = b.copy()
+    keep = set(bf)
+    drop = [f for i, f in enumerate(part.faces()) if i not in keep]
+    if drop:
+        ext.delete_faces(part, drop)
+    for k, idx in cf.items():
+        cp = caps[k].copy()
+        keep = set(idx)
+        drop = [f for i, f in enumerate(cp.faces()) if i not in keep]
+        if drop:
+            ext.delete_faces(cp, drop)
+        ext.append_brep(part, cp)
+    res = sm.stitch_advanced(part, tol, squeeze_small_edges=False, making_manifold_solid=True)
+    out = res[0]
+    try:
+        sm.unify_normals(out, max(out.faces(), key=lambda f: f.area()), 100)
+    except Exception:
+        pass
+    try:
+        h = sm.heal_brep(out)
+        if h is not None and h.is_manifold_solid() and abs(h.volume(1e-6)) > 0:
+            out = h
+    except Exception:
+        pass
+    return out
+
+
+def _job_split_solid(job, cutters, solid):
+    """job_split for a closed solid: every piece a closed solid of its own."""
+    np = _np()
+    lo, hi = (np.array(v, float) for v in solid.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    b = solid.copy()
+    for c in cutters:
+        b = c.split(b, tuple(job["ref_point"]))
+        if b is None or b.face_count() == 0:
+            raise RuntimeError("the cut produced nothing (does the cutter cross the solid?)")
+    caps = _solid_caps(solid, cutters)
+    cells = _solid_cells(b, caps, size)
+    if len(cells) < 2:
+        raise RuntimeError("the cutters do not split this solid into separate pieces")
+    tol = 1e-4 * size
+    x = job.get("xforms", {}).get("target")
+    keep = job.get("keep")
+    if keep is not None:                    # the marked pieces joined into one body
+        chosen = [cells[i] for i, k in enumerate(keep) if k and i < len(cells)]
+        bf = sorted({i for c in chosen for i in c[0]})
+        count = {}
+        for c in chosen:
+            for k, idx in c[1].items():
+                for i in idx:
+                    count[(k, i)] = count.get((k, i), 0) + 1
+        cf = {}
+        for (k, i), n in count.items():
+            if n == 1:                      # a cap between two kept pieces goes
+                cf.setdefault(k, []).append(i)
+        part = _cell_brep(b, caps, (bf, cf), tol)
+        try:              # no seam where the dropped wall met the faces (as Trim's merge)
+            healed = heal_cut_seams(part, solid)
+            if healed is not part and healed.is_manifold_solid():
+                part = healed
+        except Exception:
+            pass
+        save(to_local(part, x), job["out"]["KEEP"] if "KEEP" in job.get("out", {})
+             else os.path.join(job["out_dir"], "out_KEEP.sm"))
+        return {"regions": len(cells), "solid": True, "closed": bool(part.is_manifold_solid())}
+    areas, points, closed, volumes = [], [], [], []
+    for gi, cell in enumerate(cells):
+        part = _cell_brep(b, caps, cell, tol)
+        f = max(part.faces(), key=lambda fc: fc.area(1e-3))
+        points.append([float(v) for v in _inner_point(f)])
+        ok = bool(part.is_manifold_solid())
+        closed.append(ok)
+        try:
+            volumes.append(abs(float(part.volume(1e-6))) if ok else 0.0)
+        except Exception:
+            volumes.append(0.0)
+        areas.append(part.area())
+        save(to_local(part, x), os.path.join(job["out_dir"], f"out_region{gi}.sm"))
+    return {"regions": len(cells), "areas": areas, "extended": job.get("extended", []), "points": points,
+            "sides": [[None] * len(cutters) for _ in cells], "picked": 0, "solid": True, "closed": closed,
+            "volumes": volumes}
+
+
 def job_split(job):
     """Split the target along all cutters and write EVERY region as its own
     brep (out_region<i>.sm in out_dir). Cutting surfaces that miss the target
-    are ignored; nothing is removed."""
+    are ignored; nothing is removed. With job["solids"] a closed solid comes
+    apart into closed solids (each piece capped where it was cut); then
+    job["keep"] (one bool per piece) writes the kept pieces joined into one
+    body as out_KEEP.sm."""
     cutters = build_cutters(job, strict=False)
     if not cutters:
         raise RuntimeError("nothing crosses this surface")
     if "ref_point" not in job:
         lo, hi = world_brep(job, "target").bounding_box()
         job["ref_point"] = [0.5 * (lo[i] + hi[i]) for i in range(3)]
+    if job.get("solids"):
+        target = world_brep(job, "target")
+        try:
+            is_solid = bool(target.is_manifold_solid())
+        except Exception:
+            is_solid = False
+        if is_solid:
+            return _job_split_solid(job, cutters, target)
     b, faces, groups, picked, sides = _regions(job, cutters)
     if len(groups) < 2:
         raise RuntimeError("the cutters do not split this surface into separate regions")
@@ -2763,6 +3020,82 @@ def _try_exact(body, F, p, n, dist, G, reach, tol):
     return out, kept
 
 
+def _replace_one(body, F, p, sheet, size, tol, eps, exact=True):
+    """(body, how, lean, kept): the one face F of body (at p) replaced by the
+    open sheet, as job_replace_face does it. exact: leaning neighbours are
+    first tried on their own surfaces (_try_exact)."""
+    np = _np()
+    keep = []
+    o = np.array(F.interior_point(), float)
+    n = _face_normal(F, o)
+    flat = bool(F.surface().is_planar())
+    if not flat:
+        # swept along one direction: the face must not turn away from it
+        for e in F.edges():
+            t0, t1 = e.parameter_range()
+            for t in np.linspace(t0, t1, 5):
+                if float(_face_normal(F, np.array(e.point_at(t), float)) @ n) < 0.2:
+                    raise RuntimeError("the face turns too far to be replaced along one direction "
+                                       "(pick a flatter face)")
+    hs = _heights(sheet, n, o)
+    try:
+        face_lean = _lean(body, F)
+    except Exception:
+        face_lean = 0.0
+    if exact and face_lean > 0.5 and sheet.face_count() == 1:      # leaning neighbours: on their own surfaces
+        ex = _try_exact(body, F, p, n, 0.0, sheet.faces()[0].surface(),
+                        max(abs(h) for h in hs) + 0.05 * size, tol)
+        if ex is not None:
+            return ex[0], "exact", face_lean, [ex[1]]
+    reach = max(abs(h) for h in hs) + size
+    if not _covers(sheet, F, n, reach, tol):
+        raise RuntimeError("the surface does not cover the whole face (seen along its normal): "
+                           "extend it past the face's edges")
+    hi, lo = max(hs), min(hs)
+    V0 = _vol(body)
+    U, how = body, "cut"
+    if hi > tol:                  # the face's column joined, up to past the surface
+        H = hi + 0.1 * size
+        out = None
+        try:
+            tool, kept = (_face_prism(F, n, H, eps, tol) if flat else
+                          _swept_solid(_face_sheet(body, p), -eps * n, (H + eps) * n, tol))
+            keep.append((tool, kept))
+            out = sm.boolean(body.copy(), tool.copy(), operation=sm.BooleanOp.UNION)
+        except Exception:
+            out = None
+        if out is None or not out.face_count() or not out.is_manifold_solid() or abs(_vol(out) - V0) <= tol:
+            out, kept = _extruded_face(body, p, n, H, tol)
+            keep.append(kept)
+            how = "extrude"
+        else:
+            how = "boolean"
+        if not out.is_manifold_solid():
+            raise RuntimeError("the face's column could not be joined to the body")
+        U = out
+    top = max(hi, 0.0) + 0.2 * size
+    depth = max(-lo, 0.0) + 0.2 * size
+    col, k1 = _swept_solid(_face_sheet(body, p), -depth * n, (depth + top) * n, tol)
+    far, k2 = _swept_solid(sheet, np.zeros(3), (top + depth + size) * n, tol)
+    keep += [k1, k2, (col, far)]
+    try:
+        cut = sm.boolean(col.copy(), far.copy(), operation=sm.BooleanOp.INTERSECTION)
+    except Exception as exc:
+        raise RuntimeError(f"the part beyond the surface could not be found ({exc})")
+    if cut is None or not cut.face_count():
+        res = U                   # nothing beyond the surface: the column ends exactly there
+    else:
+        res = sm.boolean(U.copy(), cut.copy(), operation=sm.BooleanOp.DIFFERENCE)
+        if res is None or not res.face_count():
+            raise RuntimeError("nothing left: the surface cuts the whole body away")
+        # the surface over the inside of the face must now be the body's boundary
+        # (a boolean that silently did nothing leaves those points inside it)
+        if not res.is_manifold_solid() or any(dist_to_brep(tuple(map(float, h)), res) > 1e-4 * size
+                                              for h in _over_face(sheet, F, n, reach)):
+            raise RuntimeError("the cut back to the surface failed (the boolean)")
+    return res, how, face_lean, keep
+
+
 def job_replace_face(job):
     """Replace Face (world space): each face of the solid job['target'] at
     job['face_pts'] is replaced by the open surface job['surface'], its sides
@@ -2790,80 +3123,11 @@ def job_replace_face(job):
     keep, hows, lean = [], [], 0.0
     for p, want_n, was_flat in zip(pts, normals, flats):
         F, p = _find_face(body, p, want_n, was_flat, size)
-        o = np.array(F.interior_point(), float)
-        n = _face_normal(F, o)
-        flat = bool(F.surface().is_planar())
-        if not flat:
-            # swept along one direction: the face must not turn away from it
-            for e in F.edges():
-                t0, t1 = e.parameter_range()
-                for t in np.linspace(t0, t1, 5):
-                    if float(_face_normal(F, np.array(e.point_at(t), float)) @ n) < 0.2:
-                        raise RuntimeError("the face turns too far to be replaced along one direction "
-                                           "(pick a flatter face)")
-        hs = _heights(sheet, n, o)
-        try:
-            face_lean = _lean(body, F)
-        except Exception:
-            face_lean = 0.0
-        if face_lean > 0.5 and sheet.face_count() == 1:      # leaning neighbours: extended on their own surfaces
-            ex = _try_exact(body, F, p, n, 0.0, sheet.faces()[0].surface(),
-                            max(abs(h) for h in hs) + 0.05 * size, tol)
-            if ex is not None:
-                keep.append(ex[1])
-                body = ex[0]
-                hows.append("exact")
-                continue
-        lean = max(lean, face_lean)
-        reach = max(abs(h) for h in hs) + size
-        if not _covers(sheet, F, n, reach, tol):
-            raise RuntimeError("the surface does not cover the whole face (seen along its normal): "
-                               "extend it past the face's edges")
-        hi, lo = max(hs), min(hs)
-        V0 = _vol(body)
-        U, how = body, "cut"
-        if hi > tol:                  # the face's column joined, up to past the surface
-            H = hi + 0.1 * size
-            out = None
-            try:
-                tool, kept = (_face_prism(F, n, H, eps, tol) if flat else
-                              _swept_solid(_face_sheet(body, p), -eps * n, (H + eps) * n, tol))
-                keep.append((tool, kept))
-                out = sm.boolean(body.copy(), tool.copy(), operation=sm.BooleanOp.UNION)
-            except Exception:
-                out = None
-            if out is None or not out.face_count() or not out.is_manifold_solid() or abs(_vol(out) - V0) <= tol:
-                out, kept = _extruded_face(body, p, n, H, tol)
-                keep.append(kept)
-                how = "extrude"
-            else:
-                how = "boolean"
-            if not out.is_manifold_solid():
-                raise RuntimeError("the face's column could not be joined to the body")
-            U = out
-        top = max(hi, 0.0) + 0.2 * size
-        depth = max(-lo, 0.0) + 0.2 * size
-        col, k1 = _swept_solid(_face_sheet(body, p), -depth * n, (depth + top) * n, tol)
-        far, k2 = _swept_solid(sheet, np.zeros(3), (top + depth + size) * n, tol)
-        keep += [k1, k2, (col, far)]
-        try:
-            cut = sm.boolean(col.copy(), far.copy(), operation=sm.BooleanOp.INTERSECTION)
-        except Exception as exc:
-            raise RuntimeError(f"the part beyond the surface could not be found ({exc})")
-        VU = _vol(U)
-        if cut is None or not cut.face_count():
-            res = U                   # nothing beyond the surface: the column ends exactly there
-        else:
-            res = sm.boolean(U.copy(), cut.copy(), operation=sm.BooleanOp.DIFFERENCE)
-            if res is None or not res.face_count():
-                raise RuntimeError("nothing left: the surface cuts the whole body away")
-            # the surface over the inside of the face must now be the body's boundary
-            # (a boolean that silently did nothing leaves those points inside it)
-            if not res.is_manifold_solid() or any(dist_to_brep(tuple(map(float, h)), res) > 1e-4 * size
-                                                  for h in _over_face(sheet, F, n, reach)):
-                raise RuntimeError("the cut back to the surface failed (the boolean)")
-        body = res
+        body, how, face_lean, kept = _replace_one(body, F, p, sheet, size, tol, eps)
+        keep += kept
         hows.append(how)
+        if how != "exact":
+            lean = max(lean, face_lean)
     volume = _volume(body, 1e-3)               # for the report
     save(to_local(body, job.get("xforms", {}).get(job.get("into"))), job["out"]["result"])
     return {"faces": body.face_count(), "volume": volume, "how": hows, "lean": lean}
@@ -2955,6 +3219,377 @@ def job_push_pull(job):
         raise RuntimeError("nothing left: the push removes the whole body")
     save(to_local(body, job.get("xforms", {}).get(job.get("into"))), job["out"]["result"])
     return {"faces": body.face_count(), "volume": volume, "how": hows, "lean": lean}
+
+
+def _rotation(z, ang):
+    """3x3: ang radians about unit z, right-handed."""
+    np = _np()
+    z = np.asarray(z, float)
+    K = np.array([[0.0, -z[2], z[1]], [z[2], 0.0, -z[0]], [-z[1], z[0], 0.0]])
+    return np.eye(3) + np.sin(ang) * K + (1.0 - np.cos(ang)) * (K @ K)
+
+
+def _rotated_surface(srf, O, R):
+    """A free copy of srf turned by R about the point O (its CVs moved: exact,
+    rational surfaces too)."""
+    np = _np()
+    a = _srf_tuple(ext.surface_cvs(srf))
+    pts = [tuple(map(float, O + R @ (np.asarray(q, float) - O))) for q in a[2]]
+    return ext.surface_from_cvs(a[0], a[1], pts, a[3], a[4], a[5])
+
+
+def _ruled_rows(srf):
+    """(points (2, n, 3), ruling-first?) of a surface ruled straight between two
+    CV rows along one direction (an Extrude wall: degree 1, two rows), or
+    None."""
+    np = _np()
+    d = ext.surface_cvs(srf)
+    nu, nv = int(d["count_u"]), int(d["count_v"])
+    P = np.array(d["points"], float).reshape(nu, nv, 3)
+    if int(d["degree_u"]) == 1 and nu == 2:
+        return P, True
+    if int(d["degree_v"]) == 1 and nv == 2:
+        return np.transpose(P, (1, 0, 2)), False
+    return None
+
+
+def _ruled_cap_move(body, p, G, tol):
+    """(solid, kept): the flat face at p (a cap) moved onto the plane G where
+    every neighbour is a closed wall ruled straight along one direction (an
+    extruded cylinder or tube, untrimmed): each wall's row on the cap's side
+    slid along its rulings onto G (an affine map of its CVs: exact, rational
+    ones too), the cap rebuilt on those rows. No booleans: the walls stay one
+    face each. Raises when the face is not such a cap."""
+    np = _np()
+    if not G.is_planar():
+        raise RuntimeError("the new face is not flat")
+    b = body.copy()
+    F = _face_at(b, p)
+    (u0, u1), (v0, v1) = G.u_domain(), G.v_domain()
+    g0 = np.array(G.evaluate(u0, v0), float)
+    gn = np.cross(np.array(G.evaluate(u1, v0), float) - g0, np.array(G.evaluate(u0, v1), float) - g0)
+    if np.linalg.norm(gn) <= 1e-300:
+        raise RuntimeError("the new face's plane has no normal")
+    gn /= np.linalg.norm(gn)
+    walls = {}
+    for e in F.edges():
+        others = [f for f in e.faces() if f != F]
+        if len(others) != 1:
+            raise RuntimeError("an edge of the cap is not shared with one wall")
+        walls.setdefault(others[0], []).append(e)
+    built, rims = [], []
+    for N, es in walls.items():
+        srf = N.surface()
+        if not any(_closed_dirs(srf, tol)):
+            raise RuntimeError("a neighbour is not closed round")
+        rr = _ruled_rows(srf)
+        if rr is None:
+            raise RuntimeError("a neighbour is not a straight extrusion")
+        P, ruling_first = rr
+        d = ext.surface_cvs(srf)
+        D = P[1] - P[0]
+        if np.linalg.norm(D - D.mean(axis=0), axis=1).max() > 1e-6 * (np.linalg.norm(D, axis=1).max() or 1.0):
+            raise RuntimeError("a neighbour's rulings are not parallel")
+        dirn = D.mean(axis=0)
+        # which row is on the cap's side: the one the cap's edges lie on
+        mids = [np.array(e.point_at(sum(e.parameter_range()) / 2), float) for e in es]
+
+        def row_curve(R, k, d=d, ruling_first=ruling_first):
+            return ext.curve_from_cvs(int(d["degree_v" if ruling_first else "degree_u"]),
+                                      [tuple(map(float, q)) for q in R],
+                                      [float(x) for x in d["knots_v" if ruling_first else "knots_u"]],
+                                      _row_weights(d, k, ruling_first))
+        rows = [row_curve(P[k], k) for k in (0, 1)]
+        dist = [max(sm.curve_closest_point(rows[k], tuple(map(float, m)))[2] for m in mids) for k in (0, 1)]
+        k = int(np.argmin(dist))
+        if dist[k] > 1e3 * tol:
+            raise RuntimeError("the cap does not sit on a wall's end row")
+        # the wall must be natural: its own boundary is its two end rows (and the seam)
+        for e in N.edges():
+            if e in es or not e.faces() or len(set(e.faces())) == 1:
+                continue
+            m = np.array(e.point_at(sum(e.parameter_range()) / 2), float)
+            if sm.curve_closest_point(rows[1 - k], tuple(map(float, m)))[2] > 1e3 * tol:
+                raise RuntimeError("a wall is trimmed")
+        den = float(dirn @ gn)
+        if abs(den) <= 1e-6 * np.linalg.norm(dirn):
+            raise RuntimeError("the new face runs along a wall")
+        Q = P.copy()
+        Q[k] = P[k] + np.outer(((g0 - P[k]) @ gn) / den, dirn)
+        # the wall keeps its direction: the cap's row stays on its side of the far row
+        s = (Q[k] - Q[1 - k]) @ dirn * (1.0 if k == 1 else -1.0)
+        if s.min() <= 1e3 * tol:
+            raise RuntimeError("the face would run through the far end of a wall")
+        pts = Q if ruling_first else np.transpose(Q, (1, 0, 2))
+        flat = [tuple(map(float, q)) for q in pts.reshape(-1, 3)]
+        built.append(ext.brep_from_surface(ext.surface_from_cvs(
+            int(d["degree_u"]), int(d["degree_v"]), flat, [float(x) for x in d["knots_u"]],
+            [float(x) for x in d["knots_v"]], d.get("weights") or None)))
+        rims.append(row_curve(Q[k], k))
+    built.append(sm.create_planar_faces(rims))
+    gone = [F] + list(walls)
+    keep_pts = [np.array(f.interior_point(), float) for f in b.faces() if f not in gone]
+    if not keep_pts:
+        raise RuntimeError("nothing of the body stays as it was")
+    ext.delete_faces(b, gone)
+    for nb in built:
+        ext.append_brep(b, nb)
+    b = sm.stitch_advanced(b, 10 * tol, squeeze_small_edges=False, making_manifold_solid=True)[0]
+    try:
+        sm.unify_normals(b, _face_at(b, keep_pts[0]), 100)
+    except Exception:
+        pass
+    if not b.is_manifold_solid():
+        raise RuntimeError("the moved cap and its walls do not close into a solid")
+    if _vol(b) <= 0:
+        raise RuntimeError("the moved cap turned the body inside out")
+    return b, built
+
+
+def _row_weights(d, k, ruling_first):
+    """The weights of CV row k (along the rulings' cross direction), or None."""
+    np = _np()
+    if not d.get("weights"):
+        return None
+    W = np.array(d["weights"], float).reshape(int(d["count_u"]), int(d["count_v"]))
+    w = W[k] if ruling_first else W[:, k]
+    return [float(x) for x in w] if np.abs(w - 1.0).max() > 1e-12 else None
+
+
+def _own_hinge(F, O, z, size):
+    """A point of the face's straight edge along z nearest the line through O
+    (a rebuild moved the face: its hinge edge moved with it); O when it has none."""
+    np = _np()
+    best = None
+    for e in F.edges():
+        a, b = np.array(e.start_vertex().point(), float), np.array(e.end_vertex().point(), float)
+        L = float(np.linalg.norm(b - a))
+        if L <= 1e-9 * size:
+            continue
+        d = (b - a) / L
+        if abs(float(d @ z)) < 1.0 - 1e-9:
+            continue
+        m = np.array(e.point_at(sum(e.parameter_range()) / 2), float)
+        r = m - a
+        if np.linalg.norm(r - (r @ d) * d) > 1e-6 * size:          # not straight
+            continue
+        w = O - a
+        dist = float(np.linalg.norm(w - (w @ d) * d))
+        if best is None or dist < best[0]:
+            best = (dist, a + (w @ d) * d)
+    return O if best is None else best[1]
+
+
+def job_rotate_face(job):
+    """Rotate Face (world space): each face of the solid job['target'] at
+    job['face_pts'] turned by job['angle'] degrees (right-handed) about the
+    axis through job['axis_point'] along job['axis_dir'] -- usually one of
+    its own edges, a hinge. The face keeps its shape (its surface turned);
+    each neighbour keeps its own surface, extended or cut back to meet it,
+    and each corner slides along its side edge, as Push / Pull's exact move.
+    A corner with more than three faces, a side edge that never meets the
+    turned face or a neighbour that runs out (the face would vanish) is
+    refused. job['hinge_on_face'] (optional, per face): the hinge was that
+    face's own edge -- on a rebuild it is the face's straight edge along the
+    axis nearest the stored one (the face may have moved). Written in the
+    local space of job['into']."""
+    np = _np()
+    body = world_brep(job, "target")
+    if not bool(body.is_manifold_solid()):
+        raise RuntimeError("Rotate Face needs a closed solid (all edges shared by two faces)")
+    ang = float(np.radians(float(job["angle"])))
+    if abs(ang) <= 1e-9:
+        raise RuntimeError("the angle is 0")
+    O = np.asarray(job["axis_point"], float)
+    z = np.asarray(job["axis_dir"], float)
+    if np.linalg.norm(z) <= 1e-12:
+        raise RuntimeError("the axis has no direction")
+    z = z / np.linalg.norm(z)
+    R = _rotation(z, ang)
+    lo, hi = (np.array(v, float) for v in body.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    tol = 1e-6 * size
+    pts = job["face_pts"]
+    normals = job.get("face_normals") or [None] * len(pts)
+    flats = job.get("face_flat") or [True] * len(pts)
+    eps = 1e-5 * size
+    on_face = job.get("hinge_on_face") or [False] * len(pts)
+    keep, hows, lean, V0 = [], [], 0.0, _vol(body)
+    for p, want_n, was_flat, own in zip(pts, normals, flats, on_face):
+        F, p = _find_face(body, p, want_n, was_flat, size)
+        Of = _own_hinge(F, O, z, size) if own else O     # hinged on its own edge: that edge, where it is now
+        G = _rotated_surface(F.surface(), Of, R)
+        moved = max((float(np.linalg.norm((R - np.eye(3)) @ (np.array(v.point(), float) - Of)))
+                     for e in F.edges() for v in e.vertices()), default=0.0)
+        closed = any(not [f for f in e.faces() if f != F] for e in F.edges())     # a seam: closed round
+        out, why = None, ""
+        for r in (moved + 0.25 * size, moved + size):     # a slanting side edge slides further than a corner turns
+            try:
+                if closed:
+                    out, kept = _exact_move_closed(body, p, G, r, tol)
+                else:
+                    out, kept = _exact_move(body, p, _extended_surface(G, 2.0 * r + 10.0 * tol, tol), r, tol)
+                if out.is_manifold_solid():
+                    break
+                out = None
+            except Exception as exc:
+                out, why = None, str(exc)
+        if out is None and closed is False and G.is_planar():
+            try:                          # a cap on extruded walls (a cylinder's or a tube's end)
+                out, kept = _ruled_cap_move(body, p, G, tol)
+            except Exception as exc:
+                why = why or str(exc)
+                out = None
+        if out is not None:
+            keep.append(kept)
+            body = out
+            hows.append("exact")
+            continue
+        # a neighbour that can't be extended to meet it (a cylinder round a
+        # tilted cap): the face replaced by its turned surface, the walls along
+        # its normal (Replace Face)
+        try:
+            sheet = ext.brep_from_surface(_extended_surface(G, size, tol))
+            body, how, face_lean, kept = _replace_one(body, F, p, sheet, size, tol, eps, exact=False)
+        except Exception as exc:
+            if "SM_ERR" in why or "vanish" in why or "reach" in why or "far end" in why:
+                raise RuntimeError("the face can't turn that far: a side edge would no longer meet it "
+                                   "(a neighbour would vanish)")
+            raise RuntimeError(f"the face could not be turned ({why or exc})")
+        keep.append(kept)
+        hows.append(how)
+        lean = max(lean, face_lean)
+    volume = _volume(body, 1e-3)
+    if volume <= 0:
+        raise RuntimeError("the turned face turned the body inside out")
+    save(to_local(body, job.get("xforms", {}).get(job.get("into"))), job["out"]["result"])
+    return {"faces": body.face_count(), "volume": volume, "change": volume - V0, "how": hows, "lean": lean}
+
+
+def _loop_polygon(loop, k=24):
+    """Points along a face loop in its own order (each edge sampled k times)."""
+    np = _np()
+    out = []
+    for e, fw in loop:
+        t0, t1 = e.parameter_range()
+        ts = np.linspace(t0, t1, k + 1)[:-1] if fw else np.linspace(t1, t0, k + 1)[:-1]
+        out += [np.array(e.point_at(float(t)), float) for t in ts]
+    return np.array(out)
+
+
+def _inside_2d(P, poly):
+    """For each 2D point of P: inside the closed polygon poly (even-odd rule)?"""
+    np = _np()
+    x, y = P[:, 0][:, None], P[:, 1][:, None]
+    a, b = poly, np.roll(poly, -1, axis=0)
+    cross = (a[:, 1] > y) != (b[:, 1] > y)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        xs = a[:, 0] + (y - a[:, 1]) * (b[:, 0] - a[:, 0]) / (b[:, 1] - a[:, 1])
+    return (np.count_nonzero(cross & (x < xs), axis=1) % 2) == 1
+
+
+def _moved_curve(c, d):
+    deg, pts, U, w = _cv_tuple(ext.curve_cvs(c))
+    return ext.curve_from_cvs(deg, [tuple(float(a + b) for a, b in zip(q, d)) for q in pts], U, w)
+
+
+def job_move_face(job):
+    """Move Face (world space): the feature holding the faces at
+    job['face_pts'] -- the faces enclosed by an inner loop of the face(s) it
+    sits in (featregion: a hole, pocket, boss, slot, letter) -- slid by
+    job['vector'] along those seat faces. The feature moves rigidly (its faces
+    translated), each seat keeps its surface and is trimmed again with that
+    loop moved: exact, the volume stays. The seats must be flat and contain the
+    move; the moved loop must stay inside its seat, clear of its other holes.
+    Written in the local space of job['into']."""
+    np = _np()
+    from featregion import feature_region
+    from trimext import brep_tol
+    body = world_brep(job, "target")
+    if not bool(body.is_manifold_solid()):
+        raise RuntimeError("Move Face needs a closed solid (all edges shared by two faces)")
+    d = np.asarray(job["vector"], float)
+    lo, hi = (np.array(v, float) for v in body.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    tol = 1e-6 * size
+    if np.linalg.norm(d) <= tol:
+        raise RuntimeError("the move is 0")
+    faces = body.faces()
+    start = {_face_at(body, p) for p in job["face_pts"]}
+    reg = feature_region(body, start)
+    if reg is None:
+        raise RuntimeError("the face is not part of a feature sitting inside a face (a hole, pocket, boss "
+                           "or slot): Push / Pull or Rotate Face move a face of the body itself")
+    region, seats, rim_edges = reg
+    for S in seats:
+        if not S.surface().is_planar():
+            raise RuntimeError("the feature sits in a curved face: only a flat one can take the move")
+        n = _face_normal(S, np.array(S.interior_point(), float))
+        if abs(float(n @ d)) > 1e-6 * np.linalg.norm(d):
+            raise RuntimeError("the move leaves the face the feature sits in: slide it along that face "
+                               "(Push / Pull lifts or sinks a face)")
+    # the seats again, their loops round the feature moved
+    btol = brep_tol(1e-5, size)
+    built = []
+    for S in seats:
+        n = _face_normal(S, np.array(S.interior_point(), float))
+        a = np.cross(n, [1.0, 0.0, 0.0])
+        if np.linalg.norm(a) < 0.1:
+            a = np.cross(n, [0.0, 1.0, 0.0])
+        a /= np.linalg.norm(a)
+        b2 = np.cross(n, a)
+        o = np.array(S.interior_point(), float)
+        flat = lambda P: np.c_[(P - o) @ a, (P - o) @ b2]
+        outer = {e for e, _ in S.boundary_outer_loop()}
+        loops, moved, still = [], [], []
+        for loop in S.boundary_loops():
+            mine = all(e in rim_edges for e, _ in loop)
+            if mine and any(e in outer for e, _ in loop):
+                raise RuntimeError("the feature runs out to the edge of the face it sits in")
+            cs = [(_moved_curve(_edge_copy(e), d) if mine else _edge_copy(e)) for e, _ in loop
+                  if e.length() > tol]
+            ch = _chain(cs, 1e3 * tol)
+            if ch is None:
+                raise RuntimeError("a loop of the face the feature sits in does not close")
+            poly = flat(_loop_polygon(loop)) + (flat(o + d)[0] - flat(o)[0] if mine else 0.0)
+            (moved if mine else still).append((poly, any(e in outer for e, _ in loop)))
+            loops.insert(0, ch) if any(e in outer for e, _ in loop) else loops.append(ch)
+        for P, _ in moved:
+            for Q, is_outer in still:
+                if is_outer:
+                    if not _inside_2d(P, Q).all():
+                        raise RuntimeError("the feature would leave the face it sits in")
+                elif _inside_2d(P, Q).any() or _inside_2d(Q, P).any():
+                    raise RuntimeError("the feature would run into another hole or feature in that face")
+        srf = ext.surface_from_cvs(*_srf_tuple(ext.surface_cvs(S.surface())))
+        built.append(ext.trim_surface_with_3d_curves_tol(srf, [len(l) for l in loops],
+                                                        [c for l in loops for c in l], 10 * tol, btol))
+    # the feature's faces, translated
+    idx = [i for i, f in enumerate(faces) if f in region]
+    sheet = body.copy()
+    sf = sheet.faces()
+    ext.delete_faces(sheet, [sf[i] for i in range(len(sf)) if i not in set(idx)])
+    sheet = sm.translate(sheet, tuple(map(float, d)))
+    gone = set(idx) | {i for i, f in enumerate(faces) if f in seats}
+    b = body.copy()
+    bf = b.faces()
+    keep_pts = [np.array(bf[i].interior_point(), float) for i in range(len(bf)) if i not in gone]
+    ext.delete_faces(b, [bf[i] for i in gone])
+    for nb in built + [sheet]:
+        ext.append_brep(b, nb)
+    b = sm.stitch_advanced(b, 10 * tol, squeeze_small_edges=False, making_manifold_solid=True)[0]
+    try:
+        sm.unify_normals(b, _face_at(b, keep_pts[0]), 100)
+    except Exception:
+        pass
+    if not b.is_manifold_solid():
+        raise RuntimeError("the moved feature and its face do not close into a solid")
+    V0, V1 = _vol(body), _vol(b)
+    if abs(V1 - V0) > 1e-4 * abs(V0) + tol:
+        raise RuntimeError(f"the move changed the volume ({V0:.6g} to {V1:.6g}): the feature runs into "
+                           "something")
+    save(to_local(b, job.get("xforms", {}).get(job.get("into"))), job["out"]["result"])
+    return {"faces": b.face_count(), "volume": _volume(b, 1e-3), "feature": len(region), "seats": len(seats)}
 
 
 def job_boolean(job):
@@ -4072,6 +4707,22 @@ def job_flip(job):
     return {"faces": b.face_count()}
 
 
+def _to_origin(b):
+    """Move b (in place) so its box is centred on the origin; returns the
+    move back. The kernel's offsets fit their surfaces finer the farther the
+    part is from the origin: a lofted dome's offset had 20 x 15 CVs at the
+    origin, 45 x 156 six units out (and Thicken took 57 s instead of 0.2)."""
+    lo, hi = b.bounding_box()
+    c = tuple(0.5 * (float(a) + float(z)) for a, z in zip(lo, hi))
+    if max(abs(v) for v in c) > 0.0:
+        sm.translate(b, tuple(-v for v in c))
+    return c
+
+
+def _from_origin(r, c):
+    return sm.translate(r, c) if r is not None and max(abs(v) for v in c) > 0.0 else r
+
+
 def job_offset(job):
     """Offset every face of a (joined) sheet or solid by `distance` along its
     normals; corners between faces extended until they meet. World space in,
@@ -4080,7 +4731,8 @@ def job_offset(job):
     d = float(job["distance"])
     if abs(d) <= 0:
         raise RuntimeError("the distance is zero")
-    r = sm.offset_brep(b, d, extended_offset=True, self_intersection=True)
+    c = _to_origin(b)
+    r = _from_origin(sm.offset_brep(b, d, extended_offset=True, self_intersection=True), c)
     if r is None or r.face_count() == 0:
         raise RuntimeError("no offset (the distance may be bigger than a concave radius)")
     save(to_local(r, job.get("xforms", {}).get("target")), job["out"]["result"])
@@ -4100,9 +4752,10 @@ def job_thicken(job):
         solid = False
     if solid:
         raise RuntimeError("this is already a closed solid -- Thicken works on open surfaces (use Offset)")
+    c = _to_origin(b)
     if job.get("symmetric"):
         b = sm.offset_brep(b, -0.5 * d, extended_offset=True, self_intersection=True)
-    r = sm.shell_brep(b, d, extended_offset=True, self_intersection=True, create_solid=True)
+    r = _from_origin(sm.shell_brep(b, d, extended_offset=True, self_intersection=True, create_solid=True), c)
     if r is None or r.face_count() == 0:
         raise RuntimeError("no solid (the thickness may be bigger than a concave radius)")
     volume = 0.0
@@ -4325,7 +4978,7 @@ def job_mesh_to_brep(job):
             "filleted": done, "failed": failed}
 
 
-JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "untrim_region": job_untrim_region, "untrim_preview": job_untrim_preview, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean, "push_pull": job_push_pull, "replace_face": job_replace_face, "extrude_face": job_extrude_face,
+JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "untrim_region": job_untrim_region, "untrim_preview": job_untrim_preview, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean, "push_pull": job_push_pull, "rotate_face": job_rotate_face, "move_face": job_move_face, "replace_face": job_replace_face, "extrude_face": job_extrude_face,
         "flip": job_flip, "cap_solid": job_cap_solid, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken,
         "mesh_to_brep": job_mesh_to_brep}
 

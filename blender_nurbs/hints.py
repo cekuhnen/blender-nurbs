@@ -22,7 +22,7 @@ A tool calls show() whenever its state changes and clear() when it ends:
 """
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty
+from bpy.props import BoolProperty, EnumProperty, IntProperty
 
 HUD = {"spec": None, "area": None, "collapsed": False, "top": 0.0}
 FONT = 0
@@ -334,9 +334,22 @@ class NPROTO_AP_preferences(bpy.types.AddonPreferences):
         description="How sized tools take their values when started from the UI. Tools without handles "
                     "always use the dialog; scripts and the Adjust Last Operation panel use neither")
 
+    hold_transform: BoolProperty(name="Hold G / R / S / . for the Add-on's Tools", default=True,
+                                 description="Tap G, R or S for Blender's Move, Rotate or Scale; hold it "
+                                             "for the add-on's by Points tool (picked points, *n / /n "
+                                             "copies). Tap . for Blender's Pivot Point pie, hold it for "
+                                             "Move Pivot. Off: the keys are always Blender's")
+    hold_ms: IntProperty(name="Hold Time (ms)", default=300, min=120, max=1500,
+                         description="How long (milliseconds) G, R, S or . is held before the add-on's tool starts")
+
     def draw(self, context):
         self.layout.prop(self, "value_input")
         self.layout.prop(self, "hints_collapsed")
+        row = self.layout.row()
+        row.prop(self, "hold_transform")
+        sub = row.row()
+        sub.active = self.hold_transform
+        sub.prop(self, "hold_ms")
 
 
 def value_input():

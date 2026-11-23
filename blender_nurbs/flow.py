@@ -38,6 +38,7 @@ OP = "flow"
 CURVE_TOL = 1e-5          # flowed curves within this share of the target's size of the map
 SURF_TOL = 1e-6           # flowed surfaces: the same for their nets
 SURF_BUDGET = 40000       # grid nodes per face sampled for its refit
+REFIT_TOL = 1e-5          # a refit missing by more than this share of the size is sampled finer
 LAST_INFO = {}
 
 
@@ -245,15 +246,54 @@ def map_surface(S, fmap, tol):
     S's own (u, v) domain fitted to the mapped grid."""
     from .unroll import axes_for
     au, av = axes_for(S, SURF_BUDGET)
-    P = S.grid(au.t, av.t, 0)[0, 0]
-    X = fmap.map(P.reshape(-1, 3)).reshape(P.shape)
-    p = _pick_degree(S.p, au.t, X, surfmap.fit_knots(S.U, 1, 1, *S.u_domain), tol)
-    q = _pick_degree(S.q, av.t, X.transpose(1, 0, 2), surfmap.fit_knots(S.V, 1, 1, *S.v_domain), tol)
-    U0 = surfmap.fit_knots(S.U, S.p, p, *S.u_domain)
-    V0 = surfmap.fit_knots(S.V, S.q, q, *S.v_domain)
-    C, U, V, err = surfmap.fit_grid(au.t, av.t, X, U0, p, V0, q, tol,
-                                    min_u=0.5 * float(au.h.min()), min_v=0.5 * float(av.h.min()))
+    for _ in range(4):
+        P = S.grid(au.t, av.t, 0)[0, 0]
+        X = fmap.map(P.reshape(-1, 3)).reshape(P.shape)
+        p = _pick_degree(S.p, au.t, X, surfmap.fit_knots(S.U, 1, 1, *S.u_domain), tol)
+        q = _pick_degree(S.q, av.t, X.transpose(1, 0, 2), surfmap.fit_knots(S.V, 1, 1, *S.v_domain), tol)
+        U0 = surfmap.fit_knots(S.U, S.p, p, *S.u_domain)
+        V0 = surfmap.fit_knots(S.V, S.q, q, *S.v_domain)
+        C, U, V, err = surfmap.fit_grid(au.t, av.t, X, U0, p, V0, q, tol,
+                                        min_u=0.5 * float(au.h.min()), min_v=0.5 * float(av.h.min()))
+        # spans stop at half a sampling panel: a face sampled as plainly as its own shape (a flat
+        # cap: 4 panels a side) that the map bends more (folded back onto a dome) gets finer
+        # panels until it is within REFIT_TOL -- else its trim, held to 1e-4 of the size, fails
+        if err <= max(tol, REFIT_TOL * fmap.size) or 4 * au.n * av.n > SURF_BUDGET:
+            break
+        au = surfmap.Axis(surfmap.breakpoints(S.U, *S.u_domain, 2 * au.P))
+        av = surfmap.Axis(surfmap.breakpoints(S.V, *S.v_domain, 2 * av.P))
     return C, U, p, V, q, err
+
+
+def tight_plane(f, S, pad=0.02):
+    """S cut down to face f's trim, for a flat face on a bilinear plane patch:
+    the same plane (its (u, v) runs affinely) over the trim's (u, v) box grown
+    by pad of it. A word's letters are capped by one plane spanning the whole
+    word; mapped whole, its far parts land where the map bends (the next face
+    of an unrolled sheet, past the edge of a face a projection hits) and the
+    fit of a letter's cap fails there. S itself when it is no such plane or
+    no smaller than 80 % of it would do."""
+    if S.p != 1 or S.q != 1 or S.nu != 2 or S.nv != 2 or S.rational:
+        return S
+    try:
+        uv = np.vstack([q for lp in f.boundary_loops() if lp for q, _ in surfmap.loop_uvs(S, lp)])
+    except Exception:
+        return S
+    (u0, u1), (v0, v1) = S.u_domain, S.v_domain
+    lo, hi = uv.min(axis=0), uv.max(axis=0)
+    g = pad * (hi - lo) + 1e-9 * np.array([u1 - u0, v1 - v0])
+    lo = np.maximum(lo - g, [u0, v0])
+    hi = np.minimum(hi + g, [u1, v1])
+    if (hi[0] - lo[0]) * (hi[1] - lo[1]) > 0.8 * (u1 - u0) * (v1 - v0):
+        return S
+    _, ext = store._k()
+    C = S.at([lo[0], lo[0], hi[0], hi[0]], [lo[1], hi[1], lo[1], hi[1]], 0)[0, 0]     # (u, v) order: u major
+    try:
+        return surfeval.Surf(ext.surface_from_cvs(1, 1, [tuple(map(float, c)) for c in C],
+                                                  [float(lo[0])] * 2 + [float(hi[0])] * 2,
+                                                  [float(lo[1])] * 2 + [float(hi[1])] * 2, None))
+    except Exception:
+        return S
 
 
 def flow_brep(b, fmap):
@@ -268,6 +308,8 @@ def flow_brep(b, fmap):
             S = surfeval.Surf(f.surface())
         except Exception:
             raise ValueError("a face is not a B-spline surface")
+        if len(faces) > 1:
+            S = tight_plane(f, S)
         C, U, p, V, q, err = map_surface(S, fmap, tol)
         worst = max(worst, err)
         make = lambda C=C, U=U, p=p, V=V, q=q: surfmap.surface_from_net(C, U, p, V, q)

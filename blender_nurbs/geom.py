@@ -798,6 +798,32 @@ def sample_curve(curve, n):
     return np.array([curve.evaluate(t0 + (t1 - t0) * i / (n - 1)) for i in range(n)])
 
 
+def sample_curve_kinks(curve, n):
+    """sample_curve plus a sample exactly on every knot where the curve may
+    kink (multiplicity >= degree): even samples alone cut a chained profile's
+    sharp corners, so its preview showed chamfers the result does not have."""
+    t0, t1 = curve.parameter_range()
+    eps = 1e-9 * (t1 - t0)
+    try:
+        cv = _load_kernel().blender_ext.curve_cvs(curve)
+        deg, U = int(cv["degree"]), [float(k) for k in cv["knots"]]
+    except Exception:
+        return sample_curve(curve, n)
+    kinks, i = [], 0
+    while i < len(U):
+        j = i
+        while j + 1 < len(U) and abs(U[j + 1] - U[i]) <= eps:
+            j += 1
+        if j - i + 1 >= deg and t0 + eps < U[i] < t1 - eps:
+            kinks.append(U[i])
+        i = j + 1
+    if not kinks:
+        return sample_curve(curve, n)
+    T = [t0 + (t1 - t0) * i / (n - 1) for i in range(n)]
+    T = sorted([t for t in T if all(abs(t - k) > 1e-4 * (t1 - t0) for k in kinks)] + kinks)
+    return np.array([curve.evaluate(t) for t in T])
+
+
 def curve_plane_normal(curve, n=32):
     P = sample_curve(curve, n)
     c = P.mean(axis=0)
