@@ -262,18 +262,67 @@ c1 = disc_centre(B, R @ (c0 - A) + A2, r_top)
 check("a drafted boss slid by its top", r == {'FINISHED'} and solid(B) and nfaces(B) == n0
       and c1 is not None and np.allclose(c1, R @ (c0 - A) + A2, atol=1e-6), f"{c1}")
 
-# --- rounded walls (a spherical dimple) are refused ---------------------------------------------
+# --- rounded walls: a ball's dimple and bump (the ball moved and cut again), a filleted rim ----
+def ball_op(B, at, r_, op):
+    ctx.scene.cursor.location = at
+    bpy.ops.nproto.add_primitive(kind="SPHERE", radius=r_)
+    ctx.scene.cursor.location = (0, 0, 0)
+    Sb = ctx.active_object
+    bpy.ops.nproto.boolean(operation=op, names=json.dumps([B.name, Sb.name]))
+    return ctx.active_object
+
+def sphere_centre(o, limit=3.0):
+    for f in store.get_brep(o).faces():
+        srf = f.surface()
+        if srf.is_planar() or f.area(1e-6) >= limit:
+            continue
+        (u0, u1), (v0, v1) = srf.u_domain(), srf.v_domain()
+        G = np.array([[srf.evaluate(float(u), float(v)) for v in np.linspace(v0, v1, 9)]
+                      for u in np.linspace(u0, u1, 9)], float)
+        fit = sx.fit_sphere(G, 1e-7, 4.0)
+        if fit is not None:
+            return np.asarray(fit[0], float)
+    return None
+
+for kind, at, r_, op, pick, mv in (("dimple", (0.6, 0.0, 2.75), 0.4, "DIFFERENCE", (0.6, 0.0, 2.36), (-0.8, 0.3)),
+                                   ("bump", (-0.6, 0.2, 2.5), 0.45, "UNION", (-0.6, 0.2, 2.95), (0.9, -0.2))):
+    clear()
+    B = ball_op(bump_box(), at, r_, op)
+    n0 = nfaces(B)
+    idx = face_ids(B, pick)
+    R, A, A2 = expected(B, idx, mv)
+    r = move(B, pick, move_x=mv[0], move_y=mv[1])
+    c1 = sphere_centre(B)
+    want = R @ (np.array(at, float) - A) + A2
+    check(f"a ball's {kind} slid over the bump (the ball moved, cut again)", r == {'FINISHED'} and solid(B)
+          and nfaces(B) == n0 and c1 is not None and np.allclose(c1, want, atol=1e-6), f"{c1} vs {want}")
+
 clear()
 B = bump_box()
-ctx.scene.cursor.location = (0.6, 0.0, 2.75)
-bpy.ops.nproto.add_primitive(kind="SPHERE", radius=0.4)
-ctx.scene.cursor.location = (0, 0, 0)
-Sb = ctx.active_object
-bpy.ops.nproto.boolean(operation="DIFFERENCE", names=json.dumps([B.name, Sb.name]))
+B = extrude([circle(0.3, (0.6, 0.0, 4))], -2.8, body="CUT")
+es = store.get_brep(B).edges()
+rim = min(range(len(es)), key=lambda i: abs(es[i].length() - 2 * math.pi * 0.3)
+          + abs(np.array(es[i].point_at(sum(es[i].parameter_range()) / 2))[2] - 2.5))
+bpy.ops.nproto.edge_fillet(inputs=json.dumps([[B.name, f"E{rim}"]]), radius=0.08, shape="CIRCULAR")
 B = ctx.active_object
+n0 = nfaces(B)
+fil0 = sorted(f.area(1e-6) for f in store.get_brep(B).faces() if not f.surface().is_planar())[0]
+idx = face_ids(B, (0.6, 0.0, 1.2))
+R, A, A2 = expected(B, idx, (-0.5, 0.0))
+r = move(B, (0.6, 0.0, 1.2), move_x=-0.5)
+want = R @ (np.array([0.6, 0.0, 1.2]) - A) + A2
+fl = min(store.get_brep(B).faces(), key=lambda f: f.closest_point(tuple(want))[1])
+fil1 = sorted(f.area(1e-6) for f in store.get_brep(B).faces() if not f.surface().is_planar())[0]
+check("a pocket with a filleted rim slid (the rim rounded again where it lands)", r == {'FINISHED'} and solid(B)
+      and nfaces(B) == n0 and fl.closest_point(tuple(want))[1] < 1e-6 and abs(fil1 - fil0) < 0.1 * fil0,
+      f"fillet area {fil1:.4f} / {fil0:.4f}")
+
+clear()
+B = bump_box()
+B = extrude([circle(0.3, (0.6, 0.0, 4))], -2.8, body="CUT")
 v0 = vol(B)
-r = move(B, (0.6, 0.0, 2.36), move_x=-0.5)
-check("a rounded (spherical) dimple refused on a free-form face", r == {'CANCELLED'} and abs(vol(B) - v0) < 1e-9)
+r = move(B, (0.6, 0.0, 1.2), move_x=1.9)
+check("rounded or not, off the face is refused", r == {'CANCELLED'} and abs(vol(B) - v0) < 1e-9)
 
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)
