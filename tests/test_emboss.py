@@ -240,5 +240,73 @@ for hist in (True, False):
     r, res, dt = emboss_op([ln], sph)
     check(f"[{tag}] open profile refused", r == {'CANCELLED'} and store.get_brep(sph).face_count() == 1)
 
+# -- the live stage (no view: its preview and handles, against the result) --------------
+from blender_nurbs import valuedrag as _vd
+
+def stage(**attrs):
+    """An object with the operator's stage methods (no Blender operator)."""
+    body = {k: v for k, v in emboss.NPROTO_OT_emboss.__dict__.items() if not k.startswith("__")
+            and not k.startswith("bl_")}
+    st = type("_PlainEmboss", (_vd.ValueDrag,), body)()
+    base = dict(mode="PROJECT", operation="EMBOSS", height=H, overlap=D, far=False, face=-1, flip_u=False,
+                flip_v=False, swap=False, base="")
+    for k, v in {**base, **attrs}.items():
+        setattr(st, k, v)
+    return st
+
+def dist_to(o, P):
+    fs = flow.world_brep(o).faces()
+    return max(min(f.closest_point(tuple(map(float, p)))[1] for f in fs) for p in P)
+
+ctx.scene.nproto_settings.construction_history = True
+for op in ("EMBOSS", "DEBOSS"):
+    clear()
+    body = dome_body()
+    L = L_shape("L", 0.6, 0.3, 3.0, 0.6)
+    st = stage(operation=op, body=body.name, objects=json.dumps([L.name]))
+    t0 = time.perf_counter()
+    ready = st.drag_setup(ctx, None)
+    dt = time.perf_counter() - t0
+    pv = st.drag_preview()
+    h = st.drag_handles()
+    check(f"stage {op.lower()}: ready, a preview and two arrows", ready and len(pv["lines"]) > 2 and len(pv["tris"])
+          and [x["field"] for x in h] == ["height", "overlap"] and st.drag_check() == "", f"{dt * 1000:.0f} ms")
+    # the face the Height reaches: the top (Emboss) or the floor (Deboss) of the made result
+    lo, hi = st._span()
+    far_row = [B + (hi if op == "EMBOSS" else lo) * Dd for B, Dd in st._rows]
+    tip = h[0]["origin"] + h[0]["param"] * h[0]["dir"]
+    select([L, body], body)
+    bpy.ops.nproto.emboss(operation=op, height=H, overlap=D)
+    res = ctx.active_object
+    g = dist_to(res, np.vstack(far_row)[::7])
+    check(f"stage {op.lower()}: the preview's far outline lies on the result", g < 2e-4, f"{g:.1e}")
+    check(f"stage {op.lower()}: the arrow's tip lies on the result", dist_to(res, [tip]) < 2e-4,
+          f"{dist_to(res, [tip]):.1e}")
+    check(f"stage {op.lower()}: the arrow points {'out' if op == 'EMBOSS' else 'in'}, Overlap the other way",
+          (h[0]["dir"] @ st._lay.up > 0) == (op == "EMBOSS") and h[1]["dir"] @ h[0]["dir"] < 0)
+    check(f"stage {op.lower()}: dragging the tip moves Height 1:1", abs(h[0]["to_value"](h[0]["param"] + 0.02)
+                                                                    - (H + 0.02)) < 1e-9)
+    # dragging: to_value never goes below 0
+    check(f"stage {op.lower()}: a drag through the surface stops at 0", h[0]["to_value"](-0.3) == 0.0)
+
+# keys: D toggles Deboss, M cycles the modes (no sheet: Project, Place), F the far side
+clear()
+body = dome_body()
+L = L_shape("L", 0.6, 0.3, 3.0, 0.6)
+st = stage(body=body.name, objects=json.dumps([L.name]))
+st.drag_setup(ctx, None)
+check("stage keys: D makes it a Deboss", st.drag_key(ctx, None, "d") and st.operation == "DEBOSS")
+check("stage keys: M goes to Place (no sheet: no Wrap)", st.drag_key(ctx, None, "m") and st.mode == "PLACE"
+      and st._lay.mode == "PLACE" and st.drag_check() == "")
+check("stage keys: M again back to Project", st.drag_key(ctx, None, "m") and st.mode == "PROJECT")
+z_near = float(st._lay.X0[2])
+check("stage keys: F the far side (the dome's floor, seen through it)", st.drag_key(ctx, None, "f") and st.far
+      and st._lay.X0[2] < z_near - 0.2, f"{z_near:.3f} -> {st._lay.X0[2]:.3f}")
+check("stage: hint rows and state words", st.drag_rows()[0][0] == "Emboss" and "Far Side" in st.drag_state())
+# crossing outlines: no stage (the dialog's run says why)
+c1, c2 = circle("C1", 0.2, (-0.12, 0.0, 3.0)), circle("C2", 0.2, (0.12, 0.0, 3.0))
+st = stage(body=body.name, objects=json.dumps([c1.name, c2.name]))
+check("stage: crossing outlines fall back to the dialog", st.drag_setup(ctx, None) is False)
+
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)

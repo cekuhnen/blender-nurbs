@@ -32,7 +32,9 @@ import bpy
 import numpy as np
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
 
-from . import features, flow, geom, store, surfeval, surfmap
+from . import features, flow, geom, hints, store, surfeval, surfmap
+from .ops import AskValue
+from .valuedrag import ValueDrag, ruled_preview
 
 OP = "emboss"
 MODE_ITEMS = [("WRAP", "Wrap", "Bend the profiles from the sheet they lie on onto the body (an unrolled sheet "
@@ -339,73 +341,101 @@ def crossing_outlines(curves, n, size):
     return None
 
 
+class Layout:
+    """How an Emboss lays its profiles on the body (the build and the live
+    stage share it): the profiles and their curves, the map m (world points
+    over the profiles' plane -> on / over the body), the frame (foot on the
+    plane, unit normal n there, a tangent e1) and the side s: a point at
+    height h along s n over the plane lands at m(P) + h (m(P + s n) - m(P)),
+    outward -- the map is linear in the height in every mode."""
+
+    def __init__(self, inputs, p):
+        body, face, base, profiles = split_inputs(inputs)
+        if not profiles:
+            raise RuntimeError("no profiles: select closed curves to emboss")
+        mode = p.get("em_mode", "PROJECT")
+        if mode == "WRAP" and base is None:
+            raise RuntimeError("Wrap needs the sheet the profiles lie on (Unroll the body, draw on the sheet)")
+        groups = features.profile_groups(profiles)
+        curves = [features.profile_curve(g) for g in groups]
+        open_ = [g[0][0].name for g, c in zip(groups, curves) if not features.is_closed_curve(c)]
+        if open_:
+            raise RuntimeError("Emboss needs closed profiles: " + ", ".join(open_) + features._is_are(open_).rstrip())
+        c, n_plane, psize = profile_plane(curves)
+        hit = crossing_outlines(curves, n_plane, psize)
+        if hit is not None:
+            names = sorted({groups[k][0][0].name for k in hit})
+            raise RuntimeError(f"two outlines of {' and '.join(names)} cross or touch (kerned letters?): space them "
+                               "apart (Letter Spacing) or join them into one outline first")
+        tb = flow.world_brep(body)
+        if not tb.is_manifold_solid():
+            raise RuntimeError(f"{body.name} is not a closed solid")
+        size = max(flow.brep_size(tb), psize)
+        self.info = {"mode": mode}
+        if base is not None and mode != "PROJECT":
+            fmap, how = wrap_map(base, body, face, p)
+            self.info["wrap"] = how
+            foot, n, e1, _ = base_frame(base, c)
+        else:
+            n = n_plane
+            e1 = _unit(np.cross(n, [1.0, 0.0, 0.0] if abs(n[0]) < 0.9 else [0.0, 1.0, 0.0]))
+            fmap = ProjectMap(tb, c, n, size, far=bool(p.get("em_far")))
+            foot = c
+        m, A = fmap.map, None
+        if mode == "PLACE":
+            A = rigid_matrix(m, foot, n, e1, size)
+            m = lambda Q, A=A: np.asarray(Q, float) @ A[:3, :3].T + A[:3, 3]
+        # the side: a step along n from the profiles' centre must go out of the body
+        eps = 1e-3 * psize
+        X0, X1 = m(np.array([foot, foot + eps * n]))
+        _, _, nout = _hit_face(tb, X0)
+        if float((X1 - X0) @ nout) == 0.0:
+            raise RuntimeError("the profiles' plane is edge-on to the surface there")
+        self.s = 1.0 if float((X1 - X0) @ nout) > 0.0 else -1.0
+        self.mode, self.body, self.profiles, self.curves = mode, body, profiles, curves
+        self.fmap, self.m, self.A = fmap, m, A
+        self.foot, self.n, self.e1, self.psize, self.size = foot, n, e1, psize, size
+        self.X0 = X0
+        self.up = _unit(self.s * (X1 - X0))                   # outward at the profiles' centre
+
+    def lift(self, P):
+        """(B, D) of points P on the profiles' plane: where they land on the
+        body and where a unit of height takes them (outward)."""
+        P = np.asarray(P, float).reshape(-1, 3)
+        Q = self.m(np.vstack([P, P + self.s * self.n]))
+        return Q[:len(P)], Q[len(P):] - Q[:len(P)]
+
+    def tool(self, p):
+        """The prism laid onto the body (world Brep)."""
+        H = float(p.get("em_height", 0.1))
+        D = float(p.get("em_overlap", 0.025))
+        if H <= 0.0:
+            raise RuntimeError("Height must be more than 0")
+        if D < 0.0:
+            raise RuntimeError("Overlap can't be negative")
+        lo, hi = (H, D) if p.get("em_op", "EMBOSS") == "DEBOSS" else (D, H)
+        prism = _prism(self.profiles, self.s * self.n, lo, hi)
+        if self.mode == "PLACE":
+            store.transform(prism, self.A)
+            out = prism
+        else:
+            try:
+                out, err = flow.flow_brep(prism, self.fmap)
+            except Exception as exc:
+                raise RuntimeError("the lettering could not be laid on: it crosses a step or an edge of the body "
+                                   f"where the surface under it jumps ({exc})") from exc
+            self.info["fit"] = err / self.fmap.size
+        if not out.is_manifold_solid():
+            raise RuntimeError("the laid-on profiles came out open (try a larger Overlap, or Place for small ones)")
+        return out
+
+
 def emboss_tool(inputs, p):
     """The prism laid onto the body (world Brep), and how: (Brep, info)."""
-    body, face, base, profiles = split_inputs(inputs)
-    if not profiles:
-        raise RuntimeError("no profiles: select closed curves to emboss")
-    mode = p.get("em_mode", "PROJECT")
-    if mode == "WRAP" and base is None:
-        raise RuntimeError("Wrap needs the sheet the profiles lie on (Unroll the body, draw on the sheet)")
-    H = float(p.get("em_height", 0.1))
-    D = float(p.get("em_overlap", 0.025))
-    if H <= 0.0:
+    lay = Layout(inputs, p)
+    if float(p.get("em_height", 0.1)) <= 0.0:
         raise RuntimeError("Height must be more than 0")
-    if D < 0.0:
-        raise RuntimeError("Overlap can't be negative")
-    deboss = p.get("em_op", "EMBOSS") == "DEBOSS"
-    groups = features.profile_groups(profiles)
-    curves = [features.profile_curve(g) for g in groups]
-    open_ = [g[0][0].name for g, c in zip(groups, curves) if not features.is_closed_curve(c)]
-    if open_:
-        raise RuntimeError("Emboss needs closed profiles: " + ", ".join(open_) + features._is_are(open_).rstrip())
-    c, n_plane, psize = profile_plane(curves)
-    hit = crossing_outlines(curves, n_plane, psize)
-    if hit is not None:
-        names = sorted({groups[k][0][0].name for k in hit})
-        raise RuntimeError(f"two outlines of {' and '.join(names)} cross or touch (kerned letters?): space them "
-                           "apart (Letter Spacing) or join them into one outline first")
-    tb = flow.world_brep(body)
-    if not tb.is_manifold_solid():
-        raise RuntimeError(f"{body.name} is not a closed solid")
-    size = max(flow.brep_size(tb), psize)
-    info = {"mode": mode}
-    if base is not None and mode != "PROJECT":
-        fmap, how = wrap_map(base, body, face, p)
-        info["wrap"] = how
-        foot, n, e1, _ = base_frame(base, c)
-        m = fmap.map
-    else:
-        n = n_plane
-        e1 = _unit(np.cross(n, [1.0, 0.0, 0.0] if abs(n[0]) < 0.9 else [0.0, 1.0, 0.0]))
-        fmap = ProjectMap(tb, c, n, size, far=bool(p.get("em_far")))
-        foot = c
-        m = fmap.map
-    if mode == "PLACE":
-        A = rigid_matrix(m, foot, n, e1, size)
-        m = lambda Q, A=A: np.asarray(Q, float) @ A[:3, :3].T + A[:3, 3]
-    # the side: a step along n from the profiles' centre must go out of the body
-    eps = 1e-3 * psize
-    X0, X1 = m(np.array([foot, foot + eps * n]))
-    _, _, nout = _hit_face(tb, X0)
-    if float((X1 - X0) @ nout) == 0.0:
-        raise RuntimeError("the profiles' plane is edge-on to the surface there")
-    s = 1.0 if float((X1 - X0) @ nout) > 0.0 else -1.0
-    lo, hi = (H, D) if deboss else (D, H)
-    prism = _prism(profiles, s * n, lo, hi)
-    if mode == "PLACE":
-        store.transform(prism, A)
-        out = prism
-    else:
-        try:
-            out, err = flow.flow_brep(prism, fmap)
-        except Exception as exc:
-            raise RuntimeError("the lettering could not be laid on: it crosses a step or an edge of the body "
-                               f"where the surface under it jumps ({exc})") from exc
-        info["fit"] = err / fmap.size
-    if not out.is_manifold_solid():
-        raise RuntimeError("the laid-on profiles came out open (try a larger Overlap, or Place for small ones)")
-    return out, info
+    return lay.tool(p), lay.info
 
 
 @features.builder(OP)
@@ -453,12 +483,17 @@ def profile_inputs(curves):
     return [(o, f"S{i}") for o in curves for i in range(len(o.data.splines))]
 
 
-class NPROTO_OT_emboss(bpy.types.Operator):
+MODE_ORDER = ("PROJECT", "PLACE", "WRAP")
+
+
+class NPROTO_OT_emboss(ValueDrag, AskValue, bpy.types.Operator):
     """Raised or sunk lettering, logos and pads on any face of a solid. Select
     the closed profile curves (and the sheet they lie on, to wrap), then the
-    solid last (active). Wrap bends them from the sheet (an unrolled sheet
-    folds back exactly), Project throws them along their plane's normal,
-    Place moves them as a whole"""
+    solid last (active). From the UI the lettering shows laid on the body
+    with an arrow for its Height: drag it (or type), D for Deboss, M for the
+    mode, Tab for the Overlap; click away or Enter to make it. Wrap bends
+    them from the sheet (an unrolled sheet folds back exactly), Project
+    throws them along their plane's normal, Place moves them as a whole"""
     bl_idname = "nproto.emboss"
     bl_label = "Emboss"
     bl_options = {'REGISTER', 'UNDO'}
@@ -482,6 +517,11 @@ class NPROTO_OT_emboss(bpy.types.Operator):
     body: StringProperty(name="Body", description="The solid to emboss")
     base: StringProperty(name="Sheet", description="Wrap: the sheet the profiles lie on")
     objects: StringProperty(options={'HIDDEN'})          # JSON names of the profile curves
+
+    # -- the live value stage (valuedrag.py) ----------------------------------
+    drag_fields = ("height", "overlap")
+    fit_view = "shrink"         # the last height used, made smaller only if it runs off the view
+    SAMPLES = 97                # points along each outline in the preview
 
     @classmethod
     def poll(cls, context):
@@ -534,26 +574,12 @@ class NPROTO_OT_emboss(bpy.types.Operator):
                 pass
         return True
 
-    def invoke(self, context, event):
-        if not self._from_selection(context):
-            return {'CANCELLED'}
-        return self.execute(context)
-
-    def params(self):
-        return {"em_mode": self.mode, "em_op": self.operation, "em_height": self.height, "em_overlap": self.overlap,
-                "em_far": self.far, "fw_flip_u": self.flip_u, "fw_flip_v": self.flip_v, "fw_swap": self.swap,
-                "fw_fold": True}
-
-    def execute(self, context):
-        from .ops import _kernel_ok, _select_only
-        if not _kernel_ok(self):
-            return {'CANCELLED'}
-        if not self.body and not self._from_selection(context):
-            return {'CANCELLED'}
+    def _gather(self, context):
+        """(body, inputs, kept objects) for the current settings; raises
+        ValueError with the reason when something is missing."""
         body = bpy.data.objects.get(self.body)
         if body is None or not _is_solid(body):
-            self.report({'WARNING'}, "Pick a closed NURBS solid to emboss")
-            return {'CANCELLED'}
+            raise ValueError("Pick a closed NURBS solid to emboss")
         try:
             names = json.loads(self.objects or "[]")
         except Exception:
@@ -562,22 +588,142 @@ class NPROTO_OT_emboss(bpy.types.Operator):
         if not curves:
             curves = [o for o in context.selected_objects if o.type == 'CURVE']
         if not curves:
-            self.report({'WARNING'}, "No profile curves")
-            return {'CANCELLED'}
+            raise ValueError("No profile curves")
         base = bpy.data.objects.get(self.base) if self.base else None
         if self.mode == "WRAP" and (base is None or not store.is_nurbs(base)):
-            self.report({'WARNING'}, "Wrap needs the sheet the profiles lie on: Unroll the body and draw on the "
-                                     "sheet, or pick a flat sheet")
-            return {'CANCELLED'}
+            raise ValueError("Wrap needs the sheet the profiles lie on: Unroll the body and draw on the sheet, "
+                             "or pick a flat sheet")
         use_base = base is not None and self.mode != "PROJECT"
         ref = f"F{self.face}" if use_base and self.face >= 0 and not self._folds() else "SURF"
         inputs = [(body, ref)] + ([(base, "SURF")] if use_base else []) + profile_inputs(curves)
+        return body, inputs, [body] + curves + ([base] if use_base else [])
+
+    def invoke(self, context, event):
+        if not self._from_selection(context):
+            return {'CANCELLED'}
+        return self.ask(context)
+
+    def params(self):
+        return {"em_mode": self.mode, "em_op": self.operation, "em_height": self.height, "em_overlap": self.overlap,
+                "em_far": self.far, "fw_flip_u": self.flip_u, "fw_flip_v": self.flip_v, "fw_swap": self.swap,
+                "fw_fold": True}
+
+    # the stage: the outlines laid on once (where they land, and where a unit of
+    # height takes them); every Height / Overlap after that is a sum, no fit
+    def drag_setup(self, context, mouse):
+        self._ctx = context
+        self._error = ""
+        self._lay = None
+        try:
+            _, inputs, _ = self._gather(context)
+            self._lay = Layout(inputs, self.params())
+            self._rows = [self._lay.lift(geom.sample_curve(c, self.SAMPLES)) for c in self._lay.curves]
+        except Exception as exc:
+            print("NURBS Emboss preview:", exc)
+            return False                    # the dialog instead: its run reports why
+        return True
+
+    def _relayout(self):
+        """Lay the outlines on again (the mode or the side changed)."""
+        try:
+            _, inputs, _ = self._gather(self._ctx)
+            self._lay = Layout(inputs, self.params())
+            self._rows = [self._lay.lift(geom.sample_curve(c, self.SAMPLES)) for c in self._lay.curves]
+            self._error = ""
+        except Exception as exc:
+            self._error = str(exc)
+
+    def _span(self):
+        """(lo, hi): the prism from lo behind the surface to hi in front of it."""
+        return (-self.height, self.overlap) if self.operation == "DEBOSS" else (-self.overlap, self.height)
+
+    def _foot(self):
+        """(where the arrows stand, a unit of height there): on the lettering
+        itself -- the outline point nearest the profiles' centre (an L's
+        centre lies outside it)."""
+        B = np.vstack([r[0] for r in self._rows])
+        Dd = np.vstack([r[1] for r in self._rows])
+        k = int(np.argmin(np.linalg.norm(B - self._lay.X0, axis=1)))
+        return B[k], Dd[k]
+
+    def drag_handles(self):
+        if self._lay is None:
+            return []
+        B, Dd = self._foot()
+        g = float(np.linalg.norm(Dd)) or 1.0                    # length per unit of height (1 but for a warp)
+        u = Dd / g
+        d = -u if self.operation == "DEBOSS" else u           # Height: out (Emboss) or in (Deboss)
+        return [{"field": "height", "kind": "arrow", "origin": B, "dir": d, "param": self.height * g, "base": B,
+                 "to_value": lambda t, g=g: max(t / g, 0.0)},
+                {"field": "overlap", "kind": "arrow", "origin": B, "dir": -d, "param": self.overlap * g, "base": B,
+                 "to_value": lambda t, g=g: max(t / g, 0.0)}]
+
+    def drag_preview(self):
+        if self._lay is None or self._error:
+            return {"lines": [], "tris": np.zeros((0, 3))}
+        lo, hi = self._span()
+        lines, tris, guides = [], [], []
+        for B, D in self._rows:
+            walls_l, walls_t = ruled_preview([B + lo * D, B + hi * D], ribs=12)
+            lines += walls_l
+            tris.append(walls_t)
+            guides.append((B, (1.0, 1.0, 1.0, 0.35)))           # where the outline meets the surface
+        return {"lines": lines, "tris": np.vstack(tris) if tris else np.zeros((0, 3)), "guides": guides}
+
+    def drag_check(self):
+        if self._error:
+            return self._error
+        if self.height <= 0.0:
+            return "Height 0: drag the arrow out, or type a height"
+        return ""
+
+    def drag_key(self, context, event, ch):
+        if ch == "d":
+            self.operation = "EMBOSS" if self.operation == "DEBOSS" else "DEBOSS"
+            return True
+        if ch == "m":
+            order = [m for m in MODE_ORDER if m != "WRAP" or self.base]
+            self.mode = order[(order.index(self.mode) + 1) % len(order)] if self.mode in order else order[0]
+            self._relayout()
+            return True
+        if ch == "f" and self.mode == "PROJECT":
+            self.far = not self.far
+            self._relayout()
+            return True
+        return False
+
+    def drag_rows(self):
+        modes = [m.title() for m in MODE_ORDER if m != "WRAP" or self.base]
+        rows = [("Emboss", [hints.toggle("D", "deboss (cut in)", self.operation == "DEBOSS"),
+                            hints.cycle("M", modes, self.mode.title(), "mode")])]
+        if self.mode == "PROJECT":
+            rows[0][1].append(hints.toggle("F", "far side", self.far))
+        rows.append(("Sizes", [hints.note("Tab: Height, then Overlap (how far it runs on through the surface)")]))
+        return rows
+
+    def drag_state(self):
+        return [self.operation.title(), self.mode.title()] + (["Far Side"] if self.far and self.mode == "PROJECT"
+                                                               else [])
+
+    def execute(self, context):
+        from .ops import _kernel_ok, _select_only
+        if not _kernel_ok(self):
+            return {'CANCELLED'}
+        if not self.body and not self._from_selection(context):
+            return {'CANCELLED'}
+        try:
+            body, inputs, kept = self._gather(context)
+        except ValueError as exc:
+            self.report({'WARNING'}, str(exc))
+            return {'CANCELLED'}
         params = self.params()
         try:
             g = features.run(OP, inputs, params)
         except Exception as exc:
             self.report({'ERROR'}, f"Emboss failed: {exc}")
             return {'CANCELLED'}
+        curves = [o for o, r in inputs[1:] if o.type == 'CURVE']
+        curves = list(dict.fromkeys(curves))
         if features.history_enabled(context):
             res = store.new_object_text(context, f"{body.name}_{self.operation.lower()}", g[1])
             for c in body.users_collection:
@@ -587,7 +733,7 @@ class NPROTO_OT_emboss(bpy.types.Operator):
                 if c not in body.users_collection and body.users_collection:
                     c.objects.unlink(res)
             features.record(res, OP, inputs, params)
-            features.keep_inputs(context, [body] + curves + ([base] if use_base else []))
+            features.keep_inputs(context, kept)
             features.mark_built(res)
         else:
             from .ops_trim import _frozen
