@@ -1133,16 +1133,24 @@ def feature_of(o, idxs):
         for k, S in enumerate(faces):
             if S not in seats:
                 continue
-            pts, ops = [], []
-            for c, kind in face_cycles(S)[0]:
-                if kind != "inner" or not all(e in rim for e, _ in c):
-                    continue
+            def points(c):
                 P = []
-                for e, _ in c:
+                for e in c:
                     t0, t1 = e.parameter_range()
                     P += [np.array(e.point_at(float(t)), float) for t in np.linspace(t0, t1, 9)[:-1]]
+                return P
+            pts, ops = [], []
+            for c, kind in face_cycles(S)[0]:       # a hole at a dome's top runs round its pole: kind 'pole'
+                if kind not in ("inner", "pole") or not all(e in rim for e, _ in c):
+                    continue
+                P = points([e for e, _ in c])
                 pts += P
                 ops.append(np.mean(P, axis=0))
+            if not pts:                             # no whole cycle found: the rim edges in this seat
+                pts = points([e for e in rim if S in e.faces()])
+                ops = [np.mean(pts, axis=0)] if pts else []
+            if not pts:
+                continue
             centres[k] = np.mean(pts, axis=0)
             openings[k] = ops
         out = (sorted(i for i, f in enumerate(faces) if f in region), sorted(centres), centres, openings, False)
