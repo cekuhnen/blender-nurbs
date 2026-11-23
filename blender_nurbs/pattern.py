@@ -170,10 +170,11 @@ def step(distance, n, space):
     return distance
 
 
-def angle_step(angle, n):
+def angle_step(angle, n, ends=False):
     """The turn from one copy to the next: a full turn spreads n copies evenly
-    (the last is not on the first), a part of one has copies at both ends."""
-    if abs(abs(angle) - 360.0) < 1e-6:
+    (the last is not on the first), a part of one has copies at both ends --
+    a full turn too with ends (a scaled last copy does not lie on the first)."""
+    if abs(abs(angle) - 360.0) < 1e-6 and not ends:
         return angle / n
     return angle / max(n - 1, 1)
 
@@ -487,6 +488,39 @@ def path_steps(p, pd, s0):
     return [s0 + k * h for k in range(n)]
 
 
+def copy_scale(p, index):
+    """How much copy `index` is scaled (1: not). p["scale"] is the first
+    copy's scale when the spacing is per copy (each next one changes as much
+    again) and the last copy's over a length or a circle; a linear grid
+    scales along its X rows. Off for paths and mirrors."""
+    f = float(p.get("scale", 1.0))
+    mode = p.get("mode", "LINEAR")
+    if abs(f - 1.0) <= 1e-12 or mode not in ("LINEAR", "CIRCULAR"):
+        return 1.0
+    if mode == "LINEAR":
+        nx = counts(p)[0]
+        i = index % nx
+        t = i if p.get("space", "SPACING") == "SPACING" else i / max(nx - 1, 1)
+    else:
+        t = index / max(max(int(p.get("count", 2)), 1) - 1, 1)
+    return 1.0 + (f - 1.0) * t
+
+
+def _scaled(T, p, src, index):
+    """T after the copy's scale about p["scale_center"] (the source's box
+    centre when none is given); None when the scale would be 0 or less."""
+    s = copy_scale(p, index)
+    if abs(s - 1.0) <= 1e-12:
+        return T
+    if s <= 1e-9:
+        return None
+    C = np.asarray(p["scale_center"], float) if p.get("scale_center") is not None else anchor(src)
+    S = np.eye(4)
+    S[:3, :3] *= s
+    S[:3, 3] = (1.0 - s) * C
+    return T @ S
+
+
 def copy_transform(p, src, index, path=None, cache=None, surfaces=None):
     """World 4x4 that moves the source to copy `index` (None: no such copy).
     surfaces: the NURBS objects a path lies on (orient SURFACE: the copies
@@ -504,7 +538,7 @@ def copy_transform(p, src, index, path=None, cache=None, surfaces=None):
         for a, n_a, i_a, d in zip(AXES, (nx, ny, nz), ijk, frame_axes(p)):
             if i_a:
                 v = v + i_a * step(float(p.get("distance_" + a, 0.0)), n_a, space) * d
-        return _translation(v)
+        return _scaled(_translation(v), p, src, index)
     if mode == "MIRROR":
         return mirror_matrix(*mirror_plane(p)) if index == 1 else None
     n = max(int(p.get("count", 2)), 1)
@@ -513,14 +547,14 @@ def copy_transform(p, src, index, path=None, cache=None, surfaces=None):
     if mode == "CIRCULAR":
         O = np.asarray(p.get("center_point", (0.0, 0.0, 0.0)), float)
         z = _unit(p.get("frame_z", (0.0, 0.0, 1.0)))
-        R = _rotation(z, index * angle_step(float(p.get("angle", 360.0)), n))
+        R = _rotation(z, index * angle_step(float(p.get("angle", 360.0)), n, bool(p.get("ends", False))))
         if p.get("rotate", True):
             T = np.eye(4)
             T[:3, :3] = R
             T[:3, 3] = O - R @ O
-            return T
+            return _scaled(T, p, src, index)
         a = cache.setdefault(("anchor", src.name), anchor(src))
-        return _translation(R @ (a - O) + O - a)          # moved round the axis, not turned
+        return _scaled(_translation(R @ (a - O) + O - a), p, src, index)     # moved round the axis, not turned
     pd = path_data(path, cache)
     if pd is None or pd.length <= 0:
         return None
@@ -947,6 +981,17 @@ class _PatternTool(ValueDrag):
     distance: FloatProperty(name="Path Distance", default=0.0, min=0.0, unit='LENGTH',
                             description="Along the path: the spacing, or the length the copies spread over "
                                         "(0: to the path's end; a closed path: all the way round)")
+    scale: FloatProperty(name="Scale", default=1.0, min=0.001, soft_max=10.0, precision=3,
+                         options={'SKIP_SAVE'},
+                         description="Copies grow or shrink along the pattern. Spacing: the first copy's "
+                                     "scale, each next one changed as much again; Length and Circular: the "
+                                     "last copy's, the ones between blended. 1: all the same size")
+    ends: BoolProperty(options={'HIDDEN', 'SKIP_SAVE'},
+                       description="Circular: the last copy at the full angle even on a full turn (Rotate by "
+                                   "Points' scaled turns)")
+    scale_center: StringProperty(options={'HIDDEN', 'SKIP_SAVE'},
+                                 description="The point each copy is scaled about, carried with it "
+                                             "(JSON; empty: each source's box centre)")
     rotate: BoolProperty(name="Rotate Copies", default=True,
                          description="Turn each copy with the pattern (off: only moved, kept upright)")
     orient: EnumProperty(name="Follow", default="SURFACE", items=[
@@ -997,6 +1042,10 @@ class _PatternTool(ValueDrag):
     def params(self):
         p = {"v": 2, "mode": self.mode, "space": self.space, "turn": self.turn,
              "center_point": list(self.center_point), "frame_x": list(self.frame_x), "frame_z": list(self.frame_z)}
+        if self.mode in ("LINEAR", "CIRCULAR") and abs(self.scale - 1.0) > 1e-9:
+            p["scale"] = float(self.scale)
+            if self.scale_center:
+                p["scale_center"] = json.loads(self.scale_center)
         if self.mode == "LINEAR":
             for a in AXES:
                 # an arrow with no spacing makes no copies: off (a count left from an
@@ -1006,6 +1055,8 @@ class _PatternTool(ValueDrag):
                 p["distance_" + a] = d
         elif self.mode == "CIRCULAR":
             p.update(count=self.count, angle=self.angle, rotate=self.rotate)
+            if self.ends:
+                p["ends"] = True
         elif self.mode == "MIRROR":
             p.update(mirror_offset=self.mirror_offset)
         else:
@@ -1021,6 +1072,9 @@ class _PatternTool(ValueDrag):
             if k in p:
                 setattr(self, k, p[k])
         self.orient = p.get("orient", "PATH")       # (patterns made before it: turned with the path)
+        self.scale = float(p.get("scale", 1.0))
+        self.ends = bool(p.get("ends", False))
+        self.scale_center = json.dumps([float(c) for c in p["scale_center"]]) if p.get("scale_center") else ""
         for k in ("center_point", "frame_x", "frame_z"):
             if k in p:
                 setattr(self, k, tuple(float(x) for x in p[k]))
@@ -1278,12 +1332,14 @@ class _PatternTool(ValueDrag):
                 sub.active = getattr(self, "count_" + a) > 1
                 sub.prop(self, "distance_" + a, text=f"{a.upper()} {word}")
             lay.prop(self, "turn")
+            lay.prop(self, "scale", text="Scale (1st Copy)" if self.space == "SPACING" else "Scale (Last Copy)")
             lay.prop(self, "frame_x")
             lay.prop(self, "frame_z")
         elif self.mode == "CIRCULAR":
             lay.prop(self, "count")
             lay.prop(self, "angle")
             lay.prop(self, "rotate")
+            lay.prop(self, "scale", text="Scale (Last Copy)")
             lay.prop(self, "center_point")
             lay.prop(self, "frame_z", text="Axis")
         else:
@@ -2166,7 +2222,7 @@ def summary(p):
             " · through ({})".format(", ".join(fmt_length(ctx, float(c)) for c in O))
     if mode == "CIRCULAR":
         txt = f"Circular · {int(p.get('count', 2))} over {float(p.get('angle', 360.0)):g}°"
-        return txt + ("" if p.get("rotate", True) else " · not rotated")
+        return txt + ("" if p.get("rotate", True) else " · not rotated") + _scale_words(p)
     if mode == "PATH":
         d = float(p.get("distance", 0.0))
         word = "spacing" if p.get("space") == "SPACING" else "length"
@@ -2181,7 +2237,15 @@ def summary(p):
     txt = "Linear · " + (" · ".join(parts) or "no copies")
     if abs(float(p.get("turn", 0.0))) > 1e-6:
         txt += f" · turned {float(p['turn']):g}°"
-    return txt
+    return txt + _scale_words(p)
+
+
+def _scale_words(p):
+    f = float(p.get("scale", 1.0))
+    if abs(f - 1.0) <= 1e-9:
+        return ""
+    first = p.get("mode", "LINEAR") == "LINEAR" and p.get("space", "SPACING") == "SPACING"
+    return (" · 1st copy" if first else " · last copy") + f" scaled ×{f:.4g}"
 
 
 def draw_feature(box, context, obj, h):

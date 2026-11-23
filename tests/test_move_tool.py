@@ -328,6 +328,192 @@ S1 = movetool.scale_matrix((0, 0, 0), 2.0, "ONE", (1, 0, 0))
 check("scale edit mesh: 1D in world on a turned object (sheared points)", r == {'FINISHED'}
       and np.allclose(Pw, Pw0 @ S1[:3, :3].T + S1[:3, 3], atol=1e-5))
 
+# -- Move: scale at the target, the copies blend; Copy mode (D) -----------------------
+import json
+check("copy scales: *n go on", np.allclose(movetool.copy_scales(0.8, "ARRAY", 3), [0.8, 0.6, 0.4]))
+check("copy scales: /n blend to the target's", np.allclose(movetool.copy_scales(0.5, "DIVIDE", 4),
+                                                           [0.875, 0.75, 0.625, 0.5]))
+B0, d0 = np.array([1.0, 2.0, 0.0]), np.array([4.0, 0.0, 0.0])
+Ms = movetool.move_mats(B0, d0, 0.5, "DIVIDE", 4)
+check("move mats: each copy's base on its spot", all(np.allclose((T @ np.append(B0, 1))[:3], B0 + o)
+                                                    for T, o in zip(Ms, movetool.copy_offsets(d0, "DIVIDE", 4))))
+check("move mats: scaled about it", all(np.allclose(T[:3, :3], s * np.eye(3))
+                                         for T, s in zip(Ms, movetool.copy_scales(0.5, "DIVIDE", 4))))
+check("move mats: no copies = move then scale at the target",
+      np.allclose(movetool.move_mats(B0, d0, 2.0)[0], movetool.translation(d0) @ movetool.scale_matrix(B0, 2.0)))
+check("scale refusal: *3 at ×0.5 shrinks to nothing", "copy 2" in movetool._scale_refusal(0.5, "ARRAY", 3))
+check("scale refusal: none for /3", movetool._scale_refusal(0.1, "DIVIDE", 3) == "")
+for mode, n, f in (("ARRAY", 3, 0.8), ("DIVIDE", 4, 0.5), ("DIVIDE", 2, 2.0)):
+    pp = movetool.pattern_params(B0, d0, mode, n, f)
+    got = [pattern.copy_scale(pp, k) for k in range(1, n + 1)]
+    check(f"pattern scale = copy_scales ({mode} {n} ×{f})", np.allclose(got, movetool.copy_scales(f, mode, n)), got)
+check("pattern without scale: none", pattern.copy_scale(movetool.pattern_params(B0, d0, "ARRAY", 2), 1) == 1.0
+      and "scale" not in movetool.pattern_params(B0, d0, "ARRAY", 2))
+check("circular pattern: the last copy's scale", np.isclose(pattern.copy_scale(
+    {"v": 2, "mode": "CIRCULAR", "count": 5, "angle": 90.0, "scale": 0.2}, 4), 0.2))
+
+def box_pts(o):
+    return np.array([tuple(o.matrix_world @ v.co) for v in o.data.vertices])
+
+bpy.ops.object.select_all(action='DESELECT')
+bpy.ops.nproto.add_primitive(kind="BOX", width=1.0, depth=1.0, height=1.0)
+sbox = ctx.active_object
+ctx.view_layer.update()
+P0 = box_pts(sbox)
+lo = P0.min(axis=0)
+select(sbox)
+r = bpy.ops.nproto.move(base=tuple(lo), offset=(4.0, 0.0, 0.0), copies="DIVIDE", count=4, scale=0.5)
+cps = sorted([o for o in bpy.data.objects if o.get("nproto_in_0") is sbox and pattern.pattern_of(o) is not None],
+             key=lambda o: W(o)[0, 3])
+check("scaled /4: 4 pattern copies", r == {'FINISHED'} and len(cps) == 4, len(cps))
+ctx.view_layer.update()
+sizes = [float(np.ptp(box_pts(o), axis=0)[0]) for o in cps]
+check("scaled /4: sizes blend to ×0.5", np.allclose(sizes, [0.875, 0.75, 0.625, 0.5], atol=1e-5), sizes)
+mins = [box_pts(o).min(axis=0) for o in cps]
+check("scaled /4: each standing on its moved base corner",
+      all(np.allclose(m, lo + (k * 1.0, 0, 0), atol=1e-5) for k, m in enumerate(mins, 1)), mins)
+pp = pattern.pattern_of(cps[0])[1]
+check("scaled /4: the pattern holds the scale", np.isclose(pp.get("scale", 1), 0.5)
+      and np.allclose(pp.get("scale_center"), lo), pp)
+check("scaled pattern summary", "last copy scaled ×0.5" in pattern.summary(pp), pattern.summary(pp))
+check("original kept", np.allclose(box_pts(sbox), P0))
+if features.history_enabled(ctx):
+    features.rebuild(cps[-1], ctx, force=True)
+    ctx.view_layer.update()
+    check("scaled copy rebuilt from history: same place and size", np.allclose(
+        box_pts(cps[-1]).min(axis=0), mins[-1], atol=1e-5) and np.isclose(np.ptp(box_pts(cps[-1]), axis=0)[0], 0.5,
+                                                                          atol=1e-5))
+grp = pp["group"]
+r = bpy.ops.nproto.pattern(group=grp, objects=json.dumps([sbox.name]), mode="LINEAR", space="EXTENT",
+                           count_x=3, distance_x=4.0, frame_x=pp["frame_x"], frame_z=pp["frame_z"],
+                           scale=0.5, scale_center=json.dumps(list(map(float, lo))))
+cps = sorted(pattern.group_copies(grp), key=lambda c: c[2])
+ctx.view_layer.update()
+check("Edit Pattern: count changed, the last copy still ×0.5", r == {'FINISHED'} and len(cps) == 2
+      and np.isclose(np.ptp(box_pts(cps[-1][0]), axis=0)[0], 0.5, atol=1e-5), len(cps))
+for o, _s, _k in cps:
+    bpy.data.objects.remove(o)
+
+select(sbox)
+r = bpy.ops.nproto.move(base=tuple(lo), offset=(0.0, 3.0, 0.0), copies="ARRAY", count=3, scale=0.5)
+check("scaled *3 to nothing: refused", r == {'CANCELLED'})
+
+# plain mesh: moved and scaled at the target, no copies
+bpy.ops.mesh.primitive_cube_add(size=2.0, location=(0, 0, 0))
+mc = ctx.active_object
+ctx.view_layer.update()
+select(mc)
+r = bpy.ops.nproto.move(base=(-1, -1, -1), offset=(5.0, 0.0, 0.0), scale=2.0)
+ctx.view_layer.update()
+Pm = box_pts(mc)
+check("move + scale: base corner on the target, twice the size", r == {'FINISHED'}
+      and np.allclose(Pm.min(axis=0), (4, -1, -1), atol=1e-5) and np.allclose(np.ptp(Pm, axis=0), 4, atol=1e-5),
+      (Pm.min(axis=0), np.ptp(Pm, axis=0)))
+
+# Copy mode: two placements, the original stays
+M_mc = W(mc).copy()
+n0 = len(bpy.data.objects)
+select(mc)
+r = bpy.ops.nproto.move(keep=True, base=(0, 0, 0), offset=(0, 10.0, 0), scale=0.5,
+                        more=[{"name": "", "base": (0, 0, 0), "offset": (0, -10.0, 0), "scale": 1.0, "copies": "NONE",
+                               "count": 1}])
+new = [o for o in bpy.data.objects if o.name.startswith("Cube") and o is not mc and o.name not in
+       {cube.name} and o.type == 'MESH' and abs(W(o)[1, 3] - M_mc[1, 3]) > 5]
+ys = sorted(round(W(o)[1, 3] - M_mc[1, 3], 5) for o in new)
+check("copy mode: one copy per placement", r == {'FINISHED'} and len(bpy.data.objects) == n0 + 2
+      and np.allclose(ys, [-10, 10 - 0.5 * (M_mc[1, 3] - 0.0)]), (len(bpy.data.objects) - n0, ys))  # (scaled about the base)
+check("copy mode: original stays", np.allclose(W(mc), M_mc))
+up = max(new, key=lambda o: W(o)[1, 3])
+check("copy mode: placement scale kept", np.isclose(np.ptp(box_pts(up), axis=0)[0], 2.0, atol=1e-5),
+      np.ptp(box_pts(up), axis=0))
+for o in new:
+    bpy.data.objects.remove(o)
+
+# Edit Mode: the points moved and scaled about the moved base
+bpy.ops.object.select_all(action='DESELECT')
+select(mc)
+bpy.ops.object.mode_set(mode='EDIT')
+bpy.ops.mesh.select_all(action='SELECT')
+P0 = box_pts(mc)
+r = bpy.ops.nproto.move(base=tuple(P0.min(axis=0)), offset=(0, 0, 1.0), scale=0.5)
+bpy.ops.object.mode_set(mode='OBJECT')
+Pm = box_pts(mc)
+check("edit: points moved and scaled at the target", r == {'FINISHED'}
+      and np.allclose(Pm.min(axis=0), P0.min(axis=0) + (0, 0, 1), atol=1e-5)
+      and np.allclose(np.ptp(Pm, axis=0), 0.5 * np.ptp(P0, axis=0), atol=1e-5))
+bpy.data.objects.remove(mc)
+bpy.data.objects.remove(sbox)
+
+# -- Rotate: scale at the end (S), about the carried point or the centre (A) -----------------
+st = movetool.turn_steps(90.0, 0.5, "DIVIDE", 4)
+check("turn steps /4: angles and blended scales", np.allclose(st, [(22.5, 0.875), (45, 0.75), (67.5, 0.625),
+                                                                   (90, 0.5)]), st)
+check("turn steps: a scaled full turn keeps its last copy", len(movetool.turn_steps(360.0, 0.5, "DIVIDE", 4)) == 4)
+check("turn steps: an unscaled full turn drops it", len(movetool.turn_steps(360.0, 1.0, "DIVIDE", 4)) == 3)
+Cz, z = np.array([1.0, 2.0, 0.0]), np.array([0.0, 0.0, 1.0])
+Qp = np.array([3.0, 2.0, 0.0])
+for deg, mode, n, f, Q in ((90, "DIVIDE", 4, 0.5, Qp), (360, "DIVIDE", 6, 0.4, Cz), (40, "ARRAY", 3, 1.2, Qp),
+                           (90, "ARRAY", 4, 0.8, Cz), (120, "DIVIDE", 3, 1.0, Qp)):
+    pp = movetool.circular_params(Cz, z, deg, mode, n, f, Q)
+    want = movetool.turn_mats(Cz, z, deg, f, Q, mode, n)
+    bpy.ops.nproto.add_primitive(kind="BOX", width=0.4, depth=0.4, height=0.4)
+    tb = ctx.active_object
+    got = [T for _k, T in pattern.copy_transforms(pp, tb)]
+    bpy.data.objects.remove(tb)
+    check(f"circular pattern = turn_mats ({deg}° {mode} {n} ×{f})", len(got) == len(want)
+          and all(np.allclose(a, b, atol=1e-9) for a, b in zip(got, want)), (len(got), len(want)))
+
+bpy.ops.object.select_all(action='DESELECT')
+bpy.ops.nproto.add_primitive(kind="BOX", width=1.0, depth=1.0, height=1.0)
+rb = ctx.active_object
+ctx.view_layer.update()
+P0 = box_pts(rb)
+mid = 0.5 * (P0.min(axis=0) + P0.max(axis=0))
+C = mid + np.array([-4.0, 0.0, 0.0])
+select(rb)
+r = bpy.ops.nproto.rotate(center=tuple(C), axis=(0, 0, 1), angle=np.radians(90.0), copies="DIVIDE", count=2,
+                          scale=0.5, scale_about="POINT", scale_point=tuple(mid))
+cps = sorted(pattern.group_copies(pattern.pattern_of(next(o for o in bpy.data.objects if pattern.pattern_of(o)
+                                                          and o.get("nproto_in_0") is rb))[1]["group"]),
+             key=lambda c: c[2]) if r == {'FINISHED'} else []
+ctx.view_layer.update()
+mids = [0.5 * (box_pts(o).min(axis=0) + box_pts(o).max(axis=0)) for o, _s, _k in cps]
+sizes = [float(np.ptp(box_pts(o), axis=0)[2]) for o, _s, _k in cps]
+want_mid = [C + 4.0 * np.array([np.cos(np.radians(a)), np.sin(np.radians(a)), 0.0]) for a in (45, 90)]
+check("rotate /2 scaled about the carried point: on the circle", r == {'FINISHED'} and len(cps) == 2
+      and all(np.allclose(m, w, atol=1e-5) for m, w in zip(mids, want_mid)), mids)
+check("rotate /2 scaled: sizes blend to ×0.5", np.allclose(sizes, [0.75, 0.5], atol=1e-5), sizes)
+for o, _s, _k in cps:
+    bpy.data.objects.remove(o)
+
+select(rb)
+r = bpy.ops.nproto.rotate(center=tuple(C), axis=(0, 0, 1), angle=np.radians(360.0), copies="DIVIDE", count=4,
+                          scale=0.5, scale_about="CENTER")
+cps = [o for o in bpy.data.objects if o.get("nproto_in_0") is rb and pattern.pattern_of(o) is not None]
+ctx.view_layer.update()
+rads = sorted(round(float(np.linalg.norm((0.5 * (box_pts(o).min(axis=0) + box_pts(o).max(axis=0)) - C)[:2])), 5)
+              for o in cps)
+check("rotate 360 /4 about the centre: a spiral in, the last copy kept", r == {'FINISHED'} and len(cps) == 4
+      and np.allclose(rads, [2.0, 2.5, 3.0, 3.5], atol=1e-5), rads)
+pp = pattern.pattern_of(cps[0])[1]
+check("spiral pattern keeps its ends", pp.get("ends") is True and np.isclose(pp.get("scale"), 0.5), pp)
+for o in cps:
+    bpy.data.objects.remove(o)
+
+select(rb)
+r = bpy.ops.nproto.rotate(center=tuple(C), axis=(0, 0, 1), angle=np.radians(30.0), copies="ARRAY", count=4,
+                          scale=0.7, scale_point=tuple(mid))
+check("rotate *4 ×0.7 shrinks to nothing: refused", r == {'CANCELLED'})
+select(rb)
+r = bpy.ops.nproto.rotate(center=tuple(C), axis=(0, 0, 1), angle=np.radians(90.0), scale=2.0,
+                          scale_point=tuple(mid))
+ctx.view_layer.update()
+Pm = box_pts(rb)
+check("rotate + scale, no copies: turned and twice the size on the circle", r == {'FINISHED'}
+      and np.allclose(0.5 * (Pm.min(axis=0) + Pm.max(axis=0)), C + (0, 4, 0), atol=1e-5)
+      and np.isclose(np.ptp(Pm, axis=0)[2], 2.0, atol=1e-5))
+bpy.data.objects.remove(rb)
+
 # -- the hold key ------------------------------------------------------------------
 kc = ctx.window_manager.keyconfigs.addon
 items = [(km.name, k.idname) for km, k in movetool._keymaps]
