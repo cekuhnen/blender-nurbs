@@ -147,6 +147,7 @@ GROUPS = (
             (_t("nproto.push_pull", icon='FACESEL'), _t("nproto.rotate_face", icon='DRIVER_ROTATIONAL_DIFFERENCE')),
             (_t("nproto.move_face", icon='ORIENTATION_GLOBAL'), _t("nproto.replace_face", icon='FACE_MAPS')),
             (_t("nproto.boundary_fill", icon='MESH_CUBE'), _t("nproto.emboss", icon='MOD_DISPLACE', needs=EDGES)),
+            (_t("nproto.shell", icon='MOD_SOLIDIFY'),),
         ), {NURBS}),
     )),
     ("CONVERT", "Convert", (

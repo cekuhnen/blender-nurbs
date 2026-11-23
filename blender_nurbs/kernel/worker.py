@@ -5599,6 +5599,49 @@ def job_thicken(job):
     return {"faces": r.face_count(), "volume": volume}
 
 
+def job_shell(job):
+    """Shell a closed solid (world space): the faces at job['face_pts'] are
+    removed and the rest become walls job['thickness'] thick -- inside the
+    body (side INSIDE: the outside stays as it was) or around it (OUTSIDE:
+    the body becomes the cavity). No faces: a closed hollow (a void inside).
+    The kernel's own shell (offset faces extended until they meet, so the
+    inner corners stay sharp). Written in the local space of job['into']."""
+    np = _np()
+    body = world_brep(job, "target")
+    if not bool(body.is_manifold_solid()):
+        raise RuntimeError("Shell needs a closed solid (all edges shared by two faces)")
+    t = float(job["thickness"])
+    lo, hi = (np.array(v, float) for v in body.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    if t <= 1e-6 * size:
+        raise RuntimeError("the thickness is 0")
+    v0 = abs(_volume(body, 1e-4))
+    c = _to_origin(body)
+    faces = []
+    for p in job.get("face_pts") or []:
+        F = _face_at(body, [float(a) - b for a, b in zip(p, c)])
+        if F not in faces:
+            faces.append(F)
+    if faces and len(faces) >= body.face_count():
+        raise RuntimeError("every face of the body was picked: keep at least one")
+    d = t if job.get("side") == "OUTSIDE" else -t
+    why = ("the kernel could not shell this body (the wall may be thicker than an inside radius -- "
+           "a fillet, a hole, a concave curve -- or than a narrow part of the body)")
+    try:
+        r = sm.shell_brep(body, d, extended_offset=True, self_intersection=True, create_solid=True,
+                          faces_to_shell=faces)
+    except Exception:
+        raise RuntimeError(why)
+    if r is None or not r.face_count() or not bool(r.is_manifold_solid()):
+        raise RuntimeError(why)
+    v = abs(_volume(r, 1e-4))
+    if not v > 0.0 or (d < 0 and v >= v0 * (1.0 + 1e-6)):
+        raise RuntimeError(why)
+    r = _from_origin(r, c)
+    save(to_local(r, job.get("xforms", {}).get(job.get("into", "target"))), job["out"]["result"])
+    return {"faces": r.face_count(), "volume": v, "volume_before": v0, "removed": len(faces)}
+
+
 def _flat_quad(loops, tol):
     """The four corners of a face outline that is one convex, flat loop of four
     straight sides (no holes, no curves), else None. Its bilinear patch is
@@ -5810,7 +5853,7 @@ def job_mesh_to_brep(job):
 
 
 JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "untrim_region": job_untrim_region, "untrim_preview": job_untrim_preview, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean, "push_pull": job_push_pull, "rotate_face": job_rotate_face, "move_face": job_move_face, "replace_face": job_replace_face, "extrude_face": job_extrude_face,
-        "flip": job_flip, "cap_solid": job_cap_solid, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken,
+        "flip": job_flip, "cap_solid": job_cap_solid, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken, "shell": job_shell,
         "mesh_to_brep": job_mesh_to_brep}
 
 

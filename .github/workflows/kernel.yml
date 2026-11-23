@@ -229,6 +229,9 @@ jobs:
           "$BLENDER" -b --factory-startup --python tests/test_push_pull.py 2>&1 | tee pushpull.log
           grep -E "^FAIL" pushpull.log || true
           grep -q "^ALL OK" pushpull.log
+          "$BLENDER" -b --factory-startup --python tests/test_shell.py 2>&1 | tee shell.log
+          grep -E "^FAIL" shell.log || true
+          grep -q "^ALL OK" shell.log
           "$BLENDER" -b --factory-startup --python tests/test_extrude_face.py 2>&1 | tee extface.log
           grep -E "^FAIL" extface.log || true
           grep -q "^ALL OK" extface.log

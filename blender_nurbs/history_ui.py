@@ -24,6 +24,7 @@ STEP_FIELDS = {
     "rebuild_surface": ["degree_u", "degree_v", "spans_u", "spans_v"],
     "extend_surface": ["distance"],
     "push_pull": ["distance"],
+    "shell": ["thickness", "shell_side"],
     "rotate_face": ["angle"],
     "move_face": ["move_x", "move_y", "slide", "turn", "tilt"],
     "refit_trim": ["refit_degree", "refit_spans_u", "refit_spans_v"],
@@ -123,6 +124,8 @@ class NprotoStep(bpy.types.PropertyGroup):
     spans_v: IntProperty(name="Spans V", min=1, max=64, **_S())
     distance: FloatProperty(name="Distance", soft_min=-10.0, soft_max=10.0, unit='LENGTH', **_S())
     angle: FloatProperty(name="Angle", min=-179.0, max=179.0, **_S())
+    thickness: FloatProperty(name="Thickness", min=0.0, soft_max=10.0, unit='LENGTH', **_S())
+    shell_side: EnumProperty(name="Side", items=[("INSIDE", "Inside", ""), ("OUTSIDE", "Outside", "")], **_S())
     move_x: FloatProperty(name="X", unit='LENGTH', **_S())
     move_y: FloatProperty(name="Y", unit='LENGTH', **_S())
     slide: FloatProperty(name="Along", unit='LENGTH', **_S())
@@ -445,7 +448,7 @@ def draw_steps(box, obj, only=None, bare=False):
                 inner.label(text=pg.error, icon='ERROR')
 
 
-STEP_ICON = {"replace_face": 'FACE_MAPS', "push_pull": 'FACESEL', "rotate_face": 'DRIVER_ROTATIONAL_DIFFERENCE', "move_face": 'ORIENTATION_GLOBAL', "untrim_region": 'SELECT_SUBTRACT', "untrim": 'LOOP_BACK', "edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
+STEP_ICON = {"replace_face": 'FACE_MAPS', "push_pull": 'FACESEL', "shell": 'MOD_SOLIDIFY', "rotate_face": 'DRIVER_ROTATIONAL_DIFFERENCE', "move_face": 'ORIENTATION_GLOBAL', "untrim_region": 'SELECT_SUBTRACT', "untrim": 'LOOP_BACK', "edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
              "flip_normal": 'NORMALS_FACE', "surface_align": 'SNAP_EDGE', "match_surface": 'SNAP_FACE', "extend_surface": 'FULLSCREEN_ENTER',
              "rebuild_surface": 'MOD_REMESH', "refit_trim": 'MOD_LATTICE', "merge_patches": 'MESH_GRID'}
 

@@ -152,10 +152,27 @@ def face_highlight(o, i, max_fill=3000):
             "tris": W(pts)[tris].reshape(-1, 3) if len(tris) and len(pts) <= max_fill else np.zeros((0, 3))}
 
 
+VIEW_KEYS = {f"NUMPAD_{i}" for i in range(10)} | {"NUMPAD_PERIOD", "NUMPAD_PLUS", "NUMPAD_MINUS", "HOME"}
+
+
 class _FacePicking:
     """Clicking faces in the view (Push / Pull, Replace Face): what is under
     the mouse, lit up."""
     MAX_FILL = 3000             # a curved face with more tessellation points than this: outlines only
+
+    @staticmethod
+    def _view_event(context, event):
+        """An event for Blender while faces are picked: turning, panning and
+        zooming the view (middle mouse, wheel, trackpad, the numpad's views,
+        Home), the in-between moves a drag needs, and clicks / moves over the
+        navigation gizmo, the sidebar or a header (PickMixin._in_view)."""
+        et = event.type
+        if et in NAV or et == 'INBETWEEN_MOUSEMOVE' or et in VIEW_KEYS:
+            return True
+        if et in {'LEFTMOUSE', 'RIGHTMOUSE', 'MOUSEMOVE'}:
+            from .ops import PickMixin
+            return not PickMixin._in_view(context, event)
+        return False
 
     def _hit(self, context, event):
         region, _ = ValueDrag._win(context)
@@ -274,7 +291,7 @@ class NPROTO_OT_push_pull(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
     def modal(self, context, event):
         if getattr(self, "_dragging", False):
             return ValueDrag.modal(self, context, event)
-        if event.type in NAV:
+        if self._view_event(context, event):        # the view turns / pans / zooms, the gizmo and sidebar work
             return {'PASS_THROUGH'}
         if event.type == 'MOUSEMOVE':
             self._show_face(self._hit(context, event))
@@ -522,7 +539,7 @@ class NPROTO_OT_replace_face(_FacePicking, bpy.types.Operator):
                    [("MOUSE_LMB", "Pick"), ("EVENT_ESC", "Cancel")])
 
     def modal(self, context, event):
-        if event.type in NAV:
+        if self._view_event(context, event):        # the view turns / pans / zooms, the gizmo and sidebar work
             return {'PASS_THROUGH'}
         face_stage = self._stage == "FACE"
         if event.type == 'MOUSEMOVE':
@@ -812,7 +829,7 @@ class NPROTO_OT_rotate_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operato
     def modal(self, context, event):
         if getattr(self, "_dragging", False):
             return ValueDrag.modal(self, context, event)
-        if event.type in NAV or event.type == 'INBETWEEN_MOUSEMOVE':     # (gizmo drags need the in-between moves)
+        if self._view_event(context, event):        # the view turns / pans / zooms, the gizmo and sidebar work
             return {'PASS_THROUGH'}
         if event.type == 'MOUSEMOVE':
             if self._stage == "FACE":
@@ -1450,7 +1467,7 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
     def modal(self, context, event):
         if getattr(self, "_dragging", False):
             return ValueDrag.modal(self, context, event)
-        if event.type in NAV or event.type == 'INBETWEEN_MOUSEMOVE':     # (gizmo drags need the in-between moves)
+        if self._view_event(context, event):        # the view turns / pans / zooms, the gizmo and sidebar work
             return {'PASS_THROUGH'}
         if event.type == 'MOUSEMOVE':
             self._show_feature(self._hit(context, event))
