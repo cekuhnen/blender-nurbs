@@ -520,14 +520,20 @@ def apply_move_face(obj, text, inputs, p):
     """Move Face on rebuild: the feature holding the faces at the stored points
     moved again as stored (local): on a flat face slid by the two distances
     along the two directions; on a curved one turned about and slid along its
-    axis; on a sphere tilted (about the stored tilt axis), then turned."""
+    axis; on a sphere tilted (about the stored tilt axis), then turned; on a
+    free-form face carried by frames from the stored anchor (the rim cut
+    anew)."""
     M = _world(obj)
     pts = [list(M @ Vector(q)) for q in p["faces_local"]]
     L = M.to_3x3()
     kw = {}
-    if p.get("mode", "PLANE") == "PLANE":
+    if p.get("mode", "PLANE") in ("PLANE", "FREE"):
         v = L @ (float(p.get("move_x", 0.0)) * Vector(p["axis_x_local"])
                  + float(p.get("move_y", 0.0)) * Vector(p["axis_y_local"]))
+        if p.get("mode") == "FREE":              # carried by the frames over the free-form face
+            kw = {"reseat": {"anchor": list(M @ Vector(p["axis_point_local"])), "vector": list(v),
+                             "follow": bool(p.get("follow", True))}}
+            v = Vector((0.0, 0.0, 0.0))
     else:
         z = (L @ Vector(p["axis_x_local"])).normalized()
         O = list(M @ Vector(p["axis_point_local"]))
@@ -545,7 +551,7 @@ def apply_move_face(obj, text, inputs, p):
 
 
 def _move_face_label(p):
-    if p.get("mode", "PLANE") == "PLANE":
+    if p.get("mode", "PLANE") in ("PLANE", "FREE"):
         return f"Move Face · {math.hypot(float(p.get('move_x', 0)), float(p.get('move_y', 0))):.3g}"
     bits = [f"{float(p.get('turn', 0)):.3g}°" if abs(float(p.get("turn", 0))) > 0 else "",
             f"tilt {float(p.get('tilt', 0)):.3g}°" if abs(float(p.get("tilt", 0))) > 0 else "",

@@ -32,7 +32,7 @@ STEP_FIELDS = {
                       "merge_knots", "merge_seams", "merge_reduce_degree"],
 }
 MOVE_FACE_FIELDS = {"PLANE": ("move_x", "move_y"), "AXIS": ("slide", "turn"), "TURN": ("turn",),
-                    "SLIDE": ("slide",), "SPHERE": ("turn", "tilt")}
+                    "SLIDE": ("slide",), "SPHERE": ("turn", "tilt"), "FREE": ("move_x", "move_y")}
 CA_DEFAULTS = {"ca_tolerance": 1e-4, "ca_angle": 0.1, "ca_degree": 7}
 ROLE = {"replace_face": "replacing surface", "trim": "trim cutter", "fillet_trim": "fillet partner"}
 STEP_NOTE = {"fillet_trim": "Follows its Surface Fillet (edit the fillet object)"}

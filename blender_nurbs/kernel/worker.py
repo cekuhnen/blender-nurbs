@@ -3883,6 +3883,194 @@ class _SeatTrim:
                                                   10 * self.tol, self.btol)
 
 
+def _p3(p):
+    np = _np()
+    return np.array([p.x, p.y, p.z], float) if hasattr(p, "x") else np.array(p, float)
+
+
+def _reseat_motion(job, seats):
+    """(M, rotation (axis, degrees) or None, A, A2) of a Move Face on a free-form
+    face: the frame at the anchor's foot on its seat (its point and outward
+    normal) moved to the foot of anchor + vector; with follow, turned so the
+    feature keeps square to the face."""
+    np = _np()
+    rs = job["reseat"]
+    anchor = np.asarray(rs["anchor"], float)
+    S0 = min(seats, key=lambda S: S.closest_point(tuple(map(float, anchor)))[1])
+    G0 = S0.surface()
+    A = _p3(sm.surface_closest_point(G0, tuple(map(float, anchor)))[0])
+    A2 = _p3(sm.surface_closest_point(G0, tuple(map(float, A + np.asarray(rs["vector"], float))))[0])
+    n0, n1 = _face_normal(S0, A), _face_normal(S0, A2)
+    R, rot = np.eye(3), None
+    ax = np.cross(n0, n1)
+    if rs.get("follow", True) and np.linalg.norm(ax) > 1e-12:
+        ang = float(np.arctan2(np.linalg.norm(ax), float(n0 @ n1)))
+        R = _rotation(ax / np.linalg.norm(ax), ang)
+        rot = (ax / np.linalg.norm(ax), float(np.degrees(ang)))
+    return (lambda P: (np.asarray(P, float) - A) @ R.T + A2), rot, A, A2
+
+
+def _move_reseat(job, body, region, seats, rim_edges, rims_all, M, rot, A, A2, size, tol, btol):
+    """Move Face on free-form seats: the feature as a closed tool -- its faces,
+    the walls continued straight past each rim (their own rulings: an
+    Extrude's walls), capped with the seat's patch inside the rim moved along
+    -- carried rigidly, then cut from (a hole, a pocket) or joined to (a boss)
+    the body with the feature filled in: the boolean meets the walls with the
+    seat exactly, so the rim takes the face's shape where it lands."""
+    np = _np()
+    from trimext import _edge_curve
+    faces = body.faces()
+    fsize = float(np.linalg.norm(np.ptp(np.vstack([_loop_polygon([(e, True)], 6) for e in rim_edges]), axis=0)))
+    # the rims, each with the seat it sits in
+    sts = {S: _SeatTrim(S, rim_edges, M, size, tol, btol, rims_all) for S in seats}
+    rims = [(S, sp) for S, st in sts.items() for sp in st.specs if sp[2] == "mine"]
+    qc = np.mean([np.array(f.interior_point(), float) for f in region], axis=0)
+    # the walls' straight direction: their side edges (from a rim vertex out)
+    rim_v = {}
+    for S, (c, _, _) in rims:
+        for e, _ in c:
+            for v in e.vertices():
+                rim_v[v] = (S, c)
+    sides, d = [], None
+    for F in region:
+        for e in F.edges():
+            if e in rim_edges or e in sides:
+                continue
+            ends = [v for v in e.vertices() if v in rim_v]
+            if not ends:
+                continue
+            a, b = np.array(e.start_vertex().point(), float), np.array(e.end_vertex().point(), float)
+            if abs(e.length() - float(np.linalg.norm(b - a))) > 1e-6 * max(e.length(), size):
+                raise RuntimeError("the feature's walls are not straight (drafted or rounded): on a free-form "
+                                   "face only a feature with straight walls (an Extrude's) can move")
+            u = (b - a) / np.linalg.norm(b - a)
+            if d is not None and np.linalg.norm(np.cross(u, d)) > 1e-6:
+                raise RuntimeError("the feature's walls do not run one way: on a free-form face only a "
+                                   "feature with straight walls (an Extrude's) can move")
+            d = u if d is None else d
+            sides.append(e)
+    if d is None:
+        raise RuntimeError("the feature's walls have no straight side to continue past the face")
+    # each rim: which way is out of the feature (away from its middle), and how far to go
+    out = {}
+    for S, (c, _, _) in rims:
+        P = _loop_polygon(c, 8)
+        pc = P.mean(axis=0)
+        s_ = 1.0 if float((pc - qc) @ d) > 0 else -1.0
+        G = S.surface()
+        Pm = M(P)
+        dev = max(float(sm.surface_closest_point(G, tuple(map(float, q)))[2]) for q in Pm)
+        out[id(c)] = (s_ * d, 2.0 * dev + 0.25 * fsize)
+    n_anchor = _face_normal(min(seats, key=lambda S: S.closest_point(tuple(map(float, A)))[1]), A)
+    S_a = min(seats, key=lambda S: S.closest_point(tuple(map(float, A)))[1])
+    adds = float((qc - A) @ n_anchor) > 0           # the feature stands out of the face: a boss
+    # where each moved rim lands: inside its seat, clear of its other holes
+    for S, st in sts.items():
+        mine = [sp for sp in st.specs if sp[2] == "mine"]
+        if not mine:
+            continue
+        G = S.surface()
+        Q = np.vstack([M(_loop_polygon(c, 8)) for c, _, _ in mine])
+        Q = np.array([_p3(sm.surface_closest_point(G, tuple(map(float, q)))[0]) for q in Q], float)
+        F0 = st.face(lambda sp: False).faces()[0]
+        cls = lambda F, P: [F.classify_uv(*_uvxy(sm.surface_closest_point(F.surface(), tuple(map(float, q)))[1][0]))
+                            for q in P]
+        if any(c_ != "inside" for c_ in cls(F0, Q)):
+            raise RuntimeError("the feature would leave the face it sits in (or touch its edge)")
+        if any(sp[2] == "hole" for sp in st.specs):
+            F1 = st.face(lambda sp: sp[2] != "mine").faces()[0]
+            if any(c_ != "inside" for c_ in cls(F1, Q)):
+                raise RuntimeError("the feature would run into another hole or feature in that face")
+    # the tool: walls continued straight past their rims, capped
+    ext_d = 4.0 * max(e_ for _, e_ in out.values()) + 10 * tol
+    vmove = {}
+    for S, (c, _, _) in rims:
+        for e, _ in c:
+            for v in e.vertices():
+                vmove[v] = out[id(c)]
+    emove = {e: out[id(c)] for S, (c, _, _) in rims for e, _ in c}
+    idx = [i for i, f in enumerate(faces) if f in region]
+    built = []
+    for F in [faces[i] for i in idx]:
+        if not any(e in emove or e in sides for e in F.edges()):
+            built.append(None)
+            continue
+        loops = []
+        for loop in F.boundary_loops():               # in the loop's own order (a closed wall's seam form)
+            cs = []
+            for e, fw in loop:
+                if e in emove:
+                    dv, ev = emove[e]
+                    cs.append(_moved_curve(_edge_curve(e, fw), ev * dv))
+                elif e in sides:
+                    a, b = np.array(e.start_vertex().point(), float), np.array(e.end_vertex().point(), float)
+                    if e.start_vertex() in vmove:
+                        a = a + vmove[e.start_vertex()][1] * vmove[e.start_vertex()][0]
+                    if e.end_vertex() in vmove:
+                        b = b + vmove[e.end_vertex()][1] * vmove[e.end_vertex()][0]
+                    a, b = (a, b) if fw else (b, a)
+                    cs.append(ext.curve_from_cvs(1, [tuple(map(float, a)), tuple(map(float, b))],
+                                                 [0.0, 0.0, 1.0, 1.0], None))
+                elif e.length() > tol:
+                    cs.append(_edge_curve(e, fw))
+            loops.append(cs)
+        srf = _extended_surface(F.surface(), ext_d, tol)
+        for lp in loops:                              # the continued wall must lie on its own surface
+            for cv in lp:
+                t0, t1 = cv.parameter_range()
+                for t in np.linspace(t0, t1, 5):
+                    if sm.surface_closest_point(srf, tuple(map(float, cv.evaluate(float(t)))))[2] > 1e3 * tol:
+                        raise RuntimeError("the feature's walls are not straight (drafted or rounded): on a "
+                                           "free-form face only a feature with straight walls (an Extrude's) "
+                                           "can move")
+        built.append(ext.trim_surface_with_3d_curves_tol(srf, [len(l) for l in loops], [x for l in loops for x in l],
+                                                         10 * tol, btol))
+    tool = body.copy()
+    tf = tool.faces()
+    redo = {i for i, nb in zip(idx, built) if nb is not None}
+    ext.delete_faces(tool, [tf[i] for i in range(len(tf)) if i not in set(idx) or i in redo])
+    for nb in built:
+        if nb is not None:
+            ext.append_brep(tool, nb)
+    for S, (c, _, _) in rims:
+        dv, ev = out[id(c)]
+        G = ext.surface_from_cvs(*_srf_tuple(ext.surface_cvs(S.surface())))
+        plug = ext.trim_surface_with_3d_curves_tol(G, [len(c)], [_edge_curve(e, fw) for e, fw in c], 10 * tol, btol)
+        ext.append_brep(tool, sm.translate(plug, tuple(map(float, ev * dv))))
+    tool = sm.stitch_advanced(tool, 10 * tol, squeeze_small_edges=False, making_manifold_solid=True)[0]
+    if not tool.is_manifold_solid():
+        raise RuntimeError("the feature does not close into a solid when continued past the face")
+    if rot is not None:
+        sm.rotate(tool, tuple(map(float, A)), tuple(map(float, rot[0])), rot[1])
+    tool = sm.translate(tool, tuple(map(float, A2 - A)))
+    # the body with the feature filled in
+    b = body.copy()
+    bf = b.faces()
+    gone = set(idx) | {i for i, f in enumerate(faces) if f in seats}
+    keep_pt = next(np.array(bf[i].interior_point(), float) for i in range(len(bf)) if i not in gone)
+    filled = [st.face(lambda sp: sp[2] != "mine") for st in sts.values()]
+    ext.delete_faces(b, [bf[i] for i in gone])
+    for nb in filled:
+        ext.append_brep(b, nb)
+    b = sm.stitch_advanced(b, 10 * tol, squeeze_small_edges=False, making_manifold_solid=True)[0]
+    try:
+        sm.unify_normals(b, _face_at(b, keep_pt), 100)
+    except Exception:
+        pass
+    if not b.is_manifold_solid():
+        raise RuntimeError("the face does not close up where the feature was")
+    try:
+        res = sm.boolean(b, tool, operation=sm.BooleanOp.UNION if adds else sm.BooleanOp.DIFFERENCE)
+    except Exception as exc:
+        raise RuntimeError(f"the feature does not go into the face where it lands ({exc})")
+    if res is None or not res.is_manifold_solid():
+        raise RuntimeError("the moved feature and the face do not close into a solid")
+    if res.face_count() != body.face_count():
+        raise RuntimeError("the feature would run into something where it lands (the faces came out "
+                           f"{res.face_count()} instead of {body.face_count()})")
+    return res
+
+
 def job_move_face(job):
     """Move Face (world space): the feature holding the faces at
     job['face_pts'] -- the faces enclosed by an inner loop of the face(s) it
@@ -3908,8 +4096,9 @@ def job_move_face(job):
     lo, hi = (np.array(v, float) for v in body.bounding_box())
     size = float(np.linalg.norm(hi - lo)) or 1.0
     tol = 1e-6 * size
-    M = _feature_motion(job, size)
-    if M is None:
+    reseat = job.get("reseat")
+    M = _feature_motion(job, size) if not reseat else None
+    if M is None and not reseat:
         raise RuntimeError("the move is 0")
     faces = body.faces()
     start = {_face_at(body, p) for p in job["face_pts"]}
@@ -3921,6 +4110,14 @@ def job_move_face(job):
                            "or slot): Push / Pull or Rotate Face move a face of the body itself")
     region, seats, rim_edges = reg
     btol = brep_tol(1e-5, size)
+    if reseat:                                    # a free-form face: carried by frames, the rim cut anew
+        if float(np.linalg.norm(np.asarray(reseat["vector"], float))) <= tol:
+            raise RuntimeError("the move is 0")
+        M, rot, A, A2 = _reseat_motion(job, seats)
+        b = _move_reseat(job, body, region, seats, rim_edges, rims_all, M, rot, A, A2, size, tol, btol)
+        save(to_local(b, job.get("xforms", {}).get(job.get("into"))), job["out"]["result"])
+        return {"faces": b.face_count(), "volume": _volume(b, 1e-3), "feature": len(region),
+                "seats": len(seats), "turned": rot[1] if rot else 0.0}
 
     def free_surface(S):
         return ext.surface_from_cvs(*_srf_tuple(ext.surface_cvs(S.surface())))

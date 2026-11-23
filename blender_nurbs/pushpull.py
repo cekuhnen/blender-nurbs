@@ -1115,15 +1115,17 @@ def feature_of(o, idxs):
 
 
 def _plane_axes(n):
-    """Two unit axes in the plane across n: the world axes most across it,
-    flattened into it (a plate on XY: X and Y)."""
+    """Two unit axes in the plane across n: world X flattened into it (else Y,
+    else Z: the first that is not near n), then n x that, turned to keep its
+    largest world component positive (a plate on XY: X and Y; a slightly
+    sloped face: still X first)."""
     n = np.asarray(n, float)
     W = np.eye(3)
-    order = np.argsort(np.abs(W @ n))
-    a = W[order[0]] - (W[order[0]] @ n) * n
+    k = next(i for i in range(3) if abs(float(W[i] @ n)) < 0.7)
+    a = W[k] - (W[k] @ n) * n
     a /= np.linalg.norm(a)
     b = np.cross(n, a)
-    if float(b @ W[order[1]]) < 0.0:          # keep the second near its world axis's sign
+    if b[int(np.argmax(np.abs(b)))] < 0.0:
         b = -b
     return a, b
 
@@ -1142,7 +1144,8 @@ def _tilt_axis(rel, z):
 
 MOTIONS = {"PLANE": "slides in the flat face", "AXIS": "slides along the cylinder's axis and turns about it",
            "TURN": "turns about the revolved face's axis (a cone's, a torus's)", "SLIDE": "slides along the extruded face",
-           "SPHERE": "turns about the sphere's axis and tilts along its meridian"}
+           "SPHERE": "turns about the sphere's axis and tilts along its meridian",
+           "FREE": "slides over the free-form face; its rim is cut anew where it lands"}
 
 
 def seat_motion(o, s):
@@ -1180,7 +1183,35 @@ def seat_motion(o, s):
     if ex is not None:
         d = np.asarray(ex[1], float)
         return "SLIDE", G[0, 0], d / (np.linalg.norm(d) or 1.0)
-    return None
+    p, w, n, _ = face_frame(o, s)
+    return "FREE", w, n                       # no symmetry: moved by frames, the rim cut anew
+
+
+def free_frame(o, s, anchor, vec, follow=True):
+    """(R, A, A2) in world of a move over free-form seat s of body o, as the
+    worker's _reseat_motion: the anchor's foot on the seat (A) moved to the
+    foot of A + vec (A2), turned (R) from the normal at A to the one at A2
+    when follow."""
+    sm_, _ = store._k()
+    f = store.get_brep(o).faces()[s]
+    srf = f.surface()
+    M = geom.world_matrix(o)
+    Mi = M.inverted()
+
+    def foot(q):
+        r = sm_.surface_closest_point(srf, tuple(Mi @ Vector(tuple(map(float, q)))))
+        p = r[0]
+        p = np.array([p.x, p.y, p.z] if hasattr(p, "x") else p, float)
+        n = np.array(f.outward_normal_at_uv(*_uvxy(r[1][0])), float)
+        nw = np.array(M.to_3x3().inverted().transposed() @ Vector(n), float)
+        return np.array(M @ Vector(p), float), nw / (np.linalg.norm(nw) or 1.0)
+    A, n0 = foot(anchor)
+    A2, n1 = foot(A + np.asarray(vec, float))
+    R = np.eye(3)
+    ax = np.cross(n0, n1)
+    if follow and np.linalg.norm(ax) > 1e-12:
+        R = _rot3(ax / np.linalg.norm(ax), float(np.degrees(np.arctan2(np.linalg.norm(ax), float(n0 @ n1)))))
+    return R, A, A2, n0
 
 
 class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator):
@@ -1210,12 +1241,15 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
                          description="Along the axis of the curved face the feature sits in")
     turn: FloatProperty(name="Turn °", default=0.0, min=-360.0, max=360.0,
                         description="About the axis of the curved face the feature sits in (degrees)")
+    follow: bpy.props.BoolProperty(name="Keep Square", default=True,
+                                   description="On a free-form face: the feature turns with the face so it "
+                                               "stays square to it where it lands")
     tilt: FloatProperty(name="Tilt °", default=0.0, min=-360.0, max=360.0,
                         description="On a sphere: along the meridian through the feature, + towards the "
                                     "axis's top (degrees)")
 
     FIELDS = {"PLANE": ("move_x", "move_y"), "AXIS": ("slide", "turn"), "TURN": ("turn",), "SLIDE": ("slide",),
-              "SPHERE": ("turn", "tilt")}
+              "SPHERE": ("turn", "tilt"), "FREE": ("move_x", "move_y")}
     drag_fields = ("move_x", "move_y")
     angle_fields = ("turn", "tilt")
     fit_view = "none"
@@ -1288,6 +1322,13 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
             a, b = _plane_axes(n)
             self.axis_x, self.axis_y = [float(x) for x in a], [float(x) for x in b]
             return
+        if mode == "FREE":                       # the anchor: the opening's foot on the face, its tangent plane
+            C = np.array(geom.world_matrix(o) @ Vector(self._seat(context, o, feat)[2]), float)
+            _, A, _, n0 = free_frame(o, s, C, np.zeros(3))
+            a, b = _plane_axes(n0)
+            self.axis_x, self.axis_y = [float(x) for x in a], [float(x) for x in b]
+            self.axis_point = [float(x) for x in A]
+            return
         if float(np.asarray(z) @ np.array([0.0, 0.0, 1.0])) < -1e-9 or (abs(z[2]) <= 1e-9 and z[0] + z[1] < 0):
             z = -np.asarray(z)                  # the axis upwards (or towards +X/+Y): + is up the axis
         self.axis_x = [float(x) for x in z]
@@ -1302,7 +1343,7 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
         return self.drag_fields
 
     def _vector(self):
-        if self.mode == "PLANE":
+        if self.mode in ("PLANE", "FREE"):
             return self.move_x * np.array(self.axis_x, float) + self.move_y * np.array(self.axis_y, float)
         return self.slide * np.array(self.axis_x, float)
 
@@ -1320,9 +1361,27 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
             out.append((O, z, self._angle()))
         return out
 
+    def _free_seat(self):
+        """(body, seat index) the free-form move runs over: the feature's seat nearest the anchor."""
+        o, idxs = next(iter(self._by_obj(self._items()).values()))
+        feat = feature_of(o, idxs)
+        Mi = geom.world_matrix(o).inverted()
+        q = tuple(Mi @ Vector(self.axis_point))
+        faces = store.get_brep(o).faces()
+        return o, min(feat[1], key=lambda k: faces[k].closest_point(q)[1])
+
     def _moved(self, P, upto=None):
-        """World points P carried by the move: turned (tilted), then slid."""
+        """World points P carried by the move: turned (tilted), then slid;
+        on a free-form face carried by the frames (free_frame)."""
         P = np.asarray(P, float)
+        if self.mode == "FREE":
+            key = (self.move_x, self.move_y, self.follow)
+            if getattr(self, "_fkey", None) != key:
+                o, s = self._free_seat()
+                self._ff = free_frame(o, s, self.axis_point, self._vector(), self.follow)
+                self._fkey = key
+            R, A, A2, _ = self._ff
+            return (P - A) @ R.T + A2
         for O, z, a in self._turns()[:upto]:
             P = rotate_points(P, O, z, a)
         return P + self._vector()
@@ -1330,6 +1389,8 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
     def draw(self, context):
         for f in self.FIELDS.get(self.mode, ()):
             self.layout.prop(self, f)
+        if self.mode == "FREE":
+            self.layout.prop(self, "follow")
 
     def invoke(self, context, event):
         if not _kernel_ok(self):
@@ -1495,7 +1556,7 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
         ax, ay = np.array(self.axis_x, float), np.array(self.axis_y, float)
         moved = self._moved(self._C[None])[0]
         L0 = self._L0
-        if self.mode == "PLANE":
+        if self.mode in ("PLANE", "FREE"):
             return [{"field": "move_x", "kind": "arrow", "origin": self._C + self.move_y * ay, "dir": ax,
                      "param": self.move_x + L0, "base": moved, "to_value": lambda t: t - L0},
                     {"field": "move_y", "kind": "arrow", "origin": self._C + self.move_x * ax, "dir": ay,
@@ -1531,7 +1592,7 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
     def _lifted(self, P):
         """Preview fill points lifted off the face (the plane's normal; out
         from a curved face's axis)."""
-        if self.mode == "PLANE":
+        if self.mode in ("PLANE", "FREE"):
             return P + self._lift * np.cross(np.array(self.axis_x, float), np.array(self.axis_y, float))
         if self.mode == "SLIDE":
             return P
@@ -1566,7 +1627,7 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
 
     def drag_check(self):
         if np.linalg.norm(self._vector()) <= 0.0 and not self._turns():
-            if self.mode == "PLANE":
+            if self.mode in ("PLANE", "FREE"):
                 return "No move yet: drag an arrow along the face, or type a distance (Tab: the other direction)"
             if self.mode == "AXIS":
                 return "No move yet: drag the arrow along the axis or the handle round it (Tab: the other)"
@@ -1581,7 +1642,7 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
         return [("", [hints.note(f"the feature {MOTIONS[self.mode]}")])]
 
     def drag_handle_hints(self):
-        if self.mode == "PLANE":
+        if self.mode in ("PLANE", "FREE"):
             return [hints.key("LMB drag", "an arrow (the two directions in the face)")]
         if self.mode == "AXIS":
             return [hints.key("LMB drag", "the arrow (along the axis) or the handle (round it)")]
@@ -1617,6 +1678,9 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
             self.report({'WARNING'}, "Move Face: the move is 0")
             return {'CANCELLED'}
         turn = {"turns": [[[float(x) for x in O], [float(x) for x in z], a] for O, z, a in turns]} if turns else {}
+        if self.mode == "FREE":                  # the worker carries it by the frames and cuts the rim anew
+            turn = {"reseat": {"anchor": [float(x) for x in self.axis_point], "vector": [float(x) for x in d],
+                               "follow": bool(self.follow)}}
         hist = features.history_enabled(context)
         done = []
         for o, pts in [(o, [p for oo, p in items if oo == o]) for o in {o for o, _ in items}]:
@@ -1628,7 +1692,8 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
             try:
                 info, breps = jobs.run("move_face", {"target": o}, ["result"],
                                        face_pts=[[float(x) for x in f[1]] for f in frames],
-                                       vector=[float(x) for x in d], into="target", **turn)
+                                       vector=[0.0, 0.0, 0.0] if self.mode == "FREE" else [float(x) for x in d],
+                                       into="target", **turn)
             except jobs.JobError as exc:
                 self.report({'ERROR'}, f"Move Face on {o.name} failed: {exc}")
                 continue
@@ -1642,7 +1707,7 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
             store.set_geometry_text(o, breps["result"], context, keep_untrimmed=False)
             if hist:
                 L3 = M.to_3x3().inverted()
-                curved = self.mode != "PLANE"
+                curved = self.mode not in ("PLANE", "FREE")
                 features.push_step(o, "move_face", [], {
                     "faces_local": [[float(x) for x in f[0]] for f in frames], "mode": self.mode,
                     "axis_x_local": [float(x) for x in L3 @ Vector(self.axis_x)],
@@ -1650,7 +1715,8 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
                     "axis_point_local": [float(x) for x in Mi @ Vector(self.axis_point)],
                     "move_x": 0.0 if curved else float(self.move_x), "move_y": 0.0 if curved else float(self.move_y),
                     "slide": float(self.slide) if curved else 0.0, "turn": ang,
-                    "tilt": float(self.tilt) if self.mode == "SPHERE" else 0.0}, base_text=pre)
+                    "tilt": float(self.tilt) if self.mode == "SPHERE" else 0.0,
+                    "follow": bool(self.follow)}, base_text=pre)
             if moved:
                 try:
                     subsel.set_picks(o, "FACE", sorted({_face_index(o, q) for q in moved}))
