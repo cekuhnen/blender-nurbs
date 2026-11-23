@@ -9375,6 +9375,66 @@ _m2r["an icosphere (nothing to recognise): a solid of its flat facets"] = b_.fac
 bpy.ops.mesh.primitive_grid_add(x_subdivisions=3, y_subdivisions=3, size=1.0, location=(9.0, 0.0, 0.0))
 n_, s_, no_, b_, v_, sol_ = _m2b_run(ctx.active_object)
 _m2r["an open mesh: a sheet, said so"] = b_.face_count() == 1 and not sol_ and no_ is not None and "open" in no_
+# a shelled cap (Pool Table.blend): a profile spun to the axis by Screw, thickened outward by Solidify. Solidify's
+# corner offset is not exact: the outer wall leans ~0.1 deg (it stopped growing a third of the way round) and the
+# spun top's tip sits above its rim (64 triangles, no plane)
+def _m2b_shell(name, x_, ngon=False):
+    me_ = bpy.data.meshes.new(name)
+    me_.from_pydata([(-0.238125, 0, 0.40005), (-0.238125, 0, 0.45085), (0, 0, 0.45085)], [(1, 0), (2, 1)], [])   # (edge order: Solidify thickens outward)
+    o_ = bpy.data.objects.new(name, me_)
+    ctx.scene.collection.objects.link(o_)
+    o_.location = (x_, 0.0, 0.0)
+    m_ = o_.modifiers.new("Screw", 'SCREW')
+    m_.steps = m_.render_steps = 64
+    m_ = o_.modifiers.new("Solidify", 'SOLIDIFY')
+    m_.thickness, m_.offset, m_.use_even_offset = 0.00635, 1.0, True
+    if ngon:                                   # applied, each spun cap dissolved into one n-gon
+        dg_ = ctx.evaluated_depsgraph_get()
+        me2_ = bpy.data.meshes.new_from_object(o_.evaluated_get(dg_))
+        o_.modifiers.clear()
+        b_ = _bmx.new()
+        b_.from_mesh(me2_)
+        _bmx.ops.remove_doubles(b_, verts=b_.verts, dist=1e-7)
+        for z_ in (0.45085, 0.4572):
+            _bmx.ops.dissolve_faces(b_, faces=[f_ for f_ in b_.faces if len(f_.verts) == 3
+                                               and all(abs(v_.co.z - z_) < 2e-4 for v_ in f_.verts)])
+        b_.to_mesh(me_)
+        b_.free()
+    return o_
+for _ng in (False, True):
+    _o = _m2b_shell("M2B_Shell", 11.0, _ng)
+    _dg = ctx.evaluated_depsgraph_get()
+    _ev = _o.evaluated_get(_dg).to_mesh()
+    _P = np.array([tuple(v_.co) for v_ in _ev.vertices])
+    _o.evaluated_get(_dg).to_mesh_clear()
+    _ro = float(np.hypot(_P[:, 0], _P[:, 1]).max() + np.hypot(_P[:, 0], _P[:, 1])[_P[:, 2] < 0.4001].max()) / 2
+    n_, s_, no_, b_, v_, sol_ = _m2b_run(_o)
+    _exp = math.pi * (_ro ** 2 * (0.45711 - 0.40005) - 0.238125 ** 2 * (0.45085 - 0.40005))   # (top: the outer rim)
+    _dev = _m2b_cyl_dev(b_, [(0.0, 0.0, 0.238125), (0.0, 0.0, _ro)])   # (the body is local)
+    _m2r["a shelled cap (Screw + Solidify" + (", n-gon caps" if _ng else "") + "): one hole, one cylinder, 3 planes, "
+         "a closed solid of 5 faces"] = \
+        "1 hole" in s_ and "1 cylinder" in s_ and s_.startswith("3 planes") and b_.face_count() == 5 and sol_ \
+        and _dev < 6e-5 and abs(v_ - _exp) < 1e-3 * _exp and no_ is None
+    bpy.data.objects.remove(_o)
+# a tube: its hole runs through both end faces (annuli), which shut only the outer cylinder
+_tb = _bmx.new()
+_n = 48
+_vs = [[_tb.verts.new((r_ * math.cos(2 * math.pi * k_ / _n), r_ * math.sin(2 * math.pi * k_ / _n), z_))
+        for k_ in range(_n)] for r_, z_ in ((0.4, 0.0), (0.4, 0.5), (0.3, 0.5), (0.3, 0.0))]
+for j_ in range(4):
+    for k_ in range(_n):
+        _tb.faces.new((_vs[j_][k_], _vs[j_][(k_ + 1) % _n], _vs[(j_ + 1) % 4][(k_ + 1) % _n], _vs[(j_ + 1) % 4][k_]))
+_bmx.ops.recalc_face_normals(_tb, faces=_tb.faces)
+_me = bpy.data.meshes.new("M2B_Tube")
+_tb.to_mesh(_me)
+_tb.free()
+_o = bpy.data.objects.new("M2B_Tube", _me)
+ctx.scene.collection.objects.link(_o)
+_o.location = (13.0, 0.0, 0.0)
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_o)
+_m2r["a tube (quads only): an exact cylinder and hole, the hole through both annuli, a closed solid of 4 faces"] = \
+    "1 hole" in s_ and "1 cylinder" in s_ and b_.face_count() == 4 and sol_ \
+    and abs(v_ - math.pi * (0.16 - 0.09) * 0.5) < 1e-6 and _m2b_cyl_dev(b_, [(0.0, 0.0, 0.3), (0.0, 0.0, 0.4)]) < 1e-6
 # boxy bevels (Profile above 0.5): an exact superellipse strip, G2 to both faces, where it ends on flat faces
 def _boxy_vol(p_, w_=0.1, a_=0.6):
     r_ = -2 * math.log(2) / math.log(p_)

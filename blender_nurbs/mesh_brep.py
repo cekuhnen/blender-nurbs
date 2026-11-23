@@ -45,6 +45,8 @@ from . import features, jobs, store
 FLAT_COS = math.cos(math.radians(0.5))      # facets this close in direction (and offset) are one plane
 SEED_COS = math.cos(math.radians(60.0))     # neighbouring facets of a round turn by less than this
 SQUARE = 1e-3                               # |n . axis| below this: a facet is square to a round's axis
+RING_TILT = math.sin(math.radians(1.0))     # a round grows over facets tilted less than this (its circle fit decides:
+                                            # Solidify's corners leave a shell's outer wall a few hundredths off)
 BOXY_SEGMENTS = 4                           # a boxy bevel needs this many segments (fewer: any polyline fits)
 BOXY_COS = math.cos(math.radians(88.0))     # a boxy profile's middle segment can fold by up to this
 GRID_COS = math.cos(math.radians(30.6))     # free-form patches: the largest ordinary fold between two quads
@@ -217,6 +219,7 @@ class Recognizer:
                         reg.append(g)
                         todo.append(g)
             self.regs.append(reg)
+        self._fans(rid)
         self.rid = np.empty(n, int)
         for i, r in enumerate(self.regs):
             self.rid[r] = i
@@ -263,6 +266,42 @@ class Recognizer:
                 self.role[i] = ("grid", g)
         self._tan = {}
 
+    def _fans(self, rid):
+        """A spun cap -- a fan of triangles about one vertex (Spin or Screw to
+        the axis) whose normals agree within FLAT_COS and whose rim is flat --
+        is one flat region, also where its tip is a little off the rim's
+        plane (Solidify lifts it: its corner offset is not exact). Regions
+        that are only the fan's triangles merge (regs; rid is the caller's,
+        rebuilt from regs)."""
+        V, F, N, A, tol = self.V, self.F, self.N, self.A, self.tol
+        vf = {}
+        for k, f in enumerate(F):
+            for v in f:
+                vf.setdefault(v, []).append(k)
+        drop = set()
+        for v, fs in vf.items():
+            if len(fs) < 6 or any(len(F[k]) != 3 for k in fs):
+                continue
+            rs = sorted({int(rid[k]) for k in fs})
+            if len(rs) < 2 or any(r in drop or not set(self.regs[r]) <= set(fs) for r in rs):
+                continue
+            n0 = (N[fs] * A[fs, None]).sum(0)
+            n0 /= np.linalg.norm(n0) or 1.0
+            if float((N[fs] @ n0).min()) < FLAT_COS:
+                continue
+            rim = V[sorted({u for k in fs for u in F[k]} - {v})]
+            nr = np.linalg.svd(rim - rim.mean(0))[2][2]
+            if abs(float(nr @ n0)) < FLAT_COS or np.abs((rim - rim.mean(0)) @ nr).max() > tol:
+                continue
+            keep = rs[0]
+            for r in rs[1:]:
+                self.regs[keep] += self.regs[r]
+                self.regs[r] = []
+                drop.add(r)
+            rid[fs] = keep
+        if drop:
+            self.regs = [r for r in self.regs if r]
+
     # -- recognition -------------------------------------------------------------
     def _width(self, j, ax):
         """Region j's extent across the axis ax (in its plane)."""
@@ -306,10 +345,27 @@ class Recognizer:
     def _fit(self, regs, ax):
         return fit_circle(self.V[sorted({v for k in regs for v in self.rverts[k]})], ax)
 
+    def _axis(self, regs):
+        """The axis of a round's regions: the one their normals are most nearly
+        square to (two: their cross product), or the one they keep the most
+        nearly constant angle to (a cone's normals; on part of a ring of
+        slightly tilted facets the first leans by their tilt), whichever
+        their corners fit a circle about better."""
+        N, w = self.rn[regs], self.rarea[regs]
+        ax = np.linalg.eigh((N * w[:, None]).T @ N)[1][:, 0]
+        if len(regs) < 3:
+            return ax
+        D = N - w @ N / w.sum()
+        ax2 = np.linalg.eigh((D * w[:, None]).T @ D)[1][:, 0]
+        f1, f2 = self._fit(regs, ax), self._fit(regs, ax2)
+        return ax2 if f2 is not None and (f1 is None or f2[2] < f1[2]) else ax
+
     def _bands(self):
         """Strips (fillets) and rings (holes, cylinders): grown from pairs of
-        neighbouring regions over regions square to the pair's axis whose
-        corners stay on one circle."""
+        neighbouring regions over regions (nearly) square to the axis of those
+        taken so far whose corners stay on one circle. (The pair's own axis is
+        off by the facets' tilt where the wall is a little off square, which
+        stopped a shell's outer wall a third of the way round.)"""
         V, tol, rn = self.V, self.tol, self.rn
         used, tried, bands = set(), set(), []
         for s in np.argsort(self.rarea):
@@ -332,11 +388,13 @@ class Recognizer:
                     grown = False
                     for i in list(band):
                         for j in self.adj.get(i, ()):
-                            if j in band or j in used or abs(rn[j] @ ax) > SQUARE:
+                            if j in band or j in used or abs(rn[j] @ ax) > RING_TILT:
                                 continue
-                            f2 = self._fit(band + [j], ax)
+                            a2 = self._axis(band + [j])
+                            f2 = self._fit(band + [j], a2)
                             if f2 is not None and f2[2] <= 10 * tol:
                                 band.append(j)
+                                ax = a2
                                 grown = True
                 B = self._band(band)
                 if B is not None:
@@ -1089,14 +1147,19 @@ class Recognizer:
 
     def outline(self, i):
         """(outer, inners, ring ids) of plane region i on the sharp body;
-        outer None when the region is a ring's cap (the cylinder makes it)."""
+        outer None when the region is a ring's cap (the cylinder makes it).
+        The ring ids are those of its outermost outline: a ring through an
+        inner one (the hole through a tube's end) is not shut by it."""
         V = self.V
-        polys, rings = [], []
+        polys, rings, big = [], [], -1.0
         for lp in self.loops(i):
             labs = [self.label(i, j) for _, j in lp]
             keys = {l[:2] for l in labs if l is not None}
             if keys and all(k[0] == "R" for k in keys):
-                rings += [k[1] for k in keys]
+                P = V[[a for a, _ in lp]]
+                a = float(np.linalg.norm(np.cross(P, np.roll(P, -1, 0)).sum(0)))
+                if a > big:
+                    big, rings = a, [k[1] for k in keys]
                 continue
             n = len(lp)
             st = next((k for k in range(n) if labs[k] is not None and labs[k - 1] != labs[k]), None)
@@ -1249,6 +1312,7 @@ class Recognizer:
         for g in groups:
             g["r"] = float(np.mean([B["r"] for B in self.bands if not B["closed"] and "center" in B and B.get("kind") != "cut"
                                     and abs(B["r"] - g["r"]) <= 100 * self.tol]))
+        cyls.sort(key=lambda c: c["cut"])                      # added before cut (with no faces the first is the body)
         patches = [dict(zip(("net", "ku", "kv"), self.patch(G))) for G in self.grids]
         return {"faces": faces, "cylinders": cyls, "fillets": groups, "sweeps": sweeps, "patches": patches,
                 "tol": 10 * self.tol}
