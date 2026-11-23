@@ -158,6 +158,19 @@ check("no parts, nothing selected: cancelled",
       (lambda: ([o.select_set(False) for o in ctx.selected_objects],
                 bpy.ops.nproto.align_parts())[1])() == {'CANCELLED'})
 
+# -- where it is found: toolbar after Move Pivot, menus, icon -------------------------
+from bl_ui.space_toolsystem_common import ToolSelectPanelHelper
+from blender_nurbs import pivottool
+_ids = [getattr(i, "idname", None) for i in
+        ToolSelectPanelHelper._tool_class_from_space_type('VIEW_3D').tools_from_context(ctx, mode='OBJECT')]
+check("toolbar: Align Parts right after Move Pivot (Object Mode)", aligntool.TOOL_ID in _ids
+      and _ids.index(aligntool.TOOL_ID) == _ids.index(pivottool.TOOL_ID) + 1, _ids[:8])
+check("toolbar: a one-shot tool (the tool before comes back)", aligntool.TOOL_ID in pivottool.ONE_SHOT)
+check("toolbar: icon file exists", os.path.isfile(aligntool.ICON + ".dat"))
+check("menus: Object > Transform and the right-click menu",
+      all(aligntool.menu_transform in getattr(bpy.types, m).draw._draw_funcs
+          for m in ("VIEW3D_MT_transform_object", "VIEW3D_MT_object_context_menu")))
+
 print("ALL PASS" if ok else "SOME FAILED")
 sys.stdout.flush()
 os._exit(0 if ok else 1)

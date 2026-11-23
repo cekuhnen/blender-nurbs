@@ -23,7 +23,14 @@ After the second click, before it is applied:
 F, R, D and typing work while hovering the target too. It is one undo step,
 and the Adjust Last Operation panel changes the flip, spin, gap and copy
 afterwards. Object Mode only.
+
+Started by holding A (a tap is still Select All; movetool.HOLD_TOOLS), from
+the toolbar (after Move Pivot: its first click is the first element, and the
+tool before it comes back when it ends, as Move Pivot's does), Object >
+Transform, the right-click menu, the NURBS Proto menu or F3.
 """
+
+import os
 
 import math
 
@@ -32,7 +39,7 @@ import numpy as np
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty, PointerProperty, StringProperty
 from mathutils import Vector
 
-from . import alignsolve, draw, hints, pattern, snapframes, snapping
+from . import alignsolve, draw, hints, pattern, pivottool, snapframes, snapping
 from .drawtools import REFRESH_KEYS, parse_length
 from .movetool import _PointsTool, _duplicate, _len_text, roots, transform_objects
 
@@ -122,6 +129,7 @@ class NPROTO_OT_align_parts(_PointsTool, bpy.types.Operator):
                        description="Distance off the target (negative: into it)")
     keep: BoolProperty(name="Copy", default=False, options={'SKIP_SAVE'},
                        description="Leave the original where it is: a copy goes there (D in the tool)")
+    from_tool: BoolProperty(options={'HIDDEN', 'SKIP_SAVE'})    # the toolbar tool's click started it
     parts: StringProperty(name="Parts", options={'SKIP_SAVE', 'HIDDEN'},
                           description="The objects that move, one name a line (empty: the selection)")
 
@@ -201,7 +209,10 @@ class NPROTO_OT_align_parts(_PointsTool, bpy.types.Operator):
         self._others = None         # snap targets of everything but the moving parts
         self._start_common(context)
         context.window_manager.modal_handler_add(self)
-        self._refresh(context, event)
+        if self.from_tool and event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            self._click(context, event)         # the toolbar tool's click picks the first element
+        if self._stage == "SRC":
+            self._refresh(context, event)
         return {'RUNNING_MODAL'}
 
     def _snap_targets(self, context):
@@ -460,6 +471,8 @@ class NPROTO_OT_align_parts(_PointsTool, bpy.types.Operator):
     def _end(self, context):
         draw.sketch_overlay["elements"] = []
         _PointsTool._end(self, context)
+        if self.from_tool:                      # a one-off: the toolbar's tool before it comes back
+            pivottool.restore_tool(context, TOOL_ID)
 
     def _finish(self, context):
         gap = self._gap(context)
@@ -477,16 +490,65 @@ def menu_transform(self, context):
     self.layout.operator(NPROTO_OT_align_parts.bl_idname, icon='SNAP_FACE')
 
 
+# -- the toolbar tool (Object Mode, after Move Pivot) ---------------------------------
+
+TOOL_ID = "nproto.align_parts_tool"
+ICON = os.path.join(os.path.dirname(__file__), "icons", "ops.nproto.align_parts")     # tools/make_align_icon.py
+
+
+class NPROTO_TL_align_parts(bpy.types.WorkSpaceTool):
+    bl_space_type = 'VIEW_3D'
+    bl_context_mode = 'OBJECT'
+    bl_idname = TOOL_ID
+    bl_label = "Align Parts"
+    bl_description = ("Click an element of the part to move (ring, axis, face, centre, edge, point), then one of "
+                      "the part it goes to: it turns and moves to mate them. F flips, R spins, type a gap, D "
+                      "leaves a copy, Enter applies. Also: hold A")
+    bl_icon = ICON
+    bl_keymap = ((NPROTO_OT_align_parts.bl_idname, {"type": 'LEFTMOUSE', "value": 'PRESS'},
+                  {"properties": [("from_tool", True)]}),)
+
+    def draw_settings(context, layout, tool):
+        layout.label(text="Click an element of the part to move, then the target's · Enter applies · or hold A",
+                     icon='SNAP_FACE')
+
+
+def _after_pivot(mode):
+    """The tool from the toolbar's end to just after Move Pivot's (see
+    pivottool._after_transform for why register_tool's after= can't)."""
+    from bl_ui.space_toolsystem_common import ToolSelectPanelHelper
+    tools = ToolSelectPanelHelper._tool_class_from_space_type('VIEW_3D')._tools[mode]
+    ids = [getattr(it, "idname", None) for it in tools]
+    if TOOL_ID not in ids or pivottool.TOOL_ID not in ids:
+        return
+    mine = ids.index(TOOL_ID)
+    item = tools[mine]
+    del tools[mine - 1:mine + 1]            # it and the separator register_tool put before it
+    ids = [getattr(it, "idname", None) for it in tools]
+    tools.insert(ids.index(pivottool.TOOL_ID) + 1, item)
+
+
 classes = (NPROTO_PG_align_element, NPROTO_OT_align_parts)
-MENUS = ("VIEW3D_MT_transform_object",)
+MENUS = ("VIEW3D_MT_transform_object", "VIEW3D_MT_object_context_menu")
 
 
 def register():
     for m in MENUS:
         getattr(bpy.types, m).append(menu_transform)
+    pivottool.ONE_SHOT.add(TOOL_ID)
+    try:
+        bpy.utils.register_tool(NPROTO_TL_align_parts, separator=True)
+        _after_pivot('OBJECT')
+    except Exception as exc:
+        print("NURBS Align Parts tool not in the toolbar:", exc)
 
 
 def unregister():
+    try:
+        bpy.utils.unregister_tool(NPROTO_TL_align_parts)
+    except Exception:
+        pass
+    pivottool.ONE_SHOT.discard(TOOL_ID)
     for m in MENUS:
         try:
             getattr(bpy.types, m).remove(menu_transform)

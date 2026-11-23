@@ -2153,7 +2153,9 @@ class NPROTO_OT_scale(_PointsTool, bpy.types.Operator):
 HOLD_TOOLS = {"MOVE": ('G', "transform.translate", NPROTO_OT_move.bl_idname),
               "ROTATE": ('R', "transform.rotate", NPROTO_OT_rotate.bl_idname),
               "SCALE": ('S', "transform.resize", NPROTO_OT_scale.bl_idname),
-              "PIVOT": ('PERIOD', ("wm.call_menu_pie", {"name": "VIEW3D_MT_pivot_pie"}), "nproto.move_pivot")}
+              "PIVOT": ('PERIOD', ("wm.call_menu_pie", {"name": "VIEW3D_MT_pivot_pie"}), "nproto.move_pivot"),
+              # A: Select All on a tap, Align Parts held -- Object Mode only (Edit Mode's A stays Blender's)
+              "ALIGN": ('A', ("object.select_all", {"action": "SELECT"}), "nproto.align_parts", ("Object Mode",))}
 
 
 def _op(idname):
@@ -2168,15 +2170,16 @@ def _run(idname):
 
 
 class NPROTO_OT_transform_hold(bpy.types.Operator):
-    """Tap: Blender's own Move / Rotate / Scale (or the Pivot Point pie on ".").
-    Hold: Move / Rotate / Scale by Points (picked points, copies), or Move Pivot
-    on "." -- the add-on's Hold Time preference sets how long"""
+    """Tap: Blender's own Move / Rotate / Scale (or the Pivot Point pie on ".",
+    Select All on A). Hold: Move / Rotate / Scale by Points (picked points,
+    copies), Move Pivot on ".", Align Parts on A -- the add-on's Hold Time
+    preference sets how long"""
     bl_idname = "nproto.transform_hold"
     bl_label = "Blender's Tool (tap) / By Points (hold)"
     bl_options = {'INTERNAL'}
 
     kind: EnumProperty(items=[("MOVE", "Move", ""), ("ROTATE", "Rotate", ""), ("SCALE", "Scale", ""),
-                              ("PIVOT", "Move Pivot", "")], default="MOVE",
+                              ("PIVOT", "Move Pivot", ""), ("ALIGN", "Align Parts", "")], default="MOVE",
                        options={'HIDDEN'})
 
     def _native(self):
@@ -2247,7 +2250,9 @@ def register():
     if kc is not None:
         for name in KEYMAPS:
             km = kc.keymaps.new(name=name, space_type='EMPTY')
-            for kind, (key, _native, _ours) in HOLD_TOOLS.items():
+            for kind, (key, _native, _ours, *only) in HOLD_TOOLS.items():
+                if only and name not in only[0]:
+                    continue
                 kmi = km.keymap_items.new(NPROTO_OT_transform_hold.bl_idname, key, 'PRESS')
                 kmi.properties.kind = kind
                 _keymaps.append((km, kmi))

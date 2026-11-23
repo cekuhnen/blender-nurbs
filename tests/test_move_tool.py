@@ -520,8 +520,13 @@ items = [(km.name, k.idname) for km, k in movetool._keymaps]
 check("hold G / R bound in object / edit keymaps", {n for n, _ in items} == set(movetool.KEYMAPS)
       and all(i == "nproto.transform_hold" for _, i in items)
       and sorted((km.name, k.type, k.properties.kind) for km, k in movetool._keymaps)
-      == sorted((n, key, kind) for n in movetool.KEYMAPS for kind, (key, _a, _b) in movetool.HOLD_TOOLS.items()),
+      == sorted((n, key, kind) for n in movetool.KEYMAPS for kind, (key, _a, _b, *only) in movetool.HOLD_TOOLS.items()
+                if not only or n in only[0]),
       items)
+check("hold A: tap is Select All, hold is Align Parts, Object Mode only",
+      movetool.HOLD_TOOLS["ALIGN"] == ('A', ("object.select_all", {"action": "SELECT"}), "nproto.align_parts",
+                                       ("Object Mode",))
+      and [km.name for km, k in movetool._keymaps if k.type == 'A'] == ["Object Mode"])
 check("hold default", movetool.hold_ms() == 300 and movetool.hold_enabled())
 check("hold . : tap is Blender's Pivot Point pie, hold is Move Pivot",
       movetool.HOLD_TOOLS["PIVOT"] == ('PERIOD', ("wm.call_menu_pie", {"name": "VIEW3D_MT_pivot_pie"}),
