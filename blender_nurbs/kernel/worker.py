@@ -4425,6 +4425,94 @@ def _closed_tool(region):
     return tool
 
 
+def _move_notch(body, notch, d, size, tol):
+    """A notch (featregion.notch_region: faces cut into the edge of the flat
+    faces they sit in) slid by d along that edge: its faces translated, each
+    host trimmed again with its rim edges moved and its own straight edges at
+    the notch run on or cut back to meet them (a plate's front either side
+    of the notch: one longer, one shorter). The hosts must be flat and the
+    move along all of them; the volume and each host's area stay."""
+    np = _np()
+    from trimext import _edge_curve
+    region, hosts, rims = notch
+    if float(np.linalg.norm(d)) <= tol:
+        raise RuntimeError("the move is 0")
+    for H in hosts:
+        if not H.surface().is_planar():
+            raise RuntimeError("a notch slides only along flat faces (it is cut into a curved one here)")
+        n = _face_normal(H, np.array(H.interior_point(), float))
+        if abs(float(n @ d)) > 1e-6 * float(np.linalg.norm(d)):
+            raise RuntimeError("a notch slides only along the edge it is cut into (the move leaves one of "
+                               "the faces it cuts)")
+    rim_v = {v for e in rims for v in e.vertices()}
+    built = []
+    for H in hosts:
+        loops = []
+        for loop in H.boundary_loops():
+            cs = []
+            for e, fw in loop:
+                if e in rims:
+                    cs.append(_moved_curve(_edge_curve(e, fw), d))
+                    continue
+                ends = [v for v in e.vertices() if v in rim_v]
+                if not ends:
+                    if e.length() > tol:
+                        cs.append(_edge_curve(e, fw))
+                    continue
+                a, b = np.array(e.start_vertex().point(), float), np.array(e.end_vertex().point(), float)
+                if abs(e.length() - float(np.linalg.norm(b - a))) > 1e-6 * size:
+                    raise RuntimeError("an edge next to the notch is not straight: it can't run on with the move")
+                u = (b - a) / np.linalg.norm(b - a)
+                a2 = a + d if e.start_vertex() in rim_v else a
+                b2 = b + d if e.end_vertex() in rim_v else b
+                for q, q2 in ((a, a2), (b, b2)):
+                    w = q2 - a
+                    if float(np.linalg.norm(w - (w @ u) * u)) > 1e-6 * size:
+                        raise RuntimeError("the notch's edge on that face does not run along the move: it can "
+                                           "only slide along the edge it is cut into")
+                if float((b2 - a2) @ u) <= 1e3 * tol:
+                    raise RuntimeError("the notch would run past the end of the edge it is cut into")
+                a2, b2 = (a2, b2) if fw else (b2, a2)
+                cs.append(ext.curve_from_cvs(1, [tuple(map(float, a2)), tuple(map(float, b2))],
+                                             [0.0, 0.0, 1.0, 1.0], None))
+            loops.append(cs)
+        nb = sm.create_planar_faces([c for l in loops for c in l])
+        if nb.face_count() != 1:
+            raise RuntimeError("the notch would run into another feature or past a corner of a face it cuts")
+        built.append(nb)
+    A0 = sum(float(H.area(1e-6)) for H in hosts)      # (the pieces either side of it trade area; all
+    A1 = sum(float(f.area(1e-6)) for nb in built for f in nb.faces())   # together they keep it)
+    if abs(A1 - A0) > 1e-4 * A0 + tol:
+        raise RuntimeError("the notch would run into another feature or past a corner of a face it cuts")
+    faces = body.faces()
+    idx = [i for i, f in enumerate(faces) if f in region]
+    sheet = body.copy()
+    sf = sheet.faces()
+    ext.delete_faces(sheet, [sf[i] for i in range(len(sf)) if i not in set(idx)])
+    sheet = sm.translate(sheet, tuple(map(float, d)))
+    gone = set(idx) | {i for i, f in enumerate(faces) if f in hosts}
+    b = body.copy()
+    bf = b.faces()
+    keep = [np.array(bf[i].interior_point(), float) for i in range(len(bf)) if i not in gone]
+    ext.delete_faces(b, [bf[i] for i in gone])
+    for nb in built + [sheet]:
+        ext.append_brep(b, nb)
+    b = sm.stitch_advanced(b, 10 * tol, squeeze_small_edges=False, making_manifold_solid=True)[0]
+    try:
+        sm.unify_normals(b, _face_at(b, keep[0]), 100)
+    except Exception:
+        pass
+    if not b.is_manifold_solid():
+        raise RuntimeError("the moved notch and the faces it cuts do not close into a solid")
+    V0, V1 = _vol(body), _vol(b)
+    if abs(V1 - V0) > 1e-4 * abs(V0) + tol:
+        raise RuntimeError(f"the move changed the volume ({V0:.6g} to {V1:.6g}): the notch runs into something")
+    if b.face_count() != body.face_count():
+        raise RuntimeError("the notch would run into something (the faces came out "
+                           f"{b.face_count()} instead of {body.face_count()})")
+    return b
+
+
 def job_move_face(job):
     """Move Face (world space): the feature holding the faces at
     job['face_pts'] -- the faces enclosed by an inner loop of the face(s) it
@@ -4460,8 +4548,16 @@ def job_move_face(job):
     rims_all = _rims(body)
     reg = feature_region(body, start, rims_all)
     if reg is None:
+        from featregion import notch_region
+        nr = notch_region(body, start)
+        if nr is not None and not reseat and not _feature_turns(job):     # a notch: slid along its edge
+            b = _move_notch(body, nr, np.asarray(job.get("vector", (0.0, 0.0, 0.0)), float), size, tol)
+            save(to_local(b, job.get("xforms", {}).get(job.get("into"))), job["out"]["result"])
+            return {"faces": b.face_count(), "volume": _volume(b, 1e-3), "feature": len(nr[0]),
+                    "seats": len(nr[1]), "notch": True}
         raise RuntimeError("the face is not part of a feature sitting inside a face (a hole, pocket, boss "
-                           "or slot): Push / Pull or Rotate Face move a face of the body itself")
+                           "or slot) or cut into its edge (a notch): Push / Pull or Rotate Face move a face "
+                           "of the body itself")
     region, seats, rim_edges = reg
     btol = brep_tol(1e-5, size)
     if reseat:                                    # a free-form face: carried by frames, the rim cut anew

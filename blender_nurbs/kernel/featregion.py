@@ -258,3 +258,92 @@ def feature_region(brep, start, rim=None):
     if not seats or len(region) >= brep.face_count():
         return None
     return region, seats, edges
+
+
+# --------------------------------------------------------------------------
+# notches: features cut into the edge of the faces they sit in
+# --------------------------------------------------------------------------
+
+def _unit(v):
+    n = sum(float(x) * float(x) for x in v) ** 0.5 or 1.0
+    return [float(x) / n for x in v]
+
+
+def _cross(a, b):
+    return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+
+
+def _dot(a, b):
+    return sum(float(x) * float(y) for x, y in zip(a, b))
+
+
+def _normal(sm, F, q):
+    uv = sm.surface_closest_point(F.surface(), tuple(float(x) for x in q))[1][0]
+    return _unit(F.outward_normal_at_uv(float(uv.x), float(uv.y)))
+
+
+def edge_kind(e, size, sm=None):
+    """'convex', 'concave' or 'smooth' of the edge between its two faces (at
+    its middle): convex when the second face's normal points away from the
+    first face (a box's edge), concave when towards it (a pocket's floor
+    meeting its wall), smooth when they are tangent."""
+    sm = sm or _k()
+    fs = list(e.faces())
+    if len(fs) != 2 or fs[0] == fs[1]:
+        return "smooth"
+    F, G = fs
+    t0, t1 = e.parameter_range()
+    m = e.point_at(float((t0 + t1) / 2))
+    a, b = e.point_at(float(t0 + 0.49 * (t1 - t0))), e.point_at(float(t0 + 0.51 * (t1 - t0)))
+    t = _unit([float(b[i]) - float(a[i]) for i in range(3)])
+    nF, nG = _normal(sm, F, m), _normal(sm, G, m)
+    if abs(_dot(nF, nG)) > 1 - 1e-6 and _dot(nF, nG) > 0:
+        return "smooth"
+    w = _unit(_cross(nF, t))                      # in F, across the edge: the way into F
+    eps = 1e-3 * size
+    p1 = [float(m[i]) + eps * w[i] for i in range(3)]
+    p2 = [float(m[i]) - eps * w[i] for i in range(3)]
+    if F.closest_point(tuple(p2))[1] < F.closest_point(tuple(p1))[1]:
+        w = [-x for x in w]
+    return "convex" if _dot(nG, w) < 0 else "concave"
+
+
+def notch_region(brep, start, max_share=0.5):
+    """(region faces, host faces, rim edges) of a notch -- a feature cut into
+    the edge of the faces it sits in (a slot or U cut into a plate's side),
+    which no inner loop encloses -- holding the faces start: grown across
+    concave and smooth edges (a notch's walls and floor meet so), stopped at
+    convex ones (its rims on the faces it cuts: the hosts). None when it
+    grows over max_share of the body's area, meets no host, or is one face
+    (a face with convex edges all round is the body's own)."""
+    sm = _k()
+    lo, hi = brep.bounding_box()
+    size = _dist(lo, hi) or 1.0
+    region, stack = set(start), list(start)
+    hosts, rims = set(), set()
+    kinds = {}
+    while stack:
+        F = stack.pop()
+        for e in F.edges():
+            others = [G for G in e.faces() if G != F]
+            if not others:
+                continue
+            G = others[0]
+            if G in region:
+                continue
+            if e not in kinds:
+                kinds[e] = edge_kind(e, size, sm)
+            if kinds[e] == "convex":
+                hosts.add(G)
+                rims.add(e)
+                continue
+            region.add(G)
+            stack.append(G)
+    hosts -= region
+    rims = {e for e in rims if any(G in hosts for G in e.faces())}
+    if not hosts or len(region) < 2:              # one face with convex edges all round is the body's own
+        return None
+    total = sum(float(f.area(1e-3)) for f in brep.faces())
+    if sum(float(f.area(1e-3)) for f in region) > max_share * total:
+        return None
+    return region, hosts, rims

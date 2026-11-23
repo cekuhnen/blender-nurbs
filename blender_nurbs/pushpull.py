@@ -1094,20 +1094,39 @@ _features = {}      # (object, rev, picked face indices) -> feature_of's answer
 def feature_of(o, idxs):
     """(feature face indices, seat face indices, {seat index: the feature's
     centre on its rim in that seat (local)}, {seat index: the centre of each
-    opening in it (local): a cross hole has two in a cylinder's side}) of the
-    faces idxs of body o, or None when they are no feature
+    opening in it (local): a cross hole has two in a cylinder's side}, notch?)
+    of the faces idxs of body o, or None when they are no feature
     (kernel/featregion.py: the faces inside an inner loop of the face they
-    sit in)."""
+    sit in; else a notch cut into the edge of the faces it sits in, its
+    hosts as the seats)."""
     key = (o.session_uid, o.get(store.PROP_REV, 0), tuple(sorted(idxs)))
     if key in _features:
         return _features[key]
     if len(_features) > 64:
         _features.clear()
-    from .kernel.featregion import face_cycles, feature_region
+    from .kernel.featregion import face_cycles, feature_region, notch_region
     b = store.get_brep(o)
     faces = b.faces()
     reg = feature_region(b, [faces[i] for i in idxs])
     out = None
+    if reg is None:
+        nr = notch_region(b, [faces[i] for i in idxs])
+        if nr is not None:
+            region, hosts, rim = nr
+            centres = {}
+            for k, H in enumerate(faces):
+                if H not in hosts:
+                    continue
+                P = []
+                for e in rim:
+                    if H in e.faces():
+                        t0, t1 = e.parameter_range()
+                        P += [np.array(e.point_at(float(t)), float) for t in np.linspace(t0, t1, 9)[:-1]]
+                centres[k] = np.mean(P, axis=0)
+            out = (sorted(i for i, f in enumerate(faces) if f in region), sorted(centres), centres,
+                   {k: [c] for k, c in centres.items()}, True)
+            _features[key] = out
+            return out
     if reg is not None:
         region, seats, rim = reg
         centres, openings = {}, {}
@@ -1126,7 +1145,7 @@ def feature_of(o, idxs):
                 ops.append(np.mean(P, axis=0))
             centres[k] = np.mean(pts, axis=0)
             openings[k] = ops
-        out = (sorted(i for i, f in enumerate(faces) if f in region), sorted(centres), centres, openings)
+        out = (sorted(i for i, f in enumerate(faces) if f in region), sorted(centres), centres, openings, False)
     _features[key] = out
     return out
 
@@ -1157,6 +1176,34 @@ def _tilt_axis(rel, z):
         w = np.array([1.0, 0, 0]) if abs(z[0]) < 0.9 else np.array([0, 1.0, 0])
         t = np.cross(z, w)
     return t / np.linalg.norm(t)
+
+
+def notch_direction(o, feat):
+    """The unit world direction a notch slides along: across every flat host
+    face's normal (the edge it is cut into), turned towards +X/+Y/+Z; None
+    when a host is curved or the hosts leave no single direction."""
+    faces = store.get_brep(o).faces()
+    N3 = geom.world_matrix(o).to_3x3().inverted().transposed()
+    ns = []
+    for k in feat[1]:
+        f = faces[k]
+        if not f.surface().is_planar():
+            return None
+        n = np.array(N3 @ Vector(_local_normal(f, feat[2][k])), float)
+        ns.append(n / (np.linalg.norm(n) or 1.0))
+    d = None
+    for a in ns:
+        for b in ns:
+            c = np.cross(a, b)
+            if np.linalg.norm(c) > 1e-3:
+                d = c / np.linalg.norm(c)
+                break
+        if d is not None:
+            break
+    if d is None or any(abs(float(n @ d)) > 1e-6 for n in ns):
+        return None
+    k = int(np.argmax(np.abs(d)))
+    return -d if d[k] < 0 else d
 
 
 MOTIONS = {"PLANE": "slides in the flat face", "AXIS": "slides along the cylinder's axis and turns about it",
@@ -1285,6 +1332,9 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
             if feat is None:
                 return (f"{o.name}: not part of a feature sitting inside a face (a hole, pocket, boss or "
                         "slot); Push / Pull or Rotate Face move a face of the body itself")
+            if feat[4] and notch_direction(o, feat) is None:
+                return (f"{o.name}: the notch is cut into faces that are not flat or meet in no edge to slide "
+                        "it along")
             if all(seat_motion(o, k) is None for k in feat[1]):
                 return (f"{o.name}: the feature sits in a curved face with no axis to slide or turn it "
                         "along (a flat face, a cylinder, a revolved or an extruded face can take it)")
@@ -1333,6 +1383,14 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
         o, idxs = next(iter(self._by_obj(self._items()).values()))
         feat = feature_of(o, idxs)
         s, n, _ = self._seat(context, o, feat)
+        if feat[4]:                              # a notch: along the edge it is cut into (all its hosts' planes)
+            d = notch_direction(o, feat)
+            C = np.array(geom.world_matrix(o) @ Vector(self._seat(context, o, feat)[2]), float)
+            self.mode = "SLIDE"
+            self.axis_x = [float(x) for x in d]
+            self.axis_y = [0.0, 0.0, 0.0]
+            self.axis_point = [float(x) for x in C]
+            return
         mode, P, z = seat_motion(o, s)
         self.mode = mode
         if mode == "PLANE":
@@ -1526,6 +1584,8 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
         self._lift = 2e-3 * span
         self.move_x = self.move_y = self.slide = self.turn = self.tilt = 0.0
         self._fields()
+        o_, idxs_ = next(iter(self._by_obj(self._items()).values()))
+        self._is_notch = bool((feature_of(o_, idxs_) or (None,) * 5)[4])
         self._span = span
         if self.mode == "SPHERE":
             O = np.array(self.axis_point, float)
@@ -1656,6 +1716,8 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
         return ""
 
     def drag_rows(self):
+        if getattr(self, "_is_notch", False):
+            return [("", [hints.note("the notch slides along the edge it is cut into")])]
         return [("", [hints.note(f"the feature {MOTIONS[self.mode]}")])]
 
     def drag_handle_hints(self):
