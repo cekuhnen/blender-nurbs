@@ -695,15 +695,19 @@ def align_open(Q, p, ends, want=None):
     # CV mode: the clicks are the CVs, and an end moves the ones next to it (G1
     # the 2nd, G2 the 3rd too). A G3 end adds a CV on its first leg instead of
     # taking a 4th click, so it moves the same clicks as G2 and the shape holds
+    Q0 = Q
     for e, (s_, _) in sorted(ends.items()):
         if CONT[s_.get("cont", "G1")] >= 3 and len(Q) >= 2:
             Q = _insert_cv(Q, e)
     refit = max(len(Q), sum(need) + len(need), q + 1) != len(Q)     # too few CVs: refit, with room
-    n_out = refit_count(len(Q), need, q) if refit else len(Q)
+    # A refit counts the ends' CVs itself, so it starts from the clicks without
+    # the G3 legs' CVs: counted twice, they left spare CVs on the clicks'
+    # chord, and the curve dipped to it between the ends (2 inflections).
+    n_out = refit_count(len(Q0), need, q) if refit else len(Q)
     if want is not None:
         q = max(q, min(int(want), n_out - 1))
     if refit:
-        Q = _refit_points(Q, p, n_out, q)
+        Q = _refit_points(Q0, p, n_out, q)
     p = q
     U = geom.clamped_uniform_knots(len(Q), p)
     I = np.eye(4)

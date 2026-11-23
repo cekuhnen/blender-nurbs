@@ -454,6 +454,20 @@ for want, exp in ((5, 5), (4, 4), (1, 3)):
               max(np.linalg.norm(np.cross(X[-1 - j] - X[-1], D1)) for j in (1, 2)))
     check(f"CV Curve degree {want}, G2 ends on lines: degree {exp}, 6 CVs, first legs on the lines",
           sp_["order"] - 1 == exp and len(X) == 6 and off < 1e-6, (sp_["order"] - 1, len(X), off))
+# G3 ends: the refit used to count the legs' inserted CVs twice, leaving two on
+# the clicks' chord: the curve dipped to it (two inflections). Now 2 + 6 CVs,
+# all on the ends, and the CV polygon turns one way only (no inflection).
+for want in (4, 5):
+    ends = {e: ({"cont": "G3", "weight": 1.0, "mode": "EDGE", "snap": "END", "flip": False},
+                align.end_frame(L, "S0", np.array(c), "END", "EDGE")) for e, L, c in (("0", LA, clicks[0]), ("1", LB, clicks[1]))}
+    sp_, _ = drawtools.build_spec_ends(clicks, "CV", want, ends)
+    X = np.array([tuple(q)[:3] for q in sp_["points"]])
+    legs = np.diff(X, axis=0)
+    turns = [float(np.cross(a, b)[2]) for a, b in zip(legs[:-1], legs[1:])]
+    sc = 1e-9 * max(abs(t) for t in turns)
+    one_way = all(t <= sc for t in turns) or all(t >= -sc for t in turns)
+    check(f"CV Curve degree {want}, G3 ends on lines: 8 CVs, no dip between the ends",
+          sp_["order"] - 1 == want and len(X) == 8 and one_way, (sp_["order"] - 1, len(X), np.round(turns, 4)))
 
 # ------------------------------------------------------------- the user's file: aligned curves rebuild stably
 user = sys.argv[sys.argv.index("--") + 1] if "--" in sys.argv else os.path.join(ROOT, "Blend Files", "blend cv align curve  spline surface.blend")
