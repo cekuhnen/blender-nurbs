@@ -427,6 +427,7 @@ class VIEW3D_MT_nproto_tools(bpy.types.Menu):
         lay.operator("nproto.section_add", icon='MOD_EDGESPLIT')
         lay.separator()
         lay.operator("nproto.move_pivot", icon='OBJECT_ORIGIN')
+        lay.operator("nproto.align_parts", icon='SNAP_FACE')
 
 
 def menu_header(self, context):
