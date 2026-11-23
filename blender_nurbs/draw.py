@@ -23,7 +23,9 @@ COL_REGION_KEEP = (0.25, 0.9, 0.4)
 COL_REGION_DROP = (1.0, 0.2, 0.2)
 # filled by the sketch tools (CV Curve / Line): world-space polylines and points
 sketch_overlay = {"curves": [], "hull": [], "cvs": [], "snap": None, "snap_label": None, "axes": [],
-                  "refs": [], "cursor": None, "comb": None, "guides": [], "face": [], "face_pts": []}
+                  "refs": [], "cursor": None, "comb": None, "guides": [], "face": [], "face_pts": [],
+                  # snap elements with a frame (snapframes.py glyphs): [(world polyline, style, colour)]
+                  "elements": []}
 COL_CURSOR = (1.0, 1.0, 1.0, 1.0)
 COL_SNAP = (0.25, 1.0, 0.45, 1.0)
 COL_FACE_PLANE = (0.35, 0.8, 1.0, 0.85)      # the flat face a sketch is drawn on
@@ -102,6 +104,39 @@ def _draw_tris(coords, color):
     sh = gpu.shader.from_builtin('UNIFORM_COLOR')
     sh.uniform_float("color", color)
     batch_for_shader(sh, 'TRIS', {"pos": coords}).draw(sh)
+
+
+def _dashes(pl, n=24):
+    """Polyline pl as dashes: every other of n pieces."""
+    pl = np.asarray(pl, float)
+    a, b = pl[0], pl[-1]
+    t = np.linspace(0.0, 1.0, 2 * n + 1)
+    pts = a + t[:, None] * (b - a)
+    return [[pts[i].tolist(), pts[i + 1].tolist()] for i in range(0, 2 * n, 2)]
+
+
+def _draw_element(pl, style, color):
+    """One glyph polyline of a snap element: "main" thick, "axis" thin with
+    an arrow head at its end, "dash" a dashed line from its first to last point."""
+    pl = np.asarray(pl, float).reshape(-1, 3)
+    if len(pl) < 2:
+        return
+    if style == "dash":
+        _draw_lines(_lines_from_polylines(_dashes(pl), _IDENT), color, 1.5)
+        return
+    _draw_lines(_lines_from_polylines([pl.tolist()], _IDENT), color, 3.0 if style == "main" else 1.5)
+    if style == "axis":
+        a, b = pl[-2], pl[-1]
+        d = b - a
+        L = float(np.linalg.norm(d))
+        if L > 0:
+            d /= L
+            x = np.cross(d, (1.0, 0, 0) if abs(d[0]) < 0.9 else (0, 1.0, 0))
+            x /= np.linalg.norm(x)
+            y = np.cross(d, x)
+            h = 0.25 * L
+            heads = [[b.tolist(), (b - h * d + 0.4 * h * e).tolist()] for e in (x, -x, y, -y)]
+            _draw_lines(_lines_from_polylines(heads, _IDENT), color, 1.5)
 
 
 def _draw_points(coords, color, size):
@@ -581,6 +616,8 @@ def _draw():
         _draw_lines(_lines_from_polylines(dashes, _IDENT), col, 1.0)
     for pl, col, w in so.get("refs") or []:       # the edge (white) / face (beige) a G1 / G2 end follows
         _draw_lines(_lines_from_polylines([pl], _IDENT), col, w)
+    for pl, style, col in so.get("elements") or []:   # ring, axis, face, edge of a snap element (Align)
+        _draw_element(pl, style, col)
     if so.get("comb"):                     # CV Curve with the comb on: under the curve being drawn
         from . import diagnostics
         diagnostics.draw_comb_geometry(_draw_lines, so["comb"])
