@@ -25,12 +25,14 @@ STEP_FIELDS = {
     "extend_surface": ["distance"],
     "push_pull": ["distance"],
     "rotate_face": ["angle"],
-    "move_face": ["move_x", "move_y"],
+    "move_face": ["move_x", "move_y", "slide", "turn"],
     "refit_trim": ["refit_degree", "refit_spans_u", "refit_spans_v"],
     "merge_patches": ["merge_mode", "merge_tolerance", "merge_degree", "merge_spans_u", "merge_spans_v",
                       "merge_cont_u0", "merge_cont_u1", "merge_cont_v0", "merge_cont_v1", "merge_edge_tolerance",
                       "merge_knots", "merge_seams", "merge_reduce_degree"],
 }
+MOVE_FACE_FIELDS = {"PLANE": ("move_x", "move_y"), "AXIS": ("slide", "turn"), "TURN": ("turn",),
+                    "SLIDE": ("slide",)}
 CA_DEFAULTS = {"ca_tolerance": 1e-4, "ca_angle": 0.1, "ca_degree": 7}
 ROLE = {"replace_face": "replacing surface", "trim": "trim cutter", "fillet_trim": "fillet partner"}
 STEP_NOTE = {"fillet_trim": "Follows its Surface Fillet (edit the fillet object)"}
@@ -123,6 +125,8 @@ class NprotoStep(bpy.types.PropertyGroup):
     angle: FloatProperty(name="Angle", min=-179.0, max=179.0, **_S())
     move_x: FloatProperty(name="X", unit='LENGTH', **_S())
     move_y: FloatProperty(name="Y", unit='LENGTH', **_S())
+    slide: FloatProperty(name="Along", unit='LENGTH', **_S())
+    turn: FloatProperty(name="Turn °", min=-360.0, max=360.0, **_S())
     refit_degree: IntProperty(name="Degree", min=1, max=7, **_S())
     refit_spans_u: IntProperty(name="Spans U (0 auto)", min=0, max=32, **_S())
     refit_spans_v: IntProperty(name="Spans V (0 auto)", min=0, max=32, **_S())
@@ -417,6 +421,8 @@ def draw_steps(box, obj, only=None, bare=False):
                         continue
                     if name.startswith("ca_") and rims and rims.get("only"):
                         continue                  # (see the note below: nothing for them to do)
+                    if e["op"] == "move_face" and name not in MOVE_FACE_FIELDS[e["params"].get("mode", "PLANE")]:
+                        continue                  # (a flat face's two distances, or a curved one's axis moves)
                     if name in ("action", "continuity", "ca_continuity", "rail_type"):
                         inner.row(align=True).prop(pg, name, expand=True)
                     else:

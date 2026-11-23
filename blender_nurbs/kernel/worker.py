@@ -3477,42 +3477,216 @@ def _loop_polygon(loop, k=24):
     return np.array(out)
 
 
-def _inside_2d(P, poly):
-    """For each 2D point of P: inside the closed polygon poly (even-odd rule)?"""
-    np = _np()
-    x, y = P[:, 0][:, None], P[:, 1][:, None]
-    a, b = poly, np.roll(poly, -1, axis=0)
-    cross = (a[:, 1] > y) != (b[:, 1] > y)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        xs = a[:, 0] + (y - a[:, 1]) * (b[:, 0] - a[:, 0]) / (b[:, 1] - a[:, 1])
-    return (np.count_nonzero(cross & (x < xs), axis=1) % 2) == 1
-
-
 def _moved_curve(c, d):
     deg, pts, U, w = _cv_tuple(ext.curve_cvs(c))
     return ext.curve_from_cvs(deg, [tuple(float(a + b) for a, b in zip(q, d)) for q in pts], U, w)
 
 
+def _rigid_curve(c, M):
+    """A free copy of curve c carried by the rigid motion M (its CVs moved:
+    exact, rational curves too)."""
+    deg, pts, U, w = _cv_tuple(ext.curve_cvs(c))
+    return ext.curve_from_cvs(deg, [tuple(map(float, M(q))) for q in pts], U, w)
+
+
+def _feature_motion(job, size):
+    """The rigid motion M (points (..., 3) -> moved) of a Move Face job: turned
+    by job['angle'] degrees about the line job['axis_point'] + t
+    job['axis_dir'], then slid by job['vector']; None when it moves nothing."""
+    np = _np()
+    d = np.asarray(job.get("vector", (0.0, 0.0, 0.0)), float)
+    ang = float(job.get("angle", 0.0) or 0.0)
+    O, R = np.zeros(3), np.eye(3)
+    if abs(ang) > 1e-9:
+        z = np.asarray(job["axis_dir"], float)
+        z /= np.linalg.norm(z)
+        O = np.asarray(job["axis_point"], float)
+        R = _rotation(z, np.radians(ang))
+    if np.linalg.norm(d) <= 1e-6 * size and abs(ang) <= 1e-9:
+        return None
+    return lambda P: (np.asarray(P, float) - O) @ R.T + O + d
+
+
+class _SeatTrim:
+    """A face a Move Face feature sits in, trimmed again with some of its
+    cycles (featregion.face_cycles), the feature's own moved by M. An open
+    face: its outline and holes as loops. A face closed round (a cylinder's
+    side): the kernel trims it only with no hole across its seam, so the
+    surface is reseamed (exactly) where no hole is, and its outline is the two
+    rims running round it, cut at the seam, joined by the seam line both
+    ways."""
+
+    def __init__(self, S, rim_edges, M, size, tol, btol):
+        from featregion import face_cycles
+        np = _np()
+        self.S, self.M, self.tol, self.btol = S, M, tol, btol
+        cycles, self.k = face_cycles(S)
+        self.specs = []
+        for c, kind in cycles:
+            mine = all(e in rim_edges for e, _ in c)
+            if mine and kind != "inner":
+                raise RuntimeError("the feature runs out to the edge of the face it sits in")
+            self.specs.append((c, kind, mine))
+        self.combo = None
+        if self.k is None:
+            return
+        self.winding = [sp for sp in self.specs if sp[1] == "winding"]
+        if len(self.winding) not in (0, 2):
+            raise RuntimeError("the face the feature sits in closes round with "
+                               f"{len(self.winding)} rim{'s' if len(self.winding) != 1 else ''} round it: "
+                               "only a band (a cylinder's or a cone's side) can take the move")
+        # a seam clear of every cycle that is no rim round the face, as they will be
+        G = self._free()
+        lo, hi = (G.u_domain(), G.v_domain())[self.k]
+        P = hi - lo
+        spans = []
+        for c, kind, mine in self.specs:
+            if kind == "winding":
+                continue
+            pts = []
+            for mv in ((False, True) if mine else (False,)):
+                Q = _loop_polygon(c, 8)
+                pts.append(M(Q) if mv else Q)
+            for Q in pts:
+                cs = [float((uv.y if self.k else uv.x)) for uv in
+                      (sm.surface_closest_point(G, tuple(map(float, q)))[1][0] for q in Q)]
+                un = [cs[0]]
+                for x in cs[1:]:
+                    d = (x - un[-1]) % P
+                    un.append(un[-1] + (d - P if d > P / 2 else d))
+                spans.append((min(un), max(un)))
+        m = 0.02 * P
+
+        def clear(t):
+            return all((t - a + m) % P > (b - a) + 2 * m for a, b in spans)
+        seam = lo
+        if not clear(lo):
+            cand = [((a + (b - a) + (a2 - b) % P / 2.0), (a2 - b) % P) for a, b in spans for a2, _ in spans]
+            cand = [(t, g) for t, g in cand if clear(t)]
+            if not cand:
+                raise RuntimeError("the holes and features go all round the face they sit in")
+            seam = max(cand, key=lambda x: x[1])[0]
+        self.frac = ((seam - lo) % P) / P
+        if self.frac > 1 - 1e-9:
+            self.frac = 0.0
+
+    def _free(self):
+        return ext.surface_from_cvs(*_srf_tuple(ext.surface_cvs(self.S.surface())))
+
+    def _surface(self):
+        G = self._free()
+        if self.k is not None and self.frac > 0.0:
+            G = _reseamed(G, "uv"[self.k], self.frac)
+        return G
+
+    def _curves(self, spec):
+        from trimext import _edge_curve
+        c, _, mine = spec
+        out = [_edge_curve(e, fw) for e, fw in c if e.length() > self.tol]
+        return [_rigid_curve(x, self.M) for x in out] if mine else out
+
+    def _rim_from(self, G, seam, spec):
+        """(curves of the rim round the face from where it crosses the seam,
+        that point)."""
+        from trimext import _edge_curve, _piece
+        np = _np()
+        c = spec[0]
+        for j, (e, fw) in enumerate(c):
+            try:
+                pts, _, _ = sm.intersect_curves(_edge_curve(e, True), seam)
+            except Exception:
+                continue
+            if not pts:
+                continue
+            X = np.array(pts[0], float)
+            _, t, _ = sm.curve_closest_point(e.curve(), tuple(map(float, X)))
+            t0, t1 = e.parameter_range()
+            t = min(max(float(t), t0), t1)
+            begin, end = (t0, t1) if fw else (t1, t0)
+            out = []
+            if abs(end - t) > 1e-9 * abs(t1 - t0):
+                out.append(_piece(e, fw, t, end))
+            out += [_edge_curve(e2, fw2) for e2, fw2 in c[j + 1:] + c[:j] if e2.length() > self.tol]
+            if abs(t - begin) > 1e-9 * abs(t1 - t0):
+                out.append(_piece(e, fw, begin, t))
+            out = [x for x in out if x.length() > self.tol]
+            return out, X
+        raise RuntimeError("a rim round the face the feature sits in does not cross its seam")
+
+    def _outline(self, G, combo):
+        """The seam-form outline loop of a band: rim 1, seam, rim 2, seam."""
+        from trimext import _iso_piece
+        np = _np()
+        seam = _boundary_iso(G, self.k == 1, False)
+        (r1, X1), (r2, X2) = (self._rim_from(G, seam, sp) for sp in self.winding)
+        rev = lambda cs: [_reversed_curve(x) for x in reversed(cs)]
+        if combo[0]:
+            r1 = rev(r1)
+        if combo[1]:
+            r2 = rev(r2)
+        a1 = sm.surface_closest_point(G, tuple(map(float, X1)))[1][0]
+        a2 = sm.surface_closest_point(G, tuple(map(float, X2)))[1][0]
+        q1, q2 = (float(a1.y), float(a2.y)) if self.k == 0 else (float(a1.x), float(a2.x))
+        val = (G.u_domain(), G.v_domain())[self.k][0]
+        up = _iso_piece(G, self.k == 0, val, q1, q2)
+        down = _iso_piece(G, self.k == 0, val, q2, q1)
+        return r1 + [up] + r2 + [down]
+
+    def face(self, which, area=None):
+        """The face trimmed with the cycles which(spec) keeps (the outline
+        always); area: the one it must come out with (it settles which way
+        a band's outline runs)."""
+        inner = [sp for sp in self.specs if sp[1] == "inner" and which(sp)]
+        holes = lambda: [self._curves(sp) for sp in inner]
+        if self.k is None or not self.winding:
+            outer = next(sp for sp in self.specs if sp[1] == "outer")
+            loops = [self._curves(outer)] + holes()
+            return self._trim(self._surface(), loops)
+        combos = [self.combo] if self.combo is not None else [(False, False), (False, True), (True, False),
+                                                              (True, True)]
+        err = None
+        for combo in combos:
+            try:
+                G = self._surface()
+                out = self._trim(self._surface(), [self._outline(G, combo)] + holes())
+            except Exception as exc:
+                err = exc
+                continue
+            got = float(sum(f.area(1e-6) for f in out.faces()))
+            if out.face_count() == 1 and (area is None or abs(got - area) <= 1e-4 * area + self.tol):
+                self.combo = combo
+                return out
+        raise err or RuntimeError("the face the feature sits in does not trim again")
+
+    def _trim(self, G, loops):
+        return ext.trim_surface_with_3d_curves_tol(G, [len(l) for l in loops], [c for l in loops for c in l],
+                                                  10 * self.tol, self.btol)
+
+
 def job_move_face(job):
     """Move Face (world space): the feature holding the faces at
     job['face_pts'] -- the faces enclosed by an inner loop of the face(s) it
-    sits in (featregion: a hole, pocket, boss, slot, letter) -- slid by
-    job['vector'] along those seat faces. The feature moves rigidly (its faces
-    translated), each seat keeps its surface and is trimmed again with that
-    loop moved: exact, the volume stays. The seats must be flat and contain the
-    move; the moved loop must stay inside its seat, clear of its other holes.
-    Written in the local space of job['into']."""
+    sits in (featregion: a hole, pocket, boss, slot, letter) -- carried along
+    those seat faces by a rigid motion: turned job['angle'] degrees about
+    job['axis_point'] / job['axis_dir'], then slid by job['vector']. The
+    feature moves rigidly, each seat keeps its surface and is trimmed again
+    with that loop moved: exact, the volume stays. The motion must carry the
+    feature's rim along every seat's surface (a flat face: any slide in it; a
+    cylinder: a turn about and a slide along its axis; a surface of
+    revolution: a turn about its axis); the moved loop must stay inside its
+    seat, clear of its other holes. Written in the local space of
+    job['into']."""
     np = _np()
     from featregion import feature_region
     from trimext import brep_tol
     body = world_brep(job, "target")
     if not bool(body.is_manifold_solid()):
         raise RuntimeError("Move Face needs a closed solid (all edges shared by two faces)")
-    d = np.asarray(job["vector"], float)
     lo, hi = (np.array(v, float) for v in body.bounding_box())
     size = float(np.linalg.norm(hi - lo)) or 1.0
     tol = 1e-6 * size
-    if np.linalg.norm(d) <= tol:
+    M = _feature_motion(job, size)
+    if M is None:
         raise RuntimeError("the move is 0")
     faces = body.faces()
     start = {_face_at(body, p) for p in job["face_pts"]}
@@ -3521,55 +3695,69 @@ def job_move_face(job):
         raise RuntimeError("the face is not part of a feature sitting inside a face (a hole, pocket, boss "
                            "or slot): Push / Pull or Rotate Face move a face of the body itself")
     region, seats, rim_edges = reg
-    for S in seats:
-        if not S.surface().is_planar():
-            raise RuntimeError("the feature sits in a curved face: only a flat one can take the move")
-        n = _face_normal(S, np.array(S.interior_point(), float))
-        if abs(float(n @ d)) > 1e-6 * np.linalg.norm(d):
-            raise RuntimeError("the move leaves the face the feature sits in: slide it along that face "
-                               "(Push / Pull lifts or sinks a face)")
-    # the seats again, their loops round the feature moved
     btol = brep_tol(1e-5, size)
+
+    def free_surface(S):
+        return ext.surface_from_cvs(*_srf_tuple(ext.surface_cvs(S.surface())))
+
+    def off_surface(G, P):
+        return max(float(sm.surface_closest_point(G, tuple(map(float, q)))[2]) for q in P)
+
+    def classes(F, P):
+        G = F.surface()
+        out = []
+        for q in P:
+            uvs = sm.surface_closest_point(G, tuple(map(float, q)))[1]
+            out.append(F.classify_uv(float(uvs[0].x), float(uvs[0].y)) if uvs else "outside")
+        return out
+
+    # the seats again, their loops round the feature moved
     built = []
     for S in seats:
-        n = _face_normal(S, np.array(S.interior_point(), float))
-        a = np.cross(n, [1.0, 0.0, 0.0])
-        if np.linalg.norm(a) < 0.1:
-            a = np.cross(n, [0.0, 1.0, 0.0])
-        a /= np.linalg.norm(a)
-        b2 = np.cross(n, a)
-        o = np.array(S.interior_point(), float)
-        flat = lambda P: np.c_[(P - o) @ a, (P - o) @ b2]
-        outer = {e for e, _ in S.boundary_outer_loop()}
-        loops, moved, still = [], [], []
-        for loop in S.boundary_loops():
-            mine = all(e in rim_edges for e, _ in loop)
-            if mine and any(e in outer for e, _ in loop):
-                raise RuntimeError("the feature runs out to the edge of the face it sits in")
-            cs = [(_moved_curve(_edge_copy(e), d) if mine else _edge_copy(e)) for e, _ in loop
-                  if e.length() > tol]
-            ch = _chain(cs, 1e3 * tol)
-            if ch is None:
-                raise RuntimeError("a loop of the face the feature sits in does not close")
-            poly = flat(_loop_polygon(loop)) + (flat(o + d)[0] - flat(o)[0] if mine else 0.0)
-            (moved if mine else still).append((poly, any(e in outer for e, _ in loop)))
-            loops.insert(0, ch) if any(e in outer for e, _ in loop) else loops.append(ch)
-        for P, _ in moved:
-            for Q, is_outer in still:
-                if is_outer:
-                    if not _inside_2d(P, Q).all():
-                        raise RuntimeError("the feature would leave the face it sits in")
-                elif _inside_2d(P, Q).any() or _inside_2d(Q, P).any():
-                    raise RuntimeError("the feature would run into another hole or feature in that face")
-        srf = ext.surface_from_cvs(*_srf_tuple(ext.surface_cvs(S.surface())))
-        built.append(ext.trim_surface_with_3d_curves_tol(srf, [len(l) for l in loops],
-                                                        [c for l in loops for c in l], 10 * tol, btol))
-    # the feature's faces, translated
+        G = free_surface(S)
+        st = _SeatTrim(S, rim_edges, M, size, tol, btol)
+        mine_specs = [sp for sp in st.specs if sp[2]]
+        others = [sp for sp in st.specs if sp[1] == "inner" and not sp[2]]
+        for c, _, _ in mine_specs:
+            P = _loop_polygon(c, 12)
+            if off_surface(G, M(P)) > off_surface(G, P) + max(btol, 1e-5 * size):
+                raise RuntimeError("the move takes the feature off the face it sits in: slide it along "
+                                   "a flat face, turn or slide it about a cylinder's axis, turn it about "
+                                   "a revolved face's axis (Push / Pull lifts or sinks a face)")
+        A0 = float(S.area(1e-6))
+        try:
+            nb = st.face(lambda sp: True, area=A0)
+        except Exception:
+            nb = None
+        # the moved loops inside the seat with the feature filled in, clear of its other holes
+        Q = np.vstack([M(_loop_polygon(c, 8)) for c, _, _ in mine_specs])
+        if any(c == "outside" for c in classes(st.face(lambda sp: False).faces()[0], Q)):
+            raise RuntimeError("the feature would leave the face it sits in")
+        if others:
+            hit = any(c == "outside" for c in classes(st.face(lambda sp: not sp[2]).faces()[0], Q))
+            if not hit:                              # another hole swallowed by the moved feature
+                T = st.face(lambda sp: sp[2]).faces()[0]
+                hit = any(c == "outside" for c in
+                          classes(T, np.vstack([_loop_polygon(c, 8) for c, _, _ in others])))
+            if hit:
+                raise RuntimeError("the feature would run into another hole or feature in that face")
+        if nb is None:
+            raise RuntimeError("the face the feature sits in does not trim again round the moved feature")
+        A1 = float(sum(f.area(1e-6) for f in nb.faces()))
+        if nb.face_count() != 1 or abs(A1 - A0) > 1e-4 * A0 + tol:
+            raise RuntimeError("the feature would run into another hole or feature in that face")
+        built.append(nb)
+    # the feature's faces, moved
     idx = [i for i, f in enumerate(faces) if f in region]
     sheet = body.copy()
     sf = sheet.faces()
     ext.delete_faces(sheet, [sf[i] for i in range(len(sf)) if i not in set(idx)])
-    sheet = sm.translate(sheet, tuple(map(float, d)))
+    ang = float(job.get("angle", 0.0) or 0.0)
+    if abs(ang) > 1e-9:
+        sm.rotate(sheet, tuple(map(float, job["axis_point"])), tuple(map(float, job["axis_dir"])), ang)
+    d = np.asarray(job.get("vector", (0.0, 0.0, 0.0)), float)
+    if np.linalg.norm(d) > 0:
+        sheet = sm.translate(sheet, tuple(map(float, d)))
     gone = set(idx) | {i for i, f in enumerate(faces) if f in seats}
     b = body.copy()
     bf = b.faces()

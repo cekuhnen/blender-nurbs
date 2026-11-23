@@ -518,15 +518,33 @@ def apply_rotate_face(obj, text, inputs, p):
 
 def apply_move_face(obj, text, inputs, p):
     """Move Face on rebuild: the feature holding the faces at the stored points
-    slid again by the stored distances along the stored directions (local)."""
+    moved again as stored (local): on a flat face slid by the two distances
+    along the two directions; on a curved one turned about and slid along its
+    axis."""
     M = _world(obj)
     pts = [list(M @ Vector(q)) for q in p["faces_local"]]
     L = M.to_3x3()
-    v = L @ (float(p.get("move_x", 0.0)) * Vector(p["axis_x_local"])
-             + float(p.get("move_y", 0.0)) * Vector(p["axis_y_local"]))
+    kw = {}
+    if p.get("mode", "PLANE") == "PLANE":
+        v = L @ (float(p.get("move_x", 0.0)) * Vector(p["axis_x_local"])
+                 + float(p.get("move_y", 0.0)) * Vector(p["axis_y_local"]))
+    else:
+        z = (L @ Vector(p["axis_x_local"])).normalized()
+        v = float(p.get("slide", 0.0)) * z
+        if abs(float(p.get("turn", 0.0))) > 0.0:
+            kw = {"angle": float(p["turn"]), "axis_point": list(M @ Vector(p["axis_point_local"])),
+                  "axis_dir": list(z)}
     _, breps = jobs.run("move_face", {"target": (text, jobs.xform(obj))}, ["result"], face_pts=pts,
-                        vector=list(v), into="target")
+                        vector=list(v), into="target", **kw)
     return breps["result"]
+
+
+def _move_face_label(p):
+    if p.get("mode", "PLANE") == "PLANE":
+        return f"Move Face · {math.hypot(float(p.get('move_x', 0)), float(p.get('move_y', 0))):.3g}"
+    bits = [f"{float(p.get('turn', 0)):.3g}°" if abs(float(p.get("turn", 0))) > 0 else "",
+            f"{float(p.get('slide', 0)):.3g}" if abs(float(p.get("slide", 0))) > 0 else ""]
+    return " · ".join(["Move Face"] + [b for b in bits if b])
 
 
 def apply_replace_face(obj, text, inputs, p):
@@ -554,7 +572,7 @@ LABEL = {
     "untrim": lambda p: "Untrim",
     "replace_face": lambda p: "Replace Face" + (f" · {len(p.get('faces_local', []))} faces"
                                                 if len(p.get("faces_local", [])) > 1 else ""),
-    "move_face": lambda p: f"Move Face · {math.hypot(float(p.get('move_x', 0)), float(p.get('move_y', 0))):.3g}",
+    "move_face": _move_face_label,
     "rotate_face": lambda p: f"Rotate Face · {float(p.get('angle', 0)):.3g}°"
                              + (f" · {len(p.get('faces_local', []))} faces" if len(p.get("faces_local", [])) > 1 else ""),
     "push_pull": lambda p: ("Pull" if float(p.get("distance", 0)) > 0 else "Push")
