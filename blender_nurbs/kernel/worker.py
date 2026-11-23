@@ -3593,13 +3593,26 @@ class _SeatTrim:
             else:
                 role = "outline"
             self.specs.append((c, kind, role))
-        self.combo, self.R, self.frac = {}, None, 0.0
+        self.combo, self.R, self.frac, self.pre = {}, None, 0.0, None
         if self.k is None:
             return
         self.pts = [M(_loop_polygon(c, 8)) if role == "mine" else _loop_polygon(c, 8) for c, _, role in self.specs]
         G = self._free()
         lo_, hi_ = (np.array(v, float) for v in S.bounding_box())
         self.size = float(np.linalg.norm(hi_ - lo_)) or size
+        if self.k == 2:                          # closed both ways (a torus)
+            wd = [(self._winds_uv(G, P, 0), self._winds_uv(G, P, 1)) for P in self.pts]
+            if not any(a or b for a, b in wd):   # a whole torus: holes only, both seams moved clear
+                self.poles, self.wind = [], [False] * len(self.specs)
+                self.fracs = tuple(self._seam_frac(G, d, range(len(self.specs))) for d in (0, 1))
+                return
+            dirs = {0 if a else 1 for a, b in wd if a or b}
+            if any(a and b for a, b in wd) or len(dirs) != 1:
+                raise RuntimeError("the torus the feature sits in is cut in a way the move can't follow")
+            d = dirs.pop()                       # a band round the tube (an elbow): its other seam into the cut-away part
+            self.pre = (1 - d, self._outside_frac(G, 1 - d))
+            self.k = d
+            G = self._framed(reseam=False)
         self.poles = pole_ends(G, self.k)
         w = [self._winds_uv(G, P) for P in self.pts]
         if sum(w) <= 2 and self._clear_of_poles(G):
@@ -3610,19 +3623,51 @@ class _SeatTrim:
                 raise RuntimeError("the feature would run over a pole of the face it sits in")
             self._sphere_frame(G, *sph)
         # a seam clear of every cycle that does not run round the frame
-        G = self._framed(reseam=False)
-        lo, hi = (G.u_domain(), G.v_domain())[self.k]
+        self.frac = self._seam_frac(self._framed(reseam=False), self.k,
+                                    [i for i in range(len(self.specs)) if not self.wind[i]])
+
+    def _outside_frac(self, G, e):
+        """A share of direction e's domain whose whole iso lies outside the
+        face (in the part a band of a torus was cut from)."""
+        np = _np()
+        lo, hi = (G.u_domain(), G.v_domain())[e]
+        dlo, dhi = (G.u_domain(), G.v_domain())[1 - e]
+        ts = np.linspace(lo, hi, 64, endpoint=False)
+        out = []
+        for t in ts:
+            cl = [self.S.classify_uv(*((float(t), float(q)) if e == 0 else (float(q), float(t))))
+                  for q in np.linspace(dlo, dhi, 9, endpoint=False)]
+            out.append(all(c == "outside" for c in cl))
+        if not any(out):
+            raise RuntimeError("the torus band the feature sits in has no part cut away to put its seam in")
+        best, run, start = None, 0, 0
+        for i in range(2 * len(ts)):                 # the middle of the longest run (round the end)
+            if out[i % len(ts)]:
+                if run == 0:
+                    start = i
+                run += 1
+                if best is None or run > best[0]:
+                    best = (run, start)
+            else:
+                run = 0
+        n, i0 = best
+        n = min(n, len(ts))
+        t = lo + ((i0 + (n - 1) / 2.0) % len(ts)) * (hi - lo) / len(ts)
+        return float((t - lo) / (hi - lo))
+
+    def _seam_frac(self, G, d, idx):
+        """Where (a share of direction d's domain) to put G's seam in d so it
+        crosses none of the cycles idx (as they will be)."""
+        lo, hi = (G.u_domain(), G.v_domain())[d]
         P = hi - lo
         spans = []
-        for i, Q in enumerate(self.pts):
-            if self.wind[i]:
-                continue
-            cs = [float((uv.y if self.k else uv.x)) for uv in
-                  (sm.surface_closest_point(G, tuple(map(float, q)))[1][0] for q in Q)]
+        for i in idx:
+            cs = [float((uv.y if d else uv.x)) for uv in
+                  (sm.surface_closest_point(G, tuple(map(float, q)))[1][0] for q in self.pts[i])]
             un = [cs[0]]
             for x in cs[1:]:
-                d = (x - un[-1]) % P
-                un.append(un[-1] + (d - P if d > P / 2 else d))
+                dd = (x - un[-1]) % P
+                un.append(un[-1] + (dd - P if dd > P / 2 else dd))
             spans.append((min(un), max(un)))
         m = 0.02 * P
 
@@ -3635,16 +3680,16 @@ class _SeatTrim:
             if not cand:
                 raise RuntimeError("the holes and features go all round the face they sit in")
             seam = max(cand, key=lambda x: x[1])[0]
-        self.frac = ((seam - lo) % P) / P
-        if self.frac > 1 - 1e-9:
-            self.frac = 0.0
+        frac = ((seam - lo) % P) / P
+        return 0.0 if frac > 1 - 1e-9 else frac
 
     # -- the frame ----------------------------------------------------------------
-    def _winds_uv(self, G, Q):
+    def _winds_uv(self, G, Q, d=None):
         np = _np()
-        lo, hi = (G.u_domain(), G.v_domain())[self.k]
+        d = self.k if d is None else d
+        lo, hi = (G.u_domain(), G.v_domain())[d]
         P = hi - lo
-        cs = [float(uv.y if self.k else uv.x) for uv in
+        cs = [float(uv.y if d else uv.x) for uv in
               (sm.surface_closest_point(G, tuple(map(float, q)))[1][0] for q in Q)]
         net = 0.0
         for a, b in zip(cs, cs[1:] + cs[:1]):
@@ -3704,9 +3749,15 @@ class _SeatTrim:
 
     def _framed(self, reseam=True):
         G = self._free()
+        if self.pre is not None and self.pre[1] > 0.0:
+            G = _reseamed(G, "uv"[self.pre[0]], self.pre[1])
         if self.R is not None:
             G = _rotated_surface(G, *self.R)
-        if reseam and self.k is not None and self.frac > 0.0:
+        if reseam and self.k == 2:
+            for d, f in enumerate(self.fracs):
+                if f > 0.0:
+                    G = _reseamed(G, "uv"[d], f)
+        elif reseam and self.k is not None and self.frac > 0.0:
             G = _reseamed(G, "uv"[self.k], self.frac)
         return G
 
@@ -3777,6 +3828,8 @@ class _SeatTrim:
         always); area: the one it must come out with (it settles which way
         a closed face's outline runs)."""
         chosen = [i for i, sp in enumerate(self.specs) if sp[2] == "outline" or which(sp)]
+        if self.k == 2:
+            return self._torus_face(chosen, area)
         if self.k is None or (not self.poles and not any(self.wind[i] for i in chosen)):
             outer = next(i for i, sp in enumerate(self.specs) if sp[1] == "outer")
             loops = [self._curves(self.specs[outer])] + [self._curves(self.specs[i]) for i in chosen if i != outer]
@@ -3803,6 +3856,28 @@ class _SeatTrim:
                 return out
         raise err or RuntimeError("the face the feature sits in does not trim again")
 
+    def _torus_face(self, chosen, area):
+        """A whole torus with holes: its outline the two seam circles, as the
+        kernel gives it (A, B, A back, B back)."""
+        rev = _reversed_curve
+        orders = [self.combo["torus"]] if "torus" in self.combo else [0, 1, 2, 3]
+        err = None
+        for order in orders:
+            try:
+                G = self._surface()
+                A, B = _boundary_iso(G, True, False), _boundary_iso(G, False, False)
+                outline = [[A, B, rev(A), rev(B)], [B, A, rev(B), rev(A)], [rev(A), B, A, rev(B)],
+                           [rev(B), A, B, rev(A)]][order]
+                out = self._trim(self._surface(), [outline] + [self._curves(self.specs[i]) for i in chosen])
+            except Exception as exc:
+                err = exc
+                continue
+            got = float(sum(f.area(1e-6) for f in out.faces()))
+            if out.face_count() == 1 and (area is None or abs(got - area) <= 1e-4 * area + self.tol):
+                self.combo["torus"] = order
+                return out
+        raise err or RuntimeError("the torus the feature sits in does not trim again")
+
     def _trim(self, G, loops):
         return ext.trim_surface_with_3d_curves_tol(G, [len(l) for l in loops], [c for l in loops for c in l],
                                                   10 * self.tol, self.btol)
@@ -3819,7 +3894,8 @@ def job_move_face(job):
     with that loop moved: exact, the volume stays. The motion must carry the
     feature's rim along every seat's surface (a flat face: any slide in it; a
     cylinder: a turn about and a slide along its axis; a surface of
-    revolution: a turn about its axis; a sphere: any turn about its centre);
+    revolution (a cone, a torus): a turn about its axis; a sphere: any turn
+    about its centre);
     the moved loop must stay inside its
     seat, clear of its other holes. Written in the local space of
     job['into']."""
@@ -3871,8 +3947,9 @@ def job_move_face(job):
             P = _loop_polygon(c, 12)
             if off_surface(G, M(P)) > off_surface(G, P) + max(btol, 1e-5 * size):
                 raise RuntimeError("the move takes the feature off the face it sits in: slide it along "
-                                   "a flat face, turn or slide it about a cylinder's axis, turn it about "
-                                   "a revolved face's axis (Push / Pull lifts or sinks a face)")
+                                   "a flat face, slide or turn it about a cylinder's axis, turn or tilt it "
+                                   "on a sphere, turn it about a cone's or a torus's axis (Push / Pull "
+                                   "lifts or sinks a face)")
         A0 = float(S.area(1e-6))
         try:
             nb = st.face(lambda sp: True, area=A0)
@@ -3880,10 +3957,10 @@ def job_move_face(job):
             nb = None
         # the moved loops inside the seat with the feature filled in, clear of its other holes
         Q = np.vstack([M(_loop_polygon(c, 8)) for c, _, _ in mine_specs])
-        if any(c == "outside" for c in classes(st.face(lambda sp: False).faces()[0], Q)):
-            raise RuntimeError("the feature would leave the face it sits in")
+        if any(c != "inside" for c in classes(st.face(lambda sp: False).faces()[0], Q)):
+            raise RuntimeError("the feature would leave the face it sits in (or touch its edge)")
         if others:
-            hit = any(c == "outside" for c in classes(st.face(lambda sp: sp[2] != "mine").faces()[0], Q))
+            hit = any(c != "inside" for c in classes(st.face(lambda sp: sp[2] != "mine").faces()[0], Q))
             if not hit:                              # another hole swallowed by the moved feature
                 T = st.face(lambda sp: sp[2] == "mine").faces()[0]
                 hit = any(c == "outside" for c in

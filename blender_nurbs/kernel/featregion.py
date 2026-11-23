@@ -36,9 +36,8 @@ def _dist(a, b):
     return sum((float(x) - float(y)) ** 2 for x, y in zip(a, b)) ** 0.5
 
 
-def closed_dir(srf):
-    """0 when the surface closes round in u (its u ends meet), 1 in v, else
-    None (a torus, closed both ways, counts as None too)."""
+def closed_dirs(srf):
+    """(closes in u?, closes in v?): its u ends meet, its v ends meet."""
     (u0, u1), (v0, v1) = srf.u_domain(), srf.v_domain()
     out = []
     for k in (0, 1):
@@ -54,7 +53,14 @@ def closed_dir(srf):
             gap = max(gap, _dist(a, b))
         span = max(_dist(p, q) for p in pts for q in pts) or 1.0
         out.append(gap <= 1e-7 * span and span > 0)
-    return 0 if out[0] and not out[1] else 1 if out[1] and not out[0] else None
+    return tuple(out)
+
+
+def closed_dir(srf):
+    """0 when the surface closes round in u (its u ends meet), 1 in v, 2 both
+    ways (a torus), else None."""
+    cu, cv = closed_dirs(srf)
+    return 2 if cu and cv else 0 if cu else 1 if cv else None
 
 
 def seam_edges(face):
@@ -120,8 +126,9 @@ def face_cycles(face):
     feature's rim), 'winding' (a closed face's rim running round it: a
     cylinder side's two circles, a dome's base) or 'pole' (a hole round a
     pole the face does not reach: one drilled at a dome's top; it runs round
-    the face's parameters like a winding rim) -- and k, the direction it closes in (None:
-    an open face, whose loops are the cycles). On a closed face the seam edges
+    the face's parameters like a winding rim) -- and k, the direction it
+    closes in (2: both ways, a torus; None: an open face, whose loops are the
+    cycles). On a closed face the seam edges
     are left out and the runs between them joined up."""
     outer = {e for e, _ in face.boundary_outer_loop()}
     seams = seam_edges(face)
@@ -163,6 +170,9 @@ def face_cycles(face):
         cycles.append(cyc)
     sm = _k()
     srf = face.surface()
+    if k == 2:                                    # closed both ways (a torus): every cycle round neither way is a hole
+        return [(c, "winding" if _winds(sm, srf, 0, c) or _winds(sm, srf, 1, c) else "inner")
+                for c in cycles], k
     kinds = ["winding" if _winds(sm, srf, k, c) else "inner" for c in cycles]
     # poles: the open direction ending in a point (a sphere's, a dome's top). A
     # rim running round the face with a pole beyond it that the face does not

@@ -250,6 +250,9 @@ jobs:
           "$BLENDER" -b --factory-startup --python tests/test_move_face_sphere.py 2>&1 | tee movesphere.log
           grep -E "^FAIL" movesphere.log || true
           grep -q "^ALL OK" movesphere.log
+          "$BLENDER" -b --factory-startup --python tests/test_move_face_torus.py 2>&1 | tee movetorus.log
+          grep -E "^FAIL" movetorus.log || true
+          grep -q "^ALL OK" movetorus.log
           "$BLENDER" -b --factory-startup --python tests/test_unroll_flow.py 2>&1 | tee unroll.log
           grep -E "^FAIL" unroll.log || true
           grep -q "^ALL OK" unroll.log

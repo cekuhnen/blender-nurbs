@@ -1141,7 +1141,7 @@ def _tilt_axis(rel, z):
 
 
 MOTIONS = {"PLANE": "slides in the flat face", "AXIS": "slides along the cylinder's axis and turns about it",
-           "TURN": "turns about the revolved face's axis", "SLIDE": "slides along the extruded face",
+           "TURN": "turns about the revolved face's axis (a cone's, a torus's)", "SLIDE": "slides along the extruded face",
            "SPHERE": "turns about the sphere's axis and tilts along its meridian"}
 
 
