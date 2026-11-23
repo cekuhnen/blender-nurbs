@@ -4078,7 +4078,7 @@ def job_edge_fillet(job):
                             thumbweight=float(job.get("thumbweight", 1.0)))
     if r is None or r.face_count() == 0:
         raise RuntimeError("the kernel returned no result (radius too large for the neighbouring faces?)")
-    r = _fix_ring_faces(b_ring, r)
+    r = _fix_coiled_faces(b_ring, _fix_ring_faces(b_ring, r))
     rings = []
     if r1 is None or abs(float(r1) - r0) <= 1e-12:
         # rims (Class-A or not): one smooth ring each; Class-A leaves them be
@@ -4188,7 +4188,7 @@ def _soft_edge_fillet(job, b, b_ring, sel):
     r = sm.fillet_edges(b, sel, radius=rho, xsect_type=1, continuity=1, thumbweight=1.0)
     if r is None or r.face_count() == 0:
         raise RuntimeError("the kernel returned no result (radius too large for the neighbouring faces?)")
-    r = _fix_ring_faces(b_ring, r)
+    r = _fix_coiled_faces(b_ring, _fix_ring_faces(b_ring, r))
     import classa
     on_in = _input_test(b_ring)
     fil = [i for i, f in enumerate(r.faces()) if not on_in(f)]
@@ -4291,6 +4291,70 @@ def _fix_ring_faces(before, r):
             if _open_edge_count(st) <= before_open and st.face_count() == r.face_count():
                 try:
                     sm.unify_normals(st, max(st.faces(), key=lambda f: f.area()), 100)
+                except Exception:
+                    pass
+                return st
+    except Exception:
+        pass
+    return r
+
+
+def _fix_coiled_faces(before, r):
+    """The kernel's fillet can carry a neighbouring face on over a surface of
+    its own that coils round past the input's ends (a half cylinder grown into
+    one and a half turns), the trim then covering the face more than once: the
+    face has the wrong area and fails to mesh -- a hole in the solid. Each
+    face of r that lies on an input face's surface without being that surface
+    is trimmed out of the input's surface again by its own 3D edges; where
+    that gives another area the kernel's face is the broken one and the
+    re-trimmed face takes its place. Keeps r when that does not stitch as well."""
+    np = _np()
+    lo, hi = (np.array(v) for v in before.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    tol = 1e-5 * size
+    origs = [(_surface_key(f.surface()), f.surface()) for f in before.faces()]
+    keys = {k for k, _ in origs}
+    carriers = {}
+    swap = []
+    try:
+        for i, f in enumerate(r.faces()):
+            if _surface_key(f.surface()) in keys:
+                continue
+            q = f.interior_point()
+            pts = [(q.x, q.y, q.z) if hasattr(q, "x") else tuple(q)]
+            for e in f.edges():
+                t0, t1 = e.parameter_range()
+                pts += [tuple(map(float, e.point_at(t))) for t in np.linspace(t0, t1, 7)]
+            for k, (_, S) in enumerate(origs):
+                if k not in carriers:      # (copies: the kernel adopts a surface it is given)
+                    carriers[k] = ext.brep_from_surface(_surface_copy(S))
+                if any(carriers[k].faces()[0].closest_point(tuple(map(float, p)))[1] > tol for p in pts):
+                    continue
+                loops = [_chain([_edge_copy(e) for e, _ in lp], 10 * tol) for lp in f.boundary_loops()]
+                if not loops or any(lp is None for lp in loops):
+                    break
+                try:
+                    cand = ext.trim_surface_with_3d_curves_tol(_surface_copy(S), [len(lp) for lp in loops],
+                                                               [c for lp in loops for c in lp], 10 * tol, 1e2 * tol)
+                except Exception:
+                    break
+                if cand.face_count() == 1 and abs(cand.area(1e-6) - f.area()) > 1e-3 * f.area():
+                    swap.append((i, cand))
+                break
+        if not swap:
+            return r
+        out = r.copy()
+        faces = out.faces()
+        ext.delete_faces(out, [faces[i] for i, _ in swap])
+        for _, cand in swap:
+            ext.append_brep(out, cand)
+        open_before, solid = _open_edge_count(r), bool(r.is_manifold_solid())
+        for t in (tol, 10 * tol):
+            st = sm.stitch_advanced(out.copy(), t, squeeze_small_edges=False, making_manifold_solid=False)[0]
+            if st.face_count() == r.face_count() and _open_edge_count(st) <= open_before \
+                    and (bool(st.is_manifold_solid()) or not solid):
+                try:
+                    sm.unify_normals(st, max(st.faces(), key=lambda fc: fc.area()), 100)
                 except Exception:
                     pass
                 return st
