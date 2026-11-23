@@ -1128,16 +1128,31 @@ def _plane_axes(n):
     return a, b
 
 
+def _tilt_axis(rel, z):
+    """The axis a feature at rel (from a sphere's centre) tilts about: across
+    its meridian, so + tilts it towards z's end (at the pole: across world X,
+    else Y)."""
+    rel, z = np.asarray(rel, float), np.asarray(z, float)
+    t = np.cross(rel, z)
+    if np.linalg.norm(t) <= 1e-6 * (np.linalg.norm(rel) or 1.0):
+        w = np.array([1.0, 0, 0]) if abs(z[0]) < 0.9 else np.array([0, 1.0, 0])
+        t = np.cross(z, w)
+    return t / np.linalg.norm(t)
+
+
 MOTIONS = {"PLANE": "slides in the flat face", "AXIS": "slides along the cylinder's axis and turns about it",
-           "TURN": "turns about the revolved face's axis", "SLIDE": "slides along the extruded face"}
+           "TURN": "turns about the revolved face's axis", "SLIDE": "slides along the extruded face",
+           "SPHERE": "turns about the sphere's axis and tilts along its meridian"}
 
 
 def seat_motion(o, s):
     """(mode, world point on the axis, world unit axis) of how a feature can
     move along seat face s of body o -- 'PLANE' (the axis: its normal),
-    'AXIS' (a cylinder: along and about its axis), 'TURN' (a surface of
-    revolution: about its axis), 'SLIDE' (a linear extrusion: along it) -- or
-    None. Read off the seat's surface (step_export's fits on a grid of it)."""
+    'AXIS' (a cylinder: along and about its axis), 'SPHERE' (about its
+    centre: the point is the centre, the axis its own, else world Z), 'TURN'
+    (a surface of revolution: about its axis), 'SLIDE' (a linear extrusion:
+    along it) -- or None. Read off the seat's surface (step_export's fits on
+    a grid of it)."""
     from . import step_export as sx
     f = store.get_brep(o).faces()[s]
     srf = f.surface()
@@ -1155,6 +1170,10 @@ def seat_motion(o, s):
     if cyl is not None:
         return "AXIS", np.asarray(cyl[0], float), np.asarray(cyl[1], float)
     rev = sx.fit_revolution(G, tol, size)
+    sph = sx.fit_sphere(G, tol, size)
+    if sph is not None:
+        return "SPHERE", np.asarray(sph[0], float), \
+            (np.asarray(rev[1], float) if rev is not None else np.array([0.0, 0.0, 1.0]))
     if rev is not None:
         return "TURN", np.asarray(rev[0], float), np.asarray(rev[1], float)
     ex = sx.fit_extrusion(G, tol, size)
@@ -1168,7 +1187,8 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
     """Move a feature along the face it sits in: click a face of a hole,
     pocket, boss or slot (the whole feature lights up), drag the arrows or
     type the values. On a flat face it slides two ways; on a cylinder it slides
-    along the axis and turns about it; on a cone or another revolved face it
+    along the axis and turns about it; on a sphere it turns about its axis
+    and tilts along its meridian; on a cone or another revolved face it
     turns. The feature moves rigidly; the face around it is trimmed again"""
     bl_idname = "nproto.move_face"
     bl_label = "Move Face"
@@ -1190,10 +1210,14 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
                          description="Along the axis of the curved face the feature sits in")
     turn: FloatProperty(name="Turn °", default=0.0, min=-360.0, max=360.0,
                         description="About the axis of the curved face the feature sits in (degrees)")
+    tilt: FloatProperty(name="Tilt °", default=0.0, min=-360.0, max=360.0,
+                        description="On a sphere: along the meridian through the feature, + towards the "
+                                    "axis's top (degrees)")
 
-    FIELDS = {"PLANE": ("move_x", "move_y"), "AXIS": ("slide", "turn"), "TURN": ("turn",), "SLIDE": ("slide",)}
+    FIELDS = {"PLANE": ("move_x", "move_y"), "AXIS": ("slide", "turn"), "TURN": ("turn",), "SLIDE": ("slide",),
+              "SPHERE": ("turn", "tilt")}
     drag_fields = ("move_x", "move_y")
-    angle_fields = ("turn",)
+    angle_fields = ("turn", "tilt")
     fit_view = "none"
     start_value = 0.0
 
@@ -1269,6 +1293,9 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
         self.axis_x = [float(x) for x in z]
         self.axis_y = [0.0, 0.0, 0.0]
         self.axis_point = [float(x) for x in P]
+        if mode == "SPHERE":                    # the tilt axis: across the meridian through the opening
+            C = np.array(geom.world_matrix(o) @ Vector(self._seat(context, o, feat)[2]), float)
+            self.axis_y = [float(x) for x in _tilt_axis(C - P, z)]
 
     def _fields(self):
         self.drag_fields = self.FIELDS[self.mode]
@@ -1280,14 +1307,24 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
         return self.slide * np.array(self.axis_x, float)
 
     def _angle(self):
-        return float(self.turn) if self.mode in ("AXIS", "TURN") else 0.0
+        return float(self.turn) if self.mode in ("AXIS", "TURN", "SPHERE") else 0.0
 
-    def _moved(self, P):
-        """World points P carried by the move: turned about the axis, then slid."""
+    def _turns(self):
+        """[(axis point, unit axis, degrees)] in the order they apply: on a
+        sphere the tilt (about axis_y), then the turn (about axis_x)."""
+        O, z = np.array(self.axis_point, float), np.array(self.axis_x, float)
+        out = []
+        if self.mode == "SPHERE" and self.tilt:
+            out.append((O, np.array(self.axis_y, float), float(self.tilt)))
+        if self._angle():
+            out.append((O, z, self._angle()))
+        return out
+
+    def _moved(self, P, upto=None):
+        """World points P carried by the move: turned (tilted), then slid."""
         P = np.asarray(P, float)
-        a = self._angle()
-        if a:
-            P = rotate_points(P, np.array(self.axis_point, float), np.array(self.axis_x, float), a)
+        for O, z, a in self._turns()[:upto]:
+            P = rotate_points(P, O, z, a)
         return P + self._vector()
 
     def draw(self, context):
@@ -1409,14 +1446,23 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
         span = float(np.linalg.norm(np.ptp(Q, axis=0))) or 1.0
         self._L0 = 0.6 * span                     # the arrows' length past the moved centre
         self._lift = 2e-3 * span
-        self.move_x = self.move_y = self.slide = self.turn = 0.0
+        self.move_x = self.move_y = self.slide = self.turn = self.tilt = 0.0
         self._fields()
-        if self.mode in ("AXIS", "TURN"):
+        self._span = span
+        if self.mode == "SPHERE":
+            O = np.array(self.axis_point, float)
+            self._r = float(np.linalg.norm(self._C - O))
+            if self._r <= 1e-9 * span:
+                return False
+            self._t0 = np.array(self.axis_y, float)
+        if self.mode in ("AXIS", "TURN", "SPHERE"):
             O, z = np.array(self.axis_point, float), np.array(self.axis_x, float)
             rel = self._C - O
             rad = rel - (rel @ z) * z
-            if np.linalg.norm(rad) <= 1e-9 * span:
-                return False
+            if np.linalg.norm(rad) <= 1e-3 * span:
+                if self.mode != "SPHERE":
+                    return False
+                rad = np.cross(z, self._t0)          # at the sphere's pole: along the tilt
             self._x = rad / np.linalg.norm(rad)
             r = Q - O
             rho = float(np.linalg.norm(r - np.outer(r @ z, z), axis=1).max())
@@ -1429,8 +1475,11 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
 
     def _turn_handle(self):
         O, z = np.array(self.axis_point, float), np.array(self.axis_x, float)
-        Cax = O + z * float((self._C - O) @ z) + self._vector()
-        x = self._x
+        C = self._moved(self._C[None], upto=1)[0] - self._vector() if self.mode == "SPHERE" and self.tilt \
+            else self._C                          # (on a sphere: where the tilt took it)
+        Cax = O + z * float((C - O) @ z) + self._vector()
+        rad = C - O - float((C - O) @ z) * z
+        x = rad / np.linalg.norm(rad) if np.linalg.norm(rad) > 1e-3 * self._span else self._x
         y = np.cross(z, x)
         P = Cax + self._R * x
         a = self.turn
@@ -1456,9 +1505,28 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
             turned = moved - self._vector()
             out.append({"field": "slide", "kind": "arrow", "origin": turned, "dir": ax,
                         "param": self.slide + L0, "base": moved, "to_value": lambda t: t - L0})
-        if self.mode in ("AXIS", "TURN"):
+        if self.mode in ("AXIS", "TURN", "SPHERE"):
             out.append(self._turn_handle())
+        if self.mode == "SPHERE":
+            out.append(self._tilt_handle())
         return out
+
+    def _tilt_handle(self):
+        """The tilt: an arc in the feature's meridian (turned with the
+        turn), about the tilt axis through the sphere's centre."""
+        O, z = np.array(self.axis_point, float), np.array(self.axis_x, float)
+        t = rotate_points(self._t0[None], np.zeros(3), z, self.turn)[0]
+        x = rotate_points(((self._C - O) / self._r)[None], np.zeros(3), z, self.turn)[0]
+        y = np.cross(t, x)
+        P = O + (self._r + 1.1 * self._span) * x          # further out than the turn handle
+        a = self.tilt
+        n = max(2, int(abs(a) / 3.0) + 1)
+        path = np.vstack([rotate_points(P[None], O, t, a * i / (n - 1)) for i in range(n)])
+        back = a - np.copysign(min(6.0, abs(a) * 0.5), a) if abs(a) > 1e-9 else 0.0
+        return {"field": "tilt", "kind": "arrow", "pos": rotate_points(P[None], O, t, a)[0], "param": a,
+                "origin": O, "dir": None, "path": path, "head_from": rotate_points(P[None], O, t, back)[0],
+                "pick": lambda o, r, prev: angle_pick(O, x, y, t, o, r, prev),
+                "to_value": lambda v: max(-360.0, min(360.0, v)), "snap": (5.0, 1.0)}
 
     def _lifted(self, P):
         """Preview fill points lifted off the face (the plane's normal; out
@@ -1468,6 +1536,9 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
         if self.mode == "SLIDE":
             return P
         O, z = np.array(self.axis_point, float), np.array(self.axis_x, float)
+        if self.mode == "SPHERE":
+            r = P - O
+            return P + self._lift * r / np.maximum(np.linalg.norm(r, axis=1), 1e-300)[:, None]
         r = P - O
         r = r - np.outer(r @ z, z)
         return P + self._lift * r / np.maximum(np.linalg.norm(r, axis=1), 1e-300)[:, None]
@@ -1479,14 +1550,14 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
             if len(fr["pts"]):
                 tris.append(self._lifted(self._moved(fr["pts"]))[fr["tris"]].reshape(-1, 3))
         guides = []
-        if self.mode in ("AXIS", "TURN"):
+        if self.mode in ("AXIS", "TURN", "SPHERE"):
             guides.append((self._axis_line + self._vector(), HINGE_RGBA))
-            O, z = np.array(self.axis_point, float), np.array(self.axis_x, float)
-            a = self._angle()
-            if a:
+            C = self._C
+            for O, z, a in self._turns():          # the path of the feature's centre, turn by turn
                 n = max(2, int(abs(a) / 3.0) + 1)
-                guides.append((np.vstack([rotate_points(self._C[None], O, z, a * i / (n - 1))
-                                          for i in range(n)]) + self._vector(), HINGE_RGBA))
+                guides.append((np.vstack([rotate_points(C[None], O, z, a * i / (n - 1)) for i in range(n)])
+                               + self._vector(), HINGE_RGBA))
+                C = rotate_points(C[None], O, z, a)[0]
         d = self._vector()
         if np.linalg.norm(d) > 0:
             start = self._moved(self._C[None])[0] - d
@@ -1494,13 +1565,15 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
         return {"lines": lines, "tris": np.vstack(tris) if tris else np.zeros((0, 3)), "guides": guides}
 
     def drag_check(self):
-        if np.linalg.norm(self._vector()) <= 0.0 and abs(self._angle()) <= 0.0:
+        if np.linalg.norm(self._vector()) <= 0.0 and not self._turns():
             if self.mode == "PLANE":
                 return "No move yet: drag an arrow along the face, or type a distance (Tab: the other direction)"
             if self.mode == "AXIS":
                 return "No move yet: drag the arrow along the axis or the handle round it (Tab: the other)"
             if self.mode == "TURN":
                 return "No turn yet: drag the handle round the axis, or type an angle"
+            if self.mode == "SPHERE":
+                return "No move yet: drag the handle round the axis or the one along the meridian (Tab: the other)"
             return "No move yet: drag the arrow along the face, or type a distance"
         return ""
 
@@ -1514,6 +1587,8 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
             return [hints.key("LMB drag", "the arrow (along the axis) or the handle (round it)")]
         if self.mode == "TURN":
             return [hints.key("LMB drag", "the handle round the axis")]
+        if self.mode == "SPHERE":
+            return [hints.key("LMB drag", "a handle (round the axis, or along the meridian)")]
         return [hints.key("LMB drag", "the arrow along the face")]
 
     # -- making it --------------------------------------------------------------
@@ -1537,11 +1612,11 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
             self._set_axes(context)
         d = self._vector()
         ang = self._angle()
-        if np.linalg.norm(d) <= 0.0 and abs(ang) <= 0.0:
+        turns = self._turns()
+        if np.linalg.norm(d) <= 0.0 and not turns:
             self.report({'WARNING'}, "Move Face: the move is 0")
             return {'CANCELLED'}
-        turn = {"angle": ang, "axis_point": [float(x) for x in self.axis_point],
-                "axis_dir": [float(x) for x in self.axis_x]} if ang else {}
+        turn = {"turns": [[[float(x) for x in O], [float(x) for x in z], a] for O, z, a in turns]} if turns else {}
         hist = features.history_enabled(context)
         done = []
         for o, pts in [(o, [p for oo, p in items if oo == o]) for o in {o for o, _ in items}]:
@@ -1574,7 +1649,8 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
                     "axis_y_local": [float(x) for x in L3 @ Vector(self.axis_y)],
                     "axis_point_local": [float(x) for x in Mi @ Vector(self.axis_point)],
                     "move_x": 0.0 if curved else float(self.move_x), "move_y": 0.0 if curved else float(self.move_y),
-                    "slide": float(self.slide) if curved else 0.0, "turn": ang}, base_text=pre)
+                    "slide": float(self.slide) if curved else 0.0, "turn": ang,
+                    "tilt": float(self.tilt) if self.mode == "SPHERE" else 0.0}, base_text=pre)
             if moved:
                 try:
                     subsel.set_picks(o, "FACE", sorted({_face_index(o, q) for q in moved}))
@@ -1582,6 +1658,7 @@ class NPROTO_OT_move_face(_FacePicking, ValueDrag, AskValue, bpy.types.Operator)
                     print("NURBS move face picks:", exc)
             done.append(o)
             how = " ".join(x for x in (f"turned {ang:.4g}°" if ang else "",
+                                       f"tilted {self.tilt:.4g}°" if self.mode == "SPHERE" and self.tilt else "",
                                        f"moved {float(np.linalg.norm(d)):.4g}" if np.linalg.norm(d) > 0 else "") if x)
             self.report({'INFO'}, f"{o.name}: a feature of {info.get('feature', 0)} face"
                                   f"{'s' if info.get('feature', 0) != 1 else ''} {how} · "

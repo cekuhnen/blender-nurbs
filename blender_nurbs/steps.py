@@ -520,7 +520,7 @@ def apply_move_face(obj, text, inputs, p):
     """Move Face on rebuild: the feature holding the faces at the stored points
     moved again as stored (local): on a flat face slid by the two distances
     along the two directions; on a curved one turned about and slid along its
-    axis."""
+    axis; on a sphere tilted (about the stored tilt axis), then turned."""
     M = _world(obj)
     pts = [list(M @ Vector(q)) for q in p["faces_local"]]
     L = M.to_3x3()
@@ -530,10 +530,15 @@ def apply_move_face(obj, text, inputs, p):
                  + float(p.get("move_y", 0.0)) * Vector(p["axis_y_local"]))
     else:
         z = (L @ Vector(p["axis_x_local"])).normalized()
+        O = list(M @ Vector(p["axis_point_local"]))
         v = float(p.get("slide", 0.0)) * z
+        turns = []
+        if p.get("mode") == "SPHERE" and abs(float(p.get("tilt", 0.0))) > 0.0:
+            turns.append([O, list((L @ Vector(p["axis_y_local"])).normalized()), float(p["tilt"])])
         if abs(float(p.get("turn", 0.0))) > 0.0:
-            kw = {"angle": float(p["turn"]), "axis_point": list(M @ Vector(p["axis_point_local"])),
-                  "axis_dir": list(z)}
+            turns.append([O, list(z), float(p["turn"])])
+        if turns:
+            kw = {"turns": turns}
     _, breps = jobs.run("move_face", {"target": (text, jobs.xform(obj))}, ["result"], face_pts=pts,
                         vector=list(v), into="target", **kw)
     return breps["result"]
@@ -543,6 +548,7 @@ def _move_face_label(p):
     if p.get("mode", "PLANE") == "PLANE":
         return f"Move Face · {math.hypot(float(p.get('move_x', 0)), float(p.get('move_y', 0))):.3g}"
     bits = [f"{float(p.get('turn', 0)):.3g}°" if abs(float(p.get("turn", 0))) > 0 else "",
+            f"tilt {float(p.get('tilt', 0)):.3g}°" if abs(float(p.get("tilt", 0))) > 0 else "",
             f"{float(p.get('slide', 0)):.3g}" if abs(float(p.get("slide", 0))) > 0 else ""]
     return " · ".join(["Move Face"] + [b for b in bits if b])
 

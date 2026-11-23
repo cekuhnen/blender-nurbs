@@ -84,11 +84,43 @@ def _winds(sm, srf, k, cycle):
     return abs(net) > P / 2
 
 
+def pole_ends(srf, k):
+    """The ends of the open direction (the one other than k) where the
+    surface shrinks to a point (a sphere's poles), as parameter values."""
+    j = 1 - k
+    (u0, u1), (v0, v1) = srf.u_domain(), srf.v_domain()
+    size = _dist(srf.evaluate(u0, v0), srf.evaluate((u0 + u1) / 2, (v0 + v1) / 2)) + \
+        _dist(srf.evaluate(u1, v1), srf.evaluate((u0 + u1) / 2, (v0 + v1) / 2)) or 1.0
+    out = []
+    for end in ((u0, u1), (v0, v1))[j]:
+        pts = []
+        for i in range(6):
+            t = (i + 0.5) / 6
+            pts.append(srf.evaluate(end, v0 + t * (v1 - v0)) if j == 0 else srf.evaluate(u0 + t * (u1 - u0), end))
+        if max(_dist(p, pts[0]) for p in pts) <= 1e-7 * size:
+            out.append(end)
+    return out
+
+
+def _open_coord(sm, srf, j, cycle):
+    """The mean open-direction parameter along a cycle."""
+    ts = []
+    for e, _ in cycle:
+        t0, t1 = e.parameter_range()
+        for i in range(6):
+            q = e.point_at(float(t0 + (t1 - t0) * i / 6))
+            uv = sm.surface_closest_point(srf, tuple(float(x) for x in q))[1][0]
+            ts.append(float(uv.y if j else uv.x))
+    return sum(ts) / len(ts)
+
+
 def face_cycles(face):
     """(cycles, k): the face's boundary as closed cycles of (edge, forward),
     each with its kind -- 'outer' (the outline), 'inner' (a hole or a
-    feature's rim) or 'winding' (a closed face's rim running round it: a
-    cylinder side's two circles) -- and k, the direction it closes in (None:
+    feature's rim), 'winding' (a closed face's rim running round it: a
+    cylinder side's two circles, a dome's base) or 'pole' (a hole round a
+    pole the face does not reach: one drilled at a dome's top; it runs round
+    the face's parameters like a winding rim) -- and k, the direction it closes in (None:
     an open face, whose loops are the cycles). On a closed face the seam edges
     are left out and the runs between them joined up."""
     outer = {e for e, _ in face.boundary_outer_loop()}
@@ -130,28 +162,64 @@ def face_cycles(face):
             cyc += runs.pop(j)
         cycles.append(cyc)
     sm = _k()
-    kinds = ["winding" if _winds(sm, face.surface(), k, c) else "inner" for c in cycles]
-    if "winding" not in kinds:                    # a patch the seam runs across: the widest is its outline
-        def span(c):
+    srf = face.surface()
+    kinds = ["winding" if _winds(sm, srf, k, c) else "inner" for c in cycles]
+    # poles: the open direction ending in a point (a sphere's, a dome's top). A
+    # rim running round the face with a pole beyond it that the face does not
+    # reach goes round that pole: a hole drilled at a dome's top, or the
+    # dome's own base (rims() tells them apart by which side is the smaller)
+    poles = pole_ends(srf, k)
+    if poles and "winding" in kinds:
+        j = 1 - k
+        ip = face.interior_point()
+        uvi = sm.surface_closest_point(srf, tuple(float(x) for x in ip))[1][0]
+        ti = float(uvi.y if j else uvi.x)
+        lo, hi = (srf.u_domain(), srf.v_domain())[j]
+        for i, c in enumerate(cycles):
+            if kinds[i] == "winding" and (hi if ti < _open_coord(sm, srf, j, c) else lo) in poles:
+                kinds[i] = "pole"
+    if cycles and not poles and "winding" not in kinds:
+        def span(c):                              # a patch the seam runs across: the widest is its outline
             P = [e.point_at(float(t)) for e, _ in c for t in e.parameter_range()]
             return max(_dist(p, q) for p in P for q in P)
         kinds[max(range(len(cycles)), key=lambda i: span(cycles[i]))] = "outer"
     return list(zip(cycles, kinds)), k
 
 
-def inner_loop_edges(face):
-    """The edges of the face's holes and feature rims (its inner loops; on a
-    closed face its cycles that do not run round it)."""
-    cycles, _ = face_cycles(face)
-    return {e for c, kind in cycles if kind == "inner" for e, _ in c}
-
-
 def rims(brep):
-    """{edge: the face it is an inner-loop edge of} over the whole body."""
-    out = {}
+    """{edge: the face it is a feature's rim in} over the whole body: the
+    edges of every face's inner loops (on a closed face its cycles that do
+    not run round it), and of a rim round a pole when the faces beyond it are
+    the smaller part of the body (a hole drilled at a dome's top, not the
+    rod a ball sits on)."""
+    out, poles = {}, []
     for f in brep.faces():
-        for e in inner_loop_edges(f):
-            out[e] = f
+        for c, kind in face_cycles(f)[0]:
+            if kind == "inner":
+                for e, _ in c:
+                    out[e] = f
+            elif kind == "pole":
+                poles.append((f, c))
+    if not poles:
+        return out
+    bar = dict(out)
+    for f, c in poles:
+        for e, _ in c:
+            bar[e] = f
+    area = {}
+
+    def A(faces):
+        for g in faces:
+            if g not in area:
+                area[g] = float(g.area(1e-3))
+        return sum(area[g] for g in faces)
+    total = A(brep.faces())
+    for f, c in poles:
+        far = {g for e, _ in c for g in e.faces() if g != f}
+        reg = feature_region(brep, far, bar) if far else None
+        if reg is not None and A(reg[0]) < 0.5 * total:
+            for e, _ in c:
+                out[e] = f
     return out
 
 
