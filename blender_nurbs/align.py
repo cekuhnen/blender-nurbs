@@ -666,6 +666,32 @@ def _refit_points(Q, p, n, q):
     return fit(S, q, n, False)[0]
 
 
+LEG_REACH_DEFAULT = 1.0 / 3.0
+LEG_REACHES = (0.4, LEG_REACH_DEFAULT, 0.2, 0.1)      # how far an end's added CVs reach, longest first
+
+
+def _leg_points(Q, ks, q, reach=None):
+    """CV Curve with too few clicks for its aligned ends: the clicks stay the
+    CVs, and an end of G level k gets k more on its first leg. They sit as a
+    straight run of the endpoint-uniform degree-q curve spaces them (the
+    Greville points), the k-th reaching `reach` of the way to the next click,
+    so align_start turns the run onto the target and the curve keeps the end
+    speed that run has: the leg tips stay short of the clicks, the interior
+    clicks stay CVs (no dip between them)."""
+    reach = LEG_REACH_DEFAULT if reach is None else reach
+    Q = np.asarray(Q, float)
+    k0, k1 = int(ks.get("0", 0)), int(ks.get("1", 0))
+    n = len(Q) + k0 + k1
+    U = geom.clamped_uniform_knots(n, q)
+    xi = [sum(U[i + 1:i + q + 1]) / q for i in range(n)]      # Greville points (symmetric)
+
+    def run(a, b, k):
+        return [a + (xi[j] / xi[k]) * reach * (b - a) for j in range(1, k + 1)] if k else []
+    head = [Q[0]] + run(Q[0], Q[1], k0)
+    tail = run(Q[-1], Q[-2], k1)[::-1] + [Q[-1]]
+    return np.array(head + [c for c in Q[1:-1]] + tail)
+
+
 def _insert_cv(Q, e):
     """One more CV on the leg next to end e ("0" / "1"), a third of the way in."""
     Q = np.asarray(Q, float)
@@ -677,11 +703,12 @@ def _insert_cv(Q, e):
 def align_open(Q, p, ends, want=None):
     """World CVs (and degree) of an open endpoint-uniform spline with its ends
     aligned. ends = {"0" / "1": (spec, frame)}: spec as an align_curve end
-    (cont, weight, mode, snap), frame from end_frame(). The degree is raised and
-    the curve refitted with more CVs (same shape) when the ends need it, as
-    solve() would, so the result recorded as an align_curve feature rebuilds
-    unchanged. want: the degree asked for (CV Curve): p is that degree clamped
-    to the clicks, and when the ends add CVs the degree rises towards want, up
+    (cont, weight, mode, snap), frame from end_frame(). The degree is raised
+    when the ends need it, and too few clicks get the ends' CVs added on their
+    end legs (_leg_points: the clicks stay CVs), so the result recorded as an
+    align_curve feature rebuilds unchanged in solve(). want: the degree asked
+    for (CV Curve): p is that degree clamped to the clicks, and when the ends
+    add CVs the degree rises towards want, up
     to the final CV count - 1 (else two clicks with G2 ends always came out
     cubic). A NEAREST target in EDGE mode is flipped to leave the way the
     curve already heads, a NORMAL one to the side the curve is (spec["flip"]
@@ -699,16 +726,36 @@ def align_open(Q, p, ends, want=None):
     for e, (s_, _) in sorted(ends.items()):
         if CONT[s_.get("cont", "G1")] >= 3 and len(Q) >= 2:
             Q = _insert_cv(Q, e)
-    refit = max(len(Q), sum(need) + len(need), q + 1) != len(Q)     # too few CVs: refit, with room
-    # A refit counts the ends' CVs itself, so it starts from the clicks without
-    # the G3 legs' CVs: counted twice, they left spare CVs on the clicks'
-    # chord, and the curve dipped to it between the ends (2 inflections).
-    n_out = refit_count(len(Q0), need, q) if refit else len(Q)
+    grow = max(len(Q), sum(need) + len(need), q + 1) != len(Q)      # too few CVs for the ends
+    # Too few clicks: the ends' CVs are added to the clicks themselves (not to
+    # the G3 legs' inserted ones: counted twice, those left spare CVs on the
+    # clicks' chord and the curve dipped to it between the ends).
+    n_out = refit_count(len(Q0), need, q) if grow else len(Q)
     if want is not None:
         q = max(q, min(int(want), n_out - 1))
-    if refit:
-        Q = _refit_points(Q0, p, n_out, q)
-    p = q
+    if not grow:
+        return _align_ends(Q, q, ends, specs)
+    if n_out != len(Q0) + sum(need):          # (not reached: the clicks plus the ends' CVs always suffice)
+        return _align_ends(_refit_points(Q0, p, n_out, q), q, ends, specs)
+    # The clicks stay CVs, the added ones go on the end legs (a refit put the
+    # interior clicks on the old curve, below them, and its long legs rose
+    # above: a dip between). The longest legs whose CV polygon still turns one
+    # way: a planar curve with a convex CV polygon has no inflection. None
+    # does: the clicks themselves turn both ways, and the middle reach is used.
+    ks = {e: CONT[s_.get("cont", "G1")] for e, s_ in specs.items()}
+    fallback = None
+    for reach in LEG_REACHES:
+        sp_ = {e: dict(v) for e, v in specs.items()}
+        out = _align_ends(_leg_points(Q0, ks, q, reach), q, ends, sp_)
+        if one_way(out[0]):
+            return out
+        if reach == LEG_REACH_DEFAULT:
+            fallback = out
+    return fallback
+
+
+def _align_ends(Q, p, ends, specs):
+    """align_start on each end of the endpoint-uniform (Q, p) -> (Q, p, specs)."""
     U = geom.clamped_uniform_knots(len(Q), p)
     I = np.eye(4)
     for e in ("0", "1"):
@@ -724,6 +771,19 @@ def align_open(Q, p, ends, want=None):
         new = align_start(seg, Ub, p, spec, fr, I)
         Q = new if e == "0" else _reverse(new, Ub)[0]
     return Q, p, specs
+
+
+def one_way(Q):
+    """True when the CV polygon turns one way only: every turn's axis on the
+    same side (straight runs, like an aligned end's leg, don't count)."""
+    L = np.diff(np.asarray(Q, float), axis=0)
+    N = np.cross(L[:-1], L[1:])
+    size = float(np.max(np.linalg.norm(L, axis=1))) if len(L) else 0.0
+    N = N[np.linalg.norm(N, axis=1) > 1e-9 * size * size]
+    if len(N) < 2:
+        return True
+    ref = N.sum(axis=0)
+    return bool(np.all(N @ ref > 0))
 
 
 def move_end(obj, si, end, P):

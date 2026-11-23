@@ -468,6 +468,20 @@ for want in (4, 5):
     one_way = all(t <= sc for t in turns) or all(t >= -sc for t in turns)
     check(f"CV Curve degree {want}, G3 ends on lines: 8 CVs, no dip between the ends",
           sp_["order"] - 1 == want and len(X) == 8 and one_way, (sp_["order"] - 1, len(X), np.round(turns, 4)))
+# A middle click: it stays a CV (a refit put it on the old curve, below the
+# click, while the long end legs rose above it: a dip at degree 4), and the
+# ends' legs stop short enough that the CV polygon turns one way only.
+mid = (0.2, -0.5, 0.0)          # inside the lines' wedge: a curve with no inflection exists
+for cont in ("G1", "G2", "G3"):
+    for want in (3, 4, 5):
+        ends = {e: ({"cont": cont, "weight": 1.0, "mode": "EDGE", "snap": "END", "flip": False},
+                    align.end_frame(L, "S0", np.array(c), "END", "EDGE")) for e, L, c in (("0", LA, clicks[0]), ("1", LB, clicks[1]))}
+        sp_, _ = drawtools.build_spec_ends([clicks[0], mid, clicks[1]], "CV", want, ends)
+        X = np.array([tuple(q)[:3] for q in sp_["points"]])
+        k = align.CONT[cont]
+        kept = np.linalg.norm(X - np.array(mid), axis=1).min()
+        check(f"CV Curve {cont} degree {want}, a middle click: still a CV, 3 + {2 * k} CVs, no dip",
+              kept < 1e-9 and len(X) == 3 + 2 * k and align.one_way(X), (kept, len(X)))
 
 # ------------------------------------------------------------- the user's file: aligned curves rebuild stably
 user = sys.argv[sys.argv.index("--") + 1] if "--" in sys.argv else os.path.join(ROOT, "Blend Files", "blend cv align curve  spline surface.blend")
