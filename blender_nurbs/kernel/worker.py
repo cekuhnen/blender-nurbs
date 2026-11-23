@@ -186,6 +186,16 @@ class CurveCutter:
         intersection lose a sliver at a corner (a 0.15 mm gap in a spoon's
         notch, so the loop did not close); a piece's end is a sheet edge,
         which the imprint meets exactly."""
+        for sheet in self.sheet_list(b):
+            b = sm.boolean_with_options(b, sheet, operation=sm.BooleanOp.UNION, imprinting=True,
+                                        keep_other_brep=True)
+            if b is None:
+                return None
+        return b
+
+    def sheet_list(self, b):
+        """The cutting sheets (one per smooth piece of the curve), long enough
+        to pass through b."""
         np = _np()
         lo, hi = (np.array(v) for v in b.bounding_box())
         P = np.array(_poly(curve(self.data), 64))
@@ -193,14 +203,11 @@ class CurveCutter:
         L = 4.0 * (reach or 1.0)
         d = -self.dir if self.reach == "BACK" else self.dir
         start = -0.5 * L if self.reach == "BOTH" else 0.0
+        out = []
         for piece in corner_pieces(self.data):
             c = sm.translate(curve(piece), tuple(start * d)) if start else curve(piece)
-            sheet = ext.brep_from_surface(sm.create_extrude_surface(c, tuple(L * d)))
-            b = sm.boolean_with_options(b, sheet, operation=sm.BooleanOp.UNION, imprinting=True,
-                                        keep_other_brep=True)
-            if b is None:
-                return None
-        return b
+            out.append(ext.brep_from_surface(sm.create_extrude_surface(c, tuple(L * d))))
+        return out
 
     def inside(self, p):
         if not self.closed:
@@ -238,6 +245,9 @@ class SurfaceCutter:
     def split(self, b, ref):
         return sm.boolean_with_options(b, self._brep(), operation=sm.BooleanOp.UNION,
                                        imprinting=True, keep_other_brep=True)
+
+    def sheet_list(self, b):
+        return [self._brep()]
 
     def inside(self, p):
         np = _np()
@@ -1414,6 +1424,9 @@ class PullCutter(SurfaceCutter):
                 return None
         return b
 
+    def sheet_list(self, b):
+        return [sh.copy() for sh in self.sheets]
+
 
 def pull_sheets(target, data):
     """The sheets of a curve cut along itself: half height enough to pass
@@ -1625,16 +1638,247 @@ def job_untrim_region(job):
             "restored": float(sum(faces[i].area(1e-6) for gi in back for i in groups[gi]))}
 
 
+def _solid_caps(solid, cutters):
+    """Each cutter sheet cut down to its part inside the solid, split along
+    the other cutters' sheets: the faces that close the pieces of a split."""
+    per = [c.sheet_list(solid) for c in cutters]
+    caps = []
+    for ci, sheets in enumerate(per):
+        for sh in sheets:
+            try:
+                cap = sm.boolean_with_options(sh, solid.copy(), operation=sm.BooleanOp.INTERSECTION)
+            except Exception:
+                cap = None
+            if cap is None or cap.face_count() == 0:
+                continue
+            for cj, others in enumerate(per):
+                if cj == ci:
+                    continue
+                for o in others:
+                    cut = sm.boolean_with_options(cap, o.copy(), operation=sm.BooleanOp.UNION, imprinting=True,
+                                                  keep_other_brep=True)
+                    if cut is not None and cut.face_count():
+                        cap = cut
+            caps.append(cap)
+    return caps
+
+
+def _solid_cells(b, caps, size):
+    """The closed pieces of a solid cut along sheets. b: the solid imprinted
+    along every cut (outward normals); caps: the sheets' parts inside it.
+    Round every edge, the faces meeting there (b's and the caps') are put in
+    angular order; each wedge between two neighbours joins the sides of the
+    two faces that look into it. A b face's outer side is the outside; a
+    group of face sides that never reaches it is a piece. Returns
+    [(b face indices, {cap index: face indices})]; a cap face with the same
+    piece on both sides (a cut that stops inside the body) is left out."""
+    np = _np()
+    F = [(f, None) for f in b.faces()]                 # (face, cap index or None for b)
+    for k, cap in enumerate(caps):
+        F += [(f, k) for f in cap.faces()]
+    nb = b.face_count()
+    delta, near = 2e-3 * size, 1e-4 * size
+    E = []                                             # every face's edges: (face index, edge, polyline)
+    for gi, (f, _) in enumerate(F):
+        for e in f.edges():
+            P = np.array(_edge_poly(e, 24), float)
+            if len(P) >= 2 and e.length() > near:
+                E.append((gi, e, P))
+
+    def normal(gi, q):
+        f, k = F[gi]
+        _, uvs, _ = sm.surface_closest_point(f.surface(), tuple(map(float, q)))
+        u, v = uvs[0].x, uvs[0].y
+        n = np.array(f.outward_normal_at_uv(u, v) if k is None else f.normal_at_uv(u, v), float)
+        return n / (np.linalg.norm(n) or 1.0)
+
+    def into(gi, m, t):
+        """Unit direction from m into face gi, square to the edge (None: both ways, a seam)."""
+        n = normal(gi, m)
+        d = np.cross(n, t)
+        d /= np.linalg.norm(d) or 1.0
+        f = F[gi][0]
+        ins = [f.closest_point(tuple(map(float, m + s * delta * d)))[1] < 0.3 * delta for s in (1.0, -1.0)]
+        if ins[0] == ins[1]:
+            return None, n
+        return (d if ins[0] else -d), n
+
+    OUT = 2 * len(F)
+    parent = list(range(OUT + 1))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, c):
+        parent[find(a)] = find(c)
+
+    def node(gi, side):
+        if F[gi][1] is None and side > 0:
+            return OUT
+        return 2 * gi + (0 if side > 0 else 1)
+
+    for gi, e, P in E:
+        t0, t1 = e.parameter_range()
+        tm = 0.5 * (t0 + t1)
+        m = np.array(e.point_at(tm), float)
+        t = np.array(e.tangent_at(tm), float)
+        t /= np.linalg.norm(t) or 1.0
+        ring = {gi}
+        for gj, e2, P2 in E:
+            if gj in ring or np.min(np.linalg.norm(P2 - m, axis=1)) > 0.5 * float(
+                    np.max(np.linalg.norm(np.diff(P2, axis=0), axis=1))) + near:
+                continue
+            if e2.closest_point(tuple(map(float, m)))[2] <= near:
+                ring.add(gj)
+        ent = []
+        for gj in ring:
+            d, n = into(gj, m, t)
+            if d is not None:
+                ent.append((gj, d, n))
+        if len(ent) < len(ring) or not ent:
+            continue                                   # a seam: the face meets itself
+        a = ent[0][1]
+        c = np.cross(t, a)
+        ent.sort(key=lambda x: float(np.arctan2(x[1] @ c, x[1] @ a)))
+        for i in range(len(ent)):
+            (ga, da, na), (gb, db, nb_) = ent[i], ent[(i + 1) % len(ent)]
+            sa = 1 if float(na @ np.cross(t, da)) > 0 else -1           # the wedge turns on from A ...
+            sb = 1 if float(nb_ @ -np.cross(t, db)) > 0 else -1         # ... and ends at B
+            union(node(ga, sa), node(gb, sb))
+    out_root = find(OUT)
+    cells = {}
+    for gi in range(len(F)):
+        for side in (1, -1):
+            nd = node(gi, side)
+            if nd == OUT or find(nd) == out_root:
+                continue
+            cells.setdefault(find(nd), {}).setdefault(gi, set()).add(side)
+    result = []
+    for members in cells.values():
+        bf = sorted(gi for gi in members if gi < nb)
+        if not bf:
+            continue
+        cf = {}
+        for gi, sides in members.items():
+            if gi >= nb and len(sides) == 1:
+                k = F[gi][1]
+                cf.setdefault(k, []).append(gi - nb - sum(caps[j].face_count() for j in range(k)))
+        result.append((bf, cf))
+    return result
+
+
+def _cell_brep(b, caps, cell, tol):
+    """One piece of a split solid: its faces of b and of the caps stitched
+    into a closed body."""
+    bf, cf = cell
+    part = b.copy()
+    keep = set(bf)
+    drop = [f for i, f in enumerate(part.faces()) if i not in keep]
+    if drop:
+        ext.delete_faces(part, drop)
+    for k, idx in cf.items():
+        cp = caps[k].copy()
+        keep = set(idx)
+        drop = [f for i, f in enumerate(cp.faces()) if i not in keep]
+        if drop:
+            ext.delete_faces(cp, drop)
+        ext.append_brep(part, cp)
+    res = sm.stitch_advanced(part, tol, squeeze_small_edges=False, making_manifold_solid=True)
+    out = res[0]
+    try:
+        sm.unify_normals(out, max(out.faces(), key=lambda f: f.area()), 100)
+    except Exception:
+        pass
+    try:
+        h = sm.heal_brep(out)
+        if h is not None and h.is_manifold_solid() and abs(h.volume(1e-6)) > 0:
+            out = h
+    except Exception:
+        pass
+    return out
+
+
+def _job_split_solid(job, cutters, solid):
+    """job_split for a closed solid: every piece a closed solid of its own."""
+    np = _np()
+    lo, hi = (np.array(v, float) for v in solid.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    b = solid.copy()
+    for c in cutters:
+        b = c.split(b, tuple(job["ref_point"]))
+        if b is None or b.face_count() == 0:
+            raise RuntimeError("the cut produced nothing (does the cutter cross the solid?)")
+    caps = _solid_caps(solid, cutters)
+    cells = _solid_cells(b, caps, size)
+    if len(cells) < 2:
+        raise RuntimeError("the cutters do not split this solid into separate pieces")
+    tol = 1e-4 * size
+    x = job.get("xforms", {}).get("target")
+    keep = job.get("keep")
+    if keep is not None:                    # the marked pieces joined into one body
+        chosen = [cells[i] for i, k in enumerate(keep) if k and i < len(cells)]
+        bf = sorted({i for c in chosen for i in c[0]})
+        count = {}
+        for c in chosen:
+            for k, idx in c[1].items():
+                for i in idx:
+                    count[(k, i)] = count.get((k, i), 0) + 1
+        cf = {}
+        for (k, i), n in count.items():
+            if n == 1:                      # a cap between two kept pieces goes
+                cf.setdefault(k, []).append(i)
+        part = _cell_brep(b, caps, (bf, cf), tol)
+        try:              # no seam where the dropped wall met the faces (as Trim's merge)
+            healed = heal_cut_seams(part, solid)
+            if healed is not part and healed.is_manifold_solid():
+                part = healed
+        except Exception:
+            pass
+        save(to_local(part, x), job["out"]["KEEP"] if "KEEP" in job.get("out", {})
+             else os.path.join(job["out_dir"], "out_KEEP.sm"))
+        return {"regions": len(cells), "solid": True, "closed": bool(part.is_manifold_solid())}
+    areas, points, closed, volumes = [], [], [], []
+    for gi, cell in enumerate(cells):
+        part = _cell_brep(b, caps, cell, tol)
+        f = max(part.faces(), key=lambda fc: fc.area(1e-3))
+        points.append([float(v) for v in _inner_point(f)])
+        ok = bool(part.is_manifold_solid())
+        closed.append(ok)
+        try:
+            volumes.append(abs(float(part.volume(1e-6))) if ok else 0.0)
+        except Exception:
+            volumes.append(0.0)
+        areas.append(part.area())
+        save(to_local(part, x), os.path.join(job["out_dir"], f"out_region{gi}.sm"))
+    return {"regions": len(cells), "areas": areas, "extended": job.get("extended", []), "points": points,
+            "sides": [[None] * len(cutters) for _ in cells], "picked": 0, "solid": True, "closed": closed,
+            "volumes": volumes}
+
+
 def job_split(job):
     """Split the target along all cutters and write EVERY region as its own
     brep (out_region<i>.sm in out_dir). Cutting surfaces that miss the target
-    are ignored; nothing is removed."""
+    are ignored; nothing is removed. With job["solids"] a closed solid comes
+    apart into closed solids (each piece capped where it was cut); then
+    job["keep"] (one bool per piece) writes the kept pieces joined into one
+    body as out_KEEP.sm."""
     cutters = build_cutters(job, strict=False)
     if not cutters:
         raise RuntimeError("nothing crosses this surface")
     if "ref_point" not in job:
         lo, hi = world_brep(job, "target").bounding_box()
         job["ref_point"] = [0.5 * (lo[i] + hi[i]) for i in range(3)]
+    if job.get("solids"):
+        target = world_brep(job, "target")
+        try:
+            is_solid = bool(target.is_manifold_solid())
+        except Exception:
+            is_solid = False
+        if is_solid:
+            return _job_split_solid(job, cutters, target)
     b, faces, groups, picked, sides = _regions(job, cutters)
     if len(groups) < 2:
         raise RuntimeError("the cutters do not split this surface into separate regions")

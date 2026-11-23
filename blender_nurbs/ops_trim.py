@@ -1356,9 +1356,10 @@ class NPROTO_OT_split(bpy.types.Operator):
     curves, lines and picked edges (projected onto the surface). A cutter that
     stops short is extended until it cuts across. The regions show first, all
     green: each becomes its own object. Click regions to turn them blue: the
-    blue ones are joined into one piece. Enter splits. Nothing is removed. With history the
-    split surfaces are kept as hidden inputs and each piece follows them (and
-    what cut them)"""
+    blue ones are joined into one piece. Enter splits. Nothing is removed. A
+    closed solid comes apart into closed solids, each capped where it was cut
+    (Solid Pieces). With history the split surfaces are kept as hidden inputs
+    and each piece follows them (and what cut them)"""
     bl_idname = "nproto.split"
     bl_label = "Split"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1389,6 +1390,9 @@ class NPROTO_OT_split(bpy.types.Operator):
     targets: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     curves: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     cutter_surfs: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})   # surfaces that only cut (picked as cutters)
+    solids: BoolProperty(name="Solid Pieces", default=True,
+                         description="A closed solid comes apart into closed solids: each piece is capped "
+                                     "where it was cut. Off: its faces are only split, the pieces stay open")
     split_all: BoolProperty(name="Split All", default=False,
                             description="Every region becomes its own object (the marks are ignored)")
     # regions marked in the preview: {surface name: [[world point, stays?, side], ...]}
@@ -1397,7 +1401,7 @@ class NPROTO_OT_split(bpy.types.Operator):
     def _params(self):
         return {"surfaces_cut": bool(self.surfaces_cut), "projection": self.projection,
                 "view_dir": [float(x) for x in self.view_dir], "extend": bool(self.extend), "reach": self.reach,
-                "through": bool(self.through)}
+                "through": bool(self.through), "solids": bool(self.solids)}
 
     def _inputs(self, tgt, surfs, crv_inputs):
         cutters = [bpy.data.objects[n] for n in json.loads(self.cutter_surfs or "[]") if n in bpy.data.objects]
@@ -1712,7 +1716,7 @@ class NPROTO_OT_split(bpy.types.Operator):
     def draw(self, context):
         lay = self.layout
         lay.use_property_split = True
-        for name in ("surfaces_cut", "projection", "reach", "through", "extend", "split_all"):
+        for name in ("surfaces_cut", "projection", "reach", "through", "extend", "solids", "split_all"):
             lay.prop(self, name)
         if self.marks and not self.split_all:
             lay.label(text="Pieces as marked in the viewport")
@@ -1743,6 +1747,9 @@ class NPROTO_OT_split(bpy.types.Operator):
                 info = steps.split_info(inputs, params, notes)
                 if len(info["texts"]) < 2:
                     raise jobs.JobError("the cutters do not split this surface into separate regions")
+                if info.get("solid") and not all(info.get("closed") or [True]):
+                    skipped.append(f"{tgt.name}: {sum(1 for c in info['closed'] if not c)} piece(s) did not "
+                                 "close up into a solid")
                 stays = self._stays(info, all_marks.get(tgt.name))
                 if all(stays):     # every region joined: this surface only cuts the others
                     skipped.append(f"{tgt.name}: every region joined, left as it is")

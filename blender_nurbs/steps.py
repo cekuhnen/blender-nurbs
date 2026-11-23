@@ -586,7 +586,7 @@ def _split_job(inputs, p):
     d = view if proj in ("VIEW", "CURVE", "SURFACE") else Vector({"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}[proj])
     kw = {"curves": curves, "cutter_breps": list(others), "direction": list(d.normalized()),
           "extend": bool(p.get("extend", True)), "reach": p.get("reach", "BOTH"),
-          "through": bool(p.get("through", False))}
+          "through": bool(p.get("through", False)), "solids": bool(p.get("solids", False))}
     return {"target": tgt, **others}, kw, others
 
 
@@ -594,6 +594,8 @@ def split_info(inputs, p, notes=None):
     """The split of inputs[0] by the other inputs (surfaces "SURF", curves
     "S<i>" and surface edges), in the worker's region order: {"texts": local
     brep texts, "points": a world point inside each, "areas", "sides"}. With
+    p["solids"] a closed solid comes apart into closed solids ("solid": True,
+    their "volumes" and whether each "closed"). With
     p["extend"] (the default) a cutter whose cut stops inside the body is
     extended until it reaches across; `notes` (a list) receives what was."""
     import hashlib
@@ -603,7 +605,7 @@ def split_info(inputs, p, notes=None):
     for o in [tgt] + list(others.values()):
         h.update(o.get(store.PROP_BREP, "").encode())
         h.update(json.dumps(jobs.xform(o), sort_keys=True).encode())
-    h.update(json.dumps([kw["curves"], kw["direction"], kw["extend"], kw["reach"], kw["through"]],
+    h.update(json.dumps([kw["curves"], kw["direction"], kw["extend"], kw["reach"], kw["through"], kw["solids"]],
                         sort_keys=True).encode())
     key = h.hexdigest()
     if key in _split_cache:
@@ -617,7 +619,8 @@ def split_info(inputs, p, notes=None):
         notes += said
     n = info["regions"]
     out = {"texts": [breps[f"region{i}"] for i in range(n)], "points": info.get("points", []),
-           "areas": info.get("areas", []), "sides": info.get("sides", [])}
+           "areas": info.get("areas", []), "sides": info.get("sides", []), "solid": bool(info.get("solid")),
+           "volumes": info.get("volumes", []), "closed": info.get("closed", [])}
     if len(_split_cache) > 16:
         _split_cache.clear()
     _split_cache[key] = (out, said)
@@ -641,6 +644,9 @@ def merge_regions(inputs, p, keep):
     if len(picked) == 1:
         return out["texts"][picked[0]]
     objs, kw, _ = _split_job(inputs, p)
+    if out.get("solid"):          # pieces of a solid: joined into one closed body by the split job
+        _, breps = jobs.run("split", objs, ["KEEP"], keep=[bool(k) for k in keep], **kw)
+        return breps["KEEP"]
     marks = [[pt, bool(k), sd] for pt, k, sd in zip(out["points"], keep, out["sides"])]
     _, breps = jobs.run("trim", objs, ["KEEP"], ref_point=out["points"][picked[0]], action="KEEP", scope="PICKED",
                         marks=marks, strict=False, **kw)
