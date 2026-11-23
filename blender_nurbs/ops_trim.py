@@ -2203,6 +2203,7 @@ def fillet_frames(obj, idx, n=15):
     pts = np.array([_v3(e.point_at(t)) for t in np.linspace(t0, t1, 33)])
     eps = 1e-3 * float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))     # a step into a face
     Ps, D1, D2 = [], [], []
+    votes = ([], [])        # per face and sample: +1 / -1 the inside test's sign, 0 undecided
     for t in ts:
         P = _v3(e.point_at(t))
         a, c = _v3(e.point_at(max(t0, t - h))), _v3(e.point_at(min(t1, t + h)))
@@ -2228,12 +2229,25 @@ def fillet_frames(obj, idx, n=15):
                 if not (u0 - tu <= uu <= u1 + tu and v0 - tv <= vv <= v1 + tv):
                     return True
                 return f.classify_uv(uu, vv) == "outside"
-            if out(u + step[0], v + step[1]) and not out(u - step[0], v - step[1]):
-                d = -d
+            o_pos, o_neg = out(u + step[0], v + step[1]), out(u - step[0], v - step[1])
+            votes[len(ds)].append(0 if o_pos == o_neg else (1 if o_neg else -1))
             ds.append(d)
         Ps.append(P)
         D1.append(ds[0])
         D2.append(ds[1])
+    # one side for the whole edge: at a corner (the ends) the step leaves the
+    # trims both ways (or neither), so a sample's own test can't tell and a
+    # lone flipped section sticks out of the preview. Keep the directions
+    # continuous along the edge, then turn them all to the side most decided
+    # samples vote for.
+    for D, vs in ((D1, votes[0]), (D2, votes[1])):
+        sgn = [1.0]
+        for j in range(1, len(D)):
+            sgn.append(sgn[-1] * (1.0 if float(D[j] @ D[j - 1]) >= 0.0 else -1.0))
+        if sum(s * v for s, v in zip(sgn, vs)) < 0:
+            sgn = [-s for s in sgn]
+        for j, s in enumerate(sgn):
+            D[j] = s * D[j]
     P = np.array(Ps) @ M3.T + Mt
     to_w = lambda D: (lambda X: X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-300))(np.array(D) @ M3.T)
     return P, to_w(D1), to_w(D2)
