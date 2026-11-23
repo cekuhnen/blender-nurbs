@@ -674,13 +674,16 @@ def _insert_cv(Q, e):
     return np.vstack([Q[:1], Q[:1] + (Q[1] - Q[0]) / 3.0, Q[1:]])
 
 
-def align_open(Q, p, ends):
+def align_open(Q, p, ends, want=None):
     """World CVs (and degree) of an open endpoint-uniform spline with its ends
     aligned. ends = {"0" / "1": (spec, frame)}: spec as an align_curve end
     (cont, weight, mode, snap), frame from end_frame(). The degree is raised and
     the curve refitted with more CVs (same shape) when the ends need it, as
     solve() would, so the result recorded as an align_curve feature rebuilds
-    unchanged. A NEAREST target in EDGE mode is flipped to leave the way the
+    unchanged. want: the degree asked for (CV Curve): p is that degree clamped
+    to the clicks, and when the ends add CVs the degree rises towards want, up
+    to the final CV count - 1 (else two clicks with G2 ends always came out
+    cubic). A NEAREST target in EDGE mode is flipped to leave the way the
     curve already heads, a NORMAL one to the side the curve is (spec["flip"]
     set). Returns (Q, p, specs)."""
     Q = np.asarray(Q, float)
@@ -695,8 +698,12 @@ def align_open(Q, p, ends):
     for e, (s_, _) in sorted(ends.items()):
         if CONT[s_.get("cont", "G1")] >= 3 and len(Q) >= 2:
             Q = _insert_cv(Q, e)
-    if max(len(Q), sum(need) + len(need), q + 1) != len(Q):         # too few CVs: refit, with room
-        Q = _refit_points(Q, p, refit_count(len(Q), need, q), q)
+    refit = max(len(Q), sum(need) + len(need), q + 1) != len(Q)     # too few CVs: refit, with room
+    n_out = refit_count(len(Q), need, q) if refit else len(Q)
+    if want is not None:
+        q = max(q, min(int(want), n_out - 1))
+    if refit:
+        Q = _refit_points(Q, p, n_out, q)
     p = q
     U = geom.clamped_uniform_knots(len(Q), p)
     I = np.eye(4)

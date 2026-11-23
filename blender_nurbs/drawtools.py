@@ -169,7 +169,7 @@ def build_spec_ends(clicks, mode, deg, ends):
     if mode == "THROUGH":
         X, p, specs = through_ends(S, deg, ends)
     else:
-        X, p, specs = align.align_open(S, max(1, min(deg, len(S) - 1)), ends)
+        X, p, specs = align.align_open(S, max(1, min(deg, len(S) - 1)), ends, want=deg)
     return spec([tuple(x) for x in X], order=p + 1), specs
 
 

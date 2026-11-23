@@ -437,6 +437,24 @@ kept = [i for i in range(1, len(clicks)) if np.min(np.linalg.norm(X - clicks[i],
 check("CV Curve CV mode G3: one CV added, clicks 3 on stay where clicked",
       len(X) == len(clicks) + 1 and kept == list(range(3, len(clicks))), (len(X), kept))
 
+# ------------------------------------------------------------- CV Curve keeps the degree asked for (2 clicks, G2 ends)
+# The degree was clamped to the clicks (2 -> 1) before the ends added CVs, so
+# the ends' minimum (cubic) won whatever degree was picked.
+LA, LB = nurbs("DegA", [(-6, -6, 0), (-2, -2, 0)], order=2), nurbs("DegB", [(6, -6, 0), (2.5, -2.5, 0)], order=2)
+clicks = [(-2.0, -2.0, 0.0), (2.5, -2.5, 0.0)]
+for want, exp in ((5, 5), (4, 4), (1, 3)):
+    ends = {"0": ({"cont": "G2", "weight": 1.0, "mode": "EDGE", "snap": "END", "flip": False},
+                  align.end_frame(LA, "S0", np.array(clicks[0]), "END", "EDGE")),
+            "1": ({"cont": "G2", "weight": 1.0, "mode": "EDGE", "snap": "END", "flip": False},
+                  align.end_frame(LB, "S0", np.array(clicks[1]), "END", "EDGE"))}
+    sp_, specs = drawtools.build_spec_ends(clicks, "CV", want, ends)
+    X = np.array([tuple(q)[:3] for q in sp_["points"]])
+    D0, D1 = np.array([1.0, 1.0, 0.0]) / 2 ** .5, np.array([-1.0, 1.0, 0.0]) / 2 ** .5
+    off = max(max(np.linalg.norm(np.cross(X[j] - X[0], D0)) for j in (1, 2)),
+              max(np.linalg.norm(np.cross(X[-1 - j] - X[-1], D1)) for j in (1, 2)))
+    check(f"CV Curve degree {want}, G2 ends on lines: degree {exp}, 6 CVs, first legs on the lines",
+          sp_["order"] - 1 == exp and len(X) == 6 and off < 1e-6, (sp_["order"] - 1, len(X), off))
+
 # ------------------------------------------------------------- the user's file: aligned curves rebuild stably
 user = sys.argv[sys.argv.index("--") + 1] if "--" in sys.argv else os.path.join(ROOT, "Blend Files", "blend cv align curve  spline surface.blend")
 if os.path.exists(user):
