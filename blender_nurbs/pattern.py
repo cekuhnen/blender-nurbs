@@ -217,6 +217,8 @@ def local_flip(src, T):
 def total_count(p):
     if p.get("mode", "LINEAR") == "MIRROR":
         return 2
+    if p.get("mode") == "TWEEN":
+        return int(p.get("count", 3)) + int(p.get("extra", 0)) + 1
     if p.get("mode", "LINEAR") == "LINEAR":
         nx, ny, nz = counts(p)
         return nx * ny * nz
@@ -541,6 +543,9 @@ def copy_transform(p, src, index, path=None, cache=None, surfaces=None):
         return _scaled(_translation(v), p, src, index)
     if mode == "MIRROR":
         return mirror_matrix(*mirror_plane(p)) if index == 1 else None
+    if mode == "TWEEN":                         # path: (the second object, "TWEEN") -- tween.py
+        from .tween import copy_transform as tween_transform
+        return tween_transform(p, src, path[0] if path else None, index)
     n = max(int(p.get("count", 2)), 1)
     if not 0 < index < n:
         return None
@@ -2220,6 +2225,11 @@ def summary(p):
         ax = next((a.upper() for a, e in zip(AXES, np.eye(3)) if abs(abs(float(n @ e)) - 1.0) < 1e-9), None)
         return "Mirror · " + (f"normal {ax}" if ax else "normal ({:.2f}, {:.2f}, {:.2f})".format(*n)) + \
             " · through ({})".format(", ".join(fmt_length(ctx, float(c)) for c in O))
+    if mode == "TWEEN":
+        txt = f"Tween · {int(p.get('count', 3))} between"
+        if int(p.get("extra", 0)):
+            txt += f" · {int(p['extra'])} past"
+        return txt + (" · the long way round" if p.get("long_way") else "")
     if mode == "CIRCULAR":
         txt = f"Circular · {int(p.get('count', 2))} over {float(p.get('angle', 360.0)):g}°"
         return txt + ("" if p.get("rotate", True) else " · not rotated") + _scale_words(p)
@@ -2299,7 +2309,7 @@ def draw_patterns_of(layout, context, obj):
 
 
 def _edit_op(p):
-    return "nproto.mirror" if p.get("mode") == "MIRROR" else "nproto.pattern"
+    return {"MIRROR": "nproto.mirror", "TWEEN": "nproto.tween"}.get(p.get("mode"), "nproto.pattern")
 
 
 class NPROTO_OT_pattern(_PatternTool, bpy.types.Operator):
