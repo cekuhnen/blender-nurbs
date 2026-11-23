@@ -63,6 +63,23 @@ for cont in ("1", "2"):
            and f.interior_point()[1] > 0.3]
     check(f"G{cont}: the cylinder face is covered once", len(cyl) == 1 and cyl[0].area() < np.pi * 0.1524 * 0.34,
           [round(f.area(), 4) for f in cyl])
+    # the left run-out: the cylinder's sliver meets the back wall at 90 degrees;
+    # its corners must shade with their own face's normal, not one averaged
+    # across that crease (spikes)
+    sm, _ = store._k()
+    me, faces = o2.data, b.faces()
+    CN = np.array([c.vector[:] for c in me.corner_normals])
+    worst = 0.0
+    for poly in me.polygons:
+        c = np.array(poly.center[:])
+        if not (c[0] < -0.10 and 0.2 < c[1] < 0.4 and 0.15 < c[2] < 0.45):
+            continue
+        f = faces[int(np.argmin([fc.closest_point(tuple(map(float, c)))[1] for fc in faces]))]
+        for li, vi in zip(poly.loop_indices, poly.vertices):
+            w = sm.surface_closest_point(f.surface(), tuple(map(float, me.vertices[vi].co)))[1][0]
+            n = np.array(f.outward_normal_at_uv(*((w.x, w.y) if hasattr(w, "x") else (w[0], w[1]))), float)
+            worst = max(worst, float(np.degrees(np.arccos(np.clip(CN[li] @ n / np.linalg.norm(n), -1, 1)))))
+    check(f"G{cont}: run-out corners shade with their face's normal", worst < 5.0, f"worst {worst:.1f} deg")
 
 print("ALL OK" if ok else "SOME FAILED")
 if not ok:
