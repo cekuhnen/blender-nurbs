@@ -9436,6 +9436,55 @@ n_, s_, no_, b_, v_, sol_ = _m2b_run(_o)
 _m2r["a tube (quads only): an exact cylinder and hole, the hole through both annuli, a closed solid of 4 faces"] = \
     "1 hole" in s_ and "1 cylinder" in s_ and b_.face_count() == 4 and sol_ \
     and abs(v_ - math.pi * (0.16 - 0.09) * 0.5) < 1e-6 and _m2b_cyl_dev(b_, [(0.0, 0.0, 0.3), (0.0, 0.0, 0.4)]) < 1e-6
+# cones: a turned profile (closed loop of (r, z), r 0 a pole) spun into quads and pole fans; a cone is rebuilt as
+# a face ruled between its end circles and sewn to what closes its ends (the stool's lid in "mesh to brep.blend")
+def _m2b_turned(name, prof, x_, n_=48):
+    tb_ = _bmx.new()
+    rows_ = [[tb_.verts.new((r_ * math.cos(2 * math.pi * k_ / n_), r_ * math.sin(2 * math.pi * k_ / n_), z_))
+              for k_ in range(n_)] if r_ > 0 else [tb_.verts.new((0.0, 0.0, z_))] * n_ for r_, z_ in prof]
+    for j_ in range(len(prof)):
+        a_, c_ = rows_[j_], rows_[(j_ + 1) % len(prof)]
+        for k_ in range(n_):
+            q_ = [a_[k_], a_[(k_ + 1) % n_], c_[(k_ + 1) % n_], c_[k_]]
+            q_ = [v_ for i_, v_ in enumerate(q_) if v_ not in q_[:i_]]
+            if len(q_) >= 3:
+                tb_.faces.new(q_)
+    _bmx.ops.recalc_face_normals(tb_, faces=tb_.faces)
+    me_ = bpy.data.meshes.new(name)
+    tb_.to_mesh(me_)
+    tb_.free()
+    o_ = bpy.data.objects.new(name, me_)
+    ctx.scene.collection.objects.link(o_)
+    o_.location = (x_, 4.0, 0.0)
+    return o_
+_frus = lambda R_, r_, h_: math.pi * h_ / 3 * (R_ * R_ + R_ * r_ + r_ * r_)
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_turned("M2B_Chamfered", [(0, 0), (0.4, 0), (0.4, 0.4), (0.3, 0.5), (0, 0.5)], 0.0))
+_m2r["a chamfered puck (turned): an exact cylinder and a 45 deg cone sewn to the caps, a closed solid of 4 faces"] = \
+    "1 cylinder" in s_ and "1 cone 45°" in s_ and b_.face_count() == 4 and sol_ \
+    and abs(v_ - math.pi * 0.16 * 0.4 - _frus(0.4, 0.3, 0.1)) < 1e-6
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_turned("M2B_Countersink", [(0.1, 0), (0.5, 0), (0.5, 0.3), (0.2, 0.3), (0.1, 0.2)], 1.5))
+_m2r["a countersunk ring: the hole and its cone sewn, the outer wall and both annuli with it, a closed solid of 5 faces"] = \
+    "1 hole" in s_ and "1 cylinder" in s_ and "1 cone" in s_ and b_.face_count() == 5 and sol_ \
+    and abs(v_ - (math.pi * 0.25 * 0.3 - math.pi * 0.01 * 0.2 - _frus(0.2, 0.1, 0.1))) < 1e-6
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_turned("M2B_Taper", [(0, 0), (0.4, 0), (0.2, 0.5), (0, 0.5)], 3.0, n_=24))
+_m2r["a tapered plug (24 sides): one cone between two discs, the frustum's exact volume"] = \
+    "2 planes" in s_ and s_.count("cone") == 1 and b_.face_count() == 3 and sol_ and abs(v_ - _frus(0.4, 0.2, 0.5)) < 1e-6
+def _m2b_lid(name, x_):                    # the lid: a slanted rim and top spun by Screw, Solidify (complex) outward
+    me_ = bpy.data.meshes.new(name)
+    me_.from_pydata([(-0.264934, 0, 0.40005), (-0.238125, 0, 0.45085), (0, 0, 0.45085)], [(1, 0), (2, 1)], [])
+    o_ = bpy.data.objects.new(name, me_)
+    ctx.scene.collection.objects.link(o_)
+    o_.location = (x_, 4.0, 0.0)
+    sc_ = o_.modifiers.new("Screw", 'SCREW')
+    sc_.steps = sc_.render_steps = 32
+    so_ = o_.modifiers.new("Solidify", 'SOLIDIFY')
+    so_.solidify_mode, so_.thickness, so_.offset, so_.use_even_offset = 'NON_MANIFOLD', 0.00635, 1.0, True
+    return o_
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_lid("M2B_Lid", 4.5))
+_m2r["a lid (Screw + Solidify, slanted rim): three cones (outside, inside, the rim between), 2 planes, 5 faces"] = \
+    "2 planes" in s_ and s_.count("cone") == 3 and b_.face_count() == 5 and sol_ and no_ is None
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_lid("M2B_LidNoCones", 5.5), cones=False)
+_m2r["a lid with cones off: its facets, as before"] = "cone" not in s_ and b_.face_count() == 98 and sol_
 # boxy bevels (Profile above 0.5): an exact superellipse strip, G2 to both faces, where it ends on flat faces
 def _boxy_vol(p_, w_=0.1, a_=0.6):
     r_ = -2 * math.log(2) / math.log(p_)

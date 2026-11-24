@@ -6245,7 +6245,7 @@ def job_mesh_to_brep(job):
     np = _np()
     tol = float(job.get("tol", 1e-6))
     body = None
-    parts, tight = [], {}
+    parts, tight, late = [], {}, False
     at = lambda q: tuple(q["p"]) if isinstance(q, dict) else tuple(q)
     for loops in job["faces"]:
         quad = _flat_quad(loops, tol)
@@ -6263,7 +6263,11 @@ def job_mesh_to_brep(job):
                 else:
                     cs.append(sm.create_line_segment(at(q), at(P[(k + 1) % len(P)])))
         parts.append(sm.create_planar_faces(cs))
-        tight[len(parts) - 1] = _shrink_plane(parts[-1])   # its plane cut down to the outline
+        if any(len(P) == 1 and isinstance(P[0], dict) for P in loops):
+            late = True                       # a whole circle (a sewn cone's end): stitched cut down, it lost ~1e-5
+                                              # of its radius; cut down after stitching it stays exact
+        else:
+            tight[len(parts) - 1] = _shrink_plane(parts[-1])   # its plane cut down to the outline
     for g in job.get("patches", []):          # a free-form patch: a B-spline (u-major net; bicubic unless said)
         d = int(g.get("degree", 3))
         parts.append(ext.brep_from_surface(ext.surface_from_cvs(d, d, [tuple(c) for c in g["net"]],
@@ -6332,7 +6336,7 @@ def job_mesh_to_brep(job):
             continue
         body = r
         done.append(g)
-    if done or job.get("cylinders"):         # planes a fillet or a hole cut into: down to what is left of them
+    if done or job.get("cylinders") or late:  # planes a fillet or a hole cut into: down to what is left of them
         body = _shrink_planes(body)
     xf = job.get("xform")
     if "base" in job["out"]:                  # (SubD to BREP has no fillets: it asks for the result only)
