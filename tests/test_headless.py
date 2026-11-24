@@ -3593,6 +3593,9 @@ def _fake(op_cls, **props):
     cls.report = lambda self, t, m: self.msgs.append(m)
     f = cls()
     f.msgs, f.data = [], ""
+    for k_, v_ in getattr(op_cls, "__annotations__", {}).items():   # the operator's own defaults (Show CVs / Comb)
+        if "default" in getattr(v_, "keywords", {}):
+            setattr(f, k_, v_.keywords["default"])
     for k_, v_ in props.items():
         setattr(f, k_, v_)
     return f
@@ -5253,8 +5256,13 @@ _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto)
               if n not in _not_tools and not n.startswith("workplane_")}   # the Work Planes panel's own
 _menu_only = {t[0] for g in _tg.GROUPS for sec in g[2] for row in sec[1] if isinstance(row, _tg.MenuOnly)
               for t in row if t[0] != "nproto.add_primitive"}     # Edit CVs: Tab does it, the menus list it
-_tool_ops = [o_ for o_ in _in_panels if o_ not in ("nproto.add_primitive", "nproto.boolean")] + \
-    ["nproto.boolean"] + sorted(_menu_only)          # (one button per operation)
+_pbtn = [(e["op"], repr(sorted(e.get("props", {}).items()))) for n, r in _drawn.items()
+         if n.startswith("VIEW3D_PT") or n in _DROPS for e in r if "op" in e]
+_variant_ops = {o_ for o_ in set(_in_panels) if _in_panels.count(o_) > 1 and o_ != "nproto.add_primitive"
+                and len({p_ for q_, p_ in _pbtn if q_ == o_}) == _in_panels.count(o_)}
+_tool_ops = [o_ for o_ in _in_panels if o_ != "nproto.add_primitive" and o_ not in _variant_ops] + \
+    sorted(_variant_ops) + sorted(_menu_only)        # (Boolean, Twist / Bend / Taper, Remove (All) Fillets:
+                                                     # one button per variant, each with its own settings)
 _bool_ops = sorted(e["props"].get("operation") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r
                    if e.get("op") == "nproto.boolean")
 _kinds = [e["props"].get("kind") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") or n in _DROPS for e in r
@@ -5327,8 +5335,9 @@ _rows = []
 _tg.draw_panel(_ActLay(_rows), "SURFACE_EDIT", ctx)
 _rows_c = []
 _tg.draw_panel(_ActLay(_rows_c), "CURVE_EDIT", ctx)
-_cut = {"nproto.trim", "nproto.split", "nproto.emboss"}   # they take the curve (a cutter, a profile)
-check("UI: a curve selected dims Surface Edit (still clickable) but Trim / Split / Emboss and not Curve Edit; "
+_cut = {"nproto.trim", "nproto.split", "nproto.emboss",   # they take the curve (a cutter, a profile)
+        "nproto.deform"}                                   # Twist / Bend / Taper: a curve is deformed too
+check("UI: a curve selected dims Surface Edit (still clickable) but Trim / Split / Emboss / Twist and not Curve Edit; "
       "nothing selected dims nothing",
       _none_sel is None and _have == {"CURVE"} and _tg.fits({"NURBS"}, None)
       and _rows and all(r_["active"] == bool(set(r_["ops"]) & _cut) for r_ in _rows if r_["ops"])
@@ -7465,9 +7474,9 @@ _cvk.modal(fc, _ev('MOUSEMOVE', _wpx(1.8, -1.8), 'NOTHING'))
 _no_comb = _drw.sketch_overlay.get("comb")
 _cvk.modal(fc, _ev('K', _wpx(1.8, -1.8)))
 _cg = _drw.sketch_overlay.get("comb")
-_show = _v.show_comb
+_show = _cvk.show_comb and not _v.show_comb      # the tool's own Comb, not Analyze's for every curve
 _khint = [i for r in _hn.HUD["spec"]["rows"] if r[0] == "Show" for i in r[1]] if _hn.HUD["spec"] else []
-check("CV Curve: K turns the curvature comb on the curve being drawn on (the Analyze switch), with its knot ticks",
+check("CV Curve: K turns the curvature comb on the curve being drawn on (the tool's own Comb), with its knot ticks",
       _no_comb is None and _show and _cg is not None and len(_cg[0]) > 20 and len(_cg[1]) > 20
       and len(_cg[2]["jump"]) >= 2 and _khint and _khint[0]["current"] == "on",
       f"{_no_comb is None} {_show} {None if _cg is None else (len(_cg[0]), {k: len(v_) for k, v_ in _cg[2].items()})}")
