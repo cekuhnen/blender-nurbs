@@ -268,6 +268,9 @@ jobs:
           "$BLENDER" -b --factory-startup --python tests/test_unroll_flow.py 2>&1 | tee unroll.log
           grep -E "^FAIL" unroll.log || true
           grep -q "^ALL OK" unroll.log
+          "$BLENDER" -b --factory-startup --python tests/test_deform.py 2>&1 | tee deform.log
+          grep -E "^FAIL" deform.log || true
+          grep -q "^ALL OK" deform.log
           "$BLENDER" -b --factory-startup --python tests/test_emboss.py 2>&1 | tee emboss.log
           grep -E "^FAIL" emboss.log || true
           grep -q "^ALL OK" emboss.log

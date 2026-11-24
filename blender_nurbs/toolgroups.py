@@ -127,6 +127,9 @@ GROUPS = (
             (_t("nproto.rebuild_surface", icon='MOD_REMESH'), _t("nproto.extend", icon='FULLSCREEN_ENTER')),
             (_t("nproto.surface_align", icon='SNAP_EDGE'), _t("nproto.match_surface", icon='SNAP_FACE')),
             (_t("nproto.refit_trim", icon='MOD_LATTICE'), _t("nproto.merge_patches", icon='MESH_GRID')),
+            (("nproto.deform", "Twist", 'FORCE_VORTEX', {"kind": "TWIST"}, frozenset(EDGES)),   # in place, along an
+             ("nproto.deform", "Bend", 'MOD_SIMPLEDEFORM', {"kind": "BEND"}, frozenset(EDGES)),  # axis (a line
+             ("nproto.deform", "Taper", 'MOD_CAST', {"kind": "TAPER"}, frozenset(EDGES))),        # picked last)
             (_t("nproto.flip_normal", icon='NORMALS_FACE'),),
         ), {NURBS}),
         ("Trim and Split", (
