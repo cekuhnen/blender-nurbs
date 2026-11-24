@@ -323,11 +323,13 @@ def _regions(job, cutters):
     return b, faces, groups, picked, sides
 
 
-def _near_edges(brep, tol):
-    """Is a point on one of brep's edges (within tol)? Sampled finely: a
-    48-point polyline sags off a curved edge by more than tol."""
+def _near_edges(brep, tol, skip=()):
+    """Is a point on one of brep's edges (within tol; the edges skip left
+    out)? Sampled finely: a 48-point polyline sags off a curved edge by more
+    than tol."""
     np = _np()
-    polys = [np.array(p) for p in (_edge_poly(e, 400) for e in brep.edges()) if len(p)]
+    skip = set(skip)
+    polys = [np.array(p) for p in (_edge_poly(e, 400) for e in brep.edges() if e not in skip) if len(p)]
 
     def on(pt):
         for P in polys:
@@ -415,7 +417,7 @@ def _rejoin_runs(lp, segs, original, tol):
     return out
 
 
-def heal_cut_seams(b, original):
+def heal_cut_seams(b, original, skip_edges=()):
     """Remove the cut edges that have kept surface on both sides: a trim
     imprints every cutter, and where a region on each side is kept (the far
     wall a projected circle also crossed) the imprint stayed as a seam -- two
@@ -425,14 +427,16 @@ def heal_cut_seams(b, original):
     stay. Pieces of one original face count as one surface even when the
     kernel's split gave them different representations of it (a cubic plane
     split into bilinear patches): they are trimmed again on the original
-    face's surface. Returns b unchanged when anything does not check out."""
+    face's surface. skip_edges: original edges that do not count as such (a
+    moved notch's old rims). Returns b unchanged when anything does not check
+    out."""
     np = _np()
     lo, hi = (np.array(v) for v in original.bounding_box())
     size = float(np.linalg.norm(hi - lo)) or 1.0
     tol = 1e-5 * size
     from trimext import brep_tol
     btol = brep_tol(1e-5, size)      # not the kernel's 0.01: stitched below, short edges stay apart
-    on_original = _near_edges(original, 10 * tol)
+    on_original = _near_edges(original, 10 * tol, skip_edges)
 
     def key(e):
         m = _edge_mid(e)
@@ -4513,6 +4517,193 @@ def _move_notch(body, notch, d, size, tol):
     return b
 
 
+def _arc_curve(C, n, p, q, ccw):
+    """An exact (rational) arc about the centre C and unit normal n from p to
+    q, counter-clockwise about n when ccw: degree 2, a span per quarter turn."""
+    np = _np()
+    C, n, p, q = (np.asarray(x, float) for x in (C, n, p, q))
+    r = float(np.linalg.norm(p - C))
+    x = (p - C) / r
+    y = np.cross(n, x)
+    ang = float(np.arctan2((q - C) @ y, (q - C) @ x))
+    if ccw and ang <= 0:
+        ang += 2 * np.pi
+    if not ccw and ang >= 0:
+        ang -= 2 * np.pi
+    k = max(1, int(np.ceil(abs(ang) / (np.pi / 2) - 1e-9)))
+    da = ang / k
+    pts, w = [], []
+    for i in range(k):
+        a0, a1 = i * da, (i + 1) * da
+        P0 = C + r * (np.cos(a0) * x + np.sin(a0) * y)
+        am = (a0 + a1) / 2
+        P1 = C + r / np.cos(da / 2) * (np.cos(am) * x + np.sin(am) * y)
+        if i == 0:
+            pts.append(P0); w.append(1.0)
+        pts += [P1, C + r * (np.cos(a1) * x + np.sin(a1) * y)]
+        w += [float(np.cos(da / 2)), 1.0]
+    U = [0.0] * 3 + [float(j) for j in range(1, k) for _ in range(2)] + [float(k)] * 3
+    return ext.curve_from_cvs(2, [tuple(map(float, P)) for P in pts], U, w)
+
+
+def _fit_circle3(P):
+    """(centre, unit normal, radius) of points on a circle, else None."""
+    np = _np()
+    P = np.asarray(P, float)
+    c = P.mean(axis=0)
+    _, sv, Vt = np.linalg.svd(P - c)
+    if sv[-1] > 1e-7 * (sv[0] or 1.0):
+        return None
+    n = Vt[2]
+    x, y = Vt[0], Vt[1]
+    Q = np.c_[(P - c) @ x, (P - c) @ y]
+    A = np.c_[2 * Q, np.ones(len(Q))]
+    sol = np.linalg.lstsq(A, (Q * Q).sum(axis=1), rcond=None)[0]
+    r = float(np.sqrt(max(sol[2] + sol[:2] @ sol[:2], 0.0)))
+    C = c + sol[0] * x + sol[1] * y
+    if float(np.abs(np.linalg.norm(P - C, axis=1) - r).max()) > 1e-7 * max(r, 1.0):
+        return None
+    return C, n, r
+
+
+def _move_notch_recut(body, notch, M, turns, d, size, tol):
+    """A notch moved by a rigid motion that keeps every face it cuts in place
+    (a slot in a disc's rim or a tube's end turned about the axis): the
+    notch's opening on each of those faces closed by a patch of the face's
+    own surface (the edges between the faces bridged across the gap, along
+    their line or circle); the notch with its patches is the tool, the body
+    with them the notch filled in; the tool moved and cut from the filled
+    body, the faces left split on one surface merged again. Volume and face
+    count stay."""
+    np = _np()
+    from trimext import brep_tol
+    region, hosts, rims = notch
+    btol = brep_tol(1e-5, size)
+    host_of = {}
+    for e in rims:
+        H = next(g for g in e.faces() if g in hosts)
+        host_of[e] = H
+        P = _loop_polygon([(e, True)], 8)
+        G = H.surface()
+        before = max(float(sm.surface_closest_point(G, tuple(map(float, q)))[2]) for q in P)
+        after = max(float(sm.surface_closest_point(G, tuple(map(float, q)))[2]) for q in M(P))
+        if after > before + max(btol, 1e-5 * size):
+            raise RuntimeError("the move takes the notch off a face it is cut into: a notch in a round edge only "
+                               "turns about its axis")
+    # the faces it cuts, by surface (a plane or a disc's side split in two count once)
+    def skey(H):
+        if H.surface().is_planar():
+            n_ = _face_normal(H, np.array(H.interior_point(), float))
+            o_ = float(n_ @ np.array(H.interior_point(), float))
+            return ("plane",) + tuple(np.round(np.r_[n_, o_ / size], 6))
+        return _surface_key(H.surface())
+    group = {H: skey(H) for H in hosts}
+    rim_v = {v for e in rims for v in e.vertices()}
+    # the edges between two faces it cuts that end at the notch: bridged across its gap
+    dangling = {}
+    for H in hosts:
+        for e in H.edges():
+            if e in rims:
+                continue
+            fs = [g for g in e.faces() if g != H and g in hosts]
+            if not fs or group[fs[0]] == group[H]:
+                continue
+            pair = tuple(sorted([group[H], group[fs[0]]], key=repr))
+            for v in e.vertices():
+                if v in rim_v:
+                    dangling.setdefault(pair, {})[v] = e
+    bridges = {}
+    for pair, ends in dangling.items():
+        if len(ends) != 2:
+            raise RuntimeError("the notch's gap in an edge does not bridge (it meets that edge more than twice)")
+        (v1, e1), (v2, e2) = ends.items()
+        p1, p2 = np.array(v1.point(), float), np.array(v2.point(), float)
+        a, b = np.array(e1.start_vertex().point(), float), np.array(e1.end_vertex().point(), float)
+        if abs(e1.length() - float(np.linalg.norm(b - a))) <= 1e-6 * size:
+            c = ext.curve_from_cvs(1, [tuple(map(float, p1)), tuple(map(float, p2))], [0.0, 0.0, 1.0, 1.0], None)
+        else:
+            S1 = np.vstack([_loop_polygon([(e1, True)], 12), _loop_polygon([(e2, True)], 12)])
+            ci = _fit_circle3(S1)
+            if ci is None:
+                raise RuntimeError("an edge the notch cuts is neither straight nor round: it can't be bridged")
+            C, n_, r_ = ci
+            t0, t1 = e1.parameter_range()
+            mid = np.array(e1.point_at(float((t0 + t1) / 2)), float)
+            x_ = (p1 - C) / np.linalg.norm(p1 - C)
+            y_ = np.cross(n_, x_)
+            am = float(np.arctan2((mid - C) @ y_, (mid - C) @ x_))
+            c = _arc_curve(C, n_, p1, p2, ccw=am < 0)    # the way round that is not the edge's own
+        bridges[pair] = c
+    # a patch of each surface over the notch's opening
+    patches = []
+    for key in set(group.values()):
+        Hs = [H for H in hosts if group[H] == key]
+        cs = [_edge_copy(e) for e in rims if host_of[e] in Hs]
+        cs += [ext.curve_from_cvs(*_cv_tuple(ext.curve_cvs(c))) for pair, c in bridges.items() if key in pair]
+        ch = _chain(cs, 1e3 * tol)
+        if ch is None:
+            raise RuntimeError("the notch's opening in a face it cuts does not close")
+        H = Hs[0]
+        G = ext.surface_from_cvs(*_srf_tuple(ext.surface_cvs(H.surface())))
+        made = None
+        for variant in (None, "u", "v"):
+            try:
+                Gv = G if variant is None else _reseamed(ext.surface_from_cvs(*_srf_tuple(ext.surface_cvs(H.surface()))),
+                                                          variant, 0.5)
+                made = ext.trim_surface_with_3d_curves_tol(Gv, [len(ch)], [ext.curve_from_cvs(*_cv_tuple(ext.curve_cvs(x)))
+                                                                          for x in ch], 10 * tol, btol)
+                break
+            except Exception:
+                continue
+        if made is None:
+            raise RuntimeError("the notch's opening in a face it cuts could not be closed")
+        patches.append(made)
+    faces = body.faces()
+    idx = [i for i, f in enumerate(faces) if f in region]
+    tool = body.copy()
+    tf = tool.faces()
+    ext.delete_faces(tool, [tf[i] for i in range(len(tf)) if i not in set(idx)])
+    filled = body.copy()
+    ff = filled.faces()
+    keep = np.array(ff[next(i for i in range(len(ff)) if i not in set(idx))].interior_point(), float)
+    ext.delete_faces(filled, [ff[i] for i in idx])
+    for pt in patches:
+        ext.append_brep(tool, pt.copy())
+        ext.append_brep(filled, pt.copy())
+    tool = sm.stitch_advanced(tool, 10 * tol, squeeze_small_edges=False, making_manifold_solid=True)[0]
+    filled = sm.stitch_advanced(filled, 10 * tol, squeeze_small_edges=False, making_manifold_solid=True)[0]
+    try:
+        sm.unify_normals(filled, _face_at(filled, keep), 100)
+    except Exception:
+        pass
+    if not tool.is_manifold_solid() or not filled.is_manifold_solid():
+        raise RuntimeError("the notch's opening could not be closed into a solid")
+    for O, z, a in turns:
+        sm.rotate(tool, tuple(map(float, O)), tuple(map(float, z)), a)
+    if float(np.linalg.norm(d)) > 0:
+        tool = sm.translate(tool, tuple(map(float, d)))
+    try:
+        res = sm.boolean(filled, tool, operation=sm.BooleanOp.DIFFERENCE)
+    except Exception as exc:
+        raise RuntimeError(f"the notch could not be cut where it lands ({exc})")
+    if res is None:
+        raise RuntimeError("the notch could not be cut where it lands")
+    res = heal_cut_seams(res, body, skip_edges=rims)   # (the patches meet their faces along the old rims)
+    try:
+        sm.unify_normals(res, _face_at(res, keep), 100)
+    except Exception:
+        pass
+    if not res.is_manifold_solid():
+        raise RuntimeError("the moved notch and the faces it cuts do not close into a solid")
+    V0, V1 = _vol(body), _vol(res)
+    if abs(V1 - V0) > 1e-4 * abs(V0) + tol:
+        raise RuntimeError(f"the move changed the volume ({V0:.6g} to {V1:.6g}): the notch runs into something")
+    if res.face_count() != body.face_count():
+        raise RuntimeError("the notch would run into something (the faces came out "
+                           f"{res.face_count()} instead of {body.face_count()})")
+    return res
+
+
 def job_move_face(job):
     """Move Face (world space): the feature holding the faces at
     job['face_pts'] -- the faces enclosed by an inner loop of the face(s) it
@@ -4550,8 +4741,15 @@ def job_move_face(job):
     if reg is None:
         from featregion import notch_region
         nr = notch_region(body, start)
-        if nr is not None and not reseat and not _feature_turns(job):     # a notch: slid along its edge
-            b = _move_notch(body, nr, np.asarray(job.get("vector", (0.0, 0.0, 0.0)), float), size, tol)
+        if nr is not None and not reseat:      # a notch: slid along its edge, or turned about its faces' axis
+            if not _feature_turns(job) and all(H.surface().is_planar() for H in nr[1]):
+                b = _move_notch(body, nr, np.asarray(job.get("vector", (0.0, 0.0, 0.0)), float), size, tol)
+            else:
+                M = _feature_motion(job, size)
+                if M is None:
+                    raise RuntimeError("the move is 0")
+                b = _move_notch_recut(body, nr, M, _feature_turns(job),
+                                      np.asarray(job.get("vector", (0.0, 0.0, 0.0)), float), size, tol)
             save(to_local(b, job.get("xforms", {}).get(job.get("into"))), job["out"]["result"])
             return {"faces": b.face_count(), "volume": _volume(b, 1e-3), "feature": len(nr[0]),
                     "seats": len(nr[1]), "notch": True}

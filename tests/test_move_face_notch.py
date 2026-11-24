@@ -147,5 +147,76 @@ fl = min(store.get_brep(P).faces(), key=lambda f: f.closest_point((4.6, 0.4, 0.4
 check("a blind notch (a step) slid by its floor", r == {'FINISHED'} and solid(P) and nfaces(P) == n0
       and abs(vol(P) - v0) < 1e-6 and fl.closest_point((4.6, 0.4, 0.4))[1] < 1e-6, f"vol {vol(P):.6f}/{v0:.6f}")
 
+# --- notches in round edges: turned about the axis ------------------------------------------------
+from blender_nurbs.valuedrag import rotate_points
+
+def circle(r_, at, normal=(0, 0, 1)):
+    n = np.array(normal, float)
+    x = np.array((1, 0, 0) if abs(n[0]) < 0.9 else (0, 1, 0), float)
+    bpy.ops.nproto.draw_circle(data=json.dumps({"matrix": ds.frame(np.array(at, float), x, n).tolist()}),
+                               radius=r_, ctype="EXACT")
+    return ctx.active_object
+
+def rz(P, deg):
+    return rotate_points(np.asarray(P, float)[None], np.zeros(3), np.array([0, 0, 1.0]), deg)[0]
+
+def flat_through(o, p, n):
+    """A flat face through p with normal +-n?"""
+    for f in store.get_brep(o).faces():
+        if f.surface().is_planar() and f.closest_point(tuple(map(float, p)))[1] < 1e-6:
+            q = np.array(f.interior_point(), float)
+            if abs(float(np.dot(q - p, n))) < 1e-6:
+                return True
+    return False
+
+ctx.scene.nproto_settings.construction_history = True
+clear()
+D = extrude([circle(2.0, (0, 0, 0))], 0.5)
+D = extrude([poly("S", [(1.5, -0.2, -1), (2.5, -0.2, -1), (2.5, 0.2, -1), (1.5, 0.2, -1)])], 3.0, body="CUT")
+v0, n0 = vol(D), nfaces(D)
+k = pushpull._face_index(D, (1.5, 0.0, 0.25))
+feat = pushpull.feature_of(D, [k])
+ax = pushpull.notch_axis(D, feat)
+check("a slot in a disc's rim turns about the disc's axis", feat is not None and feat[4] and ax is not None
+      and np.allclose(ax[1], [0, 0, 1]) and np.linalg.norm(ax[0][:2]) < 1e-6, ax)
+t0 = time.perf_counter()
+r = run(bpy.ops.nproto.move_face, faces=faces((D, (1.5, 0.0, 0.25))), turn=60.0)
+dt = time.perf_counter() - t0
+check("the rim slot turned 60°", r == {'FINISHED'} and solid(D) and nfaces(D) == n0 and abs(vol(D) - v0) < 1e-3 * v0
+      and flat_through(D, rz([1.75, 0.2, 0.25], 60), rz([0, 1, 0], 60))
+      and flat_through(D, rz([1.5, 0.0, 0.25], 60), rz([1, 0, 0], 60)), f"vol {vol(D):.6f}/{v0:.6f} {dt * 1000:.0f} ms")
+st = features.stack(D)
+check("the turn is a step", st[-1]["params"]["mode"] == "TURN" and abs(st[-1]["params"]["turn"] - 60) < 1e-9)
+features.rebuild(D, ctx)
+check("it replays on rebuild", flat_through(D, rz([1.5, 0.0, 0.25], 60), rz([1, 0, 0], 60)) and solid(D))
+st[-1]["params"]["turn"] = 200.0
+features._write_stack(D, st)
+features.rebuild(D, ctx)
+check("the step edited to 200° (across the side's seam)", flat_through(D, rz([1.5, 0.0, 0.25], 200), rz([1, 0, 0], 200))
+      and solid(D) and nfaces(D) == n0 and abs(vol(D) - v0) < 1e-3 * v0)
+q = rz([1.5, 0.0, 0.25], 200)
+v = vol(D)
+r = run(bpy.ops.nproto.move_face, faces=faces((D, tuple(q))), mode="AXIS", axis_point=(0, 0, 0), axis_x=(0, 0, 1),
+        slide=0.2)
+check("a slide along the disc's axis refused", r == {'CANCELLED'} and abs(vol(D) - v) < 1e-9)
+
+ctx.scene.nproto_settings.construction_history = False
+clear()
+T = extrude([circle(1.0, (0, 0, 0)), circle(0.7, (0, 0, 0))], 3.0)
+T = extrude([poly("S", [(0, -0.15, 3.5), (1.5, -0.15, 3.5), (1.5, 0.15, 3.5), (0, 0.15, 3.5)])], -1.1, body="CUT")
+v0, n0 = vol(T), nfaces(T)
+r = run(bpy.ops.nproto.move_face, faces=faces((T, (0.85, 0.0, 2.4))), turn=-100.0)
+check("a slot in a tube's end turned about its axis", r == {'FINISHED'} and solid(T) and nfaces(T) == n0
+      and abs(vol(T) - v0) < 1e-3 * v0 and flat_through(T, rz([0.85, 0.0, 2.4], -100), [0, 0, 1]),
+      f"vol {vol(T):.6f}/{v0:.6f}")
+
+clear()
+D = extrude([circle(2.0, (0, 0, 0))], 0.5)
+extrude([poly("S", [(1.5, -0.2, -1), (2.5, -0.2, -1), (2.5, 0.2, -1), (1.5, 0.2, -1)])], 3.0, body="CUT")
+D = extrude([circle(0.25, tuple(rz([1.5, 0, -1], 90)))], 3.0, body="CUT")
+v0 = vol(D)
+r = run(bpy.ops.nproto.move_face, faces=faces((D, (1.5, 0.0, 0.25))), turn=90.0)
+check("a rim slot turned into a hole refused", r == {'CANCELLED'} and abs(vol(D) - v0) < 1e-9)
+
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)
