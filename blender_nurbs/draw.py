@@ -23,7 +23,9 @@ COL_REGION_KEEP = (0.25, 0.9, 0.4)
 COL_REGION_DROP = (1.0, 0.2, 0.2)
 # filled by the sketch tools (CV Curve / Line): world-space polylines and points
 sketch_overlay = {"curves": [], "hull": [], "cvs": [], "snap": None, "snap_label": None, "axes": [],
-                  "refs": [], "cursor": None, "comb": None, "guides": [], "face": [], "face_pts": []}
+                  "refs": [], "cursor": None, "comb": None, "guides": [], "face": [], "face_pts": [],
+                  # snap elements with a frame (snapframes.py glyphs): [(world polyline, style, colour)]
+                  "elements": []}
 COL_CURSOR = (1.0, 1.0, 1.0, 1.0)
 COL_SNAP = (0.25, 1.0, 0.45, 1.0)
 COL_FACE_PLANE = (0.35, 0.8, 1.0, 0.85)      # the flat face a sketch is drawn on
@@ -47,6 +49,17 @@ COL_REFUSED = (1.0, 0.25, 0.2, 0.9)   # an edge the running tool cannot take
 # the curve a drawing tool is making: as thin as the curvature comb outline
 SKETCH_W = 1.5
 COL_PICKS = [(0.1, 0.8, 1.0, 1.0), (1.0, 0.25, 0.6, 1.0), (0.3, 1.0, 0.4, 1.0), (1.0, 0.75, 0.1, 1.0)]  # last: Loft rails
+
+
+def _polylines(pl):
+    """A pick highlight as a list of polylines: one polyline (points), or
+    several (a list of point lists: every edge of a surface on its own, never
+    joined end to start)."""
+    import numbers
+    first = next((p for p in pl if len(p)), None) if pl is not None and len(pl) else None
+    if first is None or isinstance(first[0], numbers.Real):     # points: one polyline
+        return [pl]
+    return list(pl)
 
 
 def _lines_from_polylines(polys, M, bias=None):
@@ -102,6 +115,39 @@ def _draw_tris(coords, color):
     sh = gpu.shader.from_builtin('UNIFORM_COLOR')
     sh.uniform_float("color", color)
     batch_for_shader(sh, 'TRIS', {"pos": coords}).draw(sh)
+
+
+def _dashes(pl, n=24):
+    """Polyline pl as dashes: every other of n pieces."""
+    pl = np.asarray(pl, float)
+    a, b = pl[0], pl[-1]
+    t = np.linspace(0.0, 1.0, 2 * n + 1)
+    pts = a + t[:, None] * (b - a)
+    return [[pts[i].tolist(), pts[i + 1].tolist()] for i in range(0, 2 * n, 2)]
+
+
+def _draw_element(pl, style, color):
+    """One glyph polyline of a snap element: "main" thick, "axis" thin with
+    an arrow head at its end, "dash" a dashed line from its first to last point."""
+    pl = np.asarray(pl, float).reshape(-1, 3)
+    if len(pl) < 2:
+        return
+    if style == "dash":
+        _draw_lines(_lines_from_polylines(_dashes(pl), _IDENT), color, 1.5)
+        return
+    _draw_lines(_lines_from_polylines([pl.tolist()], _IDENT), color, 3.0 if style == "main" else 1.5)
+    if style == "axis":
+        a, b = pl[-2], pl[-1]
+        d = b - a
+        L = float(np.linalg.norm(d))
+        if L > 0:
+            d /= L
+            x = np.cross(d, (1.0, 0, 0) if abs(d[0]) < 0.9 else (0, 1.0, 0))
+            x /= np.linalg.norm(x)
+            y = np.cross(d, x)
+            h = 0.25 * L
+            heads = [[b.tolist(), (b - h * d + 0.4 * h * e).tolist()] for e in (x, -x, y, -y)]
+            _draw_lines(_lines_from_polylines(heads, _IDENT), color, 1.5)
 
 
 def _draw_points(coords, color, size):
@@ -279,19 +325,34 @@ def curve_cage(obj):
     return hull, cvs, handles
 
 
-_CURVE_PREVIEW_OPS = ("NPROTO_OT_blend_curve", "nproto.blend_curve")
+_CURVE_PREVIEW_OPS = ("NPROTO_OT_blend_curve", "nproto.blend_curve", "NPROTO_OT_align_curve", "nproto.align_curve",
+                      "NPROTO_OT_draw_curve", "nproto.draw_curve")
+
+
+def curve_panel(ctx):
+    """The properties of the curve tool whose F9 panel is up (Blend / Align /
+    CV Curve was the last operator), else None. Their Show CVs / Show Comb
+    switches draw the curve it made (selected) like Analyze does."""
+    ops = ctx.window_manager.operators
+    return ops[-1].properties if ops and ops[-1].bl_idname in _CURVE_PREVIEW_OPS else None
 
 
 def curve_preview_active(ctx):
-    """A curve tool's F9 panel is up (it was the last operator): the curve it
-    is making shows its CVs."""
-    ops = ctx.window_manager.operators
-    return bool(ops) and ops[-1].bl_idname in _CURVE_PREVIEW_OPS
+    """A curve tool's F9 panel is up with Show CVs on: the curve it is making
+    shows its CVs."""
+    p = curve_panel(ctx)
+    return p is not None and bool(getattr(p, "show_cvs", True))
+
+
+def curve_comb_shown(ctx):
+    """A curve tool's F9 panel is up with Show Comb on."""
+    p = curve_panel(ctx)
+    return p is not None and bool(getattr(p, "show_comb", False))
 
 
 def curve_cvs_shown(ctx, obj):
-    """Is this curve's CV hull drawn: selected, and CVs / Hulls on or a Blend
-    Curve being made (its F9 panel up)? Never in Edit mode, where Blender
+    """Is this curve's CV hull drawn: selected, and CVs / Hulls on or a curve
+    tool's F9 panel up with Show CVs? Never in Edit mode, where Blender
     draws its own."""
     if obj.type != 'CURVE' or obj.mode == 'EDIT' or not obj.select_get():
         return False
@@ -299,6 +360,28 @@ def curve_cvs_shown(ctx, obj):
     if v is not None and v.show_cvs:
         return True
     return curve_preview_active(ctx)
+
+
+def show_cvs_prop(default=True):
+    """Show CVs for a curve tool's F9 panel (remembered between runs)."""
+    from bpy.props import BoolProperty
+    return BoolProperty(name="CVs", default=default, description="Show the curve's CVs and hull")
+
+
+def show_comb_prop():
+    """Show Comb for a curve tool's F9 panel (remembered between runs)."""
+    from bpy.props import BoolProperty
+    return BoolProperty(name="Comb", default=False,
+                        description="Show the curve's curvature comb (Scale and Samples from Analyze > "
+                                    "Curvature Comb)")
+
+
+def draw_curve_show(layout, op):
+    """The Show row of a curve tool's F9 panel."""
+    row = layout.row(align=True)
+    row.label(text="Show")
+    row.prop(op, "show_cvs", toggle=True, icon='OUTLINER_DATA_LATTICE')
+    row.prop(op, "show_comb", toggle=True, icon='IPO_ELASTIC')
 
 
 _PREVIEW_OPS = ("NPROTO_OT_rebuild_surface", "nproto.rebuild_surface", "NPROTO_OT_square", "nproto.square",
@@ -562,13 +645,13 @@ def _draw():
         cols = [min(i, 2) for i in range(len(pick_overlay["picked"]))]
     else:
         cols = [c % len(COL_PICKS) for c in cols]     # Loft: one colour per side
-    for pl, c in zip(pick_overlay["picked"], cols):
-        _draw_lines(_lines_from_polylines([pl], _IDENT), COL_PICKS[c], 4.0)
+    for pl, c in zip(pick_overlay["picked"], cols):     # one polyline, or several (a surface's edges)
+        _draw_lines(_lines_from_polylines(_polylines(pl), _IDENT), COL_PICKS[c], 4.0)
     hov = pick_overlay["hover"]
     if hov:                 # one polyline, or several (an isoparm broken by a trim)
-        _draw_lines(_lines_from_polylines(hov if isinstance(hov[0], list) else [hov], _IDENT), COL_HOVER, 4.0)
+        _draw_lines(_lines_from_polylines(_polylines(hov), _IDENT), COL_HOVER, 4.0)
     if pick_overlay.get("refused"):
-        _draw_lines(_lines_from_polylines([pick_overlay["refused"]], _IDENT), COL_REFUSED, 3.0)
+        _draw_lines(_lines_from_polylines(_polylines(pick_overlay["refused"]), _IDENT), COL_REFUSED, 3.0)
     pv = pick_overlay.get("preview")
     if pv:
         _draw_preview(pv)
@@ -581,6 +664,8 @@ def _draw():
         _draw_lines(_lines_from_polylines(dashes, _IDENT), col, 1.0)
     for pl, col, w in so.get("refs") or []:       # the edge (white) / face (beige) a G1 / G2 end follows
         _draw_lines(_lines_from_polylines([pl], _IDENT), col, w)
+    for pl, style, col in so.get("elements") or []:   # ring, axis, face, edge of a snap element (Align)
+        _draw_element(pl, style, col)
     if so.get("comb"):                     # CV Curve with the comb on: under the curve being drawn
         from . import diagnostics
         diagnostics.draw_comb_geometry(_draw_lines, so["comb"])

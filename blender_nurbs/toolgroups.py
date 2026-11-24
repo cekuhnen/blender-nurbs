@@ -99,7 +99,8 @@ GROUPS = (
         ("From Surfaces", (
             (_t("nproto.offset", icon='MOD_OFFSET'), _t("nproto.thicken", icon='MOD_SOLIDIFY')),
             (("nproto.pattern", "Pattern", 'MOD_ARRAY', {"auto": True}, frozenset(EDGES)),  # linear / circular / path: M
-             ("nproto.mirror", "Mirror", 'MOD_MIRROR', None, frozenset(EDGES))),            # mirror copy / make symmetric: S
+             ("nproto.mirror", "Mirror", 'MOD_MIRROR', None, frozenset(EDGES)),             # mirror copy / make symmetric: S
+             _t("nproto.tween", "Tween", 'IPO_EASE_IN_OUT', needs=EDGES)),                  # two objects: copies between
             (_t("nproto.unroll", "Unroll", 'UV'), _t("nproto.flow", "Flow", 'MOD_SIMPLEDEFORM', needs=EDGES)),
             (_t("nproto.from_blender_surface", icon='SURFACE_NSURFACE', needs={SURFACE}),),
         ), {NURBS}),
@@ -126,6 +127,9 @@ GROUPS = (
             (_t("nproto.rebuild_surface", icon='MOD_REMESH'), _t("nproto.extend", icon='FULLSCREEN_ENTER')),
             (_t("nproto.surface_align", icon='SNAP_EDGE'), _t("nproto.match_surface", icon='SNAP_FACE')),
             (_t("nproto.refit_trim", icon='MOD_LATTICE'), _t("nproto.merge_patches", icon='MESH_GRID')),
+            (("nproto.deform", "Twist", 'FORCE_VORTEX', {"kind": "TWIST"}, frozenset(EDGES)),   # in place, along an
+             ("nproto.deform", "Bend", 'MOD_SIMPLEDEFORM', {"kind": "BEND"}, frozenset(EDGES)),  # axis (a line
+             ("nproto.deform", "Taper", 'MOD_CAST', {"kind": "TAPER"}, frozenset(EDGES))),        # picked last)
             (_t("nproto.flip_normal", icon='NORMALS_FACE'),),
         ), {NURBS}),
         ("Trim and Split", (
@@ -138,6 +142,8 @@ GROUPS = (
         ), {NURBS}),
         ("Fillets", (
             (_t("nproto.fillet", "Surface Fillet", 'MOD_BEVEL'), _t("nproto.edge_fillet", icon='MOD_BEVEL')),
+            (_t("nproto.remove_fillets", icon='SELECT_SUBTRACT'),
+             ("nproto.remove_fillets", "Remove All Fillets", 'X', {"all_fillets": True})),
         ), {NURBS}),
         ("Solids", (
             (("nproto.boolean", "Union", 'SELECT_EXTEND', {"operation": "UNION"}),
@@ -146,6 +152,7 @@ GROUPS = (
             (_t("nproto.push_pull", icon='FACESEL'), _t("nproto.rotate_face", icon='DRIVER_ROTATIONAL_DIFFERENCE')),
             (_t("nproto.move_face", icon='ORIENTATION_GLOBAL'), _t("nproto.replace_face", icon='FACE_MAPS')),
             (_t("nproto.boundary_fill", icon='MESH_CUBE'), _t("nproto.emboss", icon='MOD_DISPLACE', needs=EDGES)),
+            (_t("nproto.shell", icon='MOD_SOLIDIFY'),),
         ), {NURBS}),
     )),
     ("CONVERT", "Convert", (
@@ -426,6 +433,7 @@ class VIEW3D_MT_nproto_tools(bpy.types.Menu):
         lay.operator("nproto.section_add", icon='MOD_EDGESPLIT')
         lay.separator()
         lay.operator("nproto.move_pivot", icon='OBJECT_ORIGIN')
+        lay.operator("nproto.align_parts", icon='SNAP_FACE')
 
 
 def menu_header(self, context):

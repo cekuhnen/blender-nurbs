@@ -24,13 +24,19 @@ STEP_FIELDS = {
     "rebuild_surface": ["degree_u", "degree_v", "spans_u", "spans_v"],
     "extend_surface": ["distance"],
     "push_pull": ["distance"],
+    "shell": ["thickness", "shell_side"],
+    "remove_fillets": ["max_radius", "keep_others"],
     "rotate_face": ["angle"],
-    "move_face": ["move_x", "move_y"],
+    "move_face": ["move_x", "move_y", "slide", "turn", "tilt"],
     "refit_trim": ["refit_degree", "refit_spans_u", "refit_spans_v"],
     "merge_patches": ["merge_mode", "merge_tolerance", "merge_degree", "merge_spans_u", "merge_spans_v",
                       "merge_cont_u0", "merge_cont_u1", "merge_cont_v0", "merge_cont_v1", "merge_edge_tolerance",
                       "merge_knots", "merge_seams", "merge_reduce_degree"],
+    "deform": ["deform_kind", "deform_angle", "deform_factor", "deform_flat", "deform_axis", "deform_direction",
+               "deform_smooth", "deform_infinite"],
 }
+MOVE_FACE_FIELDS = {"PLANE": ("move_x", "move_y"), "AXIS": ("slide", "turn"), "TURN": ("turn",),
+                    "SLIDE": ("slide",), "SPHERE": ("turn", "tilt"), "FREE": ("move_x", "move_y")}
 CA_DEFAULTS = {"ca_tolerance": 1e-4, "ca_angle": 0.1, "ca_degree": 7}
 ROLE = {"replace_face": "replacing surface", "trim": "trim cutter", "fillet_trim": "fillet partner"}
 STEP_NOTE = {"fillet_trim": "Follows its Surface Fillet (edit the fillet object)"}
@@ -91,7 +97,7 @@ class NprotoStep(bpy.types.PropertyGroup):
     scope: EnumProperty(name="Scope", items=[("THROUGH", "Through", "Every region on the picked side"),
                                              ("PICKED", "Picked Region", "Only the clicked region")], **_S())
     projection: EnumProperty(name="Project", items=[
-        ("CURVE", "Curve Normal", ""), ("VIEW", "View", ""), ("NORMAL", "Surface Normal", ""),
+        ("CURVE", "Sketch Normal", ""), ("VIEW", "View", ""), ("NORMAL", "Surface Normal", ""),
         ("X", "World X", ""), ("Y", "World Y", ""), ("Z", "World Z", "")], **_S())
     reach: EnumProperty(name="Cut", items=[("BOTH", "Both Ways", "A projected curve cuts on both sides of itself"),
                                            ("FRONT", "Along Normal", "Only along the sketch normal (the curve's Z)"),
@@ -121,8 +127,15 @@ class NprotoStep(bpy.types.PropertyGroup):
     spans_v: IntProperty(name="Spans V", min=1, max=64, **_S())
     distance: FloatProperty(name="Distance", soft_min=-10.0, soft_max=10.0, unit='LENGTH', **_S())
     angle: FloatProperty(name="Angle", min=-179.0, max=179.0, **_S())
+    thickness: FloatProperty(name="Thickness", min=0.0, soft_max=10.0, unit='LENGTH', **_S())
+    shell_side: EnumProperty(name="Side", items=[("INSIDE", "Inside", ""), ("OUTSIDE", "Outside", "")], **_S())
+    max_radius: FloatProperty(name="Max Radius (0 any)", min=0.0, soft_max=10.0, unit='LENGTH', **_S())
+    keep_others: BoolProperty(name="Keep Others", **_S())
     move_x: FloatProperty(name="X", unit='LENGTH', **_S())
     move_y: FloatProperty(name="Y", unit='LENGTH', **_S())
+    slide: FloatProperty(name="Along", unit='LENGTH', **_S())
+    turn: FloatProperty(name="Turn °", min=-360.0, max=360.0, **_S())
+    tilt: FloatProperty(name="Tilt °", min=-360.0, max=360.0, **_S())
     refit_degree: IntProperty(name="Degree", min=1, max=7, **_S())
     refit_spans_u: IntProperty(name="Spans U (0 auto)", min=0, max=32, **_S())
     refit_spans_v: IntProperty(name="Spans V (0 auto)", min=0, max=32, **_S())
@@ -139,6 +152,16 @@ class NprotoStep(bpy.types.PropertyGroup):
     merge_knots: EnumProperty(name="Knots", items=[("ADAPTIVE", "Adaptive", ""), ("UNIFORM", "Uniform", "")], **_S())
     merge_seams: EnumProperty(name="Seams", items=[("KEEP", "Keep Kinks", ""), ("SMOOTH", "Smooth", "")], **_S())
     merge_reduce_degree: BoolProperty(name="Reduce Degree", **_S())
+    deform_kind: EnumProperty(name="Deform", items=[("TWIST", "Twist", ""), ("BEND", "Bend", ""), ("TAPER", "Taper", "")],
+                              **_S())
+    deform_angle: FloatProperty(name="Angle", soft_min=-720.0, soft_max=720.0, **_S())
+    deform_factor: FloatProperty(name="End Scale", soft_min=0.0, soft_max=4.0, **_S())
+    deform_flat: BoolProperty(name="Flat", **_S())
+    deform_axis: EnumProperty(name="Axis", items=[("AUTO", "Auto", ""), ("X", "Local X", ""), ("Y", "Local Y", ""),
+                                                  ("Z", "Local Z", ""), ("LINE", "Line", "")], **_S())
+    deform_direction: FloatProperty(name="Direction", soft_min=-180.0, soft_max=180.0, **_S())
+    deform_smooth: BoolProperty(name="Smooth", **_S())
+    deform_infinite: BoolProperty(name="Infinite", **_S())
 
 
 def sync_step(obj, k):
@@ -417,7 +440,11 @@ def draw_steps(box, obj, only=None, bare=False):
                         continue
                     if name.startswith("ca_") and rims and rims.get("only"):
                         continue                  # (see the note below: nothing for them to do)
-                    if name in ("action", "continuity", "ca_continuity", "rail_type"):
+                    if e["op"] == "move_face" and name not in MOVE_FACE_FIELDS[e["params"].get("mode", "PLANE")]:
+                        continue                  # (a flat face's two distances, or a curved one's axis moves)
+                    if e["op"] == "deform" and not _deform_shows(pg, name, e["params"]):
+                        continue
+                    if name in ("action", "continuity", "ca_continuity", "rail_type", "deform_kind"):
                         inner.row(align=True).prop(pg, name, expand=True)
                     else:
                         inner.prop(pg, name)
@@ -438,7 +465,23 @@ def draw_steps(box, obj, only=None, bare=False):
                 inner.label(text=pg.error, icon='ERROR')
 
 
-STEP_ICON = {"replace_face": 'FACE_MAPS', "push_pull": 'FACESEL', "rotate_face": 'DRIVER_ROTATIONAL_DIFFERENCE', "move_face": 'ORIENTATION_GLOBAL', "untrim_region": 'SELECT_SUBTRACT', "untrim": 'LOOP_BACK', "edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
+def _deform_shows(pg, name, p):
+    """Twist / Bend / Taper: only the settings the kind uses."""
+    taper = pg.deform_kind == "TAPER"
+    if name == "deform_angle":
+        return not taper
+    if name in ("deform_factor", "deform_flat"):
+        return taper
+    if name == "deform_direction":
+        return pg.deform_kind == "BEND" or (taper and pg.deform_flat)
+    if name == "deform_axis":
+        return p.get("deform_axis") != "LINE"         # a picked line stays the axis (follow it by moving it)
+    if name == "deform_infinite":
+        return not pg.deform_smooth
+    return True
+
+
+STEP_ICON = {"deform": 'MOD_SIMPLEDEFORM', "replace_face": 'FACE_MAPS', "push_pull": 'FACESEL', "shell": 'MOD_SOLIDIFY', "remove_fillets": 'SELECT_SUBTRACT', "rotate_face": 'DRIVER_ROTATIONAL_DIFFERENCE', "move_face": 'ORIENTATION_GLOBAL', "untrim_region": 'SELECT_SUBTRACT', "untrim": 'LOOP_BACK', "edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
              "flip_normal": 'NORMALS_FACE', "surface_align": 'SNAP_EDGE', "match_surface": 'SNAP_FACE', "extend_surface": 'FULLSCREEN_ENTER',
              "rebuild_surface": 'MOD_REMESH', "refit_trim": 'MOD_LATTICE', "merge_patches": 'MESH_GRID'}
 

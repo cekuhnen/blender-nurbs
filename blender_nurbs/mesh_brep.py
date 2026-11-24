@@ -10,6 +10,9 @@ modelled and doing it again with the kernel, not by copying facets.
   radius is the bevel's (any number of segments from 2). A symmetric chamfer
   can fit a circle by chance; it is not tangent and stays a plane.
 * A closed ring of such regions is a hole (facing its axis) or a cylinder.
+* A closed ring of regions whose normals keep one angle to an axis, their
+  corners on circles whose radius changes linearly along it, is a cone (a
+  chamfer or taper of a turned part, a Solidify rim on a slanted wall).
 * A boxy bevel (Profile above 0.5) is a strip of evenly wide regions square
   to one axis between two planes whose corners lie on one superellipse
   (1 - x/w1)^r + (1 - y/w2)^r = 1 in the corner's frame (Blender's Profile p
@@ -26,7 +29,11 @@ modelled and doing it again with the kernel, not by copying facets.
 
 The body is rebuilt sharp: each plane's outline is walked, continuing across
 a fillet onto the plane beyond it, with its corners where three planes meet.
-Then cylinders are added, holes cut and each radius filleted with the
+A cone, and every ring joined to it end to end or by a shared end plane, is
+made as a face ruled between its exact end circles, sewn in with the planes
+(their outlines get the circles); such a group is only made when each ring
+in it ends cleanly on one plane or ring at each end, else its cones keep
+their facets. Then the other cylinders are added, holes cut and each radius filleted with the
 kernel's rolling-ball fillet (kernel/worker.py, job "mesh_to_brep"). The
 fillets become Edge Fillet steps in the object's history, so their radius
 stays editable. What is not recognised keeps its facets; if the rebuild
@@ -45,6 +52,8 @@ from . import features, jobs, store
 FLAT_COS = math.cos(math.radians(0.5))      # facets this close in direction (and offset) are one plane
 SEED_COS = math.cos(math.radians(60.0))     # neighbouring facets of a round turn by less than this
 SQUARE = 1e-3                               # |n . axis| below this: a facet is square to a round's axis
+RING_TILT = math.sin(math.radians(1.0))     # a round grows over facets tilted less than this (its circle fit decides:
+                                            # Solidify's corners leave a shell's outer wall a few hundredths off)
 BOXY_SEGMENTS = 4                           # a boxy bevel needs this many segments (fewer: any polyline fits)
 BOXY_COS = math.cos(math.radians(88.0))     # a boxy profile's middle segment can fold by up to this
 GRID_COS = math.cos(math.radians(30.6))     # free-form patches: the largest ordinary fold between two quads
@@ -98,6 +107,25 @@ def fit_circle(P, axis):
         return None
     r = math.sqrt(r2)
     return c0 + cx * u + cy * w, r, float(np.abs(np.hypot(x - cx, y - cy) - r).max())
+
+
+def fit_cone(P, axis):
+    """(centre on the axis, radius there, slope, largest residual) of points
+    on a cone about axis: radius r + k t at height t = (p - centre) . axis
+    (k = 0: a cylinder). x^2 + y^2 = 2 cx x + 2 cy y + Q(t), Q quadratic, is
+    linear in its unknowns; Q is only used where the points are (on two
+    rings it is not unique there, its values are)."""
+    u = np.cross(axis, (1.0, 0.0, 0.0) if abs(axis[0]) < 0.9 else (0.0, 1.0, 0.0))
+    u /= np.linalg.norm(u)
+    w = np.cross(axis, u)
+    c0 = P.mean(0)
+    x, y, t = (P - c0) @ u, (P - c0) @ w, (P - c0) @ axis
+    one = np.ones_like(x)
+    s = np.linalg.lstsq(np.column_stack([x, y, one, t, t * t]), x * x + y * y, rcond=None)[0]
+    cx, cy = 0.5 * s[0], 0.5 * s[1]
+    R = np.hypot(x - cx, y - cy)
+    r0, k = np.linalg.lstsq(np.column_stack([one, t]), R, rcond=None)[0]
+    return c0 + cx * u + cy * w, float(r0), float(k), float(np.abs(R - r0 - k * t).max())
 
 
 def _basis(knots, p, n, s):
@@ -173,7 +201,7 @@ class Recognizer:
     """Planar regions of a mesh, the fillets and rings among them, and the
     sharp body's face outlines."""
 
-    def __init__(self, V, F, size, rel_tol=1e-5, fillets=True, rings=True):
+    def __init__(self, V, F, size, rel_tol=1e-5, fillets=True, rings=True, cones=True):
         self.V, self.F, self.size = V, F, size
         self.tol = tol = rel_tol * size + 1e-12
         n = len(F)
@@ -217,6 +245,7 @@ class Recognizer:
                         reg.append(g)
                         todo.append(g)
             self.regs.append(reg)
+        self._fans(rid)
         self.rid = np.empty(n, int)
         for i, r in enumerate(self.regs):
             self.rid[r] = i
@@ -236,6 +265,8 @@ class Recognizer:
         self._kept = {}                      # boxy bevels that end in a corner: {their faces: their regions}
         self.bands = [B for B in self._merge_cuts(self._bands()) if ((B["closed"] or B.get("kind") == "cut") and rings)
                       or (not B["closed"] and B.get("kind") != "cut" and fillets)]
+        if rings and cones:
+            self.bands += self._cones({i for B in self.bands for i in B["regions"]})
         if fillets:
             self.bands += self._strips({i for B in self.bands for i in B["regions"]})
         self.pn, self.pd = np.array(self.pn), np.array(self.pd)
@@ -261,7 +292,44 @@ class Recognizer:
         for g, G in enumerate(self.grids):
             for i in G["regions"]:
                 self.role[i] = ("grid", g)
+        self._sew()
         self._tan = {}
+
+    def _fans(self, rid):
+        """A spun cap -- a fan of triangles about one vertex (Spin or Screw to
+        the axis) whose normals agree within FLAT_COS and whose rim is flat --
+        is one flat region, also where its tip is a little off the rim's
+        plane (Solidify lifts it: its corner offset is not exact). Regions
+        that are only the fan's triangles merge (regs; rid is the caller's,
+        rebuilt from regs)."""
+        V, F, N, A, tol = self.V, self.F, self.N, self.A, self.tol
+        vf = {}
+        for k, f in enumerate(F):
+            for v in f:
+                vf.setdefault(v, []).append(k)
+        drop = set()
+        for v, fs in vf.items():
+            if len(fs) < 6 or any(len(F[k]) != 3 for k in fs):
+                continue
+            rs = sorted({int(rid[k]) for k in fs})
+            if len(rs) < 2 or any(r in drop or not set(self.regs[r]) <= set(fs) for r in rs):
+                continue
+            n0 = (N[fs] * A[fs, None]).sum(0)
+            n0 /= np.linalg.norm(n0) or 1.0
+            if float((N[fs] @ n0).min()) < FLAT_COS:
+                continue
+            rim = V[sorted({u for k in fs for u in F[k]} - {v})]
+            nr = np.linalg.svd(rim - rim.mean(0))[2][2]
+            if abs(float(nr @ n0)) < FLAT_COS or np.abs((rim - rim.mean(0)) @ nr).max() > tol:
+                continue
+            keep = rs[0]
+            for r in rs[1:]:
+                self.regs[keep] += self.regs[r]
+                self.regs[r] = []
+                drop.add(r)
+            rid[fs] = keep
+        if drop:
+            self.regs = [r for r in self.regs if r]
 
     # -- recognition -------------------------------------------------------------
     def _width(self, j, ax):
@@ -306,10 +374,27 @@ class Recognizer:
     def _fit(self, regs, ax):
         return fit_circle(self.V[sorted({v for k in regs for v in self.rverts[k]})], ax)
 
+    def _axis(self, regs):
+        """The axis of a round's regions: the one their normals are most nearly
+        square to (two: their cross product), or the one they keep the most
+        nearly constant angle to (a cone's normals; on part of a ring of
+        slightly tilted facets the first leans by their tilt), whichever
+        their corners fit a circle about better."""
+        N, w = self.rn[regs], self.rarea[regs]
+        ax = np.linalg.eigh((N * w[:, None]).T @ N)[1][:, 0]
+        if len(regs) < 3:
+            return ax
+        D = N - w @ N / w.sum()
+        ax2 = np.linalg.eigh((D * w[:, None]).T @ D)[1][:, 0]
+        f1, f2 = self._fit(regs, ax), self._fit(regs, ax2)
+        return ax2 if f2 is not None and (f1 is None or f2[2] < f1[2]) else ax
+
     def _bands(self):
         """Strips (fillets) and rings (holes, cylinders): grown from pairs of
-        neighbouring regions over regions square to the pair's axis whose
-        corners stay on one circle."""
+        neighbouring regions over regions (nearly) square to the axis of those
+        taken so far whose corners stay on one circle. (The pair's own axis is
+        off by the facets' tilt where the wall is a little off square, which
+        stopped a shell's outer wall a third of the way round.)"""
         V, tol, rn = self.V, self.tol, self.rn
         used, tried, bands = set(), set(), []
         for s in np.argsort(self.rarea):
@@ -332,11 +417,13 @@ class Recognizer:
                     grown = False
                     for i in list(band):
                         for j in self.adj.get(i, ()):
-                            if j in band or j in used or abs(rn[j] @ ax) > SQUARE:
+                            if j in band or j in used or abs(rn[j] @ ax) > RING_TILT:
                                 continue
-                            f2 = self._fit(band + [j], ax)
+                            a2 = self._axis(band + [j])
+                            f2 = self._fit(band + [j], a2)
                             if f2 is not None and f2[2] <= 10 * tol:
                                 band.append(j)
+                                ax = a2
                                 grown = True
                 B = self._band(band)
                 if B is not None:
@@ -496,6 +583,201 @@ class Recognizer:
                            "closed": False, "inward": A["inward"]}, vs)
             out += [B] if B is not None else g
         return rest + out
+
+    def _cone_axis(self, regs):
+        """The axis regions' normals keep one angle to: the normal of the plane
+        through their tips (a faceted cone's facet normals are its normals at
+        the facets' middles, so this is exact from three)."""
+        N, w = self.rn[regs], self.rarea[regs]
+        D = N - w @ N / w.sum()
+        ax = np.linalg.eigh((D * w[:, None]).T @ D)[1][:, 0]
+        return ax if ax @ (w @ N) >= 0 else -ax
+
+    def _cones(self, used):
+        """Cones (a turned part's chamfer or taper, a Solidify rim on a slanted
+        wall): closed rings of regions whose normals keep one angle to an axis
+        and whose corners lie on one cone about it, radius linear in height.
+        Grown from a gently folded pair and a third region beside it (two
+        normals do not fix a cone's axis) over regions at the same angle to
+        the axis. Only whole rings: they are rebuilt sewn to what closes their
+        two ends (_sew)."""
+        V, rn, tol = self.V, self.rn, self.tol
+        used, out = set(used), []
+        fits = lambda regs, ax: fit_cone(V[sorted({v for k in regs for v in self.rverts[k]})], ax)
+        gentle = lambda i, j: SEED_COS < rn[i] @ rn[j] < FLAT_COS
+        for s in np.argsort(self.rarea):
+            if s in used:
+                continue
+            band = None
+            for t in sorted(self.adj.get(s, ()), key=lambda j: self.rarea[j]):
+                if t in used or not gentle(s, t):
+                    continue
+                for u in sorted((self.adj.get(s, set()) | self.adj.get(t, set())) - {s, t} - used,
+                                key=lambda j: self.rarea[j]):
+                    if not (gentle(s, u) or gentle(t, u)):
+                        continue
+                    ax = self._cone_axis([s, t, u])
+                    if fits([s, t, u], ax)[3] <= 10 * tol:
+                        band = [s, t, u]
+                        break
+                if band:
+                    break
+            if band is None:
+                continue
+            grown = True
+            while grown:
+                grown = False
+                ca = float(np.mean(rn[band] @ ax))
+                for i in list(band):
+                    for j in self.adj.get(i, ()):
+                        if j in band or j in used or not gentle(i, j) or abs(rn[j] @ ax - ca) > RING_TILT:
+                            continue
+                        a2 = self._cone_axis(band + [j])
+                        if fits(band + [j], a2)[3] <= 10 * tol:
+                            band.append(j)
+                            ax = a2
+                            grown = True
+            vs = sorted({v for k in band for v in self.rverts[k]})
+            c, r, k, res = fit_cone(V[vs], ax)
+            if res > 10 * tol or len(band) < 6:
+                continue
+            d = V[vs] - c
+            t = d @ ax
+            d -= np.outer(t, ax)
+            u = d[0] / (np.linalg.norm(d[0]) or 1.0)
+            a = np.sort(np.arctan2(d @ np.cross(ax, u), d @ u))
+            gaps = np.diff(np.concatenate([a, a[:1] + 2 * math.pi]))
+            steps = gaps[gaps > 1e-6]
+            if len(steps) < 6 or gaps.max() >= 2.5 * float(np.median(steps)):
+                continue                                     # not a whole ring: its facets stay
+            k0 = band[0]
+            p0 = V[self.rverts[k0]].mean(0) - c
+            out.append({"regions": band, "r": r, "k": k, "axis": ax, "center": c,
+                        "t": (float(t.min()), float(t.max())), "closed": True, "kind": "cone",
+                        "inward": float((p0 - (p0 @ ax) * ax) @ rn[k0]) < 0})
+            used.update(band)
+        return out
+
+    def _ring_ends(self, b):
+        """The outlines of closed ring b's facets: [(vertices in order, owners
+        across)], an owner ("P", j) for plane region j, ("R", b2) for another
+        closed ring, None for anything else (an open edge, a fillet, a patch)."""
+        F, E, rid = self.F, self.E, self.rid
+        gf = getattr(self, "gridface", {})
+        mine = {f for i in self.bands[b]["regions"] for f in self.regs[i]}
+        nxt = {}
+        for f in mine:
+            fv = F[f]
+            for k in range(len(fv)):
+                a, c = fv[k], fv[(k + 1) % len(fv)]
+                fs = E[(min(a, c), max(a, c))]
+                other = [g for g in fs if g not in mine]
+                if len(fs) == 1 or (other and other[0] in gf):
+                    own = None
+                elif not other:
+                    continue
+                else:
+                    role = self.role.get(int(rid[other[0]]), ("plane",))
+                    own = ("P", int(rid[other[0]])) if role[0] == "plane" else \
+                        ("R", role[1]) if role[0] == "band" and self.bands[role[1]]["closed"] \
+                        and self.bands[role[1]].get("kind") != "cut" else None
+                nxt[a] = (c, own)
+        loops = []
+        while nxt:
+            a = next(iter(nxt))
+            vs, owners = [], set()
+            while a in nxt:
+                c, own = nxt.pop(a)
+                vs.append(a)
+                owners.add(own)
+                a = c
+            loops.append((vs, owners))
+        return loops
+
+    def _sew(self):
+        """Rings rebuilt as faces sewn into the body, not added or cut as whole
+        cylinders: each cone (no boolean primitive has its shape) and the rings
+        linked end to end with it, when each of their two ends is closed by
+        one plane or one other such ring. Rings on one plane go together (a
+        plane cannot have one ring's end as a circle and leave another's to a
+        boolean: that loop would be dropped). A cone that is not so keeps its
+        facets. self.sewn: {ring: its two (end loop, owner)}."""
+        rings = [b for b, B in enumerate(self.bands) if B["closed"] and B.get("kind") != "cut"]
+        allends = {b: self._ring_ends(b) for b in rings}
+        ends = {b: L for b, L in allends.items() if len(L) == 2 and all(len(o) == 1 and None not in o for _, o in L)}
+        at_plane = {}
+        for b, L in allends.items():
+            for _, os in L:
+                for o in os:
+                    if o is not None and o[0] == "P":
+                        at_plane.setdefault(o[1], set()).add(b)
+        link = {b: set() for b in rings}
+        for b, L in allends.items():
+            for _, os in L:
+                for o in os:
+                    if o is not None:
+                        link[b] |= at_plane[o[1]] if o[0] == "P" else {o[1]}
+                        if o[0] == "R":
+                            link[o[1]].add(b)
+        keep, seen = set(), set()
+        for b0 in ends:
+            if b0 in seen:
+                continue
+            comp, todo = {b0}, [b0]
+            while todo:
+                for o in link[todo.pop()]:
+                    if o not in comp:
+                        comp.add(o)
+                        todo.append(o)
+            seen |= comp
+            if all(o in ends for o in comp) and any(self.bands[o].get("kind") == "cone" for o in comp):
+                keep |= comp
+        drop = [b for b, B in enumerate(self.bands) if B.get("kind") == "cone" and b not in keep]
+        if drop:
+            for b in drop:
+                for i in self.bands[b]["regions"]:
+                    self.role[i] = ("plane",)
+            new = {b: n for n, b in enumerate(b for b in range(len(self.bands)) if b not in drop)}
+            self.role = {i: (("band", new[r[1]]) if r[0] == "band" else r) for i, r in self.role.items()}
+            self.bands = [B for b, B in enumerate(self.bands) if b not in drop]
+            keep = {new[b] for b in keep}
+        self.sewn = {b: [(vs, next(iter(os))) for vs, os in self._ring_ends(b)] for b in keep}
+        self._circles = {}
+
+    def _loop_circle(self, b, vs, own):
+        """(centre, normal, radius) of the circle through ring b's end loop vs,
+        shared by both faces along it: in the plane that closes it, else about
+        the lower-numbered ring's axis."""
+        key = frozenset(vs)
+        if key not in self._circles:
+            if own[0] == "P":
+                n = self.pn[own[1]]
+            else:
+                n = self.bands[min(b, own[1])]["axis"]
+            c, r, _ = fit_circle(self.V[vs], n)
+            if own[0] == "P":
+                c = c - (c @ n - self.pd[own[1]]) * n
+            self._circles[key] = (c, n / np.linalg.norm(n), r)
+        return self._circles[key]
+
+    def _circle(self, c, n, r, uref):
+        """A whole circle about normal n (rational quadratic, four spans),
+        starting towards uref."""
+        u = uref - (uref @ n) * n
+        u /= np.linalg.norm(u)
+        return self._arc(c, n, u, np.cross(n, u), r, 0.0, 2 * math.pi, n, float(n @ c))
+
+    def _ring_sweep(self, b):
+        """Sewn ring b's face: ruled between its two end circles (a cone or a
+        cylinder exactly), both started at one angle about its axis."""
+        ax = self.bands[b]["axis"]
+        uref = np.cross(ax, (1.0, 0.0, 0.0) if abs(ax[0]) < 0.9 else (0.0, 1.0, 0.0))
+        cs = []
+        for vs, own in self.sewn[b]:
+            c, n, r = self._loop_circle(b, vs, own)
+            cs.append(self._circle(c, n if n @ ax >= 0 else -n, r, uref))
+        return {"cvs": cs[0]["cvs"], "cvs2": cs[1]["cvs"], "knots": cs[0]["knots"], "degree": 2,
+                "weights": cs[0]["weights"]}
 
     @staticmethod
     def _arc(c, ax, u, w, r, a0, span, n, dist):
@@ -1089,14 +1371,31 @@ class Recognizer:
 
     def outline(self, i):
         """(outer, inners, ring ids) of plane region i on the sharp body;
-        outer None when the region is a ring's cap (the cylinder makes it)."""
+        outer None when the region is a ring's cap (the cylinder makes it).
+        The ring ids are those of its outermost outline: a ring through an
+        inner one (the hole through a tube's end) is not shut by it."""
         V = self.V
-        polys, rings = [], []
+        polys, rings, big = [], [], -1.0
         for lp in self.loops(i):
             labs = [self.label(i, j) for _, j in lp]
             keys = {l[:2] for l in labs if l is not None}
+            if len(keys) == 1 and next(iter(keys))[0] == "R" and next(iter(keys))[1] in self.sewn:
+                b = next(iter(keys))[1]                        # a sewn ring's end: its circle
+                vs = {a for a, _ in lp}
+                end = next(((v, o) for v, o in self.sewn[b] if set(v) == vs), None)
+                if end is not None:
+                    c, n, r = self._loop_circle(b, *end)
+                    P = V[[a for a, _ in lp]]
+                    if n @ np.cross(P, np.roll(P, -1, 0)).sum(0) < 0:
+                        n = -n                                 # running as the mesh's outline does
+                    C = self._circle(c, n, r, np.cross(n, (1.0, 0.0, 0.0) if abs(n[0]) < 0.9 else (0.0, 1.0, 0.0)))
+                    polys.append([dict(C, p=C["cvs"][0])])
+                    continue
             if keys and all(k[0] == "R" for k in keys):
-                rings += [k[1] for k in keys]
+                P = V[[a for a, _ in lp]]
+                a = float(np.linalg.norm(np.cross(P, np.roll(P, -1, 0)).sum(0)))
+                if a > big:
+                    big, rings = a, [k[1] for k in keys]
                 continue
             n = len(lp)
             st = next((k for k in range(n) if labs[k] is not None and labs[k - 1] != labs[k]), None)
@@ -1182,9 +1481,8 @@ class Recognizer:
                 polys.append([q if isinstance(q, dict) else list(map(float, q)) for q in pts])
         if not polys:
             return None, [], rings
-        at = lambda q: q["p"] if isinstance(q, dict) else q
-        area = lambda P: float(np.linalg.norm(np.cross(np.array([at(q) for q in P]),
-                                                       np.roll(np.array([at(q) for q in P]), -1, 0)).sum(0)))
+        at = lambda P: np.array([x for q in P for x in (q["cvs"][:-1] if isinstance(q, dict) else [q])], float)
+        area = lambda P: float(np.linalg.norm(np.cross(at(P), np.roll(at(P), -1, 0)).sum(0)))   # (a curve: its control polygon)
         polys.sort(key=area, reverse=True)
         return polys[0], polys[1:], rings
 
@@ -1195,7 +1493,7 @@ class Recognizer:
         boxy bevels' sweeps (world). faceted: every region a face, its outline
         the mesh's."""
         if faceted:
-            self.bands, self.grids, self.faceted, self.gridface = [], [], True, {}
+            self.bands, self.grids, self.faceted, self.gridface, self.sewn = [], [], True, {}, {}
             self.role = {i: ("plane",) for i in range(len(self.regs))}
         faces, caps = [], {}
         for i in range(len(self.regs)):
@@ -1218,6 +1516,9 @@ class Recognizer:
         pad = max(20 * self.tol, 2e-3 * self.size)
         cyls, fillets, sweeps = [], [], []
         for b, B in enumerate(self.bands):
+            if b in self.sewn:                                # a cone, or a ring sewn to one: ruled between its end circles
+                sweeps.append(self._ring_sweep(b))
+                continue
             if B.get("kind") == "cut":                        # ruled between its arcs on its two end planes
                 A0, A1 = (B["arcs"][j] for j in B["ends"])
                 sweeps.append({"cvs": A0["cvs"], "cvs2": A1["cvs"], "knots": A0["knots"], "degree": 2,
@@ -1249,22 +1550,25 @@ class Recognizer:
         for g in groups:
             g["r"] = float(np.mean([B["r"] for B in self.bands if not B["closed"] and "center" in B and B.get("kind") != "cut"
                                     and abs(B["r"] - g["r"]) <= 100 * self.tol]))
+        cyls.sort(key=lambda c: c["cut"])                      # added before cut (with no faces the first is the body)
         patches = [dict(zip(("net", "ku", "kv"), self.patch(G))) for G in self.grids]
         return {"faces": faces, "cylinders": cyls, "fillets": groups, "sweeps": sweeps, "patches": patches,
                 "tol": 10 * self.tol}
 
     def summary(self):
         roles = [r[0] for r in self.role.values()]
-        cut = lambda B: B["closed"] or B.get("kind") == "cut"
+        cut = lambda B: (B["closed"] and B.get("kind") != "cone") or B.get("kind") == "cut"
+        cones = [B for B in self.bands if B.get("kind") == "cone"]
         holes = [B for B in self.bands if cut(B) and B["inward"]]
         cyls = [B for B in self.bands if cut(B) and not B["inward"]]
-        fil = [B for B in self.bands if not cut(B) and "center" in B]
+        fil = [B for B in self.bands if not cut(B) and "center" in B and B.get("kind") != "cone"]
         boxy = [B for B in self.bands if B.get("kind") == "boxy"]
         planes = sum(1 for i, r in self.role.items() if r[0] == "plane"
                      and not all(f in self.gridface for f in self.regs[i]))
         return {"planes": planes, "fillets": [B["r"] for B in fil],
                 "holes": [2 * B["r"] for B in holes], "cylinders": [2 * B["r"] for B in cyls],
                 "boxy": [(math.exp(-2.0 * math.log(2.0) / B["r"]), 0.5 * (B["w"][0] + B["w"][1])) for B in boxy],
+                "cones": [math.degrees(math.atan(abs(B["k"]))) for B in cones],
                 "patches": len(self.grids)}
 
 
@@ -1283,6 +1587,10 @@ def describe(context, s):
             k = next((k for k in out if abs(k - v) <= 1e-6 * max(abs(v), 1.0)), v)
             out[k] = out.get(k, 0) + 1
         return [f"{n} {what}{'s' if n > 1 else ''} {sym} {_length(context, k)}" for k, n in out.items()]
+    cones = {}                                        # half angles, the same within 0.01 degrees: one entry
+    for a in s.get("cones", ()):
+        k = next((k for k in cones if abs(k - a) < 1e-2), a)
+        cones[k] = cones.get(k, 0) + 1
     boxy = {}
     for p, w in s.get("boxy", ()):
         k = next((k for k in boxy if abs(k[0] - p) < 5e-4 and abs(k[1] - w) <= 1e-6 * max(w, 1.0)), (p, w))
@@ -1291,24 +1599,35 @@ def describe(context, s):
                       + grouped(s["fillets"], "fillet", "r")
                       + [f"{n} bevel{'s' if n > 1 else ''} profile {p:.3g} w {_length(context, w)}" for (p, w), n in boxy.items()]
                       + grouped(s["holes"], "hole", "⌀") + grouped(s["cylinders"], "cylinder", "⌀")
+                      + [f"{n} cone{'s' if n > 1 else ''} {a:.3g}°" for a, n in cones.items()]
                       + ([f"{s['patches']} free-form patch{'es' if s['patches'] > 1 else ''}"] if s.get("patches") else []))
 
 
-def convert(context, obj, rel_tol=1e-5, fillets=True, rings=True):
+def convert(context, obj, rel_tol=1e-5, fillets=True, rings=True, cones=True):
     """(new NURBS object, summary text, warning or None) for a mesh object."""
     V, F, size = mesh_arrays(obj, context.evaluated_depsgraph_get(), rel_tol)
     if not F:
         raise RuntimeError("the mesh has no faces")
-    rec = Recognizer(V, F, size, rel_tol, fillets, rings)
+    rec = Recognizer(V, F, size, rel_tol, fillets, rings, cones)
     loc, rot, _ = obj.matrix_world.decompose()
     M = Matrix.Translation(loc) @ rot.to_matrix().to_4x4()
     axis, angle = rot.to_axis_angle()
     xf = {"loc": list(loc), "axis": list(axis), "angle": math.degrees(angle), "scale": [1.0, 1.0, 1.0]}
     note = None
-    try:
+    def build(rec):
         info, breps = jobs.run("mesh_to_brep", {}, ["base", "result"], xform=xf, **rec.job())
         if not info.get("solid") and not rec.open:
             raise jobs.JobError("the rebuilt faces did not close into a solid")
+        return info, breps
+    try:
+        try:
+            info, breps = build(rec)
+        except jobs.JobError as exc:
+            if not rec.sewn:
+                raise
+            rec = Recognizer(V, F, size, rel_tol, fillets, rings, cones=False)    # the rings as before, cones as facets
+            info, breps = build(rec)
+            note = f"cones kept as facets ({exc})"
         summary = describe(context, rec.summary())
     except jobs.JobError as exc:
         info, breps = jobs.run("mesh_to_brep", {}, ["base", "result"], xform=xf, **rec.job(faceted=True))
@@ -1349,7 +1668,7 @@ def convert(context, obj, rel_tol=1e-5, fillets=True, rings=True):
 
 class NPROTO_OT_mesh_to_brep(bpy.types.Operator):
     """Rebuild the selected mesh objects as NURBS bodies: flat faces become planes,
-    round holes and cylinders exact cylinders, bevels (Profile 0.5) fillets of the
+    round holes and cylinders exact cylinders, round tapers exact cones, bevels (Profile 0.5) fillets of the
     bevel's radius, which stay editable in the Feature panel. The meshes are kept (hidden)"""
     bl_idname = "nproto.mesh_to_brep"
     bl_label = "Mesh to BREP"
@@ -1361,6 +1680,9 @@ class NPROTO_OT_mesh_to_brep(bpy.types.Operator):
     rings: BoolProperty(name="Holes and Cylinders", default=True,
                         description="Round holes and cylinders become exact cylinders of the mesh's diameter; "
                                     "off: they keep their facets")
+    cones: BoolProperty(name="Cones", default=True,
+                        description="Round tapers and chamfers (a ring of facets at one angle to an axis) become "
+                                    "exact cones, sewn to the faces that close their ends; off: they keep their facets")
     tolerance: FloatProperty(name="Tolerance", default=1e-5, min=1e-8, max=1e-2, precision=7, step=0.0001,
                              description="How far points may be off a plane or circle and still count, as a "
                                          "fraction of the object's size (raise it for imported or scanned meshes)")
@@ -1377,7 +1699,7 @@ class NPROTO_OT_mesh_to_brep(bpy.types.Operator):
         made, lines, warn = [], [], []
         for src in srcs:
             try:
-                new, summary, note = convert(context, src, self.tolerance, self.fillets, self.rings)
+                new, summary, note = convert(context, src, self.tolerance, self.fillets, self.rings, self.cones)
             except (jobs.JobError, RuntimeError) as exc:
                 warn.append(f"{src.name}: not converted ({exc})")
                 continue

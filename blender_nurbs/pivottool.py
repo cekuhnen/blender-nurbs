@@ -436,6 +436,7 @@ TOOL_ID = "nproto.move_pivot_tool"
 TOOL_MODES = ('OBJECT', 'EDIT_MESH', 'EDIT_CURVE', 'EDIT_SURFACE', 'EDIT_LATTICE')
 ICON = os.path.join(os.path.dirname(__file__), "icons", "ops.nproto.move_pivot")    # tools/make_pivot_icon.py
 _last_tool = {}         # mode -> the tool id that was active before this one
+ONE_SHOT = {TOOL_ID}    # toolbar tools that hand the toolbar back (aligntool adds Align Parts')
 _draw_handle = None
 
 
@@ -450,13 +451,13 @@ def _active_tool(context):
 def _note_tool():
     ctx = bpy.context
     t = _active_tool(ctx)
-    if t and t != TOOL_ID:
+    if t and t not in ONE_SHOT:
         _last_tool[ctx.mode] = t
 
 
-def restore_tool(context):
-    """Put back the tool that was active before the Move Pivot tool (if it still is)."""
-    if _active_tool(context) != TOOL_ID:
+def restore_tool(context, tool_id=TOOL_ID):
+    """Put back the tool that was active before the one-shot tool tool_id (if it still is)."""
+    if _active_tool(context) != tool_id:
         return
     prev = _last_tool.get(context.mode, "builtin.select_box")
     try:

@@ -169,7 +169,7 @@ def build_spec_ends(clicks, mode, deg, ends):
     if mode == "THROUGH":
         X, p, specs = through_ends(S, deg, ends)
     else:
-        X, p, specs = align.align_open(S, max(1, min(deg, len(S) - 1)), ends)
+        X, p, specs = align.align_open(S, max(1, min(deg, len(S) - 1)), ends, want=deg)
     return spec([tuple(x) for x in X], order=p + 1), specs
 
 
@@ -533,6 +533,36 @@ def add_curve(context, name, specs_world, edit_obj=None):
         P = np.array(sp["points"], float) - origin
         _add_spline(cu, dict(sp, points=[tuple(p) for p in P]))
     return obj
+
+
+def _plane_normal(op):
+    """The sketch plane's normal of a SketchMixin tool (a list), or None."""
+    pl = getattr(op, "_plane", None)
+    return None if pl is None else [float(x) for x in pl[1]]
+
+
+def mark_sketch_normal(obj, normal):
+    """Record on a new curve object the normal of the plane it was drawn on
+    (its sketch normal: what a straight line cuts along in Trim / Split),
+    when the curve lies in that plane (an axis lock can take a line out of it)."""
+    if normal is None or obj is None or obj.type != 'CURVE':
+        return
+    n = np.array(normal, float)
+    if np.linalg.norm(n) < 1e-12:
+        return
+    n /= np.linalg.norm(n)
+    P = np.array([tuple(p.co)[:3] for sp in obj.data.splines for p in sp.points]
+                 + [tuple(p.co) for sp in obj.data.splines for p in sp.bezier_points], float)
+    if len(P) == 0:
+        return
+    size = float(np.linalg.norm(P.max(axis=0) - P.min(axis=0))) or 1.0
+    R = np.array(obj.matrix_world.to_3x3(), float)
+    nl = np.linalg.solve(R, n) if abs(np.linalg.det(R)) > 1e-12 else n    # local (the points are local)
+    nl /= np.linalg.norm(nl) or 1.0
+    if np.abs((P - P[0]) @ nl).max() > 1e-6 * size:
+        return
+    from . import store
+    obj[store.PROP_SKETCH_N] = [float(x) for x in nl]
 
 
 def _edit_target(context):
@@ -1538,7 +1568,13 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
                                            "are aligned once, and the curve is a plain curve (Align Curve can "
                                            "add the step later)")
     edge_mode: EnumProperty(name="On Surfaces", items=CURVE_EDGE_MODES, default="SURFACE")
+    show_cvs: draw.show_cvs_prop()
+    show_comb: draw.show_comb_prop()
     data: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+
+    def comb_on(self, context):
+        """The comb is drawn: this tool's switch, or Analyze > Curvature Comb."""
+        return self.show_comb or bool(getattr(context.window_manager.nproto_view, "show_comb", False))
 
     def draw(self, context):
         lay = self.layout
@@ -1552,6 +1588,7 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
         col.row().prop(self, "end_cont", expand=True)
         col.prop(self, "keep_aligned")
         col.prop(self, "edge_mode")
+        draw.draw_curve_show(lay, self)
         if LAST_INFO["text"]:
             for line in LAST_INFO["text"].split("\n"):
                 lay.label(text=line)
@@ -1586,8 +1623,8 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
                  ("Curve", [hints.cycle("M", ["CVs", "through points"],
                                         "CVs" if self.mode == "CV" else "through points"),
                             hints.cycle("1-5", [str(d) for d in range(1, 6)], str(self.degree), "degree")]),
-                ("Show", [hints.toggle("K", "curvature comb",
-                                       bool(getattr(context.window_manager.nproto_view, "show_comb", False)))])]
+                ("Show", [hints.toggle("K", "curvature comb", self.comb_on(context)),
+                          hints.toggle("V", "CVs", self.show_cvs)])]
         hints.show(context, "CV Curve", [f"{n} point(s)", self.lock_text().strip(" ·")], rows, MOUSE_SKETCH)
 
     # -- end conditions ---------------------------------------------------
@@ -1660,9 +1697,11 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
             try:
                 sp, _ = self._spec(pts, [self._src(x) for x in sn])
                 ov["curves"] = [[Vector(p) for p in spec_polyline(sp, 16)]]
-                ov["hull"] = [Vector(p) for p in sp["points"]]
+                if self.show_cvs:           # the curve's own CVs (Through Points: not the points clicked)
+                    ov["hull"] = [Vector(p) for p in sp["points"]]
+                    ov["cvs"] = ov["cvs"] + ov["hull"]
                 v = getattr(context.window_manager, "nproto_view", None)
-                if v is not None and v.show_comb:
+                if v is not None and self.comb_on(context):
                     ov["comb"] = preview_comb(sp, int(v.comb_samples), v.comb_scale)
             except Exception:
                 pass
@@ -1757,8 +1796,14 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
             self._preview(context, hover())
             self._status(context)
         elif event.value == 'PRESS' and event.type == 'K':
-            v = context.window_manager.nproto_view
-            v.show_comb = not v.show_comb             # the same switch as Analyze > Curvature Comb
+            on = not self.comb_on(context)
+            self.show_comb = on                       # this tool's switch (its F9 panel's Comb)
+            if not on:
+                context.window_manager.nproto_view.show_comb = False   # off means off: Analyze's too
+            self._preview(context, hover())
+            self._status(context)
+        elif event.value == 'PRESS' and event.type == 'V':
+            self.show_cvs = not self.show_cvs
             self._preview(context, hover())
             self._status(context)
         elif event.value == 'PRESS' and event.type == 'C':
@@ -1780,7 +1825,8 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
         self.data = json.dumps({"pts": [list(map(float, p)) for p in self._pts],
                                 "start": list(srcs[0]) if srcs and srcs[0] else None,
                                 "end": list(srcs[-1]) if len(srcs) > 1 and srcs[-1] else None,
-                                "edit": self._edit.name if self._edit else ""})
+                                "edit": self._edit.name if self._edit else "",
+                                "normal": _plane_normal(self)})
         self.sketch_end(context)
         return self.execute(context)
 
@@ -1813,6 +1859,7 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
             edit = None
         obj = add_curve(context, "NURBS Curve", [sp], edit)
         if edit is None:
+            mark_sketch_normal(obj, d.get("normal"))
             _select_new(context, [obj])
         info = f"Curve: degree {sp['order'] - 1}, {len(sp['points'])} CVs" + (", closed" if sp["cyclic"] else "")
         lines = [info]
@@ -2459,7 +2506,8 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
                 return {'CANCELLED'}
             self.data = json.dumps({"lines": [[list(map(float, a)), list(map(float, b))] for a, b in self._lines],
                                     "arcs": [None if m is None else list(map(float, m)) for m in self._arc_list()],
-                                    "edit": self._edit.name if self._edit else ""})
+                                    "edit": self._edit.name if self._edit else "",
+                                    "normal": _plane_normal(self)})
             return self.execute(context)
         return {'RUNNING_MODAL'}
 
@@ -2491,6 +2539,8 @@ class NPROTO_OT_draw_line(SketchMixin, bpy.types.Operator):
                 sp = segments_spec(g)           # lines and tangent arcs: one exact curve
             made.append(add_curve(context, "NURBS Line", [sp], edit))
         if edit is None:
+            for o in made:
+                mark_sketch_normal(o, d.get("normal"))
             _select_new(context, made)
         n_arcs = sum(1 for _, _, m in segs if m is not None)
         self.report({'INFO'}, f"{len(lines) - n_arcs} line(s)" + (f", {n_arcs} arc(s)" if n_arcs else "")

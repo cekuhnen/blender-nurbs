@@ -99,6 +99,7 @@ def fresh_surfaces(obj):
 
 PROP_NATURAL = "nproto_natural"   # 1 = one untrimmed face (iso boundaries are its edges)
 PROP_UNTRIM = "nproto_untrimmed"  # brep text before the first trim (for Untrim)
+PROP_SKETCH_N = "nproto_sketch_n"  # curve: normal (local) of the plane the Line / CV Curve tool drew it on
 
 
 def is_natural(obj):
@@ -1143,6 +1144,13 @@ def _corner_normals(brep, pts, nrm, tris):
             ks = tri_of[order[starts[v]:starts[v + 1]]]
             N_ = tri_n[ks[ln[ks] > 1e-14 * max(float(ln.max()), 1e-300)]]
             crease[v] = len(N_) > 1 and (N_ @ N_.T).min() < cos_c
+        # a vertex whose triangles all lie on one face can still carry the
+        # tessellator's normal averaged with a face across a crease (the crack
+        # repair took that face's triangles off it: a fillet's run-out sliver
+        # met by a wall at 90 degrees shaded as spikes 45 degrees off)
+        Nk = np.asarray(nrm, float)
+        Nk = Nk / np.maximum(np.linalg.norm(Nk, axis=1), 1e-300)[:, None]
+        crease |= (count > 0) & ((Nk * mean).sum(1) < np.cos(np.radians(CREASE_DEG / 2)))
     else:
         tri_n = []
         for t in T:
@@ -1153,11 +1161,15 @@ def _corner_normals(brep, pts, nrm, tris):
         for k, t in enumerate(T):
             for v in t:
                 inc[v].append(k)
+        cos_h = np.cos(np.radians(CREASE_DEG / 2))
         for v, ks in enumerate(inc):
             if len(ks) > 1:
                 N_ = tri_n[ks]
                 if (N_ @ N_.T).min() < cos_c:
                     crease[v] = True
+            if ks and not crease[v]:            # (as above: the kernel's normal off its own triangles)
+                m_, n_ = tri_n[ks].sum(0), np.asarray(nrm[v], float)
+                crease[v] = m_ @ n_ < cos_h * (np.linalg.norm(m_) * np.linalg.norm(n_) or 1.0)
     if crease.any():
         crease = _true_creases(brep, P, crease)
     if not crease.any():

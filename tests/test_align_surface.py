@@ -437,6 +437,52 @@ kept = [i for i in range(1, len(clicks)) if np.min(np.linalg.norm(X - clicks[i],
 check("CV Curve CV mode G3: one CV added, clicks 3 on stay where clicked",
       len(X) == len(clicks) + 1 and kept == list(range(3, len(clicks))), (len(X), kept))
 
+# ------------------------------------------------------------- CV Curve keeps the degree asked for (2 clicks, G2 ends)
+# The degree was clamped to the clicks (2 -> 1) before the ends added CVs, so
+# the ends' minimum (cubic) won whatever degree was picked.
+LA, LB = nurbs("DegA", [(-6, -6, 0), (-2, -2, 0)], order=2), nurbs("DegB", [(6, -6, 0), (2.5, -2.5, 0)], order=2)
+clicks = [(-2.0, -2.0, 0.0), (2.5, -2.5, 0.0)]
+for want, exp in ((5, 5), (4, 4), (1, 3)):
+    ends = {"0": ({"cont": "G2", "weight": 1.0, "mode": "EDGE", "snap": "END", "flip": False},
+                  align.end_frame(LA, "S0", np.array(clicks[0]), "END", "EDGE")),
+            "1": ({"cont": "G2", "weight": 1.0, "mode": "EDGE", "snap": "END", "flip": False},
+                  align.end_frame(LB, "S0", np.array(clicks[1]), "END", "EDGE"))}
+    sp_, specs = drawtools.build_spec_ends(clicks, "CV", want, ends)
+    X = np.array([tuple(q)[:3] for q in sp_["points"]])
+    D0, D1 = np.array([1.0, 1.0, 0.0]) / 2 ** .5, np.array([-1.0, 1.0, 0.0]) / 2 ** .5
+    off = max(max(np.linalg.norm(np.cross(X[j] - X[0], D0)) for j in (1, 2)),
+              max(np.linalg.norm(np.cross(X[-1 - j] - X[-1], D1)) for j in (1, 2)))
+    check(f"CV Curve degree {want}, G2 ends on lines: degree {exp}, 6 CVs, first legs on the lines",
+          sp_["order"] - 1 == exp and len(X) == 6 and off < 1e-6, (sp_["order"] - 1, len(X), off))
+# G3 ends: the refit used to count the legs' inserted CVs twice, leaving two on
+# the clicks' chord: the curve dipped to it (two inflections). Now 2 + 6 CVs,
+# all on the ends, and the CV polygon turns one way only (no inflection).
+for want in (4, 5):
+    ends = {e: ({"cont": "G3", "weight": 1.0, "mode": "EDGE", "snap": "END", "flip": False},
+                align.end_frame(L, "S0", np.array(c), "END", "EDGE")) for e, L, c in (("0", LA, clicks[0]), ("1", LB, clicks[1]))}
+    sp_, _ = drawtools.build_spec_ends(clicks, "CV", want, ends)
+    X = np.array([tuple(q)[:3] for q in sp_["points"]])
+    legs = np.diff(X, axis=0)
+    turns = [float(np.cross(a, b)[2]) for a, b in zip(legs[:-1], legs[1:])]
+    sc = 1e-9 * max(abs(t) for t in turns)
+    one_way = all(t <= sc for t in turns) or all(t >= -sc for t in turns)
+    check(f"CV Curve degree {want}, G3 ends on lines: 8 CVs, no dip between the ends",
+          sp_["order"] - 1 == want and len(X) == 8 and one_way, (sp_["order"] - 1, len(X), np.round(turns, 4)))
+# A middle click: it stays a CV (a refit put it on the old curve, below the
+# click, while the long end legs rose above it: a dip at degree 4), and the
+# ends' legs stop short enough that the CV polygon turns one way only.
+mid = (0.2, -0.5, 0.0)          # inside the lines' wedge: a curve with no inflection exists
+for cont in ("G1", "G2", "G3"):
+    for want in (3, 4, 5):
+        ends = {e: ({"cont": cont, "weight": 1.0, "mode": "EDGE", "snap": "END", "flip": False},
+                    align.end_frame(L, "S0", np.array(c), "END", "EDGE")) for e, L, c in (("0", LA, clicks[0]), ("1", LB, clicks[1]))}
+        sp_, _ = drawtools.build_spec_ends([clicks[0], mid, clicks[1]], "CV", want, ends)
+        X = np.array([tuple(q)[:3] for q in sp_["points"]])
+        k = align.CONT[cont]
+        kept = np.linalg.norm(X - np.array(mid), axis=1).min()
+        check(f"CV Curve {cont} degree {want}, a middle click: still a CV, 3 + {2 * k} CVs, no dip",
+              kept < 1e-9 and len(X) == 3 + 2 * k and align.one_way(X), (kept, len(X)))
+
 # ------------------------------------------------------------- the user's file: aligned curves rebuild stably
 user = sys.argv[sys.argv.index("--") + 1] if "--" in sys.argv else os.path.join(ROOT, "Blend Files", "blend cv align curve  spline surface.blend")
 if os.path.exists(user):

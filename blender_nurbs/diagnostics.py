@@ -224,9 +224,13 @@ def analysis_objects(ctx, v):
 def draw_combs(ctx, draw_lines):
     s = ctx.scene.nproto_settings
     v = ctx.window_manager.nproto_view
-    if not v.show_comb:
-        return
-    objs = [o for o in analysis_objects(ctx, v) if o.type == 'CURVE']
+    if v.show_comb:
+        objs = [o for o in analysis_objects(ctx, v) if o.type == 'CURVE']
+    else:
+        from . import draw          # a curve tool's F9 panel with Show Comb: the curve it made
+        if not draw.curve_comb_shown(ctx):
+            return
+        objs = [o for o in ctx.selected_objects if o.type == 'CURVE']
     if not objs:
         return
     gpu.state.depth_test_set('NONE')

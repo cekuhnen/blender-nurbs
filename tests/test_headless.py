@@ -3593,6 +3593,9 @@ def _fake(op_cls, **props):
     cls.report = lambda self, t, m: self.msgs.append(m)
     f = cls()
     f.msgs, f.data = [], ""
+    for k_, v_ in getattr(op_cls, "__annotations__", {}).items():   # the operator's own defaults (Show CVs / Comb)
+        if "default" in getattr(v_, "keywords", {}):
+            setattr(f, k_, v_.keywords["default"])
     for k_, v_ in props.items():
         setattr(f, k_, v_)
     return f
@@ -5247,13 +5250,19 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cy
               "measure",    # Measure: in the Analyze panel / header popover, with Continuity Check
               "remove_symmetry",    # Mirror's Make Symmetric: the Active Object panel's button
               "move", "rotate", "scale", "transform_hold",   # by Points: hold G / R / S (movetool keymap), no button
+              "align_parts",    # Align Parts: Object > Transform and the NURBS Proto menu
               "square"}     # Square: merged into Patch (Quad Sided); kept for older files, off the menus
 _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto)
               if n not in _not_tools and not n.startswith("workplane_")}   # the Work Planes panel's own
 _menu_only = {t[0] for g in _tg.GROUPS for sec in g[2] for row in sec[1] if isinstance(row, _tg.MenuOnly)
               for t in row if t[0] != "nproto.add_primitive"}     # Edit CVs: Tab does it, the menus list it
-_tool_ops = [o_ for o_ in _in_panels if o_ not in ("nproto.add_primitive", "nproto.boolean")] + \
-    ["nproto.boolean"] + sorted(_menu_only)          # (one button per operation)
+_pbtn = [(e["op"], repr(sorted(e.get("props", {}).items()))) for n, r in _drawn.items()
+         if n.startswith("VIEW3D_PT") or n in _DROPS for e in r if "op" in e]
+_variant_ops = {o_ for o_ in set(_in_panels) if _in_panels.count(o_) > 1 and o_ != "nproto.add_primitive"
+                and len({p_ for q_, p_ in _pbtn if q_ == o_}) == _in_panels.count(o_)}
+_tool_ops = [o_ for o_ in _in_panels if o_ != "nproto.add_primitive" and o_ not in _variant_ops] + \
+    sorted(_variant_ops) + sorted(_menu_only)        # (Boolean, Twist / Bend / Taper, Remove (All) Fillets:
+                                                     # one button per variant, each with its own settings)
 _bool_ops = sorted(e["props"].get("operation") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") for e in r
                    if e.get("op") == "nproto.boolean")
 _kinds = [e["props"].get("kind") for n, r in _drawn.items() if n.startswith("VIEW3D_PT") or n in _DROPS for e in r
@@ -5326,8 +5335,9 @@ _rows = []
 _tg.draw_panel(_ActLay(_rows), "SURFACE_EDIT", ctx)
 _rows_c = []
 _tg.draw_panel(_ActLay(_rows_c), "CURVE_EDIT", ctx)
-_cut = {"nproto.trim", "nproto.split", "nproto.emboss"}   # they take the curve (a cutter, a profile)
-check("UI: a curve selected dims Surface Edit (still clickable) but Trim / Split / Emboss and not Curve Edit; "
+_cut = {"nproto.trim", "nproto.split", "nproto.emboss",   # they take the curve (a cutter, a profile)
+        "nproto.deform"}                                   # Twist / Bend / Taper: a curve is deformed too
+check("UI: a curve selected dims Surface Edit (still clickable) but Trim / Split / Emboss / Twist and not Curve Edit; "
       "nothing selected dims nothing",
       _none_sel is None and _have == {"CURVE"} and _tg.fits({"NURBS"}, None)
       and _rows and all(r_["active"] == bool(set(r_["ops"]) & _cut) for r_ in _rows if r_["ops"])
@@ -7464,9 +7474,9 @@ _cvk.modal(fc, _ev('MOUSEMOVE', _wpx(1.8, -1.8), 'NOTHING'))
 _no_comb = _drw.sketch_overlay.get("comb")
 _cvk.modal(fc, _ev('K', _wpx(1.8, -1.8)))
 _cg = _drw.sketch_overlay.get("comb")
-_show = _v.show_comb
+_show = _cvk.show_comb and not _v.show_comb      # the tool's own Comb, not Analyze's for every curve
 _khint = [i for r in _hn.HUD["spec"]["rows"] if r[0] == "Show" for i in r[1]] if _hn.HUD["spec"] else []
-check("CV Curve: K turns the curvature comb on the curve being drawn on (the Analyze switch), with its knot ticks",
+check("CV Curve: K turns the curvature comb on the curve being drawn on (the tool's own Comb), with its knot ticks",
       _no_comb is None and _show and _cg is not None and len(_cg[0]) > 20 and len(_cg[1]) > 20
       and len(_cg[2]["jump"]) >= 2 and _khint and _khint[0]["current"] == "on",
       f"{_no_comb is None} {_show} {None if _cg is None else (len(_cg[0]), {k: len(v_) for k, v_ in _cg[2].items()})}")
@@ -9375,6 +9385,115 @@ _m2r["an icosphere (nothing to recognise): a solid of its flat facets"] = b_.fac
 bpy.ops.mesh.primitive_grid_add(x_subdivisions=3, y_subdivisions=3, size=1.0, location=(9.0, 0.0, 0.0))
 n_, s_, no_, b_, v_, sol_ = _m2b_run(ctx.active_object)
 _m2r["an open mesh: a sheet, said so"] = b_.face_count() == 1 and not sol_ and no_ is not None and "open" in no_
+# a shelled cap (Pool Table.blend): a profile spun to the axis by Screw, thickened outward by Solidify. Solidify's
+# corner offset is not exact: the outer wall leans ~0.1 deg (it stopped growing a third of the way round) and the
+# spun top's tip sits above its rim (64 triangles, no plane)
+def _m2b_shell(name, x_, ngon=False):
+    me_ = bpy.data.meshes.new(name)
+    me_.from_pydata([(-0.238125, 0, 0.40005), (-0.238125, 0, 0.45085), (0, 0, 0.45085)], [(1, 0), (2, 1)], [])   # (edge order: Solidify thickens outward)
+    o_ = bpy.data.objects.new(name, me_)
+    ctx.scene.collection.objects.link(o_)
+    o_.location = (x_, 0.0, 0.0)
+    m_ = o_.modifiers.new("Screw", 'SCREW')
+    m_.steps = m_.render_steps = 64
+    m_ = o_.modifiers.new("Solidify", 'SOLIDIFY')
+    m_.thickness, m_.offset, m_.use_even_offset = 0.00635, 1.0, True
+    if ngon:                                   # applied, each spun cap dissolved into one n-gon
+        dg_ = ctx.evaluated_depsgraph_get()
+        me2_ = bpy.data.meshes.new_from_object(o_.evaluated_get(dg_))
+        o_.modifiers.clear()
+        b_ = _bmx.new()
+        b_.from_mesh(me2_)
+        _bmx.ops.remove_doubles(b_, verts=b_.verts, dist=1e-7)
+        for z_ in (0.45085, 0.4572):
+            _bmx.ops.dissolve_faces(b_, faces=[f_ for f_ in b_.faces if len(f_.verts) == 3
+                                               and all(abs(v_.co.z - z_) < 2e-4 for v_ in f_.verts)])
+        b_.to_mesh(me_)
+        b_.free()
+    return o_
+for _ng in (False, True):
+    _o = _m2b_shell("M2B_Shell", 11.0, _ng)
+    _dg = ctx.evaluated_depsgraph_get()
+    _ev = _o.evaluated_get(_dg).to_mesh()
+    _P = np.array([tuple(v_.co) for v_ in _ev.vertices])
+    _o.evaluated_get(_dg).to_mesh_clear()
+    _ro = float(np.hypot(_P[:, 0], _P[:, 1]).max() + np.hypot(_P[:, 0], _P[:, 1])[_P[:, 2] < 0.4001].max()) / 2
+    n_, s_, no_, b_, v_, sol_ = _m2b_run(_o)
+    _exp = math.pi * (_ro ** 2 * (0.45711 - 0.40005) - 0.238125 ** 2 * (0.45085 - 0.40005))   # (top: the outer rim)
+    _dev = _m2b_cyl_dev(b_, [(0.0, 0.0, 0.238125), (0.0, 0.0, _ro)])   # (the body is local)
+    _m2r["a shelled cap (Screw + Solidify" + (", n-gon caps" if _ng else "") + "): one hole, one cylinder, 3 planes, "
+         "a closed solid of 5 faces"] = \
+        "1 hole" in s_ and "1 cylinder" in s_ and s_.startswith("3 planes") and b_.face_count() == 5 and sol_ \
+        and _dev < 6e-5 and abs(v_ - _exp) < 1e-3 * _exp and no_ is None
+    bpy.data.objects.remove(_o)
+# a tube: its hole runs through both end faces (annuli), which shut only the outer cylinder
+_tb = _bmx.new()
+_n = 48
+_vs = [[_tb.verts.new((r_ * math.cos(2 * math.pi * k_ / _n), r_ * math.sin(2 * math.pi * k_ / _n), z_))
+        for k_ in range(_n)] for r_, z_ in ((0.4, 0.0), (0.4, 0.5), (0.3, 0.5), (0.3, 0.0))]
+for j_ in range(4):
+    for k_ in range(_n):
+        _tb.faces.new((_vs[j_][k_], _vs[j_][(k_ + 1) % _n], _vs[(j_ + 1) % 4][(k_ + 1) % _n], _vs[(j_ + 1) % 4][k_]))
+_bmx.ops.recalc_face_normals(_tb, faces=_tb.faces)
+_me = bpy.data.meshes.new("M2B_Tube")
+_tb.to_mesh(_me)
+_tb.free()
+_o = bpy.data.objects.new("M2B_Tube", _me)
+ctx.scene.collection.objects.link(_o)
+_o.location = (13.0, 0.0, 0.0)
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_o)
+_m2r["a tube (quads only): an exact cylinder and hole, the hole through both annuli, a closed solid of 4 faces"] = \
+    "1 hole" in s_ and "1 cylinder" in s_ and b_.face_count() == 4 and sol_ \
+    and abs(v_ - math.pi * (0.16 - 0.09) * 0.5) < 1e-6 and _m2b_cyl_dev(b_, [(0.0, 0.0, 0.3), (0.0, 0.0, 0.4)]) < 1e-6
+# cones: a turned profile (closed loop of (r, z), r 0 a pole) spun into quads and pole fans; a cone is rebuilt as
+# a face ruled between its end circles and sewn to what closes its ends (the stool's lid in "mesh to brep.blend")
+def _m2b_turned(name, prof, x_, n_=48):
+    tb_ = _bmx.new()
+    rows_ = [[tb_.verts.new((r_ * math.cos(2 * math.pi * k_ / n_), r_ * math.sin(2 * math.pi * k_ / n_), z_))
+              for k_ in range(n_)] if r_ > 0 else [tb_.verts.new((0.0, 0.0, z_))] * n_ for r_, z_ in prof]
+    for j_ in range(len(prof)):
+        a_, c_ = rows_[j_], rows_[(j_ + 1) % len(prof)]
+        for k_ in range(n_):
+            q_ = [a_[k_], a_[(k_ + 1) % n_], c_[(k_ + 1) % n_], c_[k_]]
+            q_ = [v_ for i_, v_ in enumerate(q_) if v_ not in q_[:i_]]
+            if len(q_) >= 3:
+                tb_.faces.new(q_)
+    _bmx.ops.recalc_face_normals(tb_, faces=tb_.faces)
+    me_ = bpy.data.meshes.new(name)
+    tb_.to_mesh(me_)
+    tb_.free()
+    o_ = bpy.data.objects.new(name, me_)
+    ctx.scene.collection.objects.link(o_)
+    o_.location = (x_, 4.0, 0.0)
+    return o_
+_frus = lambda R_, r_, h_: math.pi * h_ / 3 * (R_ * R_ + R_ * r_ + r_ * r_)
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_turned("M2B_Chamfered", [(0, 0), (0.4, 0), (0.4, 0.4), (0.3, 0.5), (0, 0.5)], 0.0))
+_m2r["a chamfered puck (turned): an exact cylinder and a 45 deg cone sewn to the caps, a closed solid of 4 faces"] = \
+    "1 cylinder" in s_ and "1 cone 45°" in s_ and b_.face_count() == 4 and sol_ \
+    and abs(v_ - math.pi * 0.16 * 0.4 - _frus(0.4, 0.3, 0.1)) < 1e-6
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_turned("M2B_Countersink", [(0.1, 0), (0.5, 0), (0.5, 0.3), (0.2, 0.3), (0.1, 0.2)], 1.5))
+_m2r["a countersunk ring: the hole and its cone sewn, the outer wall and both annuli with it, a closed solid of 5 faces"] = \
+    "1 hole" in s_ and "1 cylinder" in s_ and "1 cone" in s_ and b_.face_count() == 5 and sol_ \
+    and abs(v_ - (math.pi * 0.25 * 0.3 - math.pi * 0.01 * 0.2 - _frus(0.2, 0.1, 0.1))) < 1e-6
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_turned("M2B_Taper", [(0, 0), (0.4, 0), (0.2, 0.5), (0, 0.5)], 3.0, n_=24))
+_m2r["a tapered plug (24 sides): one cone between two discs, the frustum's exact volume"] = \
+    "2 planes" in s_ and s_.count("cone") == 1 and b_.face_count() == 3 and sol_ and abs(v_ - _frus(0.4, 0.2, 0.5)) < 1e-6
+def _m2b_lid(name, x_):                    # the lid: a slanted rim and top spun by Screw, Solidify (complex) outward
+    me_ = bpy.data.meshes.new(name)
+    me_.from_pydata([(-0.264934, 0, 0.40005), (-0.238125, 0, 0.45085), (0, 0, 0.45085)], [(1, 0), (2, 1)], [])
+    o_ = bpy.data.objects.new(name, me_)
+    ctx.scene.collection.objects.link(o_)
+    o_.location = (x_, 4.0, 0.0)
+    sc_ = o_.modifiers.new("Screw", 'SCREW')
+    sc_.steps = sc_.render_steps = 32
+    so_ = o_.modifiers.new("Solidify", 'SOLIDIFY')
+    so_.solidify_mode, so_.thickness, so_.offset, so_.use_even_offset = 'NON_MANIFOLD', 0.00635, 1.0, True
+    return o_
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_lid("M2B_Lid", 4.5))
+_m2r["a lid (Screw + Solidify, slanted rim): three cones (outside, inside, the rim between), 2 planes, 5 faces"] = \
+    "2 planes" in s_ and s_.count("cone") == 3 and b_.face_count() == 5 and sol_ and no_ is None
+n_, s_, no_, b_, v_, sol_ = _m2b_run(_m2b_lid("M2B_LidNoCones", 5.5), cones=False)
+_m2r["a lid with cones off: its facets, as before"] = "cone" not in s_ and b_.face_count() == 98 and sol_
 # boxy bevels (Profile above 0.5): an exact superellipse strip, G2 to both faces, where it ends on flat faces
 def _boxy_vol(p_, w_=0.1, a_=0.6):
     r_ = -2 * math.log(2) / math.log(p_)

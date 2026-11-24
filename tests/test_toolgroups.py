@@ -64,7 +64,7 @@ rows = [[t[0].split(".")[1] for t in row] for sec in tg.GROUP["SURFACES"][2][1:]
 check("Create Surfaces rows", rows == [
     ["loft", "loft_rails", "network"], ["revolve", "rail_revolve"], ["sweep", "pipe"],
     ["extrude", "flange"], ["planar", "dome"], ["boundary", "patch"],
-    ["offset", "thicken"], ["pattern", "mirror"], ["unroll", "flow"], ["from_blender_surface"]], rows)
+    ["offset", "thicken"], ["pattern", "mirror", "tween"], ["unroll", "flow"], ["from_blender_surface"]], rows)
 
 rows = [[t[0].split(".")[1] for t in row] for sec in tg.GROUP["CURVE_EDIT"][2] for row in sec[1]]
 check("Curve Edit rows, in Surface Edit's order (shape, trim, join)", rows == [
@@ -76,9 +76,10 @@ rows = [[t[0].split(".")[1] for t in row] for sec in tg.GROUP["SURFACE_EDIT"][2]
         if not isinstance(row, tg.MenuOnly)]
 check("Surface Edit rows (Edit CVs only in the menus: Tab does it)", rows == [
     ["rebuild_surface", "extend"], ["surface_align", "match_surface"], ["refit_trim", "merge_patches"],
-    ["flip_normal"], ["trim", "split"], ["untrim", "untrim_region"], ["detach_iso"], ["join", "unjoin"],
-    ["fillet", "edge_fillet"], ["boolean", "boolean", "boolean"], ["push_pull", "rotate_face"],
-    ["move_face", "replace_face"], ["boundary_fill", "emboss"]], rows)
+    ["deform", "deform", "deform"], ["flip_normal"], ["trim", "split"], ["untrim", "untrim_region"], ["detach_iso"], ["join", "unjoin"],
+    ["fillet", "edge_fillet"], ["remove_fillets", "remove_fillets"], ["boolean", "boolean", "boolean"],
+    ["push_pull", "rotate_face"],
+    ["move_face", "replace_face"], ["boundary_fill", "emboss"], ["shell"]], rows)
 menu = []
 class _M:
     def separator(self, **k): pass

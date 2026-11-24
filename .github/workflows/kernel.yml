@@ -229,6 +229,12 @@ jobs:
           "$BLENDER" -b --factory-startup --python tests/test_push_pull.py 2>&1 | tee pushpull.log
           grep -E "^FAIL" pushpull.log || true
           grep -q "^ALL OK" pushpull.log
+          "$BLENDER" -b --factory-startup --python tests/test_shell.py 2>&1 | tee shell.log
+          grep -E "^FAIL" shell.log || true
+          grep -q "^ALL OK" shell.log
+          "$BLENDER" -b --factory-startup --python tests/test_remove_fillets.py 2>&1 | tee rmfillet.log
+          grep -E "^FAIL" rmfillet.log || true
+          grep -q "^ALL OK" rmfillet.log
           "$BLENDER" -b --factory-startup --python tests/test_extrude_face.py 2>&1 | tee extface.log
           grep -E "^FAIL" extface.log || true
           grep -q "^ALL OK" extface.log
@@ -244,9 +250,27 @@ jobs:
           "$BLENDER" -b --factory-startup --python tests/test_move_face.py 2>&1 | tee moveface.log
           grep -E "^FAIL" moveface.log || true
           grep -q "^ALL OK" moveface.log
+          "$BLENDER" -b --factory-startup --python tests/test_move_face_curved.py 2>&1 | tee movecurved.log
+          grep -E "^FAIL" movecurved.log || true
+          grep -q "^ALL OK" movecurved.log
+          "$BLENDER" -b --factory-startup --python tests/test_move_face_sphere.py 2>&1 | tee movesphere.log
+          grep -E "^FAIL" movesphere.log || true
+          grep -q "^ALL OK" movesphere.log
+          "$BLENDER" -b --factory-startup --python tests/test_move_face_torus.py 2>&1 | tee movetorus.log
+          grep -E "^FAIL" movetorus.log || true
+          grep -q "^ALL OK" movetorus.log
+          "$BLENDER" -b --factory-startup --python tests/test_move_face_freeform.py 2>&1 | tee movefree.log
+          grep -E "^FAIL" movefree.log || true
+          grep -q "^ALL OK" movefree.log
+          "$BLENDER" -b --factory-startup --python tests/test_move_face_notch.py 2>&1 | tee movenotch.log
+          grep -E "^FAIL" movenotch.log || true
+          grep -q "^ALL OK" movenotch.log
           "$BLENDER" -b --factory-startup --python tests/test_unroll_flow.py 2>&1 | tee unroll.log
           grep -E "^FAIL" unroll.log || true
           grep -q "^ALL OK" unroll.log
+          "$BLENDER" -b --factory-startup --python tests/test_deform.py 2>&1 | tee deform.log
+          grep -E "^FAIL" deform.log || true
+          grep -q "^ALL OK" deform.log
           "$BLENDER" -b --factory-startup --python tests/test_emboss.py 2>&1 | tee emboss.log
           grep -E "^FAIL" emboss.log || true
           grep -q "^ALL OK" emboss.log

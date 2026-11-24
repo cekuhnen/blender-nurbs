@@ -54,7 +54,8 @@ TIE_PX = 1.5            # targets this close in rank count as overlapping: neare
 BONUS = {"first": 4.0, "end": 4.0, "vertex": 4.0, "mid": 2.0, "center": 2.0, "cv": 0.0}
 LABELS = {"first": "Close", "end": "End", "mid": "Mid", "center": "Center", "cv": "CV",
           "edge": "Edge", "curve": "On Curve", "perp": "Perpendicular", "tan": "Tangent",
-          "vertex": "Vertex", "face": "On Face", "line": "On Line"}
+          "vertex": "Vertex", "face": "On Face", "line": "On Line",
+          "ring": "Ring", "arc": "Arc", "axis": "Axis", "plane": "Face", "sphere": "Sphere"}
 MESH_ELEMENTS = ("VERTEX", "EDGE", "EDGE_MIDPOINT", "FACE", "FACE_MIDPOINT")
 MESH_RINGS = (0.5, 1.0)     # rays around the mouse at these fractions of SNAP_PX (8 each), and one at it
 LOOSE_MAX = 200_000        # more loose vertices + edges than this (a point cloud) don't snap
@@ -547,20 +548,33 @@ class SurfaceTarget(MeshTarget):
             print("NURBS face snap skipped", getattr(obj, "name", "?"), exc)
             return None
 
-    def flat(self, poly, P):
+    def _cache(self):
         obj = self.obj
         rev = obj.get(store.PROP_REV, 0)
         c = _SURF_FLAT.get(obj.session_uid)
         if c is None or c[0] != rev:
             c = _SURF_FLAT[obj.session_uid] = (rev, {}, {})
+        return rev, c
+
+    def face_index(self, poly, P):
+        """Index of the B-rep face displayed polygon `poly` (hit at world P)
+        belongs to (cached per revision), or -1."""
+        _, c = self._cache()
+        i = c[1].get(poly)
+        if i is None:
+            from .kernel import load as load_kernel
+            brep = store.get_brep(self.obj)
+            q = self.Ri @ np.asarray(P, float) + self.ti
+            f = load_kernel().find_face(brep, tuple(float(x) for x in q))
+            i = c[1][poly] = next((k for k, g in enumerate(brep.faces()) if g == f), -1)
+        return i
+
+    def flat(self, poly, P):
+        obj = self.obj
+        rev, c = self._cache()
         try:
             brep = store.get_brep(obj)
-            i = c[1].get(poly)
-            if i is None:
-                from .kernel import load as load_kernel
-                q = self.Ri @ np.asarray(P, float) + self.ti
-                f = load_kernel().find_face(brep, tuple(float(x) for x in q))
-                i = c[1][poly] = next((k for k, g in enumerate(brep.faces()) if g == f), -1)
+            i = self.face_index(poly, P)
             if i < 0:
                 return None
             if i not in c[2]:
@@ -622,8 +636,10 @@ def _ray_segment(o, d, A, B):
 class Targets:
     def __init__(self):
         self._pts, self.kinds, self.tans, self.srcs = [], [], [], []
+        self.owners = []        # the object name each point belongs to (or None)
+        self.rings = []         # circular edges and curves: {"c", "n", "r", "W" world polyline, "obj", "ref"}
         self._lines = []        # (world polyline (m, 3), refine(segment, s) -> world point, kind, src, meta)
-        self._faces = []        # (world bbox corners (8, 3), centre() -> world point or None)
+        self._faces = []        # (world bbox corners (8, 3), centre() -> world point or None, owner name)
         self._meshes = []       # MeshTarget
         self._surfaces = []     # SurfaceTarget: NURBS objects' faces, for flat_face
         self.mesh_elements = lambda: MESH_ELEMENTS      # which mesh elements snap (read on every move)
@@ -640,6 +656,24 @@ class Targets:
         point under the mouse (on the face), "n" its normal towards the
         viewer, "u", "v" axes in it (u along its edges), "seg" its outline,
         "size"}; None over nothing, a curved surface, or a face seen edge-on."""
+        best = self.ray_hit(view, mouse)
+        if best is None:
+            return None
+        m, (P, poly, _) = best
+        d = view.ray(np.asarray(mouse, float))[1]
+        f = m.flat(poly, P)
+        if f is None:
+            return None
+        n = f["n"] if float(f["n"] @ d) < 0 else -f["n"]
+        if abs(float(n @ d)) < 0.02:
+            return None
+        u = face_axis(n, f["seg"])
+        return dict(f, P=P - float((P - f["c"]) @ n) * n, n=n, u=u, v=np.cross(n, u))
+
+    def ray_hit(self, view, mouse):
+        """(MeshTarget or SurfaceTarget, (world point, polygon, distance)) of
+        the face under the mouse nearest the viewer, of a plain mesh or a NURBS
+        object, or None."""
         mouse = np.asarray(mouse, float)
         cands = [m for m in self._meshes + self._surfaces if m.near(view, mouse) and m.ready()]
         if not cands:
@@ -650,17 +684,7 @@ class Targets:
             h = m.cast(o, d)
             if h is not None and (best is None or h[2] < best[1][2]):
                 best = (m, h)
-        if best is None:
-            return None
-        m, (P, poly, _) = best
-        f = m.flat(poly, P)
-        if f is None:
-            return None
-        n = f["n"] if float(f["n"] @ d) < 0 else -f["n"]
-        if abs(float(n @ d)) < 0.02:
-            return None
-        u = face_axis(n, f["seg"])
-        return dict(f, P=P - float((P - f["c"]) @ n) * n, n=n, u=u, v=np.cross(n, u))
+        return best
 
     def _mesh_near(self, view, mouse):
         """The mesh elements near the mouse: {"P", "kinds"} points (vertices,
@@ -672,7 +696,7 @@ class Targets:
             return None
         offs = [np.zeros(2)] + [SNAP_PX * f * np.array([math.cos(a), math.sin(a)])
                                 for f in MESH_RINGS for a in np.linspace(0, 2 * math.pi, 8, endpoint=False)]
-        polys, face = {}, None
+        polys, face, face_obj = {}, None, None
         for j, off in enumerate(offs):
             o, d = view.ray(mouse + off)
             best = None
@@ -684,8 +708,9 @@ class Targets:
                 continue
             polys.setdefault(id(best[0]), (best[0], set()))[1].add(best[1][1])
             if j == 0:
-                face = best[1][0]
+                face, face_obj = best[1][0], best[0].obj.name
         P, kinds, frames, A, B, F = [], [], [], [], [], []
+        objs, eobjs = [], []        # the object of each point, of each edge
         hit = [(m, sorted(ps)) for m, ps in polys.values()]
         for m in meshes:
             if len(m.loose_v) or len(m.loose_e):
@@ -701,40 +726,53 @@ class Targets:
             T = (eb - ea) / np.maximum(np.linalg.norm(eb - ea, axis=1), 1e-30)[:, None]
             U = np.array([nmap.get(int(e), np.zeros(3)) for e in es], float).reshape(-1, 3)
             fr = [np.array([T[i], U[i]]) for i in range(len(es))]
+            name = m.obj.name
             if "VERTEX" in el:
                 P.append(m.world(vs))
                 kinds += ["vertex"] * len(vs)
                 frames += [None] * len(vs)
+                objs += [name] * len(vs)
             if "EDGE_MIDPOINT" in el:
                 P.append(0.5 * (ea + eb))
                 kinds += ["mid"] * len(es)
                 frames += fr
+                objs += [name] * len(es)
             if "FACE_MIDPOINT" in el and len(ps):
                 P.append(m.centers(ps))
                 kinds += ["center"] * len(ps)
                 frames += [None] * len(ps)
+                objs += [name] * len(ps)
             if "EDGE" in el:
                 A.append(ea)
                 B.append(eb)
                 F += fr
-        return {"P": np.vstack(P) if P else np.zeros((0, 3)), "kinds": kinds, "frames": frames,
+                eobjs += [name] * len(es)
+        return {"P": np.vstack(P) if P else np.zeros((0, 3)), "kinds": kinds, "frames": frames, "objs": objs,
                 "A": np.vstack(A) if A else np.zeros((0, 3)), "B": np.vstack(B) if B else np.zeros((0, 3)),
-                "F": F, "face": face if "FACE" in el else None}
+                "F": F, "eobjs": eobjs, "face": face if "FACE" in el else None,
+                "face_obj": face_obj if "FACE" in el else None}
 
-    def point(self, P, kind, tangent=None, src=None):
-        """src = (object name, ref, "END" / "NEAREST"): what the point lies on."""
+    def point(self, P, kind, tangent=None, src=None, owner=None):
+        """src = (object name, ref, "END" / "NEAREST"): what the point lies on;
+        owner: the object it belongs to (src's by default)."""
         self._pts.append(np.asarray(P, float))
         self.kinds.append(kind)
         self.tans.append(None if tangent is None else np.asarray(tangent, float))
         self.srcs.append(src)
+        self.owners.append(owner if owner is not None or src is None else src[0])
+
+    def ring(self, c, n, r, W, owner, ref):
+        """A circular edge or curve (world centre, unit axis, radius, polyline)."""
+        self.rings.append({"c": np.asarray(c, float), "n": np.asarray(n, float), "r": float(r),
+                           "W": np.asarray(W, float), "obj": owner, "ref": ref})
 
     def line(self, W, refine, kind, src=None, meta=None):
         """meta: {"obj", "edge": index} of a B-rep edge, {"obj", "spline": index} of a curve."""
         if len(W) >= 2:
             self._lines.append((np.asarray(W, float), refine, kind, src, meta or {}))
 
-    def face(self, corners, center):
-        self._faces.append((np.asarray(corners, float), center))
+    def face(self, corners, center, owner=None):
+        self._faces.append((np.asarray(corners, float), center, owner))
 
     def done(self):
         self.P = np.array(self._pts, float).reshape(-1, 3)
@@ -748,7 +786,7 @@ class Targets:
         self.B = np.vstack(B) if B else np.zeros((0, 3))
         self.owner = np.concatenate(owner) if owner else np.zeros(0, int)
         self.seg = np.concatenate(seg) if seg else np.zeros(0, int)
-        self.C = np.array([c for c, _ in self._faces], float).reshape(-1, 8, 3)
+        self.C = np.array([f[0] for f in self._faces], float).reshape(-1, 8, 3)
         return self
 
     @property
@@ -759,6 +797,13 @@ class Targets:
 
     def pick(self, view, mouse, extra=(), edges=True, segments=()):
         """(world point, kind, outward tangent or None, src or None) under the mouse, or None.
+        See pick_info for the arguments."""
+        h = self.pick_info(view, mouse, extra, edges, segments)
+        return None if h is None else (h["P"], h["kind"], h["tan"], h["src"])
+
+    def pick_info(self, view, mouse, extra=(), edges=True, segments=()):
+        """What pick returns, as {"P", "kind", "tan", "src", "obj"} (obj: the
+        name of the object the point belongs to, None for a drawn point), or None.
         A mesh edge or edge centre has no src; its "tangent" is its frame: rows
         (edge direction, its face's normal -- zero for a loose edge).
         extra = [(point, tangent, kind)] (the points drawn so far), segments =
@@ -767,7 +812,7 @@ class Targets:
         them as "line", put exactly onto the curve by refine when given). edges=False: points only (a lock, Ctrl or
         Shift is in charge)."""
         mouse = np.asarray(mouse, float)
-        P, kinds, tans, srcs = self.P, self.kinds, self.tans, self.srcs
+        P, kinds, tans, srcs, owners = self.P, self.kinds, self.tans, self.srcs, self.owners
         extra = list(extra)
         segs, seg_refine = [], []       # (A, B[, middle snaps?[, refine(point) -> exact point]])
         for sg in segments:
@@ -783,12 +828,14 @@ class Targets:
             kinds = kinds + [e[2] for e in extra]
             tans = tans + [e[1] for e in extra]
             srcs = srcs + [None] * len(extra)
-        cands = []          # (score, depth, point, kind, tangent, src)
+            owners = owners + [None] * len(extra)
+        out = lambda P_, kind, tan, src, obj: {"P": P_, "kind": kind, "tan": tan, "src": src, "obj": obj}
+        cands = []          # (score, depth, point, kind, tangent, src, owner)
         if len(P):
             xy, z, ok = view.project(P)
             d = np.linalg.norm(xy - mouse, axis=1)
             for i in np.flatnonzero(ok & (d <= SNAP_PX)):
-                cands.append((d[i] - BONUS.get(kinds[i], 0.0), z[i], P[i], kinds[i], tans[i], srcs[i]))
+                cands.append((d[i] - BONUS.get(kinds[i], 0.0), z[i], P[i], kinds[i], tans[i], srcs[i], owners[i]))
         if len(self.C):
             xy, _, ok = view.project(self.C.reshape(-1, 3))
             xy = xy.reshape(-1, 8, 2)
@@ -802,20 +849,22 @@ class Targets:
                 q, z, okc = view.project(c)
                 dc = float(np.linalg.norm(q[0] - mouse))
                 if okc[0] and dc <= SNAP_PX:
-                    cands.append((dc - BONUS["center"], z[0], np.asarray(c, float), "center", None, None))
+                    cands.append((dc - BONUS["center"], z[0], np.asarray(c, float), "center", None, None,
+                                  self._faces[f][2]))
         mesh = self._mesh_near(view, mouse) if self._meshes else None
         if mesh is not None and len(mesh["P"]):
             xy, z, ok = view.project(mesh["P"])
             d = np.linalg.norm(xy - mouse, axis=1)
             for i in np.flatnonzero(ok & (d <= SNAP_PX)):
                 kd = mesh["kinds"][i]
-                cands.append((d[i] - BONUS.get(kd, 0.0), z[i], mesh["P"][i], kd, mesh["frames"][i], None))
+                cands.append((d[i] - BONUS.get(kd, 0.0), z[i], mesh["P"][i], kd, mesh["frames"][i], None,
+                              mesh["objs"][i]))
         if cands:
             k = _choose(np.array([c[0] for c in cands]), np.array([c[1] for c in cands]))
-            return cands[k][2], cands[k][3], cands[k][4], cands[k][5]
+            return out(*cands[k][2:7])
         if not edges:
             return None
-        hits = []           # (distance px, depth, point, kind, src, frame): the best curve / surface edge, mesh edge
+        hits = []           # (distance px, depth, point, kind, src, frame, owner): the best curve / surface edge, mesh edge
         SA = np.array([a for a, _ in segs], float).reshape(-1, 3)
         SB = np.array([b for _, b in segs], float).reshape(-1, 3)
         for A, B, curves in ((self.A, self.B, True),) + (((mesh["A"], mesh["B"], False),) if mesh else ()) \
@@ -834,28 +883,30 @@ class Targets:
             depth = za + s * (zb - za)
             k = hit[_choose(dist[hit], depth[hit])]
             if curves is True:
-                W, refine, kind, src, _ = self._lines[self.owner[k]]
+                W, refine, kind, src, meta = self._lines[self.owner[k]]
+                ob = meta.get("obj")
                 hits.append((dist[k], depth[k], np.asarray(refine(int(self.seg[k]), float(s[k])), float), kind, src,
-                             None))
+                             None, ob.name if ob is not None else (src[0] if src else None)))
             else:           # the point of the mesh edge / drawn line under the mouse (exact in perspective too)
                 Q = _ray_segment(*view.ray(mouse), A[k], B[k])
                 Q = A[k] + s[k] * (B[k] - A[k]) if Q is None else Q
                 if curves == "line":
                     if seg_refine[k] is not None:
                         Q = np.asarray(seg_refine[k](Q), float)
-                    hits.append((dist[k], depth[k], Q, "line", None, None))
+                    hits.append((dist[k], depth[k], Q, "line", None, None, None))
                 else:
-                    hits.append((dist[k], depth[k], Q, "edge", None, mesh["F"][k]))
+                    hits.append((dist[k], depth[k], Q, "edge", None, mesh["F"][k], mesh["eobjs"][k]))
         if hits:
             k = _choose(np.array([h[0] for h in hits]), np.array([h[1] for h in hits]))
-            return hits[k][2], hits[k][3], hits[k][5], hits[k][4]
+            h = hits[k]
+            return out(h[2], h[3], h[5], h[4], h[6])
         sf = self.surface_face(view, mouse)
         if mesh is not None and mesh["face"] is not None:
             o, d = view.ray(mouse)
             if sf is None or float((np.asarray(mesh["face"], float) - o) @ d) < sf[2]:
-                return np.asarray(mesh["face"], float), "face", None, None
+                return out(np.asarray(mesh["face"], float), "face", None, None, mesh["face_obj"])
         if sf is not None:
-            return sf[0], "face", None, sf[1]
+            return out(sf[0], "face", None, sf[1], sf[1][0])
         return None
 
     def surface_face(self, view, mouse):
@@ -1011,6 +1062,13 @@ def _half_way(X):
 def circle_centre(X, tol=1e-6):
     """Centre of the circle the points X lie on (a circle or an arc of one),
     or None: three spread points give the circle, all of them must be on it."""
+    ci = circle_frame(X, tol)
+    return None if ci is None else ci[0]
+
+
+def circle_frame(X, tol=1e-6):
+    """(centre, unit normal, radius) of the circle the points X lie on, as
+    circle_centre, or None."""
     X = np.asarray(X, float)
     n = len(X)
     if n < 5:
@@ -1026,7 +1084,7 @@ def circle_centre(X, tol=1e-6):
     if float(np.abs(np.linalg.norm(X - O, axis=1) - r).max()) > tol * r \
             or float(np.abs((X - O) @ (nn / math.sqrt(q))).max()) > tol * r:
         return None
-    return O
+    return O, nn / math.sqrt(q), r
 
 
 def add_curve(T, obj):
@@ -1045,7 +1103,7 @@ def add_curve(T, obj):
             T.point(b, "end", tb, (obj.name, ref, "END"))
         pts = ([b.co for b in sp.bezier_points] if sp.type == 'BEZIER' else [p.co[:3] for p in sp.points])
         for c in pts:
-            T.point(M[:3, :3] @ np.array(c[:3], float) + M[:3, 3], "cv")
+            T.point(M[:3, :3] @ np.array(c[:3], float) + M[:3, 3], "cv", owner=obj.name)
         X, g = _samples(spans)
 
         def refine(i, s, X=X, g=g, spans=spans):
@@ -1060,9 +1118,10 @@ def add_curve(T, obj):
                {"obj": obj, "spline": si, "closest": closest, "mid": mid})
         if mid is not None:
             T.point(mid, "mid", None, (obj.name, ref, "NEAREST"))
-        cen = circle_centre(X)
-        if cen is not None:                     # a circle or an arc: its centre
-            T.point(cen, "center")
+        ci = circle_frame(X)
+        if ci is not None:                      # a circle or an arc: its centre
+            T.point(ci[0], "center", owner=obj.name)
+            T.ring(*ci, X, obj.name, ref)
 
 
 # --------------------------------------------------------------------------
@@ -1194,11 +1253,15 @@ def add_brep(T, obj, show_cvs=False):
         if e is not None and len(L) >= 5:              # a circular edge (a rim): its centre
             try:
                 t0, t1 = e.parameter_range()
-                cen = circle_centre([e.point_at(t0 + (t1 - t0) * k / 12) for k in range(13)])
+                ci = circle_frame([e.point_at(t0 + (t1 - t0) * k / 12) for k in range(13)])
             except Exception:
-                cen = None
-            if cen is not None:
-                T.point(world(cen), "center")
+                ci = None
+            if ci is not None:
+                T.point(world(ci[0]), "center", owner=obj.name)
+                n = np.linalg.solve(R.T, ci[1])          # normals go with the inverse transpose
+                n /= np.linalg.norm(n) or 1.0
+                rw = float(np.linalg.norm(world(L[0]) - world(ci[0])))
+                T.ring(world(ci[0]), n, rw, world(L), obj.name, ref)
         if mid is not None:
             T.point(mid, "mid", None, (obj.name, ref, "NEAREST"))
     try:
@@ -1216,11 +1279,11 @@ def add_brep(T, obj, show_cvs=False):
         def center(i=i):
             c = face_center(obj, i)
             return None if c is None else world(c)
-        T.face(world(corners), center)
+        T.face(world(corners), center, obj.name)
     if show_cvs:
         for net in d.get("nets", []):
             for p in world(np.asarray(net["p"], float).reshape(-1, 3)):
-                T.point(p, "cv")
+                T.point(p, "cv", owner=obj.name)
 
 
 SKETCH_MESH = ("VERTEX", "EDGE", "EDGE_MIDPOINT", "FACE_MIDPOINT")   # always on, like curves and surfaces
