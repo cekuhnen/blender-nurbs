@@ -3667,6 +3667,12 @@ class _SeatTrim:
     def _seam_frac(self, G, d, idx):
         """Where (a share of direction d's domain) to put G's seam in d so it
         crosses none of the cycles idx (as they will be)."""
+        return self._seam_fracs(G, d, idx)[0]
+
+    def _seam_fracs(self, G, d, idx):
+        """_seam_frac's seam, then the others a quarter, half and three
+        quarters round from it (and the eighths between) that cross none of
+        the cycles idx either."""
         lo, hi = (G.u_domain(), G.v_domain())[d]
         P = hi - lo
         spans = []
@@ -3689,8 +3695,14 @@ class _SeatTrim:
             if not cand:
                 raise RuntimeError("the holes and features go all round the face they sit in")
             seam = max(cand, key=lambda x: x[1])[0]
-        frac = ((seam - lo) % P) / P
-        return 0.0 if frac > 1 - 1e-9 else frac
+        out = []
+        for s in (0.0, 0.5, 0.25, 0.75, 0.125, 0.375, 0.625, 0.875):
+            t = seam + s * P
+            if s and not clear(t):
+                continue
+            frac = ((t - lo) % P) / P
+            out.append(0.0 if frac > 1 - 1e-9 else frac)
+        return out
 
     # -- the frame ----------------------------------------------------------------
     def _winds_uv(self, G, Q, d=None):
@@ -3850,19 +3862,31 @@ class _SeatTrim:
             raise RuntimeError("more than two rims run round the face the feature sits in")
         combos = [self.combo[form]] if form in self.combo else \
             ([(False, False), (False, True), (True, False), (True, True)] if form != "sphere" else [(False,), (True,)])
+        # a cap (rim, seam to the pole and back): where its seam lies can settle which side of the
+        # rim the kernel keeps (some builds keep only the far side with the seam here), so with an
+        # area to meet and no combo meeting it, the seam moves round to the next place clear of
+        # every hole; the one that works is kept for the face's later trims
+        fracs = [self.frac]
+        if form == "cap" and area is not None and form not in self.combo:
+            fracs += [f for f in self._seam_fracs(self._framed(reseam=False), self.k,
+                                                 [i for i in range(len(self.specs)) if not self.wind[i]])
+                      if abs(f - self.frac) > 1e-9]
         err = None
-        for combo in combos:
-            try:
-                G = self._surface()
-                loops = [self._outline(G, form, W, combo)] + [self._curves(self.specs[i]) for i in holes]
-                out = self._trim(self._surface(), loops)
-            except Exception as exc:
-                err = exc
-                continue
-            got = float(sum(f.area(1e-6) for f in out.faces()))
-            if out.face_count() == 1 and (area is None or abs(got - area) <= 1e-4 * area + self.tol):
-                self.combo[form] = combo
-                return out
+        for frac in fracs:
+            self.frac = frac
+            for combo in combos:
+                try:
+                    G = self._surface()
+                    loops = [self._outline(G, form, W, combo)] + [self._curves(self.specs[i]) for i in holes]
+                    out = self._trim(self._surface(), loops)
+                except Exception as exc:
+                    err = exc
+                    continue
+                got = float(sum(f.area(1e-6) for f in out.faces()))
+                if out.face_count() == 1 and (area is None or abs(got - area) <= 1e-4 * area + self.tol):
+                    self.combo[form] = combo
+                    return out
+        self.frac = fracs[0]
         raise err or RuntimeError("the face the feature sits in does not trim again")
 
     def _torus_face(self, chosen, area):
