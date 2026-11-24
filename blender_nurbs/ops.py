@@ -2641,6 +2641,8 @@ class NPROTO_OT_align_curve(PickMixin, bpy.types.Operator):
     face_point: FloatVectorProperty(name="Face Point", size=3, subtype='XYZ', options={'HIDDEN'},
                                     description="Where a face target was clicked: the end goes there")
     use_face_point: BoolProperty(default=False, options={'HIDDEN'})
+    show_cvs: draw.show_cvs_prop()
+    show_comb: draw.show_comb_prop()
 
     def expand_pick(self, cand):
         if not getattr(self, "_picks", None):          # first pick: the curve; which end?
@@ -2747,6 +2749,7 @@ class NPROTO_OT_align_curve(PickMixin, bpy.types.Operator):
         row = lay.row(align=True)
         row.prop(self, "weight")
         row.prop(self, "flip", toggle=True)
+        draw.draw_curve_show(lay, self)
 
 
 class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
@@ -2788,6 +2791,8 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
     uv_a: FloatVectorProperty(name="Face Point A", size=2, default=(0.5, 0.5), min=0.0, max=1.0,
                               description="The point on a face input (0..1 of the surface's U and V)")
     uv_b: FloatVectorProperty(name="Face Point B", size=2, default=(0.5, 0.5), min=0.0, max=1.0)
+    show_cvs: draw.show_cvs_prop()
+    show_comb: draw.show_comb_prop()
 
     extra_keys = (("P", "point along / end"),)
     extra_help = "(a click inside a face blends from that point of the surface)"
@@ -2939,6 +2944,7 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
             sub.enabled = getattr(self, f"cont_{side}") == "G3"
             sub.prop(self, f"d_{side}", text="Rate")
             box.prop(self, f"flip_{side}")
+        draw.draw_curve_show(lay, self)
 
 
 classes = (NPROTO_OT_align_curve, 

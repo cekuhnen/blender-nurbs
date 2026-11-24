@@ -325,19 +325,34 @@ def curve_cage(obj):
     return hull, cvs, handles
 
 
-_CURVE_PREVIEW_OPS = ("NPROTO_OT_blend_curve", "nproto.blend_curve")
+_CURVE_PREVIEW_OPS = ("NPROTO_OT_blend_curve", "nproto.blend_curve", "NPROTO_OT_align_curve", "nproto.align_curve",
+                      "NPROTO_OT_draw_curve", "nproto.draw_curve")
+
+
+def curve_panel(ctx):
+    """The properties of the curve tool whose F9 panel is up (Blend / Align /
+    CV Curve was the last operator), else None. Their Show CVs / Show Comb
+    switches draw the curve it made (selected) like Analyze does."""
+    ops = ctx.window_manager.operators
+    return ops[-1].properties if ops and ops[-1].bl_idname in _CURVE_PREVIEW_OPS else None
 
 
 def curve_preview_active(ctx):
-    """A curve tool's F9 panel is up (it was the last operator): the curve it
-    is making shows its CVs."""
-    ops = ctx.window_manager.operators
-    return bool(ops) and ops[-1].bl_idname in _CURVE_PREVIEW_OPS
+    """A curve tool's F9 panel is up with Show CVs on: the curve it is making
+    shows its CVs."""
+    p = curve_panel(ctx)
+    return p is not None and bool(getattr(p, "show_cvs", True))
+
+
+def curve_comb_shown(ctx):
+    """A curve tool's F9 panel is up with Show Comb on."""
+    p = curve_panel(ctx)
+    return p is not None and bool(getattr(p, "show_comb", False))
 
 
 def curve_cvs_shown(ctx, obj):
-    """Is this curve's CV hull drawn: selected, and CVs / Hulls on or a Blend
-    Curve being made (its F9 panel up)? Never in Edit mode, where Blender
+    """Is this curve's CV hull drawn: selected, and CVs / Hulls on or a curve
+    tool's F9 panel up with Show CVs? Never in Edit mode, where Blender
     draws its own."""
     if obj.type != 'CURVE' or obj.mode == 'EDIT' or not obj.select_get():
         return False
@@ -345,6 +360,28 @@ def curve_cvs_shown(ctx, obj):
     if v is not None and v.show_cvs:
         return True
     return curve_preview_active(ctx)
+
+
+def show_cvs_prop(default=True):
+    """Show CVs for a curve tool's F9 panel (remembered between runs)."""
+    from bpy.props import BoolProperty
+    return BoolProperty(name="CVs", default=default, description="Show the curve's CVs and hull")
+
+
+def show_comb_prop():
+    """Show Comb for a curve tool's F9 panel (remembered between runs)."""
+    from bpy.props import BoolProperty
+    return BoolProperty(name="Comb", default=False,
+                        description="Show the curve's curvature comb (Scale and Samples from Analyze > "
+                                    "Curvature Comb)")
+
+
+def draw_curve_show(layout, op):
+    """The Show row of a curve tool's F9 panel."""
+    row = layout.row(align=True)
+    row.label(text="Show")
+    row.prop(op, "show_cvs", toggle=True, icon='OUTLINER_DATA_LATTICE')
+    row.prop(op, "show_comb", toggle=True, icon='IPO_ELASTIC')
 
 
 _PREVIEW_OPS = ("NPROTO_OT_rebuild_surface", "nproto.rebuild_surface", "NPROTO_OT_square", "nproto.square",

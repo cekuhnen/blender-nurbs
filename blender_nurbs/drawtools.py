@@ -1568,7 +1568,13 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
                                            "are aligned once, and the curve is a plain curve (Align Curve can "
                                            "add the step later)")
     edge_mode: EnumProperty(name="On Surfaces", items=CURVE_EDGE_MODES, default="SURFACE")
+    show_cvs: draw.show_cvs_prop()
+    show_comb: draw.show_comb_prop()
     data: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+
+    def comb_on(self, context):
+        """The comb is drawn: this tool's switch, or Analyze > Curvature Comb."""
+        return self.show_comb or bool(getattr(context.window_manager.nproto_view, "show_comb", False))
 
     def draw(self, context):
         lay = self.layout
@@ -1582,6 +1588,7 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
         col.row().prop(self, "end_cont", expand=True)
         col.prop(self, "keep_aligned")
         col.prop(self, "edge_mode")
+        draw.draw_curve_show(lay, self)
         if LAST_INFO["text"]:
             for line in LAST_INFO["text"].split("\n"):
                 lay.label(text=line)
@@ -1616,8 +1623,8 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
                  ("Curve", [hints.cycle("M", ["CVs", "through points"],
                                         "CVs" if self.mode == "CV" else "through points"),
                             hints.cycle("1-5", [str(d) for d in range(1, 6)], str(self.degree), "degree")]),
-                ("Show", [hints.toggle("K", "curvature comb",
-                                       bool(getattr(context.window_manager.nproto_view, "show_comb", False)))])]
+                ("Show", [hints.toggle("K", "curvature comb", self.comb_on(context)),
+                          hints.toggle("V", "CVs", self.show_cvs)])]
         hints.show(context, "CV Curve", [f"{n} point(s)", self.lock_text().strip(" ·")], rows, MOUSE_SKETCH)
 
     # -- end conditions ---------------------------------------------------
@@ -1690,9 +1697,11 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
             try:
                 sp, _ = self._spec(pts, [self._src(x) for x in sn])
                 ov["curves"] = [[Vector(p) for p in spec_polyline(sp, 16)]]
-                ov["hull"] = [Vector(p) for p in sp["points"]]
+                if self.show_cvs:           # the curve's own CVs (Through Points: not the points clicked)
+                    ov["hull"] = [Vector(p) for p in sp["points"]]
+                    ov["cvs"] = ov["cvs"] + ov["hull"]
                 v = getattr(context.window_manager, "nproto_view", None)
-                if v is not None and v.show_comb:
+                if v is not None and self.comb_on(context):
                     ov["comb"] = preview_comb(sp, int(v.comb_samples), v.comb_scale)
             except Exception:
                 pass
@@ -1787,8 +1796,14 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
             self._preview(context, hover())
             self._status(context)
         elif event.value == 'PRESS' and event.type == 'K':
-            v = context.window_manager.nproto_view
-            v.show_comb = not v.show_comb             # the same switch as Analyze > Curvature Comb
+            on = not self.comb_on(context)
+            self.show_comb = on                       # this tool's switch (its F9 panel's Comb)
+            if not on:
+                context.window_manager.nproto_view.show_comb = False   # off means off: Analyze's too
+            self._preview(context, hover())
+            self._status(context)
+        elif event.value == 'PRESS' and event.type == 'V':
+            self.show_cvs = not self.show_cvs
             self._preview(context, hover())
             self._status(context)
         elif event.value == 'PRESS' and event.type == 'C':
