@@ -51,6 +51,17 @@ SKETCH_W = 1.5
 COL_PICKS = [(0.1, 0.8, 1.0, 1.0), (1.0, 0.25, 0.6, 1.0), (0.3, 1.0, 0.4, 1.0), (1.0, 0.75, 0.1, 1.0)]  # last: Loft rails
 
 
+def _polylines(pl):
+    """A pick highlight as a list of polylines: one polyline (points), or
+    several (a list of point lists: every edge of a surface on its own, never
+    joined end to start)."""
+    import numbers
+    first = next((p for p in pl if len(p)), None) if pl is not None and len(pl) else None
+    if first is None or isinstance(first[0], numbers.Real):     # points: one polyline
+        return [pl]
+    return list(pl)
+
+
 def _lines_from_polylines(polys, M, bias=None):
     """World-space line pairs; `bias` = (eye, view_dir, amount) pulls every point
     toward the viewer (see _edge_bias)."""
@@ -597,13 +608,13 @@ def _draw():
         cols = [min(i, 2) for i in range(len(pick_overlay["picked"]))]
     else:
         cols = [c % len(COL_PICKS) for c in cols]     # Loft: one colour per side
-    for pl, c in zip(pick_overlay["picked"], cols):
-        _draw_lines(_lines_from_polylines([pl], _IDENT), COL_PICKS[c], 4.0)
+    for pl, c in zip(pick_overlay["picked"], cols):     # one polyline, or several (a surface's edges)
+        _draw_lines(_lines_from_polylines(_polylines(pl), _IDENT), COL_PICKS[c], 4.0)
     hov = pick_overlay["hover"]
     if hov:                 # one polyline, or several (an isoparm broken by a trim)
-        _draw_lines(_lines_from_polylines(hov if isinstance(hov[0], list) else [hov], _IDENT), COL_HOVER, 4.0)
+        _draw_lines(_lines_from_polylines(_polylines(hov), _IDENT), COL_HOVER, 4.0)
     if pick_overlay.get("refused"):
-        _draw_lines(_lines_from_polylines([pick_overlay["refused"]], _IDENT), COL_REFUSED, 3.0)
+        _draw_lines(_lines_from_polylines(_polylines(pick_overlay["refused"]), _IDENT), COL_REFUSED, 3.0)
     pv = pick_overlay.get("preview")
     if pv:
         _draw_preview(pv)

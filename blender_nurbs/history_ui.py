@@ -94,7 +94,7 @@ class NprotoStep(bpy.types.PropertyGroup):
     scope: EnumProperty(name="Scope", items=[("THROUGH", "Through", "Every region on the picked side"),
                                              ("PICKED", "Picked Region", "Only the clicked region")], **_S())
     projection: EnumProperty(name="Project", items=[
-        ("CURVE", "Curve Normal", ""), ("VIEW", "View", ""), ("NORMAL", "Surface Normal", ""),
+        ("CURVE", "Sketch Normal", ""), ("VIEW", "View", ""), ("NORMAL", "Surface Normal", ""),
         ("X", "World X", ""), ("Y", "World Y", ""), ("Z", "World Z", "")], **_S())
     reach: EnumProperty(name="Cut", items=[("BOTH", "Both Ways", "A projected curve cuts on both sides of itself"),
                                            ("FRONT", "Along Normal", "Only along the sketch normal (the curve's Z)"),

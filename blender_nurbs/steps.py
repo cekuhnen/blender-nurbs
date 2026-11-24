@@ -27,20 +27,69 @@ def untrimmed_cutters(cutters):
     return out
 
 
-def cutter_curve_json(kc, projection, view, up=None):
+def cutter_curve_json(kc, projection, view, up=None, sketch=None):
     """Worker data of a cutting curve for Trim / Split. CURVE: a planar curve
-    projects along its own normal, others along the view; a curve lying on the
-    surface cuts along itself ("auto"). SURFACE: always along itself.
+    projects along its own normal, a straight line along its sketch normal
+    (`sketch`, see sketch_normal), others along the view; a curve lying on
+    the surface cuts along itself ("auto"). SURFACE: always along itself.
     up: the curve object's Z axis (world): the sketch normal points its way,
-    so a one-sided trim (reach FRONT) goes where the blue axis points."""
+    so a one-sided trim (reach FRONT) goes where the blue axis points. A
+    known sketch normal is the up direction itself."""
     cj = jobs.curve_json(kc)
     if projection == "CURVE":
-        d = geom.cutter_direction(kc, view)
+        if sketch is not None:
+            up = sketch
+        d = geom.cutter_direction(kc, view if sketch is None else sketch)
         if up is not None and Vector(up).length > 1e-9 and abs(d.dot(Vector(up).normalized())) > 0.1:
             d = d if d.dot(Vector(up)) > 0 else -d
         cj["dir"] = list(d)
     cj["pull"] = True if projection == "SURFACE" else ("auto" if projection == "CURVE" else False)
     return cj
+
+
+def sketch_normal(obj, kc, target=None, view=None):
+    """World normal of the plane a cutting curve (kc, world) was sketched on:
+    the one the Line / CV Curve tool recorded (while the curve still lies in
+    that plane), else the plane of a flat face of `target` the curve lies in
+    (of several, the one facing the view most: a line drawn on a face, even
+    where it crosses holes and gaps of the part). None when unknown."""
+    import numpy as np
+    P = np.array(geom.sample_curve(kc, 24), float)
+    size = float(np.linalg.norm(P.max(axis=0) - P.min(axis=0))) or 1.0
+    if getattr(obj, "type", None) == 'CURVE' and store.PROP_SKETCH_N in obj:
+        n = obj.matrix_world.to_3x3().inverted_safe().transposed() @ Vector(tuple(obj[store.PROP_SKETCH_N]))
+        if n.length > 1e-12:
+            n.normalize()
+            if np.abs((P - P[0]) @ np.array(n)).max() <= 1e-5 * size:
+                return n
+    if target is None or not store.is_nurbs(target):
+        return None
+    from .snapping import _plane_of
+    M = np.array(geom.world_matrix(target), float)
+    R, t = M[:3, :3], M[:3, 3]
+    try:
+        Ri = np.linalg.inv(R)
+        b = store.get_brep(target)
+        lo, hi = (np.array(v, float) for v in b.bounding_box())
+    except Exception:
+        return None
+    tsize = float(np.linalg.norm(hi - lo)) or 1.0
+    Pl = (P - t) @ Ri.T
+    v = None if view is None else np.array(view, float)
+    best = None
+    for f in b.faces():
+        pl = _plane_of(f, tsize)
+        if pl is None:
+            continue
+        o, n = pl
+        if np.abs((Pl - o) @ n).max() > 1e-4 * tsize:
+            continue
+        nw = Ri.T @ n
+        nw /= np.linalg.norm(nw) or 1.0
+        score = abs(float(nw @ v)) if v is not None else 1.0
+        if best is None or score > best[0] + 1e-9:
+            best = (score, nw)
+    return Vector(tuple(best[1])) if best else None
 
 
 def curve_up(obj):
@@ -142,8 +191,10 @@ def apply_trim(obj, text, inputs, p):
                     cutter = (bt, jobs.xform(src))
             cutters[f"c{len(cutters)}"] = cutter
         else:
-            curves.append(cutter_curve_json(features.input_curve(src, ref_s), p.get("projection", "CURVE"), view,
-                                            curve_up(src)))
+            kc = features.input_curve(src, ref_s)
+            sk = sketch_normal(src, kc, obj, view) if p.get("sketch") and p.get("projection", "CURVE") == "CURVE" \
+                else None
+            curves.append(cutter_curve_json(kc, p.get("projection", "CURVE"), view, curve_up(src), sk))
     proj = p.get("projection", "CURVE")
     if proj in ("NORMAL", "CURVE", "SURFACE"):
         d = nrm
@@ -610,9 +661,13 @@ def _split_job(inputs, p):
     view = Vector(p.get("view_dir", (0.0, 0.0, -1.0)))
     if view.length < 1e-9:
         view = Vector((0.0, 0.0, -1.0))
-    curves = [cutter_curve_json(features.input_curve(o, r), p.get("projection", "CURVE"), view, curve_up(o))
-              for o, r in inputs[1:] if r != "SURF"]
     proj = p.get("projection", "CURVE")
+    curves = []
+    for o, r in inputs[1:]:
+        if r != "SURF":
+            kc = features.input_curve(o, r)
+            sk = sketch_normal(o, kc, tgt, view) if p.get("sketch") and proj == "CURVE" else None
+            curves.append(cutter_curve_json(kc, proj, view, curve_up(o), sk))
     d = view if proj in ("VIEW", "CURVE", "SURFACE") else Vector({"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}[proj])
     kw = {"curves": curves, "cutter_breps": list(others), "direction": list(d.normalized()),
           "extend": bool(p.get("extend", True)), "reach": p.get("reach", "BOTH"),

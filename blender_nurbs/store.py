@@ -99,6 +99,7 @@ def fresh_surfaces(obj):
 
 PROP_NATURAL = "nproto_natural"   # 1 = one untrimmed face (iso boundaries are its edges)
 PROP_UNTRIM = "nproto_untrimmed"  # brep text before the first trim (for Untrim)
+PROP_SKETCH_N = "nproto_sketch_n"  # curve: normal (local) of the plane the Line / CV Curve tool drew it on
 
 
 def is_natural(obj):

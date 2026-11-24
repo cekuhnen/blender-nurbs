@@ -1075,9 +1075,7 @@ class NPROTO_OT_detach_iso(bpy.types.Operator):
         draw.sketch_overlay["snap_label"] = SNAP_LABELS.get(h[2]) if snap is not None else None
         if h and h[0] == "REFUSED":
             M = h[1].matrix_world
-            pts = []
-            for e in store.display(h[1]).get("edges", []):
-                pts += [M @ Vector(p) for p in e]
+            pts = [[M @ Vector(p) for p in e] for e in store.display(h[1]).get("edges", [])]
             draw.pick_overlay["refused"] = pts or None
         self._status(context)
         if context.area is not None:

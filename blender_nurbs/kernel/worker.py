@@ -1697,15 +1697,20 @@ def _solid_cells(b, caps, size):
         return n / (np.linalg.norm(n) or 1.0)
 
     def into(gi, m, t):
-        """Unit direction from m into face gi, square to the edge (None: both ways, a seam)."""
+        """Unit direction from m into face gi, square to the edge (None: both ways, a seam).
+        A face narrower than the step (a sliver where a cut passes a corner)
+        is tried again with shorter steps."""
         n = normal(gi, m)
         d = np.cross(n, t)
         d /= np.linalg.norm(d) or 1.0
         f = F[gi][0]
-        ins = [f.closest_point(tuple(map(float, m + s * delta * d)))[1] < 0.3 * delta for s in (1.0, -1.0)]
-        if ins[0] == ins[1]:
-            return None, n
-        return (d if ins[0] else -d), n
+        for step in (delta, 0.25 * delta, 0.0625 * delta):
+            ins = [f.closest_point(tuple(map(float, m + s * step * d)))[1] < 0.3 * step for s in (1.0, -1.0)]
+            if ins[0] != ins[1]:
+                return (d if ins[0] else -d), n
+            if ins[0]:                                 # inside both ways: a seam
+                break
+        return None, n
 
     OUT = 2 * len(F)
     parent = list(range(OUT + 1))

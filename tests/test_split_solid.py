@@ -149,6 +149,47 @@ for hist in (True, False):
     check(f"[{tag}] surface cutter: two solids", r == {'FINISHED'} and len(P) == 2 and all_solid(P)
           and close(v[0], 9.0) and close(v[1], 15.0), f"{v}")
 
+    # --- a straight line cuts along its sketch normal, not the view: drawn on the front face (y = 0)
+    # diagonally, the cut plane holds Y: two pieces of 12 (an oblique view would give others)
+    clear()
+    B = box()
+    bpy.ops.nproto.draw_line(data=json.dumps({"lines": [[[1, 0, -1], [3, 0, 3]]], "normal": [0, -1, 0]}))
+    D = ctx.active_object
+    oblique = (0.5, 0.8, -0.3)
+    r, P = split(B, D, projection="CURVE", view_dir=oblique)
+    v = [vol(o) for o in P]
+    check(f"[{tag}] drawn line: along its sketch normal", store.PROP_SKETCH_N in D and r == {'FINISHED'}
+          and len(P) == 2 and all_solid(P) and close(v[0], 12.0) and close(v[1], 12.0), f"{v}")
+    # the same line without a recorded plane: the flat face it lies in gives the normal
+    clear()
+    B = box()
+    L = poly("L", [(1, 0, -1), (3, 0, 3)])
+    r, P = split(B, L, projection="CURVE", view_dir=oblique)
+    v = [vol(o) for o in P]
+    check(f"[{tag}] line in a face's plane: along the face normal", r == {'FINISHED'} and len(P) == 2
+          and all_solid(P) and close(v[0], 12.0) and close(v[1], 12.0), f"{v}")
+
+    # --- the user's tube frame (two hollow C's), cut along the view past a corner: the cut leaves a
+    # 1 mm sliver face at the corner, which belongs to its piece (it was a piece of its own, open)
+    import gzip
+    def frame():
+        clear()
+        with gzip.open(os.path.join(ROOT, "tests", "data", "split_tube_frame.sm.gz"), "rt") as f:
+            Fr = store.new_object_text(ctx, "Frame", f.read())
+        return Fr, poly("L", [(0.238125, 0.01905, 0.0), (-0.238125, 0.01905, 0.45085)])
+    Fr, L = frame()
+    v0 = vol(Fr)
+    r, P = split(Fr, L, projection="VIEW", view_dir=(0.5, 0.8, -0.3))
+    v = [vol(o) for o in P]
+    check(f"[{tag}] tube frame cut past a corner: closed pieces", r == {'FINISHED'} and len(P) == 4
+          and all_solid(P) and close(sum(v), v0, 1e-8), f"{[round(x * 1e6, 2) for x in v]}")
+    Fr, L = frame()
+    r, P = split(Fr, L, projection="CURVE", view_dir=(0.5, 0.8, -0.3))
+    v = [vol(o) for o in P]
+    check(f"[{tag}] tube frame, sketch normal: 4 closed pieces", r == {'FINISHED'} and len(P) == 4
+          and all_solid(P) and close(v[0], 88.24e-6, 1e-8) and close(v[-1], 272.27e-6, 1e-8),
+          f"{[round(x * 1e6, 2) for x in v]}")
+
     # --- Solid Pieces off: the faces are only split, as before
     clear()
     B = box()
