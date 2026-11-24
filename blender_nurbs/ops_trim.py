@@ -900,7 +900,6 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
     def _variable(self):
         return getattr(self, "variable", False) and self.rail_type == "RADIUS" and self.shape != "SOFT"
 
-
     def _soft_cont(self):
         return 3 if self.continuity == "3" else 2
 
@@ -1098,7 +1097,6 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         if self._variable() and self.end_radius > 1e-9:
             return ""                   # a fillet growing from nothing at its start
         return super()._too_short(context)
-
 
     def drag_key(self, context, event, ch):
         if ch == "c":
