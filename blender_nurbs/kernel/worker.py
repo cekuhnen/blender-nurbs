@@ -6162,6 +6162,31 @@ def job_shell(job):
     return {"faces": r.face_count(), "volume": v, "volume_before": v0, "removed": len(faces)}
 
 
+def job_remove_fillets(job):
+    """Remove fillets from a solid (world space; defeature.py): the fillets at
+    job['face_pts'] (each takes its chain; the chain's other fillets put back
+    when job['keep_others']), or every fillet no larger than
+    job['max_radius'] (0: any) when no points are given. Written in the local
+    space of job['into']."""
+    import defeature
+    if not defeature.has_kernel(sm):
+        raise RuntimeError("this kernel build has no fillet removal: update the add-on (or restart Blender "
+                           "after building the kernel)")
+    body = world_brep(job, "target")
+    pts = job.get("face_pts")
+    v0 = abs(_vol(body))
+    r, rep = defeature.remove(sm, body, picked=pts if pts else None,
+                              max_radius=float(job.get("max_radius") or 0.0),
+                              keep_others=bool(job.get("keep_others", True)))
+    if r is None:
+        why = "; ".join(dict.fromkeys(f["why"] for f in rep["failed"])) or "nothing removed"
+        raise RuntimeError(f"no fillet could be removed ({why})")
+    save(to_local(r, job.get("xforms", {}).get(job.get("into", "target"))), job["out"]["result"])
+    rep.update(faces=r.face_count(), volume=abs(_vol(r)), volume_before=v0,
+               solid=bool(r.is_manifold_solid()))
+    return rep
+
+
 def _flat_quad(loops, tol):
     """The four corners of a face outline that is one convex, flat loop of four
     straight sides (no holes, no curves), else None. Its bilinear patch is
@@ -6377,7 +6402,7 @@ def job_mesh_to_brep(job):
 
 
 JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "untrim_region": job_untrim_region, "untrim_preview": job_untrim_preview, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean, "push_pull": job_push_pull, "rotate_face": job_rotate_face, "move_face": job_move_face, "replace_face": job_replace_face, "extrude_face": job_extrude_face,
-        "flip": job_flip, "cap_solid": job_cap_solid, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken, "shell": job_shell,
+        "flip": job_flip, "cap_solid": job_cap_solid, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken, "shell": job_shell, "remove_fillets": job_remove_fillets,
         "mesh_to_brep": job_mesh_to_brep}
 
 

@@ -7,6 +7,7 @@
 //   - build a B-spline surface / curve from explicit CVs, knots and weights
 //   - read CVs, knots and weights back from curves and surfaces
 //   - wrap a surface into a single-face Brep (for tessellation / export)
+//   - identify fillet faces and remove picked face groups (Remove Fillets)
 
 #include "SmPyCommon.h"
 
@@ -23,6 +24,8 @@
 #include <SmEdge.h>
 #include <SmTrimmingTools.h>
 #include <SmVertex.h>
+#include <SmFeatureExecutive.h>
+#include <SmExtent1d.h>
 #include <algorithm>
 
 #include <cmath>
@@ -581,6 +584,130 @@ void bind_usd(py::module_& m)
         py::arg("delete_edges") = true, py::arg("region_nesting") = true,
         "Delete faces (and edges/vertices left dangling) from a Brep, in place. "
         "Face handles passed here are stale afterwards.");
+
+    // -- Remove Fillets: the kernel's own fillet recognition and defeaturing, face by
+    //    face (the upstream remove_fillet only does the whole Brep, all or nothing).
+    ext.def("fillet_info",
+        [](SmFace* face, double tol, double tangency_deg) {
+            if (face == nullptr)
+                throw std::invalid_argument("no face");
+            SmBoolean is_fillet = FALSE;
+            ULONG xsect = 0, solver = 0;
+            SmSurfParamType rail_dir = SM_SP_U;
+            double radius = 0.0, dist = 0.0;
+            SmTArray<SmEdge*> rails_min, rails_max;
+            SmExtent1d radii;
+            SmStatus st = face->IdentifyFillet(tol, tangency_deg, TRUE, FALSE, is_fillet, xsect, solver,
+                                               rail_dir, radius, dist, rails_min, rails_max, &radii);
+            py::dict out;
+            const bool ok = st == SM_SUCCESS && is_fillet;
+            out["is_fillet"] = ok;
+            out["cross_section"] = (int)xsect;
+            out["solver"] = (int)solver;
+            out["rail_dir"] = rail_dir == SM_SP_U ? "U" : "V";
+            out["radius"] = radius;
+            out["dist"] = dist;
+            const bool varying = ok && solver == 2 && radii.GetMin() <= radii.GetMax();
+            out["radius_min"] = varying ? radii.GetMin() : radius;
+            out["radius_max"] = varying ? radii.GetMax() : radius;
+            std::vector<SmEdge*> a, b;
+            for (ULONG i = 0; ok && i < rails_min.GetSize(); i++) a.push_back(rails_min[i]);
+            for (ULONG i = 0; ok && i < rails_max.GetSize(); i++) b.push_back(rails_max[i]);
+            out["rails_min"] = py::cast(a, py::return_value_policy::reference);
+            out["rails_max"] = py::cast(b, py::return_value_policy::reference);
+            return out;
+        },
+        py::arg("face"), py::arg("tol") = 1e-3, py::arg("tangency_deg") = 5.0,
+        "Is the face a fillet (SmFace::IdentifyFillet with tangent rails)? dict: is_fillet, "
+        "cross_section (0 circular, 1 approx. circular, 2 linear, 3/4/5 G1/G2/G3 blend, 6 other), "
+        "solver (0 constant radius, 1 constant distance, 2 variable radius), rail_dir ('U'/'V'), radius, "
+        "dist, radius_min, radius_max, rails_min, rails_max (the rail edges on either side).");
+
+    ext.def("delete_fillet_face",
+        [](SmBrep* brep, SmFace* face, bool stitch) {
+            if (face == nullptr || face->GetBrep() != brep)
+                throw std::invalid_argument("face does not belong to this brep");
+            SmTemporaryChangeValue<SmBoolean> editing(brep->m_bEditingEnabled, TRUE);
+            CHECK_STATUS(brep->DeleteFilletFace(face));
+            if (stitch)
+                CHECK_STATUS(brep->StitchAndOrient());
+            return brep;
+        },
+        py::return_value_policy::reference, py::arg("brep"), py::arg("face"), py::arg("stitch") = true,
+        "Remove one fillet face in place: its neighbours run on to meet in a sharp edge "
+        "(SmBrep::DeleteFilletFace). Face handles are stale afterwards; on failure the brep may be "
+        "half edited, so call it on a copy.");
+
+    ext.def("defeature_faces",
+        [](SmBrep* brep, std::vector<std::vector<SmFace*>>& groups, double ext_dist) {
+            const SmContext& ctx = *brep->GetContext();
+            SmTArray<SmFace*> orig;
+            brep->GetFaces(orig);
+            // the work copy keeps the face order: the groups are found in it by index
+            SmBrep* work = new (ctx) SmBrep(*brep, NULL, NULL);
+            SmObjDelete clean_work(work);
+            SmTArray<SmFace*> wf;
+            work->GetFaces(wf);
+            if (wf.GetSize() != orig.GetSize())
+                throw std::runtime_error("the brep copy has a different face count");
+            SmFeatureExecutive exec(ctx, *work);
+            std::vector<SmFeature*> feats;
+            for (auto& g : groups)
+            {
+                SmTArray<SmFace*> grp;
+                for (SmFace* f : g)
+                {
+                    long idx = -1;
+                    for (ULONG i = 0; i < orig.GetSize(); i++)
+                        if (orig[i] == f) { idx = (long)i; break; }
+                    if (idx < 0)
+                        throw std::invalid_argument("face does not belong to this brep");
+                    grp.AddUnique(wf[idx]);
+                }
+                if (grp.GetSize() == 0)
+                    continue;
+                SmFeature* ft = exec.AddFeature(grp, SM_RB_EXTEND_SURFACE, SM_RB_FROM_OTHER_BREP);
+                if (ft == nullptr)
+                    throw std::runtime_error("the faces do not make a feature (a group must be connected "
+                                             "and leave the body round it)");
+                feats.push_back(ft);
+            }
+            if (feats.empty())
+                return brep;
+            if (ext_dist > 0.0)
+                exec.SetBaseExtDist(ext_dist);
+            SmBrep* base = NULL;
+            SmTArray<SmBrep*> feature_breps;
+            SmObjsDelete<SmBrep*> clean_features(&feature_breps);
+            CHECK_STATUS(exec.DoDefeature(base, &feature_breps));
+            for (SmFeature* ft : feats)
+                if (!ft->GetBaseWasApplied())
+                    throw std::runtime_error("the faces round a group could not be extended to close it");
+            {
+                SmTemporaryChangeValue<SmBoolean> editing(work->m_bEditingEnabled, TRUE);
+                CHECK_STATUS(work->RemoveTopologicalEdgesAndVertices());   // rejoin faces the extensions split
+            }
+            if (!work->AssertValid(NULL, SM_LEVEL_2))
+                throw std::runtime_error("the result is not a valid brep");
+            if (brep->IsManifoldSolid() && !work->IsManifoldSolid())
+                throw std::runtime_error("the result is not a closed solid");
+            SmBrep* backup = new (ctx) SmBrep(*brep, NULL, NULL);
+            SmObjDelete clean_backup(backup);
+            SmTemporaryChangeValue<SmBoolean> editing(brep->m_bEditingEnabled, TRUE);
+            SmStatus st = brep->RemoveAllTopology();
+            if (st == SM_SUCCESS)
+                st = brep->MergeBrep(*work);
+            if (st != SM_SUCCESS && brep->RemoveAllTopology() == SM_SUCCESS)
+                brep->MergeBrep(*backup);
+            CHECK_STATUS(st);
+            return brep;
+        },
+        py::return_value_policy::reference, py::arg("brep"), py::arg("groups"), py::arg("ext_dist") = 0.0,
+        "Remove each group of connected faces (fillets with their corner patches, a hole, a boss, a "
+        "chamfer) and close the gap by extending the faces round it (SmFeatureExecutive, "
+        "SM_RB_EXTEND_SURFACE). Works on a copy: the brep is replaced only by a valid result, else left "
+        "as it was and RuntimeError raised. ext_dist: how far the surfaces are extended (0: estimated "
+        "from the loop's size). Face handles are stale afterwards.");
 
     py::class_<KKTFactor>(ext, "KKTFactor",
         "The system [[M, C^T], [C, -delta I]] factorised once (supernodal LDL^T from Accelerate on macOS, "

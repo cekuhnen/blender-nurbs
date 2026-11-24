@@ -139,6 +139,8 @@ GROUPS = (
         ), {NURBS}),
         ("Fillets", (
             (_t("nproto.fillet", "Surface Fillet", 'MOD_BEVEL'), _t("nproto.edge_fillet", icon='MOD_BEVEL')),
+            (_t("nproto.remove_fillets", icon='SELECT_SUBTRACT'),
+             ("nproto.remove_fillets", "Remove All Fillets", 'X', {"all_fillets": True})),
         ), {NURBS}),
         ("Solids", (
             (("nproto.boolean", "Union", 'SELECT_EXTEND', {"operation": "UNION"}),

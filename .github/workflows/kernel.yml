@@ -232,6 +232,9 @@ jobs:
           "$BLENDER" -b --factory-startup --python tests/test_shell.py 2>&1 | tee shell.log
           grep -E "^FAIL" shell.log || true
           grep -q "^ALL OK" shell.log
+          "$BLENDER" -b --factory-startup --python tests/test_remove_fillets.py 2>&1 | tee rmfillet.log
+          grep -E "^FAIL" rmfillet.log || true
+          grep -q "^ALL OK" rmfillet.log
           "$BLENDER" -b --factory-startup --python tests/test_extrude_face.py 2>&1 | tee extface.log
           grep -E "^FAIL" extface.log || true
           grep -q "^ALL OK" extface.log
