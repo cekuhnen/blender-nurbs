@@ -78,6 +78,8 @@ def fillet(a, b, **kw):
 
 # --- Notch: the fillet stops where the slope ends, the floor is notched ----------
 for shape in ("CIRCULAR", "CHAMFER", "BLEND"):
+    # a chamfer is sized by its distance: the rails sit R from the crossing
+    sb = R if shape == "CHAMFER" else SETBACK
     a, b = tent()
     a0, b0 = A(a), A(b)
     r, fil = fillet(a, b, shape=shape)
@@ -86,13 +88,13 @@ for shape in ("CIRCULAR", "CHAMFER", "BLEND"):
     check(f"notch {shape}: the fillet runs exactly along the shared 0.23 of the edge",
           r == {'FINISHED'} and abs(Y.min()) < 1e-6 and abs(Y.max() - LB) < 1e-6, (r, Y.min(), Y.max()))
     check(f"notch {shape}: the floor loses only the strip under the fillet, one face with the step (6 edges)",
-          fb.face_count() == 1 and len(fb.edges()) == 6 and abs(A(a) - (a0 - SETBACK * LB)) < 1e-6,
-          (fb.face_count(), len(fb.edges()), A(a), a0 - SETBACK * LB))
+          fb.face_count() == 1 and len(fb.edges()) == 6 and abs(A(a) - (a0 - sb * LB)) < 1e-6,
+          (fb.face_count(), len(fb.edges()), A(a), a0 - sb * LB))
     check(f"notch {shape}: past the slope's end the floor keeps its own edge; the rail and the step are edges",
-          on_edges(a, (0, 0.30, 0)) < 1e-7 and on_edges(a, (-SETBACK, 0.1, 0)) < 1e-7
-          and on_edges(a, (-0.5 * SETBACK, LB, 0)) < 1e-7 and on_edges(a, (-0.5 * SETBACK, 0.1, 0)) > 6e-3)
+          on_edges(a, (0, 0.30, 0)) < 1e-7 and on_edges(a, (-sb, 0.1, 0)) < 1e-7
+          and on_edges(a, (-0.5 * sb, LB, 0)) < 1e-7 and on_edges(a, (-0.5 * sb, 0.1, 0)) > 6e-3)
     check(f"notch {shape}: the slope is cut back along its whole length",
-          abs(A(b) - (b0 - SETBACK * LB)) < 1e-6 and store.get_brep(b).face_count() == 1, (A(b), b0 - SETBACK * LB))
+          abs(A(b) - (b0 - sb * LB)) < 1e-6 and store.get_brep(b).face_count() == 1, (A(b), b0 - sb * LB))
 
 # --- Extend: the slope grows to the floor's end first ---------------------------
 a, b = tent()

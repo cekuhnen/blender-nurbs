@@ -761,11 +761,14 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
     ], default="RADIUS")
     radius: FloatProperty(name="Radius A", default=0.25, min=0.0, soft_max=10.0, unit='LENGTH',
                           description="How far the ball's centre sits from surface A (the rails are the "
-                                      "ball's feet; a chamfer runs straight between them). With Variable "
-                                      "Radius: the start radius, 0 allowed")
+                                      "ball's feet). Chamfer: how far its rail sits from the crossing on "
+                                      "surface A. With Variable Radius: the start radius, 0 allowed")
     radius_b: FloatProperty(name="Radius B", default=0.25, min=1e-5, soft_max=10.0, unit='LENGTH',
-                            description="How far the ball's centre sits from surface B (Same Radius off)")
-    same_radius: BoolProperty(name="Same Radius", default=True)
+                            description="How far the ball's centre sits from surface B (Same Radius off). "
+                                        "Chamfer: how far its rail sits from the crossing on surface B")
+    same_radius: BoolProperty(name="Same Radius", default=True,
+                              description="One size for both surfaces (a chamfer: one distance; off: Distance "
+                                          "A on surface A, Distance B on B)")
     variable: BoolProperty(name="Variable Radius", default=False,
                            description="The ball radius runs smoothly (linearly with length) along the crossing "
                                        "from Radius at its start to End Radius at its end, the same from both "
@@ -900,13 +903,17 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
     def _variable(self):
         return getattr(self, "variable", False) and self.rail_type == "RADIUS" and self.shape != "SOFT"
 
+    def _setback(self):
+        """A chamfer sized by distances: how far each rail sits from the crossing."""
+        return self.shape == "CHAMFER" and self.rail_type == "RADIUS"
+
     def _soft_cont(self):
         return 3 if self.continuity == "3" else 2
 
     def _label(self, name):
         if self.shape == "SOFT":
             return "Min Radius"
-        word = "Radius"                 # a chamfer's too: the ball's radii, its rails the feet
+        word = "Distance" if self._setback() else "Radius"
         if self._variable():
             return f"{'Start' if name == 'radius' else 'End'} {word}"
         if name == "radius" and self.rail_type == "CHORD":
@@ -976,9 +983,17 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
             return r, r
         if self._variable():            # linear in length along the crossing (the worker's law)
             r = self.radius + (self.end_radius - self.radius) * self._frac[i]
-            return r, r
-        rb = self.radius if self.same_radius else self.radius_b
-        return np.full(len(P), self.radius), np.full(len(P), rb)
+            ra, rb = r, r
+        else:
+            rb = self.radius if self.same_radius else self.radius_b
+            ra, rb = np.full(len(P), self.radius), np.full(len(P), rb)
+        if self._setback():             # distances: the ball whose feet sit there (secfillet.setback_radii)
+            sa, sb = self._sides()
+            g = np.sum(sa * NA * sb * NB, axis=1)
+            s = np.sqrt(np.clip(1.0 - g * g, 1e-12, None))
+            da, db = np.broadcast_to(ra, (len(P),)), np.broadcast_to(rb, (len(P),))
+            return (g * da + db) / s, (da + g * db) / s
+        return ra, rb
 
     def drag_preview(self):
         sa, sb = self._sides()
@@ -1044,6 +1059,11 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         sa, sb = self._sides()
         ca, cb, A, B = (x[0] for x in surface_fillet_rails(P[j:j + 1], NA[j:j + 1], NB[j:j + 1], sa, sb))
         ra, rb = (x[j] for x in self._radii(P, NA, NB, i))
+        if self._setback():             # a distance is the rail's own distance from the crossing
+            on_b = field == "radius_b"
+            D = _unit(ca if on_b else cb)   # the rail on A leaves along cb, the one on B along ca
+            return {"field": field, "kind": "arrow", "origin": P[j], "dir": D, "base": P[j],
+                    "param": getattr(self, field), "to_value": lambda t: max(0.0, t)}
         if self._variable():            # both radii the field's: the rail on A, along D1
             D = ca - A + cb
             D /= np.linalg.norm(D) or 1.0
@@ -1137,18 +1157,21 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         return True
 
     def drag_handle_hints(self):
+        word = "distance" if self._setback() else "radius"
         if self._variable():
-            return [hints.key("LMB drag", "arrows: start / end radius")]
+            return [hints.key("LMB drag", f"arrows: start / end {word}")]
         if len(self.drag_fields) > 1:
-            return [hints.key("LMB drag", "arrows: radius on A, on B")]
-        return [hints.key("LMB drag", "arrow: chord" if self.rail_type == "CHORD" else "arrow: radius")]
+            return [hints.key("LMB drag", f"arrows: {word} on A, on B")]
+        return [hints.key("LMB drag", "arrow: chord" if self.rail_type == "CHORD" else f"arrow: {word}")]
 
     def drag_rows(self):
         rows = [("Shape", [hints.cycle("C", ["circular", "chamfer", "blend", "soft"], self.shape.lower())]
                  + ([] if self.shape == "SOFT" else
-                    [hints.cycle("R", ["rolling ball", "chord"],
-                                 "rolling ball" if self.rail_type == "RADIUS" else "chord", "size"),
-                     hints.toggle("S", "same radius", self.same_radius),
+                    [hints.cycle("R", ["distance" if self.shape == "CHAMFER" else "rolling ball", "chord"],
+                                 ("distance" if self.shape == "CHAMFER" else "rolling ball")
+                                 if self.rail_type == "RADIUS" else "chord", "size"),
+                     hints.toggle("S", "same distance" if self.shape == "CHAMFER" else "same radius",
+                                  self.same_radius),
                      hints.toggle("V", "variable", self.variable)])
                  + ([hints.cycle("G", ["G1", "G2", "G3"], "G" + self.continuity)] if self.shape == "BLEND" else [])
                  + ([hints.cycle("G", ["G2", "G3"], "G%d" % self._soft_cont())] if self.shape == "SOFT" else [])),
@@ -1189,6 +1212,8 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         if self._variable():            # the sides' signs on the larger radius (a 0 has no sign)
             ra = rb = max(self.radius, self.end_radius)
             var = {"radii": [self.radius, self.end_radius], "start_point": self._start_point(a, b)}
+        if self._setback():
+            var["setback"] = True       # radius / radius_b are the rails' distances from the crossing
         self._used = {"radius_a": -ra if fa else ra, "radius_b": -rb if fb else rb,
                       "xsect": 0 if self.shape == "CHAMFER" else 2, "chord": chord,
                       "blend": int(self.continuity) if self.shape == "BLEND" else 0, "ends": self.ends,
@@ -1284,8 +1309,13 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
         if u.get("soft") is not None and res.get("min_radius"):
             self.report({'INFO'}, soft_summary(res))
         if u.get("radii"):
-            self.report({'INFO'}, f"Variable radius {u['radii'][0]:.4g} to {u['radii'][1]:.4g} m "
+            word = "distance" if u.get("setback") else "radius"
+            self.report({'INFO'}, f"Variable {word} {u['radii'][0]:.4g} to {u['radii'][1]:.4g} m "
                                   f"({res.get('sections', 0)} sections)")
+        elif u.get("setback") and res.get("setback"):
+            (a0, a1), (b0, b1) = res["setback"]
+            rng = lambda lo, hi: f"{lo:.4g}" if hi - lo <= 1e-4 * max(hi, 1e-12) else f"{lo:.4g}..{hi:.4g}"
+            self.report({'INFO'}, f"Chamfer {rng(a0, a1)} m on {a.name}, {rng(b0, b1)} m on {b.name}")
         if u["chord"] and res.get("radius_range"):
             lo, mean, hi = res["radius_range"]
             spread = (f"{lo:.4g}..{hi:.4g}" if hi - lo > 1e-3 * mean else f"{mean:.4g}")
@@ -1302,19 +1332,30 @@ class NPROTO_OT_fillet(ValueDrag, AskValue, bpy.types.Operator):
             lay.row(align=True).prop(self, "continuity", expand=True)
         if self.shape == "SOFT":
             _draw_soft(lay, self)
+        elif self.shape == "CHAMFER":
+            row = lay.row(align=True)
+            row.prop_enum(self, "rail_type", "RADIUS", text="Distance")
+            row.prop_enum(self, "rail_type", "CHORD", text="Chord")
         else:
             lay.row(align=True).prop(self, "rail_type", expand=True)
         col = lay.column(align=True)
+        word = "Distance" if self._setback() else "Radius"
         if self.shape == "SOFT":
             col.prop(self, "radius", text="Min Radius")
         elif self.rail_type == "CHORD":
             col.prop(self, "radius", text="Chord")
         elif self.variable:
-            col.prop(self, "radius", text="Start Radius")
-            col.prop(self, "end_radius", text="End Radius")
-            col.prop(self, "variable")
+            col.prop(self, "radius", text=f"Start {word}")
+            col.prop(self, "end_radius", text=f"End {word}")
+            col.prop(self, "variable", text=f"Variable {word}")
+        elif self._setback():           # one distance on both surfaces, or one on each
+            col.prop(self, "same_radius", text="Two Distances", invert_checkbox=True)
+            col.prop(self, "radius", text="Distance" if self.same_radius else "Distance A")
+            if not self.same_radius:
+                col.prop(self, "radius_b", text="Distance B")
+            col.prop(self, "variable", text="Variable Distance")
         else:
-            col.prop(self, "radius", text="Radius A")       # a chamfer's too (the ball between its rails)
+            col.prop(self, "radius", text="Radius A")
             col.prop(self, "same_radius")
             sub = col.row()
             sub.enabled = not self.same_radius
@@ -2564,9 +2605,20 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
     fill_corners: BoolProperty(name="Fill Corners", default=True,
                                description="Soft: where three or four fillets meet (a box corner), fill the opening "
                                            "with a Square, G2 to the fillets around it")
-    radius: FloatProperty(name="Radius", default=0.1, min=1e-4, soft_max=5.0, unit='LENGTH')
+    radius: FloatProperty(name="Radius", default=0.1, min=1e-4, soft_max=5.0, unit='LENGTH',
+                          description="The rolling ball's radius. Chamfer: how far its rails sit from the edge "
+                                      "on each face (Two Distances: on face A)")
     variable: BoolProperty(name="Variable Radius", default=False)
     end_radius: FloatProperty(name="End Radius", default=0.2, min=1e-4, soft_max=5.0, unit='LENGTH')
+    same_distance: BoolProperty(name="Same Distance", default=True,
+                                description="Chamfer: one distance on both faces (off: Distance A on one face, "
+                                            "Distance B on the other)")
+    distance_b: FloatProperty(name="Distance B", default=0.1, min=1e-4, soft_max=5.0, unit='LENGTH',
+                              description="Chamfer, two distances: how far the rail sits from the edge on face B")
+    flip_distances: BoolProperty(name="Flip", default=False,
+                                 description="Chamfer, two distances: swap the faces Distance A and B go on (A "
+                                             "goes on the face more of the picked edges border: round a box's "
+                                             "top, the top)")
     continuity: EnumProperty(name="Continuity", items=[("1", "G1", ""), ("2", "G2", ""), ("3", "G3", "")], default="2")
     thumbweight: FloatProperty(name="Fullness", default=1.0, min=0.1, soft_max=3.0,
                                description="Blend shape: >1 fuller, <1 thinner")
@@ -2651,7 +2703,7 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
             names = set()
         objs = [bpy.data.objects[n] for n in names if n in bpy.data.objects]
         if objs:
-            fit_radius(self, objs, ["radius", "end_radius"])     # a size that fits, shown in the dialog
+            fit_radius(self, objs, ["radius", "end_radius", "distance_b"])     # a size that fits, shown in the dialog
 
     # -- the live value stage (valuedrag.py) ----------------------------------
     angle_fields = ()
@@ -2661,8 +2713,19 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
 
     @property
     def drag_fields(self):
-        return ("radius", "end_radius") if (self.variable and self.rail_type == "RADIUS"
-                                            and self.shape != "SOFT") else ("radius",)
+        if self._two():
+            return ("radius", "distance_b")
+        return ("radius", "end_radius") if self._variable() else ("radius",)
+
+    def _variable(self):
+        return self.variable and self.rail_type == "RADIUS" and self.shape != "SOFT" and not self._two()
+
+    def _setback(self):
+        """A chamfer sized by distances: how far each rail sits from the edge."""
+        return self.shape == "CHAMFER" and self.rail_type == "RADIUS"
+
+    def _two(self):
+        return self._setback() and not self.same_distance
 
     def _soft_cont(self):
         return 3 if self.continuity == "3" else 2
@@ -2670,10 +2733,42 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
     def _label(self, name):
         if self.shape == "SOFT":
             return "Min Radius"
+        if self._setback():
+            if self._two():
+                return "Distance B" if name == "distance_b" else "Distance A"
+            if self._variable():
+                return "End Distance" if name == "end_radius" else "Start Distance"
+            return "Distance"
         return super()._label(name)
 
+    def _sides_a(self):
+        """Per edge preview (self._ef): True when its first face (D1) takes
+        Distance A -- the worker's rule (secfillet.chamfer_sides), per object."""
+        from .kernel import secfillet
+        by_obj = {}
+        for k, (name, idx) in enumerate(self._ef_refs):
+            by_obj.setdefault(name, []).append((k, idx))
+        out = [True] * len(self._ef_refs)
+        for name, items in by_obj.items():
+            obj = bpy.data.objects.get(name)
+            try:
+                es = store.get_brep(obj).edges()
+                sides = secfillet.chamfer_sides([es[i] for _, i in items], self.flip_distances)
+            except Exception:
+                continue
+            for (k, _), a in zip(items, sides):
+                out[k] = a
+        return out
+
+    def _dists(self, i):
+        """(distance into D1's face, into D2's) for preview edge i."""
+        da, db = self.radius, self.distance_b
+        if not getattr(self, "_afirst", None):
+            self._afirst = self._sides_a()
+        return (da, db) if self._afirst[i] else (db, da)
+
     def drag_setup(self, context, mouse):
-        self._ef = []
+        self._ef, self._ef_refs = [], []
         for name, ref in json.loads(self.inputs or "[]"):
             obj = bpy.data.objects.get(name)
             if obj is None or not ref.startswith("E"):
@@ -2681,6 +2776,8 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
             fr = fillet_frames(obj, int(ref[1:]))
             if fr is not None:
                 self._ef.append(fr)
+                self._ef_refs.append((name, int(ref[1:])))
+        self._afirst = None             # which face takes Distance A (found on first use)
         if not self._ef:
             return False
         n_all = sum(len(P) for P, _, _ in self._ef)
@@ -2702,10 +2799,13 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
         f = self._frac[i]
         P, D1, D2 = self._ef[i]
         cosa = np.sum(D1 * D2, axis=1)
-        if self.variable and self.rail_type == "RADIUS":
+        if self._variable():
             vals = self.radius + (self.end_radius - self.radius) * f
         else:
             vals = np.full(len(P), self.radius)
+        if self._setback():             # the distance is the rail's: the ball r = d tan(a / 2)
+            half = 0.5 * np.arccos(np.clip(cosa, -0.9999, 0.9999))
+            return vals * np.tan(half)
         return np.array([self._r_of(v, c) for v, c in zip(vals, cosa)])
 
     def drag_preview(self):
@@ -2714,6 +2814,10 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
             P, D1, D2 = self._ef[i]
             if self.shape == "SOFT":
                 X = soft_sections(P, D1, D2, self.radius, self.smoothing, self._soft_cont())
+            elif self._two():           # straight from the rail on one face to the rail on the other
+                d1, d2 = self._dists(i)
+                w = np.linspace(0.0, 1.0, 9)[None, :, None]
+                X = (P + d1 * D1)[:, None] * (1 - w) + (P + d2 * D2)[:, None] * w
             else:
                 X = fillet_sections(P, D1, D2, self._radii(i), self.shape, fullness=self.thumbweight)
             L, T = ruled_preview(list(X), ribs=2)
@@ -2730,6 +2834,13 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
             g = soft_setback_factor(cosa, self.smoothing, self._soft_cont())
             return {"field": field, "kind": "arrow", "origin": P[j], "dir": D1[j], "base": P[j],
                     "param": g * value, "to_value": lambda t: t / g}
+        if self._setback():               # a distance is the rail's own distance from the edge
+            D = D1[j]
+            if self._two():               # each on the rail it moves (face A's or B's)
+                self._dists(i)            # (finds which face takes A)
+                D = D1[j] if self._afirst[i] == (field == "radius") else D2[j]
+            return {"field": field, "kind": "arrow", "origin": P[j], "dir": D, "base": P[j],
+                    "param": value, "to_value": lambda t: max(1e-4, t)}
         if self.rail_type == "CHORD":     # chord -> rail distance and back
             th = np.pi - np.arccos(np.clip(cosa, -0.9999, 0.9999))
             k = 2.0 * np.sin(0.5 * max(th, np.radians(1.0)))
@@ -2745,6 +2856,10 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
         if variable:
             Pl = self._ef[-1][0]
             hs.append(self._handle("end_radius", len(self._ef) - 1, len(Pl) - 2))
+        if self._two():                   # Distance B beside A, both shown
+            hs.append(self._handle("distance_b", 0, len(P0) // 2))
+            for h in hs:
+                h["label"] = True
         return hs
 
     def drag_key(self, context, event, ch):
@@ -2758,6 +2873,14 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
             self._field = 0
         elif ch == "g" and self.shape == "SOFT":
             self.continuity = "2" if self.continuity == "3" else "3"
+        elif ch == "s" and self._setback():
+            self.same_distance = not self.same_distance
+            if not self.same_distance:
+                self.distance_b = self.radius
+            self._field = 0
+        elif ch == "f" and self._two():
+            self.flip_distances = not self.flip_distances
+            self._afirst = None
         else:
             return False
         return True
@@ -2765,19 +2888,28 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
     def drag_handle_hints(self):
         if self.shape == "SOFT":
             return [hints.key("LMB drag", "arrow: min radius")]
-        hs = [hints.key("LMB drag", "arrow: radius" if self.rail_type == "RADIUS" else "arrow: chord")]
+        if self._two():
+            return [hints.key("LMB drag", "arrows: distance A, distance B")]
+        word = "distance" if self._setback() else "radius"
+        hs = [hints.key("LMB drag", f"arrow: {word}" if self.rail_type == "RADIUS" else "arrow: chord")]
         if "end_radius" in self.drag_fields:
-            hs.append(hints.key("LMB drag", "2nd arrow: end radius"))
+            hs.append(hints.key("LMB drag", f"2nd arrow: end {word}"))
         return hs
 
     def drag_rows(self):
         if self.shape == "SOFT":
             return [("Shape", [hints.cycle("C", ["circular", "chamfer", "blend", "soft"], "soft"),
                                hints.cycle("G", ["G2", "G3"], "G%d" % self._soft_cont())])]
-        return [("Shape", [hints.cycle("C", ["circular", "chamfer", "blend", "soft"], self.shape.lower()),
-                           hints.cycle("R", ["rolling ball", "chord"],
-                                       "rolling ball" if self.rail_type == "RADIUS" else "chord", "size"),
-                           hints.toggle("V", "variable", self.variable)])]
+        ball = "distance" if self.shape == "CHAMFER" else "rolling ball"
+        row = [hints.cycle("C", ["circular", "chamfer", "blend", "soft"], self.shape.lower()),
+               hints.cycle("R", [ball, "chord"], ball if self.rail_type == "RADIUS" else "chord", "size")]
+        if self._setback():
+            row.append(hints.toggle("S", "same distance", self.same_distance))
+            if self._two():
+                row.append(hints.toggle("F", "flip A / B", self.flip_distances))
+        if not self._two():
+            row.append(hints.toggle("V", "variable", self.variable))
+        return [("Shape", row)]
 
     def drag_state(self):
         n = len(self._ef)
@@ -2815,10 +2947,13 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
         if not by_obj:
             self.report({'WARNING'}, "Pick shared edges of a joined surface")
             return {'CANCELLED'}
-        fit_radius(self, [bpy.data.objects[n] for n in by_obj], ["radius", "end_radius"])
+        fit_radius(self, [bpy.data.objects[n] for n in by_obj], ["radius", "end_radius", "distance_b"])
         soft = self.shape == "SOFT"
         chord = self.radius if (self.rail_type == "CHORD" and not soft) else None
-        variable = self.variable and not chord and not soft
+        variable = self._variable()
+        # a chamfer's distances: setback marks the radius as the rails' distance
+        # from the edge (older steps without it: the ball's radius)
+        two = {"distance_b": self.distance_b if self._two() else None, "flip": bool(self.flip_distances)}
         cont = self._soft_cont() if soft else int(self.continuity)
         done = []
         for name, idxs in by_obj.items():
@@ -2829,7 +2964,7 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
                                        shape=self.shape, radius=self.radius,
                                        end_radius=self.end_radius if variable else None,
                                        chord=chord, smoothing=float(self.smoothing),
-                                       continuity=cont, thumbweight=self.thumbweight,
+                                       continuity=cont, thumbweight=self.thumbweight, setback=True, **two,
                                        **steps.class_a_params(self._ca_params()))
                 breps["result"] = steps.soft_corners(obj, breps["result"], info,
                                                      {"shape": self.shape, "fill_corners": self.fill_corners})
@@ -2852,7 +2987,7 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
                     "mids_local": [list(Mi @ Vector(m)) for m in mids], "shape": self.shape, "radius": self.radius,
                     "end_radius": self.end_radius if variable else None, "chord": chord,
                     "continuity": cont, "thumbweight": self.thumbweight, "smoothing": float(self.smoothing),
-                    "fill_corners": bool(self.fill_corners),
+                    "fill_corners": bool(self.fill_corners), "setback": True, **two,
                     **self._ca_params()}, base_text=pre)
             done.append(obj)
             from . import subsel
@@ -2860,6 +2995,14 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
             msg = f"{name}: {info['edges']} edge(s) filleted" + (" (solid)" if info.get("solid") else "")
             if info.get("exact"):
                 msg += " · exact rolling-ball fillets (the face is curved)"
+            if info.get("distances"):
+                da_, db_ = info["distances"]
+                msg += (f" · distance {da_:.4g} m on every edge" if abs(da_ - db_) <= 1e-9 * max(da_, db_)
+                        else f" · distances {da_:.4g} / {db_:.4g} m")
+            elif self._setback() and info.get("setback"):
+                lo, hi = info["setback"]
+                msg += (f" · distance {lo:.4g}..{hi:.4g} m (one ball for edges at different angles)"
+                        if hi - lo > 1e-3 * hi else f" · distance {hi:.4g} m")
             if info.get("chord"):
                 lo, mean, hi = info["chord"]
                 rr = info.get("radius_range") or (info["radius"],) * 3
@@ -2876,6 +3019,10 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
                 level = 'WARNING'
             if info.get("rings") and "class_a" not in info:
                 msg += " · " + ring_summary(info["rings"])
+            if info.get("skipped_tangent"):
+                msg += (f" · {info['skipped_tangent']} edge(s) left out: their faces meet tangent "
+                        "(a fillet's seam, no corner)")
+                level = 'WARNING'
             if "class_a" in info and not soft:
                 ca_msg, ok = class_a_summary(info["class_a"])
                 msg += " · " + ca_msg
@@ -2901,12 +3048,29 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
             _draw_soft(lay, self)
             lay.prop(self, "fill_corners")
             return
-        lay.row(align=True).prop(self, "rail_type", expand=True)
+        if self.shape == "CHAMFER":
+            row = lay.row(align=True)
+            row.prop_enum(self, "rail_type", "RADIUS", text="Distance")
+            row.prop_enum(self, "rail_type", "CHORD", text="Chord")
+        else:
+            lay.row(align=True).prop(self, "rail_type", expand=True)
         col = lay.column(align=True)
         if self.rail_type == "CHORD":
             col.prop(self, "radius", text="Chord")
+        elif self._setback():           # one distance on both faces, or one on each
+            col.prop(self, "same_distance", text="Two Distances", invert_checkbox=True)
+            if self.same_distance:
+                col.prop(self, "radius", text="Distance")
+                col.prop(self, "variable", text="Variable Distance")
+                sub = col.row()
+                sub.enabled = self.variable
+                sub.prop(self, "end_radius", text="End Distance")
+            else:
+                col.prop(self, "radius", text="Distance A")
+                col.prop(self, "distance_b")
+                col.prop(self, "flip_distances", text="Flip A / B", toggle=True)
         else:
-            col.prop(self, "radius", text="Distance" if self.shape == "CHAMFER" else "Radius")
+            col.prop(self, "radius", text="Radius")
             col.prop(self, "variable")
             sub = col.row()
             sub.enabled = self.variable

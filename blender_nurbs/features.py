@@ -5,6 +5,7 @@ it later. An input is (object, ref) -- see geom.py for the ref strings.
 """
 
 import json
+import math
 
 import numpy as np
 from mathutils import Vector
@@ -1805,6 +1806,16 @@ def revolve_exact(curve, origin, axis, angle_deg, start_deg=0.0):
     # frame: x towards the profile's start point (projected off the axis)
     rel = P - O
     radial = rel - np.outer(rel @ z, z)
+    # CVs a hair off the axis go onto it: a profile end meant to lie there (a
+    # rectangle's corner, float32 in Blender and turned by a rotation not
+    # exactly 90 degrees, ends 2e-9 off) would revolve into a ring a few
+    # nanometres wide instead of a pole -- sliver triangles whose normals
+    # point anywhere: a bright spot at the axis
+    rl = np.linalg.norm(radial, axis=1)
+    on = rl <= 1e-6 * (float(np.ptp(P, axis=0).max()) or 1.0)
+    if on.any() and not on.all():
+        rel[on] -= radial[on]
+        radial[on] = 0.0
     k = int(np.argmax(np.linalg.norm(radial, axis=1)))
     x = radial[k] / (np.linalg.norm(radial[k]) or 1.0)
     if np.linalg.norm(radial[k]) < 1e-12:
@@ -1858,9 +1869,10 @@ def _revolve_solid_side(obj, curve, p):
     two half turns (one face closed both ways -- a torus-like ring -- has no
     volume in the kernel: its integration needs a seam it can cross)."""
     angle = float(p.get("angle", 360.0))
-    if abs(abs(angle) - 360.0) > 1e-9 or not is_closed_curve(curve):
-        return _revolve_side(obj, curve, p)
     origin, axis = revolve_axis(obj, p)
+    if (abs(abs(angle) - 360.0) > 1e-9 or not is_closed_curve(curve)
+            or _off_axis_runs(curve, origin, axis)[0] is not curve):    # a side on the axis: open runs
+        return _revolve_side(obj, curve, p, solid=True)
     seam = float(p.get("seam_angle", 0.0))
     sm, ext = _k()
     copy = lambda: ext.curve_from_cvs(*_cv_args(ext.curve_cvs(curve)))
@@ -1873,12 +1885,126 @@ def _cv_args(d):
             d.get("weights") or None)
 
 
-def _revolve_side(obj, curve, p):
-    """The revolve's wall (a surface) of one profile curve."""
+def _revolve_side(obj, curve, p, solid=False):
+    """The revolve's wall (a surface) of one profile curve. Stretches of the
+    profile lying on the axis (a rectangle's side on it) turn into no area --
+    the kernel refuses such a face -- so they are left out: the rest is
+    revolved (one surface; a Brep of several when the axis cuts the profile
+    into separate runs, or a list of them for a solid's walls)."""
     origin, axis = revolve_axis(obj, p)
     angle = float(p.get("angle", 360.0))
     seam = float(p.get("seam_angle", 0.0)) if abs(abs(angle) - 360.0) < 1e-9 else 0.0
-    return revolve_exact(curve, tuple(origin), tuple(axis), angle, seam)
+    runs = _off_axis_runs(curve, origin, axis)
+    if p.get("split_kinks") and not solid:      # one face per smooth stretch: its corners become edges
+        runs = [q for c in runs for q in _split_at_kinks(c)]
+    walls = [revolve_exact(c, tuple(origin), tuple(axis), angle, seam) for c in runs]
+    if len(walls) == 1 or solid:
+        return walls[0] if len(walls) == 1 else walls
+    sm, ext = _k()
+    merged = ext.brep_from_surface(walls[0])
+    for w in walls[1:]:
+        ext.append_brep(merged, ext.brep_from_surface(w))
+    size = float(np.ptp(geom.sample_curve(curve, 33), axis=0).max()) or 1.0
+    return sm.stitch_advanced(merged, max(1e-5, 1e-6 * size), squeeze_small_edges=False,
+                              making_manifold_solid=False)[0]
+
+
+def _off_axis_runs(curve, origin, axis, rel=1e-6):
+    """The profile's runs off the revolve axis: the curve cut exactly at the
+    ends of its spans that lie on the axis (each run one curve; a closed
+    profile's run across its start is joined back into one). [curve] when no
+    span lies on it, or when all do (dropped elsewhere)."""
+    sm, ext = _k()
+    d = ext.curve_cvs(curve)
+    U = [float(k) for k in d["knots"]]
+    brk = sorted(set(U))
+    spans = [(a, b) for a, b in zip(brk, brk[1:]) if b - a > 1e-12 * (brk[-1] - brk[0])]
+    O, z = np.asarray(origin, float), np.asarray(axis, float)
+    z = z / np.linalg.norm(z)
+    S = geom.sample_curve(curve, 33)
+    tol = rel * (float(np.ptp(S, axis=0).max()) or 1.0)
+
+    def on(a, b):
+        X = np.array([curve.evaluate(a + (b - a) * s) for s in np.linspace(0.0, 1.0, 9)])
+        rel_ = X - O
+        return float(np.linalg.norm(rel_ - np.outer(rel_ @ z, z), axis=1).max()) <= tol
+
+    flags = [on(a, b) for a, b in spans]
+    if not any(flags) or all(flags):
+        return [curve]
+    runs, cur = [], None
+    for (a, b), f in zip(spans, flags):
+        if f:
+            if cur:
+                runs.append(cur)
+            cur = None
+        else:
+            cur = [cur[0], b] if cur else [a, b]
+    if cur:
+        runs.append(cur)
+    pieces = [_sub_curve(curve, a, b) for a, b in runs]
+    if len(runs) > 1 and not flags[0] and not flags[-1] and is_closed_curve(curve):
+        pieces = pieces[1:-1] + [_join_curves_c0(pieces[-1], pieces[0])]
+    return pieces
+
+
+def _turn_deg(curve, t, h):
+    """How far the curve's direction turns at t (degrees): the chords just
+    before and just after it. None where a chord has no length."""
+    a, m, b = (np.asarray(curve.evaluate(x), float) for x in (t - h, t, t + h))
+    u, v = m - a, b - m
+    lu, lv = np.linalg.norm(u), np.linalg.norm(v)
+    if lu <= 0.0 or lv <= 0.0:
+        return None
+    return math.degrees(math.acos(min(1.0, max(-1.0, float(u @ v) / (lu * lv)))))
+
+
+def _split_at_kinks(curve, min_deg=0.5):
+    """The curve cut at its corners (knots as multiple as its degree where it
+    turns by more than min_deg): a revolved polyline gets one face per stretch,
+    so its creases are edges that can be picked (fillets, chamfers) and shade
+    sharp. A closed curve smooth across its start keeps that stretch whole.
+    [curve] when it has no corner."""
+    sm, ext = _k()
+    d = ext.curve_cvs(curve)
+    U, deg = [float(k) for k in d["knots"]], int(d["degree"])
+    t0, t1 = U[0], U[-1]
+    h = 1e-6 * (t1 - t0)
+    kinks = [k for k in geom._corner_knots(U, deg, t0, t1) if (_turn_deg(curve, k, h) or 0.0) > min_deg]
+    if not kinks:
+        return [curve]
+    cuts = [t0] + kinks + [t1]
+    pieces = [_sub_curve(curve, a, b) for a, b in zip(cuts, cuts[1:])]
+    if is_closed_curve(curve):
+        a0, a1 = (np.asarray(curve.evaluate(x), float) for x in (t0, t0 + h))
+        b0, b1 = (np.asarray(curve.evaluate(x), float) for x in (t1 - h, t1))
+        u, v = b1 - b0, a1 - a0
+        if np.linalg.norm(u) > 0 and np.linalg.norm(v) > 0 and \
+                math.degrees(math.acos(min(1.0, max(-1.0, float(u @ v) / (np.linalg.norm(u) * np.linalg.norm(v)))))) <= min_deg:
+            pieces = pieces[1:-1] + [_join_curves_c0(pieces[-1], pieces[0])]
+    return pieces
+
+
+def _join_curves_c0(c1, c2):
+    """Two kernel curves of one degree where c1 ends at c2's start, as one
+    (a C0 knot where they meet; c2's weights scaled to c1's at the joint)."""
+    sm, ext = _k()
+    d1, d2 = ext.curve_cvs(c1), ext.curve_cvs(c2)
+    p = int(d1["degree"])
+    if int(d2["degree"]) != p:
+        raise RuntimeError("revolve: the profile's pieces off the axis differ in degree")
+    U1, U2 = [float(k) for k in d1["knots"]], [float(k) for k in d2["knots"]]
+    f1 = lambda t: (t - U1[0]) / (U1[-1] - U1[0])
+    f2 = lambda t: 1.0 + (t - U2[0]) / (U2[-1] - U2[0])
+    U = [f1(t) for t in U1[:-1]] + [f2(t) for t in U2[p + 1:]]
+    P = [tuple(map(float, q)) for q in d1["points"]] + [tuple(map(float, q)) for q in d2["points"][1:]]
+    W = None
+    if d1.get("weights") or d2.get("weights"):
+        w1 = [float(w) for w in (d1.get("weights") or [1.0] * len(d1["points"]))]
+        w2 = [float(w) for w in (d2.get("weights") or [1.0] * len(d2["points"]))]
+        k = w1[-1] / w2[0]
+        W = w1 + [w * k for w in w2[1:]]
+    return ext.curve_from_cvs(p, P, U, W)
 
 
 # --------------------------------------------------------------------------

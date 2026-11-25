@@ -1123,6 +1123,7 @@ def write_mesh(obj, brep, context=None):
 
 
 CREASE_DEG = 30.0
+SHARP_DEG = 2.0     # a B-rep edge whose faces bend more than this shades sharp, however shallow
 
 
 DRAFT = [False]     # a live drag (Face CVs): a coarser mesh, and crease corners take their triangle's own
@@ -1187,8 +1188,10 @@ def _corner_normals(brep, pts, nrm, tris):
             if ks and not crease[v]:            # (as above: the kernel's normal off its own triangles)
                 m_, n_ = tri_n[ks].sum(0), np.asarray(nrm[v], float)
                 crease[v] = m_ @ n_ < cos_h * (np.linalg.norm(m_) * np.linalg.norm(n_) or 1.0)
+    bends = _edge_bends(brep)
     if crease.any():
-        crease = _true_creases(brep, P, crease)
+        crease = _true_creases(brep, P, crease, bends=bends)
+    crease |= _shallow_crease_vertices(P, bends)
     if not crease.any():
         return None
     from .square import _foot
@@ -1278,7 +1281,87 @@ def _may_fold(surf):
     return False
 
 
-def _true_creases(brep, P, crease, band=0.01, m=7):
+def _edge_bends(brep, m=7, n=120):
+    """Per B-rep edge: (n points along it or None, how many faces it joins,
+    the smallest and largest bend in degrees between its two faces' exact
+    normals at m points along it -- None where they could not be found)."""
+    sm, _ = _k()
+    out = []
+    for e in brep.edges():
+        try:
+            t0, t1 = e.parameter_range()
+            pts = np.array([e.point_at(t0 + (t1 - t0) * i / (n - 1)) for i in range(n)], float)
+        except Exception:
+            try:  # some edges (e.g. fillet rails) only evaluate through their curve
+                c = e.curve()
+                t0, t1 = c.parameter_range()
+                pts = np.array([c.evaluate(t0 + (t1 - t0) * i / (n - 1)) for i in range(n)], float)
+            except Exception:
+                pts = None
+        fs = e.faces()
+        lo = hi = None
+        if len(fs) == 2 and pts is not None:
+            try:
+                ss = [f.surface() for f in fs]
+                bends = []
+                for p in pts[np.linspace(2, n - 3, m).astype(int)]:
+                    ns = []
+                    for f, s in zip(fs, ss):
+                        w = sm.surface_closest_point(s, tuple(map(float, p)))[1][0]
+                        uv = (float(w.x), float(w.y)) if hasattr(w, "x") else (float(w[0]), float(w[1]))
+                        nv = np.array(f.outward_normal_at_uv(*uv), float)
+                        ns.append(nv / (np.linalg.norm(nv) or 1.0))
+                    bends.append(math.degrees(math.acos(min(1.0, max(-1.0, float(ns[0] @ ns[1]))))))
+                lo, hi = min(bends), max(bends)
+            except Exception:
+                lo = hi = None
+        out.append((pts, len(fs), lo, hi))
+    return out
+
+
+def _shallow_crease_vertices(P, bends):
+    """The vertices lying on B-rep edges whose faces bend by more than
+    SHARP_DEG but (somewhere) by less than the triangle test sees: a 26 deg
+    bevel meeting a flat bottom would shade as if rounded. A vertex is on the
+    edge when it is within the chord's sagitta of the edge's polyline."""
+    out = np.zeros(len(P), bool)
+    edges = [pts for pts, nf, lo, hi in bends
+             if pts is not None and nf == 2 and hi is not None
+             and hi > SHARP_DEG and lo < CREASE_DEG + 5.0]
+    if not edges or not len(P):
+        return out
+    from mathutils import kdtree
+    P = np.asarray(P, float)
+    lo_, hi_ = P.min(axis=0), P.max(axis=0)
+    eps = 1e-6 * (float(np.linalg.norm(hi_ - lo_)) or 1.0)
+    tree = kdtree.KDTree(len(P))
+    for i, p in enumerate(P):
+        tree.insert(p, i)
+    tree.balance()
+    for pts in edges:
+        a, b = pts[:-1], pts[1:]
+        d = b - a
+        L2 = np.einsum("ij,ij->i", d, d)
+        # the chord cuts inside a curved edge: a vertex on the curve may lie up
+        # to the sagitta off it, an eighth of the samples' second difference
+        # (twice that here, and the larger of the segment's two ends)
+        t_ = np.zeros(len(pts), float)
+        t_[1:-1] = np.linalg.norm(pts[2:] - 2.0 * pts[1:-1] + pts[:-2], axis=1)
+        t_[0], t_[-1] = t_[1], t_[-2]
+        sag = 0.25 * np.maximum(t_[:-1], t_[1:]) + eps
+        for k in range(len(a)):
+            if L2[k] <= 0.0:
+                continue
+            c, r = 0.5 * (a[k] + b[k]), 0.5 * math.sqrt(L2[k]) + sag[k]
+            for _co, i, _dist in tree.find_range(c, r):
+                q = P[i] - a[k]
+                t = min(1.0, max(0.0, float(q @ d[k]) / L2[k]))
+                if np.linalg.norm(q - t * d[k]) <= sag[k]:
+                    out[i] = True
+    return out
+
+
+def _true_creases(brep, P, crease, band=0.01, m=7, bends=None):
     """The crease vertices the B-rep confirms. A thin triangle on a curved
     face can lean far off the surface, so the triangle test also flags smooth
     places: along finely sampled edges, by a SubD body's sliver knots (the
@@ -1286,38 +1369,14 @@ def _true_creases(brep, P, crease, band=0.01, m=7):
     length from it stays a crease only when that edge's two faces bend by
     more than CREASE_DEG at one of m points along it; a vertex away from
     every edge only when some face can fold inside. Anything unsure keeps
-    the triangles' verdict."""
-    sm, _ = _k()
-    cos_c = np.cos(np.radians(CREASE_DEG))
+    the triangles' verdict. bends: _edge_bends(brep, m), if already found."""
+    if bends is None:
+        bends = _edge_bends(brep, m)
     S, B, sharp_rows = [], [], []
-    for e in brep.edges():
-        try:
-            t0, t1 = e.parameter_range()
-            pts = np.array([e.point_at(t0 + (t1 - t0) * i / 119) for i in range(120)], float)
-        except Exception:
-            try:  # some edges (e.g. fillet rails) only evaluate through their curve
-                c = e.curve()
-                t0, t1 = c.parameter_range()
-                pts = np.array([c.evaluate(t0 + (t1 - t0) * i / 119) for i in range(120)], float)
-            except Exception:
-                return crease
-        fs = e.faces()
-        sharp = len(fs) > 2
-        if len(fs) == 2:
-            try:
-                ss = [f.surface() for f in fs]
-                for p in pts[np.linspace(2, 117, m).astype(int)]:
-                    ns = []
-                    for f, s in zip(fs, ss):
-                        w = sm.surface_closest_point(s, tuple(map(float, p)))[1][0]
-                        uv = (float(w.x), float(w.y)) if hasattr(w, "x") else (float(w[0]), float(w[1]))
-                        n = np.array(f.outward_normal_at_uv(*uv), float)
-                        ns.append(n / (np.linalg.norm(n) or 1.0))
-                    if ns[0] @ ns[1] < cos_c:
-                        sharp = True
-                        break
-            except Exception:
-                sharp = True
+    for pts, nf, lo, hi in bends:
+        if pts is None:
+            return crease
+        sharp = nf > 2 or (nf == 2 and (hi is None or hi > CREASE_DEG))
         L = float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
         S.append(pts)
         B.append(np.full(len(pts), band * L))

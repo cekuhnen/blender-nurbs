@@ -19,7 +19,10 @@ own angle so the rails sit where that span needs them. A variable radius
 the crossing; a 0 section is the crossing's point (the rails meet there).
 Radius A != B (circular): the ball's centre r_A from A and r_B from B, and
 between its feet the conic tangent to both (conic(); at 90 deg a quarter
-ellipse) -- the kernel's circular fillet takes only one radius.
+ellipse) -- the kernel's circular fillet takes only one radius. Setback (a
+chamfer's distances): the sizes are how far the rails sit from the crossing
+on each surface, d_A on A and d_B on B; each section's ball radii are found
+so its feet land there (setback_radii, then Newton on the curved faces).
 
 The sections are skinned through, in homogeneous coordinates (rational arcs
 stay exact), periodic round a closed crossing; a section is added halfway
@@ -398,13 +401,23 @@ def _plane(T):
     return e1, np.cross(T, e1)
 
 
+def setback_radii(da, db, g):
+    """(r_A, r_B): the ball radii whose feet sit d_A from the crossing on
+    surface A and d_B on B, flat faces whose normals (each turned to the
+    ball's side) have the dot product g. The foot on A is (r_B - g r_A) /
+    sqrt(1 - g^2) from the crossing, on B (r_A - g r_B) / sqrt(1 - g^2)."""
+    s = math.sqrt(max(1.0 - g * g, 1e-12))
+    return (g * da + db) / s, (da + g * db) / s
+
+
 class Solver:
-    def __init__(self, A, B, ra, rb, chord=None, scale=1.0, soft=None, law=None):
+    def __init__(self, A, B, ra, rb, chord=None, scale=1.0, soft=None, law=None, setback=False):
         self.A, self.B = A, B
         self.ra, self.rb, self.chord = ra, rb, chord
         self.scale = scale
         self.soft = soft            # (R, smoothing, cont): each section's ball from its own angle
         self.law = law              # s -> ball radius (a variable radius; 0 allowed: the rails meet)
+        self.setback = setback      # ra, rb (or the law) are the rails' distances from the crossing
 
     def ball(self, P0, T, ra, rb, C):
         """Centre in the plane (P0, T) at signed distances ra from A, rb from B."""
@@ -505,6 +518,15 @@ class Solver:
                 r_prev, e_prev, r = r, err, r_new
                 C, pa, na, wa, pb, nb, wb = self.ball(P0, T, r, r, C)
             ra = rb = r
+        elif self.setback:
+            da, db = (self.law(s),) * 2 if self.law else (self.ra, self.rb)
+            if max(da, db) <= 1e-12 * self.scale:
+                pa, na, wa = self.A.foot(P0)
+                pb, nb, wb = self.B.foot(P0)
+                C = pa = pb = P0
+                ra = rb = 0.0
+            else:
+                C, pa, na, wa, pb, nb, wb, ra, rb = self._setback_ball(P0, T, da, db)
         else:
             ra, rb = (self.law(s),) * 2 if self.law else (self.ra, self.rb)
             if max(ra, rb) <= 1e-12 * self.scale:
@@ -519,6 +541,31 @@ class Solver:
         x.s, x.P0, x.C, x.pa, x.pb, x.na, x.nb, x.wa, x.wb, x.ra, x.rb = s, P0, C, pa, pb, na, nb, wa, wb, ra, rb
         x.turn = math.acos(max(-1.0, min(1.0, float(na @ nb))))
         return x
+
+    def _setback_ball(self, P0, T, da, db):
+        """The ball whose feet sit da from P0 on A and db on B: the flat
+        faces' radii (setback_radii), then Newton with that same linear map
+        at the feet's normals (curved faces bend the feet away)."""
+        if min(da, db) <= 0.0:
+            raise RuntimeError("a chamfer distance is 0")
+        _, na0, nb0 = self.start(P0, 1.0, 1.0)
+        ra, rb = setback_radii(da, db, float(na0 @ nb0))
+        if min(ra, rb) <= 0.0:
+            raise RuntimeError("no chamfer of these distances fits between the surfaces here")
+        C = self.start(P0, ra, rb)[0]
+        big = max(da, db)
+        for _ in range(40):
+            C, pa, na, wa, pb, nb, wb = self.ball(P0, T, ra, rb, C)
+            ea = da - float(np.linalg.norm(pa - P0))
+            eb = db - float(np.linalg.norm(pb - P0))
+            if max(abs(ea), abs(eb)) <= 1e-10 * big:
+                break
+            dra, drb = setback_radii(ea, eb, float(na @ nb))
+            ra = min(max(ra + dra, 0.5 * ra), 2.0 * ra)     # (the last centre: the next one's guess)
+            rb = min(max(rb + drb, 0.5 * rb), 2.0 * rb)
+        if max(abs(ea), abs(eb)) > 1e-6 * big:
+            raise RuntimeError("the chamfer's rails could not be placed at these distances")
+        return C, pa, na, wa, pb, nb, wb, ra, rb
 
 
 # ---------------------------------------------------------------------------
@@ -656,13 +703,14 @@ def _bern(n, t):
 # ---------------------------------------------------------------------------
 
 
-def _sides_on(sm, brep_a, brep_b, cr, ra, rb, chord, size, faces, soft=None):
+def _sides_on(sm, brep_a, brep_b, cr, ra, rb, chord, size, faces, soft=None, setback=False):
     """(side_a, side_b) whose ball's rails lie on the given faces (sampled at
     three places along the crossing)."""
     best = None
     for sa in (-1.0, 1.0):
         for sb in (-1.0, 1.0):
-            solver = Solver(Base(sm, brep_a, sa), Base(sm, brep_b, sb), ra, rb, chord, size, soft)
+            solver = Solver(Base(sm, brep_a, sa), Base(sm, brep_b, sb), ra, rb, chord, size, soft,
+                            setback=setback)
             worst = 0.0
             try:
                 for s in (0.25, 0.5, 0.75):
@@ -675,6 +723,28 @@ def _sides_on(sm, brep_a, brep_b, cr, ra, rb, chord, size, faces, soft=None):
     if best is None or best[0] > 1e-4 * size:
         raise RuntimeError("no fillet of this size fits between the two faces")
     return best[1], best[2]
+
+def chamfer_sides(edges, flip=False):
+    """Per edge (each between two faces): True when its first face takes a
+    two-distance chamfer's Distance A, False when its second does. A goes on
+    the face more of the edges border (round a box's top: the top), on a tie
+    the larger face (one edge of a box's top: the top again); flip turns
+    every edge the other way. The Edge Fillet preview and the worker both
+    decide by it."""
+    faces = [f for e in edges for f in list(e.faces())[:2]]
+    count = lambda f: sum(1 for g in faces if g == f)
+    out = []
+    for e in edges:
+        f0, f1 = list(e.faces())[:2]
+        c0, c1 = count(f0), count(f1)
+        if c0 == c1:
+            try:
+                c0, c1 = f0.area(), f1.area()
+            except Exception:
+                pass
+        out.append((c0 >= c1) != bool(flip))
+    return out
+
 
 def radius_law(cr, radii, start=None):
     """s -> ball radius running linearly with arc length along the crossing
@@ -691,7 +761,7 @@ def radius_law(cr, radii, start=None):
 
 
 def build(sm, brep_a, brep_b, side_a, side_b, ra, rb, chord=None, shape="CIRCULAR", tolerance=1e-4,
-          curves=None, on_faces=None, smoothing=0.6, radii=None, start=None):
+          curves=None, on_faces=None, smoothing=0.6, radii=None, start=None, setback=False):
     """(fillet brep, info) between two world-space breps. side_a / side_b: +1
     for the fillet on that surface's outward-normal side, -1 the other.
     curves: the crossing to follow (an edge fillet's edges) instead of the
@@ -702,7 +772,9 @@ def build(sm, brep_a, brep_b, side_a, side_b, ra, rb, chord=None, shape="CIRCULA
     smoothing its share of the turn in the ramps. radii = (r0, r1): a variable
     ball radius (the same from both surfaces, not with chord or soft) running
     from r0 at the crossing's end nearer the point start to r1 at the other;
-    a 0 end closes the rails on the crossing there."""
+    a 0 end closes the rails on the crossing there. setback: ra / rb (and
+    radii) are the rails' distances from the crossing, on A and on B (a
+    chamfer's one or two distances), not the ball's radii."""
     ext = sm.blender_ext
     if shape not in SHAPES:
         raise ValueError(f"unknown section {shape}")
@@ -712,6 +784,7 @@ def build(sm, brep_a, brep_b, side_a, side_b, ra, rb, chord=None, shape="CIRCULA
         cont = 3 if shape == "SOFT3" else 2
         soft = (float(ra), softfillet.clamp_smoothing(smoothing, cont), cont)
         chord = None
+        setback = False
         ra = rb = softfillet.ball_radius(ra, 0.5 * math.pi, soft[1], cont)     # a first guess, for the sides
     if curves is None:
         try:
@@ -729,9 +802,10 @@ def build(sm, brep_a, brep_b, side_a, side_b, ra, rb, chord=None, shape="CIRCULA
     if radii is not None and chord is None and soft is None:
         law = radius_law(cr, radii, start)
     if side_a is None or side_b is None:
-        side_a, side_b = _sides_on(sm, brep_a, brep_b, cr, ra, rb, chord, size, on_faces, soft)
+        side_a, side_b = _sides_on(sm, brep_a, brep_b, cr, ra, rb, chord, size, on_faces, soft,
+                                   setback=bool(setback and not chord))
     A, B = Base(sm, brep_a, side_a), Base(sm, brep_b, side_b)
-    solver = Solver(A, B, ra, rb, chord, size, soft, law)
+    solver = Solver(A, B, ra, rb, chord, size, soft, law, setback=bool(setback and not chord))
     polys = []
     for br in (brep_a, brep_b):
         for e in br.edges():
@@ -766,6 +840,12 @@ def build(sm, brep_a, brep_b, side_a, side_b, ra, rb, chord=None, shape="CIRCULA
     info = {"radius": (float(min(radii)), float(np.mean(radii)), float(max(radii))),
             "chord": (float(min(chords)), float(np.mean(chords)), float(max(chords))),
             "sections": len(secs)}
+    if cr.closed:           # the sections' rows (n, deg + 1, 4) round a closed crossing (a rim's exact ring)
+        info["ring"] = np.array([r for _, r in rows], float)
+    if setback and not chord:
+        sa_ = [float(np.linalg.norm(x.pa - x.P0)) for x in secs]
+        sb_ = [float(np.linalg.norm(x.pb - x.P0)) for x in secs]
+        info["setback"] = ((min(sa_), max(sa_)), (min(sb_), max(sb_)))
     if soft:
         import softfillet
         pk = [softfillet.peak_radius(np.asarray(r)[:, :3] / np.asarray(r)[:, 3:]) for _, r in rows]

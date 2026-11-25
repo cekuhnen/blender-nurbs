@@ -1674,8 +1674,10 @@ class NPROTO_OT_revolve(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
                                           "away from openings you will trim -- fillets cannot cross a seam")
 
     def params(self):
+        # split_kinks: a surface revolved from a profile with corners is one face per
+        # smooth stretch (older steps without it: one face across the corners)
         return {"angle": self.angle, "axis": self.axis, "pivot": self.pivot, "seam_angle": self.seam_angle,
-                "axis_point": list(self.axis_point), "axis_dir": list(self.axis_dir)}
+                "axis_point": list(self.axis_point), "axis_dir": list(self.axis_dir), "split_kinks": True}
 
     def invoke(self, context, event):
         self.body_prefer(context)
