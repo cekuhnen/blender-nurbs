@@ -310,6 +310,9 @@ def _crease_pieces(surf, angle_deg, v_rows=None):
     return pieces
 
 
+LAST_RAW = [0]     # triangles the kernel gave the last _tessellate (facetex: which face each one is on)
+
+
 def _tessellate(brep, chord, angle, edge_angle=None, max_edge_rel=1.0 / 30.0, natural=False, diag=None):
     """edge_angle: separate (finer) angle tolerance for the edges. Neighbouring
     objects are tessellated independently; along a shared curved edge each
@@ -362,6 +365,7 @@ def _tessellate(brep, chord, angle, edge_angle=None, max_edge_rel=1.0 / 30.0, na
             c = int(f[i])
             tris.append(f[i + 1:i + 1 + c])
             i += 1 + c
+    LAST_RAW[0] = len(tris)      # the kernel's own triangles (one run per face), before the crack fills
     try:
         tris = _zip(pts, nrm, tris, edge_pts=lambda: _edge_samples(brep), tol=4.0 * chord * diag)
     except Exception as exc:
@@ -1088,6 +1092,9 @@ def write_mesh(obj, brep, context=None):
     me = obj.data
     me.clear_geometry()
     faces = tris.tolist() if isinstance(tris, np.ndarray) else [list(map(int, t)) for t in tris]
+    textured = "nproto_tex" in obj.keys()       # B-rep face materials and UVs (facetex), after the mesh
+    if textured:
+        all_faces, n_raw = faces, LAST_RAW[0]
     # a face using one vertex twice (the kernel's mesh of a closed seam can have
     # them) is not kept by Blender: drop it here so the per-corner normals
     # below count the same corners as the mesh
@@ -1105,6 +1112,10 @@ def write_mesh(obj, brep, context=None):
     except Exception as exc:
         print("NURBS normals:", exc)
     me.update()
+    if textured:
+        from . import facetex
+        LAST_RAW[0] = n_raw
+        facetex.apply(obj, brep, pts, all_faces)
     from .pivot import remember
     remember(obj)              # (Set Origin / Apply Transform move the mesh: pivot.py follows with the B-rep)
 

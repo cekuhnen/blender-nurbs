@@ -19,7 +19,7 @@ Tools that don't fit the selection are dimmed: select a curve and the tools that
 | **Create Surfaces** | Plane, Box, Cylinder, **Primitive** ▾ (Plane, Disk, Box, Cylinder, Cone, Sphere, Torus) · through curves or edges: Loft, Loft Rails, Curve Network, Revolve, Rail Revolve, Sweep, Pipe · extrude and fill: Extrude (curves, edges or a face), Flange (and draft surface), Planar, Dome, Boundary, Patch · from surfaces: Offset, Thicken, Pattern, Mirror, Unroll, Flow, Convert Blender Surface |
 | **Curve Edit** | Rebuild / Extend Curve, Align Curve · Trim / Split Curves · Join / Unjoin Curves (in Surface Edit's order: shape, trim, join) |
 | **Surface Edit** | Rebuild Surface, Extend Surface, Surface Align, Match Surface, Refit to Trim, Merge Patches, Flip Normal · Trim, Split, Untrim, Untrim Region, Detach at Isoparm · Join, Unjoin · Surface Fillet, Edge Fillet, Remove Fillets, Remove All Fillets · solids: Union, Difference, Intersection, Push / Pull, Rotate Face, Move Face, Replace Face, Boundary Fill, Emboss, Shell. **Edit CVs** has no button: Tab on a NURBS surface (it is in the NURBS menu and F3 search too) |
-| **Convert** (closed at first) | BREP to Mesh, Mesh to BREP, SubD to BREP (all also in Object › Convert) |
+| **Convert** (closed at first) | BREP to Mesh, Plywood, Face Material, Mesh to BREP, SubD to BREP (BREP to Mesh, Mesh to BREP and SubD to BREP also in Object › Convert) |
 | **Scan** (closed at first) | Fitting surfaces to a scan: Cage from Scan, Fit Cage to Scan (with Add Loops, and Trim to Curve when a curve is selected), Drape Patch to Scan |
 | **Analyze** (closed at first) | Measure, Continuity Check and the overlays (also in the viewport header's Analyze popover) |
 | **Display** | **Edges**, **CVs / Hulls**, **Spans**, **Feature Labels** and **Fine Grid** on / off (also as icons in the 3D view header, next to the Analyze button, so they are always at hand); **CVs / Hulls** also draws the CV hulls of selected curves (NURBS and Poly CVs, Bezier points with their handles) outside Edit mode, where Blender draws its own; **Spans** draws the knot lines (isoparms) of every face of the visible NURBS surfaces, clipped to their trims, so you see each surface's layout at a glance; **Fine Grid** draws the floor grid's finer levels (mm, cm, 10 cm; inches) in a perspective or turned orthographic view, where Blender's floor grid stops at 1 m (1 ft); right under them how finely surfaces are meshed for display: **Quality** *Fast / Medium / Fine* sets the four values below at once (Fast: angle 10°, chord 0.001, edges 3°, max edge 1/20; Medium, the defaults: 5°, 0.0005, 2°, 1/30; Fine: 2.5°, 0.0002, 1°, 1/50), one retessellation of every body; it reads *Custom* once a value is set by hand: Chord / Angle Tolerance, Edge Angle, Max Edge. The display mesh is rebuilt after every edit, so Fast makes editing quicker (a 38-face SubD body: 0.16 s Fast, 0.37 s Medium, 1.2 s Fine, 12k / 40k / 144k triangles). The analysis overlays (zebra, curvature map) don't use it: they have their own mesh and quality. **Clip Start warning:** a 3D view's depth buffer spreads its precision between Clip Start and Clip End, so a tiny Clip Start (say 1 µm) leaves depth steps of about 8 mm at 0.37 m. Surfaces, edges and Face / Edge highlights then flicker against each other (blotchy fills, dashed edges). When the steps exceed 0.05 % of the view distance, the Display panel says so and a red ⚠ appears in the header: one click sets Clip Start to about a thousandth of the view distance. |
@@ -674,6 +674,68 @@ materials and modifiers. The NURBS object stays with its history, hidden in the 
 * **brep_face** (an integer face attribute) names each polygon's B-rep face: select by it in Edit Mode to give a face
   its own material.
 * **Join** makes one mesh object of all the selected NURBS objects.
+
+### Plywood
+
+Under Convert › Texture, next to Face Material. It textures a bent plywood shell for rendering the way the real part
+looks: a veneer on the front, one on the back, and the band of plies where the shell is cut along its rim. Select a
+NURBS solid of even thickness (a sheet after **Thicken**, a chair shell, a bent panel) or a plain mesh shell and click
+it.
+
+* **Texture: NURBS Object** (default) puts the materials and UVs on the NURBS object's **own B-rep faces**. It stays a
+  NURBS object you can keep editing: every rebuild (a history edit, CV moves, a new display detail) sorts the faces
+  again and writes the UVs again, and the materials stay. **Render Mesh** meshes it like BREP to Mesh (Light, at the
+  Detail you choose) into a separate "‹name› Plywood" and hides the NURBS object, for export, modifiers or texture
+  painting. A plain mesh is **textured in place** (its own mesh, before its modifiers).
+* **Which face is which:** a face is veneer when the other side of the shell lies straight behind it, at the
+  thickness, facing the other way. Everything else is **edge**: the rim walls, and a rounding or chamfer of the rim
+  too (sanding a rounded edge shows the plies, so it gets them). The veneer faces fall into two sides; the **front**
+  is the one facing up (most of its area). **Swap Sides** turns that round.
+* **Veneer UVs:** each side is unwrapped as **one sheet**, as a veneer is bent over the form, so the grain runs on
+  across patch boundaries and over the bend. The unwrap keeps the sheet's true size (in metres) and its shape as
+  closely as a doubly curved sheet allows; the sheet is turned so the grain runs along its length, and **Grain Angle**
+  turns it from there (90° across).
+* **Edge UVs:** u is the length along the rim in metres, v the **depth through the shell, 0 at the front, 1 at the
+  back**, measured from both veneers, so a rounded rim spreads the plies over its curve. Any edge texture whose height
+  is the full ply stack fits exactly, whatever the thickness. A hole's rim is its own strip.
+* **Materials** (slots 0 Front, 1 Back, 2 Edge):
+  * **Front Veneer** and **Back Veneer**: a procedural figure with fibres along u in the chosen wood (Birch, Beech,
+    Maple, Ash, Oak, Walnut, Teak), satin lacquer. **Back Veneer: Same as Front** puts the front's material on the
+    back. **Veneer Image** uses a photo instead (its grain along the image's width), **Image Width** the length of
+    veneer it covers.
+  * **Edge**: **Plies** stripes across v (0: about one per 1.5 mm, odd), the outer two in the veneers' woods, the
+    core plies alternating long grain and cross grain in the **Core Plies** wood, dark **Glue Lines** between. The
+    count, glue width and thickness are the object's `ply_count`, `ply_glue` and `ply_thickness` properties, so you
+    can change them without running the tool again. **Edge Image** uses a photo of a ply edge instead: its height spans the
+    thickness, its width runs along the rim in proportion.
+  * **Your own materials:** **Own Front**, **Own Back** and **Own Edge** put a material of yours in that slot. A
+    material you drop into one of the three slots yourself (Material Properties) is kept by later runs too; empty
+    the slot to get the tool's own back. The tool's materials are made once and kept, so your edits to them stay.
+    The UVs above are what your textures map to: real-size veneer sheets, and the edge band's 0–1 depth.
+* **Run it again** on the result (the textured NURBS object, the render mesh or its NURBS object) to change the
+  settings: the last run's settings come back for anything you don't set. The Adjust Last Operation panel shows the
+  thickness found and how many faces went where.
+* A shell it can't read (a lone sheet, no faces opposite each other) is refused with a message.
+
+### Face Material
+
+Under Convert › Texture, and in **Material Properties** under the slot list of a NURBS object (**Assign to Picked
+Faces** / **Assign to All Faces**, **Clear**, ✕). It gives B-rep faces a material of their own, as Edit Mode's Assign
+does for a mesh: pick faces in **Face** mode, choose a slot in the material list, click Assign. With no faces picked,
+it assigns to all faces.
+
+* The faces keep their material through every rebuild: each one is stored with a point on it and found again however
+  the rebuild numbers the faces. A face rebuilt somewhere else loses it.
+* The object gets **UVs in metres**: each face is its own island, unwrapped at its true size and turned so its long
+  side runs along u, the islands laid side by side, so a tiling texture keeps its scale from face to face. On a
+  Plywood object the veneer sheets and the edge band keep their Plywood UVs, and an assigned face only changes material
+  (an inlay, a painted patch).
+* The display mesh carries a face attribute `brep_face` (the B-rep face of every triangle), for shader tricks and
+  selection.
+* **Clear** puts the picked faces (all, when none are picked) back to slot 0, or to their Plywood material. **✕**
+  (Remove Texture) drops the per-face materials, the Plywood sorting and the UVs; the slots stay.
+* Texturing costs a little at every rebuild (about a third more on a chair shell of 35 faces). Untextured objects
+  don't pay it.
 
 ### Mesh to BREP
 

@@ -159,6 +159,10 @@ GROUPS = (
         ("To Mesh", (
             (_t("nproto.brep_to_mesh", "BREP to Mesh", 'MESH_DATA'),),
         ), {NURBS}),
+        ("Texture", (
+            (_t("nproto.plywood", "Plywood", 'TEXTURE', needs={NURBS, MESH}),
+             _t("nproto.face_material", "Face Material", 'MATERIAL')),
+        ), {NURBS}),
         ("To BREP", (
             (_t("nproto.mesh_to_brep", "Mesh to BREP", 'MESH_CUBE'),),
         ), {MESH}),
