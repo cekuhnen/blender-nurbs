@@ -12,9 +12,15 @@ that edge, a corner CV slides the corner along its side edge, and moving
 edge CVs out of a wall's plane only changes how the face leans there (the
 wall still cuts it off).
 
-Phase 1 limits: sharp edges only (a fillet along the face: Remove Fillets
-first), three faces at each corner, no closed (seamed) faces. A shape that
-can't be built keeps the last one that could, with the reason in the panel.
+Fillets along the face (circular, one radius each; their whole chains) are
+taken off first -- the face and its walls then meet at sharp edges, which
+the cage spans -- and made again with their radii after every rebuild
+(the kernel's defeature; on a sculpted face, which it can't extend, our
+own: worker._sharpen_region). On a curved face the kernel's fillet is only
+fitted: its worst kink against the face shows in the panel. Soft or
+varying fillets: Remove Fillets first. Three faces at each corner, no
+closed (seamed) faces. A shape that can't be built keeps the last one that
+could, with the reason in the panel.
 
 Done adds a Face CVs step (history on): the face's point and normal, the
 net's layout and each moved CV's offset in its own frame (CV Tweak's
@@ -35,6 +41,8 @@ OP = "face_cvs"
 CAGE_FACE = "nproto_cage_face"       # on a face cage: json {pt_local, n_local, flat, min_counts, plane}
 CAGE_GOOD = "nproto_cage_good"       # json: the last CVs (local) the solid was built from
 CAGE_ERROR = "nproto_cage_error"     # why the last CVs could not be built
+CAGE_FILLETS = "nproto_cage_fillets" # json [fillets made again, worst kink (deg), exact, exact tried]
+KINK_NOTE, KINK_ALERT = 0.25, 2.0    # degrees: show the kernel fillet's kink above this, in red above that
 
 
 def is_face_cage(cage):
@@ -80,17 +88,23 @@ def net_for(obj, text, face, counts=None, degree=None):
     return net
 
 
-def built_text(obj, text, face, meta, X0, X1):
+def built_text(obj, text, face, meta, X0, X1, exact=True):
     """The body text with the face on the net meta with CVs X1 (local; X0
-    the unmoved ones)."""
+    the unmoved ones). exact False: fillets along the face made again by the
+    kernel (fitted, quick: a live drag) instead of exactly."""
     M = geom.world_matrix(obj)
     W = lambda X: [list(M @ Vector(q)) for q in X]
     net = {"degree_u": meta["degree_u"], "degree_v": meta["degree_v"], "count_u": meta["nu"],
            "count_v": meta["nv"], "knots_u": meta["knots_u"], "knots_v": meta["knots_v"],
            "weights": meta.get("weights") or []}
-    _, breps = jobs.run(OP, {"target": (text, jobs.xform(obj))}, ["result"], persistent=True,
-                        net=net, cvs=W(X1), cvs0=W(X0), into="target", **_face_world(obj, face))
+    res, breps = jobs.run(OP, {"target": (text, jobs.xform(obj))}, ["result"], persistent=True,
+                          net=net, cvs=W(X1), cvs0=W(X0), into="target", exact_fillets=bool(exact),
+                          **_face_world(obj, face))
+    _last_res[0] = res
     return breps["result"]
+
+
+_last_res = [{}]        # the last built_text's job result (fillets made again, their kink)
 
 
 # --------------------------------------------------------------------------
@@ -185,7 +199,7 @@ def rebuild(surf_obj, cage, pts, moved, context=None):
     meta = json.loads(cage[cvs.CAGE_META])
     X0 = json.loads(cage[cvs.CAGE_CVS0])
     try:
-        text = built_text(surf_obj, cage[cvs.CAGE_ORIG], json.loads(cage[CAGE_FACE]), meta, X0, pts)
+        text = built_text(surf_obj, cage[cvs.CAGE_ORIG], json.loads(cage[CAGE_FACE]), meta, X0, pts, exact=False)
     except jobs.JobError as exc:
         cage[CAGE_ERROR] = str(exc)
         _redraw()
@@ -200,6 +214,7 @@ def rebuild(surf_obj, cage, pts, moved, context=None):
     if not bpy.app.timers.is_registered(_settle):
         bpy.app.timers.register(_settle, first_interval=SETTLE)
     cage[CAGE_GOOD] = json.dumps([list(map(float, p)) for p in pts])
+    _note_fillets(cage)
     if CAGE_ERROR in cage:
         del cage[CAGE_ERROR]
     return True
@@ -210,14 +225,46 @@ _drafted = set()        # objects drawn with draft shading
 _last = [0.0]
 
 
+def _note_fillets(cage, tried=False):
+    """The last build's fillets (count, worst kink, exact, exact tried) on the cage, for the panel."""
+    res = _last_res[0] or {}
+    if res.get("fillets"):
+        cage[CAGE_FILLETS] = json.dumps([int(res["fillets"]), float(res.get("fillet_kink") or 0.0),
+                                         bool(res.get("fillets_exact")), bool(tried)])
+    elif CAGE_FILLETS in cage:
+        del cage[CAGE_FILLETS]
+
+
+def _exact_again(o):
+    """The object built again from its face cage's last good CVs with exact
+    fillets (the live drag made them the kernel's way); True when it was."""
+    cage = cvs.cage_for(o)
+    if cage is None or not is_face_cage(cage) or not cage.get(CAGE_GOOD) or CAGE_FILLETS not in cage:
+        return False
+    if any(json.loads(cage[CAGE_FILLETS])[2:4]):         # exact already, or tried (the kernel's then)
+        return False
+    try:
+        text = built_text(o, cage[cvs.CAGE_ORIG], json.loads(cage[CAGE_FACE]), json.loads(cage[cvs.CAGE_META]),
+                          json.loads(cage[cvs.CAGE_CVS0]), json.loads(cage[CAGE_GOOD]), exact=True)
+    except jobs.JobError as exc:
+        print("NURBS Face CVs (exact fillets):", exc)
+        return False
+    store.set_geometry_text(o, text, None, keep_untrimmed=False)
+    _note_fillets(cage, tried=True)
+    return True
+
+
 def settle_now(names=None):
-    """Rewrite the drafted objects' meshes with the exact crease normals."""
+    """The drafted objects finished: their fillets made exactly (a face
+    cage's live drag made them the kernel's way), their meshes written with
+    the exact crease normals."""
     for n in list(names if names is not None else _drafted):
         _drafted.discard(n)
         o = bpy.data.objects.get(n)
         if o is not None and store.is_nurbs(o):
             try:
-                store.write_mesh(o, store.get_brep(o))
+                if not _exact_again(o):
+                    store.write_mesh(o, store.get_brep(o))
             except Exception as exc:
                 print("NURBS Face CVs (shading):", exc)
     _redraw()
@@ -451,6 +498,18 @@ def draw_panel(lay, context, cage):
                          icon='FILE_REFRESH').mode = "REBUILD"
             if "nproto_face_dev" in cage:
                 col.label(text=f"Last rebuild moved the shape up to {cage['nproto_face_dev']:.3g}", icon='INFO')
+    fil = json.loads(cage[CAGE_FILLETS]) if CAGE_FILLETS in cage else None
+    if fil:
+        n, kink = fil[:2]
+        exact, tried = (bool(fil[2]), bool(fil[3])) if len(fil) > 3 else (False, False)
+        col.label(text=f"{n} fillet{'s' if n != 1 else ''} along the face made again"
+                       + (" (exact)" if exact else ""), icon='MOD_BEVEL')
+        if kink > KINK_NOTE:
+            r = col.row()
+            r.alert = tried and kink > KINK_ALERT
+            r.label(text=(f"Kernel fillets, up to {kink:.1f}° off tangent (they meet three at a corner or "
+                          "run on past the face)") if tried else
+                    f"Live: kernel fillets, up to {kink:.1f}° off -- exact when you pause", icon='INFO')
     err = cage.get(CAGE_ERROR)
     if err:
         box = lay.box()

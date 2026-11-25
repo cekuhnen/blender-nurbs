@@ -291,12 +291,213 @@ if facecvs.is_face_cage(cage):
           f"{cage.get(facecvs.CAGE_ERROR, '')[:80]}")
     bpy.ops.nproto.cvs_done()
 
-# --- a filleted top edge (tangent to the top) is refused
+# --- fillets along the face: taken off to sculpt the sharp face, made again with their radius
+from blender_nurbs.kernel import defeature
+_sm = store._k()[0]
+
+def fillet_edges(B, pts, r, shape="CIRCULAR"):
+    bpy.ops.nproto.edge_fillet(inputs=json.dumps([[B.name, f"E{edge_at(B, p)}"] for p in pts]), shape=shape,
+                               radius=r)
+
+def _uv(srf, q):
+    w = _sm.surface_closest_point(srf, tuple(map(float, q)))[1][0]
+    return (float(w.x), float(w.y)) if hasattr(w, "x") else (float(w[0]), float(w[1]))
+
+def _kmax(srf, u, v):
+    """The larger principal curvature of srf at (u, v) (finite differences)."""
+    (u0, u1), (v0, v1) = srf.u_domain(), srf.v_domain()
+    h = 1e-4 * max(u1 - u0, v1 - v0)
+    u, v = min(max(u, u0 + h), u1 - h), min(max(v, v0 + h), v1 - h)
+    S = lambda a, b: np.array(srf.evaluate(a, b), float)
+    Su, Sv = (S(u + h, v) - S(u - h, v)) / (2 * h), (S(u, v + h) - S(u, v - h)) / (2 * h)
+    Suu = (S(u + h, v) - 2 * S(u, v) + S(u - h, v)) / h ** 2
+    Svv = (S(u, v + h) - 2 * S(u, v) + S(u, v - h)) / h ** 2
+    Suv = (S(u + h, v + h) - S(u + h, v - h) - S(u - h, v + h) + S(u - h, v - h)) / (4 * h * h)
+    n = np.cross(Su, Sv); n /= np.linalg.norm(n)
+    I = np.array([[Su @ Su, Su @ Sv], [Su @ Sv, Sv @ Sv]])
+    II = np.array([[Suu @ n, Suv @ n], [Suv @ n, Svv @ n]])
+    return float(np.abs(np.linalg.eigvals(np.linalg.solve(I, II))).max())
+
+def rounds(B, r, top_pt, ktol=0.05):
+    """(how many faces round the top at top_pt are rounds of radius r -- one
+    principal curvature 1/r at points inside them, within ktol --, the
+    largest kink in degrees along the top's edges with them: 0 when they are tangent).
+    The kernel's circular fillet is exact between planes but only fitted on
+    a free-form face: ~0.5-1 deg on a gentle dome (its Fillet tool alike)."""
+    b = brep(B)
+    fs = b.faces()
+    top = fs[face_at(B, top_pt)]
+    n_ok, kink = 0, 0.0
+    for e in top.edges():
+        g = [f for f in e.faces() if f != top][0]
+        if g.surface().is_planar():
+            continue                                   # a sharp edge (no fillet there)
+        t0, t1 = e.parameter_range()
+        for t in np.linspace(0.05, 0.95, 10):
+            q = np.array(e.point_at(t0 + (t1 - t0) * t), float)
+            na = np.array(top.outward_normal_at_uv(*_uv(top.surface(), q)), float)
+            nb = np.array(g.outward_normal_at_uv(*_uv(g.surface(), q)), float)
+            c = na @ nb / (np.linalg.norm(na) * np.linalg.norm(nb))
+            kink = max(kink, float(np.degrees(np.arccos(min(1.0, c)))))
+    for g in {f for e in top.edges() for f in e.faces() if f != top}:
+        if g.surface().is_planar():
+            continue
+        ip = np.array(g.interior_point(), float)
+        pts = [ip] + [0.5 * (ip + np.array(e.point_at(sum(e.parameter_range()) / 2), float)) for e in g.edges()
+                      if e.length() > 0.1]
+        ks = [_kmax(g.surface(), *_uv(g.surface(), g.closest_point(tuple(map(float, q)))[0])) for q in pts]
+        n_ok += all(abs(k * r - 1.0) < ktol for k in ks)
+    return n_ok, kink
+
+def round_faces(B, top_pt):
+    """How many faces along the top's edges are curved (its fillets)."""
+    top = brep(B).faces()[face_at(B, top_pt)]
+    return len({f for e in top.edges() for f in e.faces() if f != top and not f.surface().is_planar()})
+
+def fit(name, B, r, top_pt):
+    """The kernel fillet's fit on a sculpted face, printed (not checked: its
+    circular fillet is exact between planes, only fitted on a free-form
+    face -- 0.5 to 10 deg off tangent here, the Fillet tool alike)."""
+    rk = rounds(B, r, top_pt, 0.05)
+    print(f"INFO kernel fillet fit, {name}: {rk[0]} of 4 within 5 % of radius {r}, worst kink {rk[1]:.2f} deg")
+
+def exact_ok(B, r, top_pt, n):
+    """(the n fillets round the top are exact: one principal curvature 1/r
+    within 1 % and no kink above 0.05 deg, the measures)."""
+    rk = rounds(B, r, top_pt, 0.01)
+    return rk[0] == n and rk[1] < 0.05, rk
+
+TOP4 = [(2, 0, 2), (2, 3, 2), (0, 1.5, 2), (4, 1.5, 2)]
+def gentle(P):
+    P[1:-1, 1:-1, 2] += 0.3
+def front_row_down(P):
+    P[:, 0, 2] -= 0.4
+
+def net_mid(meta, P):
+    net = {"degree_u": meta["degree_u"], "degree_v": meta["degree_v"], "count_u": meta["nu"], "count_v": meta["nv"],
+           "knots_u": meta["knots_u"], "knots_v": meta["knots_v"], "points": P.reshape(-1, 3).tolist(),
+           "weights": meta.get("weights") or []}
+    return cvnet.evaluate(net, [0.5 * (meta["knots_u"][0] + meta["knots_u"][-1])],
+                          [0.5 * (meta["knots_v"][0] + meta["knots_v"][-1])])[0, 0]
+
 clear()
 B = box()
-bpy.ops.nproto.edge_fillet(inputs=json.dumps([[B.name, f"E{edge_at(B, (2, 0, 2))}"]]), shape="CIRCULAR", radius=0.4)
+fillet_edges(B, TOP4, 0.4)
+n0 = brep(B).face_count()
+r = open_face(B, (2, 1.5, 2)); cage = ctx.active_object
+check("a top filleted all round opens", r == {'FINISHED'} and facecvs.is_face_cage(cage), f"{n0} faces")
+if facecvs.is_face_cage(cage):
+    meta, P = cage_net(cage)
+    check("its net spans the sharp top (the fillets off: 4 x 3)",
+          np.allclose([P[..., 0].min(), P[..., 0].max(), P[..., 1].min(), P[..., 1].max()], [0, 4, 0, 3], atol=1e-6)
+          and np.allclose(P[..., 2], 2.0, atol=1e-9))
+    meta, P, dt = move(cage, gentle)
+    mid = net_mid(meta, P)
+    top = brep(B).faces()[face_at(B, mid)]
+    rk = rounds(B, 0.4, mid)
+    fl = json.loads(cage.get(facecvs.CAGE_FILLETS, "null"))
+    check("domed: a closed solid, its four 0.4 fillets made again (kernel fit: within 1 deg of tangent)",
+          solid(B) and brep(B).face_count() == n0 and rk[0] == 4 and rk[1] < 1.0
+          and top.closest_point(tuple(map(float, mid)))[1] < 1e-6 and not cage.get(facecvs.CAGE_ERROR),
+          f"{brep(B).face_count()} faces, rounds / kink {rk}, {dt * 1000:.0f} ms")
+    check("the panel reports the four fillets and their kink (live: the kernel's)", fl is not None
+          and fl[0] == 4 and abs(fl[1] - rk[1]) < 0.3 and not fl[2], f"{fl} vs {rk[1]:.2f}")
+    t0 = time.perf_counter(); facecvs.settle_now(); dt = time.perf_counter() - t0
+    ok_x, rk = exact_ok(B, 0.4, mid, 4)
+    fl = json.loads(cage.get(facecvs.CAGE_FILLETS, "null"))
+    check("the drag pauses: the four fillets made exactly (rolling ball, tangent), the panel says so",
+          ok_x and solid(B) and brep(B).face_count() == n0 and fl and fl[2],
+          f"rounds / kink {rk}, {dt * 1000:.0f} ms, panel {fl}")
+    meta, P, dt = move(cage, front_row_down)
+    check("its front edge down: the front fillet follows", solid(B) and brep(B).face_count() == n0
+          and round_faces(B, mid) == 4 and not cage.get(facecvs.CAGE_ERROR), cage.get(facecvs.CAGE_ERROR, "")[:80])
+    fit("front edge down (live)", B, 0.4, mid)
+    facecvs.settle_now()
+    ok_x, rk = exact_ok(B, 0.4, mid, 4)
+    check("... exact once it pauses", ok_x and solid(B) and brep(B).face_count() == n0, f"rounds / kink {rk}")
+    V_done = vol(B)
+    r = bpy.ops.nproto.cvs_done()
+    check("Done: a Face CVs step after the fillet", r == {'FINISHED'} and abs(vol(B) - V_done) < 1e-5 * V_done
+          and [e["op"] for e in features.stack(B)][-1] == "face_cvs", [e["op"] for e in features.stack(B)])
+    # Tab on the sculpted top again: it opens (it reads as a fillet itself, tangent to its fillets all
+    # round, and the kernel can't take fillets off a free-form face: worker._sharpen_region does)
+    fs = brep(B).faces()
+    itop = max(range(len(fs)), key=lambda k: fs[k].area(1e-6) if not fs[k].surface().is_planar() else 0)
+    for x in ctx.selected_objects: x.select_set(False)
+    B.select_set(True); ctx.view_layer.objects.active = B
+    subsel.set_picks(B, "FACE", [itop])
+    r = bpy.ops.nproto.edit_cvs(); cage = ctx.active_object
+    meta2, P2 = cage_net(cage) if facecvs.is_face_cage(cage) else (None, None)
+    cands = [P, P.transpose(1, 0, 2)]
+    cands += [c[::-1] for c in cands] + [c[:, ::-1] for c in cands] + [c[::-1, ::-1] for c in cands]
+    diffs = [float(np.abs(P2 - c).max()) for c in cands if P2 is not None and c.shape == P2.shape]
+    check("the sculpted, filleted top opens again on its sculpted net", r == {'FINISHED'}
+          and facecvs.is_face_cage(cage) and diffs and min(diffs) < 1e-4, f"diff {min(diffs) if diffs else '-'}")
+    if facecvs.is_face_cage(cage):
+        def lift(P):
+            P[2:4, 2, 2] += 0.1
+        move(cage, lift)
+        check("... and sculpts again, its fillets made again", solid(B) and brep(B).face_count() == n0
+              and round_faces(B, mid) == 4 and not cage.get(facecvs.CAGE_ERROR),
+              f"{brep(B).face_count()} faces {cage.get(facecvs.CAGE_ERROR, '')[:80]}")
+        fit("re-opened and sculpted again (live)", B, 0.4, mid)
+        facecvs.settle_now()
+        ok_x, rk = exact_ok(B, 0.4, mid, 4)
+        check("... exact once it pauses", ok_x and solid(B) and brep(B).face_count() == n0, f"rounds / kink {rk}")
+        bpy.ops.nproto.cvs_cancel()
+    raw = json.loads(B[features.PROP_STACK])
+    k = next((i for i, e in enumerate(raw) if e["op"] == "edge_fillet"), None)
+    if k is not None:
+        raw[k]["params"]["radius"] = 0.3
+        B[features.PROP_STACK] = json.dumps(raw)
+        features.rebuild(B, ctx)
+    ok_x, rk = exact_ok(B, 0.3, mid, 4)
+    check("history: the fillet made smaller, the sculpted top keeps exact 0.3 fillets", k is not None
+          and solid(B) and brep(B).face_count() == n0 and ok_x, f"rounds / kink {rk}")
+
+# --- one filleted top edge: the fillet ends against the side walls, exactly
+clear()
+B = box()
+fillet_edges(B, [(2, 0, 2)], 0.4)
+n0 = brep(B).face_count()
+r = open_face(B, (2, 1.5, 2)); cage = ctx.active_object
+if facecvs.is_face_cage(cage):
+    meta, P, dt = move(cage, gentle)
+    mid = net_mid(meta, P)
+    facecvs.settle_now()
+    ok_x, rk = exact_ok(B, 0.4, mid, 1)
+    check("one filleted top edge, domed: its fillet made exactly, cut off by the side walls", ok_x and solid(B)
+          and brep(B).face_count() == n0 and not cage.get(facecvs.CAGE_ERROR), f"{brep(B).face_count()}/{n0} "
+          f"faces, rounds / kink {rk}")
+    bpy.ops.nproto.cvs_cancel()
+else:
+    check("one filleted top edge opens", False)
+
+clear()
+B = box()
+fillet_edges(B, TOP4 + [(2, 0, 0), (2, 3, 0), (0, 1.5, 0), (4, 1.5, 0), (0, 0, 1), (4, 0, 1), (4, 3, 1), (0, 3, 1)], 0.4)
+n0 = brep(B).face_count()
+r = open_face(B, (2, 1.5, 2)); cage = ctx.active_object
+dt = 0.0
+if facecvs.is_face_cage(cage):
+    meta, P, dt = move(cage, front_row_down)
+check("every edge filleted: the top sculpted, all twelve fillets (and corners) made again",
+      facecvs.is_face_cage(cage) and solid(B) and brep(B).face_count() == n0 and not cage.get(facecvs.CAGE_ERROR)
+      and round_faces(B, (2, 1.5, 2)) == 4, f"{brep(B).face_count()}/{n0} faces, {dt * 1000:.0f} ms")
+fit("every edge filleted", B, 0.4, (2, 1.5, 2))
+if facecvs.is_face_cage(cage):
+    facecvs.settle_now()
+    fl = json.loads(cage.get(facecvs.CAGE_FILLETS, "null"))
+    check("... they meet three at a corner: still the kernel's when it pauses (tried, said in the panel)",
+          solid(B) and brep(B).face_count() == n0 and fl and not fl[2] and fl[3], f"panel {fl}")
+    bpy.ops.nproto.cvs_cancel()
+
+# --- a soft (blend) fillet along the top is still refused
+clear()
+B = box()
+fillet_edges(B, [(2, 0, 2)], 0.4, "BLEND")
 r = open_face(B, (2, 1.5, 2))
-check("a top with a fillet along it is refused (Remove Fillets first)",
+check("a top with a soft fillet along it is refused (Remove Fillets first)",
       r == {'CANCELLED'} and not cvs.is_cage(ctx.active_object))
 
 print("ALL OK" if ok else "SOME FAILED")
