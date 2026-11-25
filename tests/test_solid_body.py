@@ -138,6 +138,17 @@ for hist in (True, False):
     V4 = ctx.active_object
     check(f"[{tag}] revolve open profile on axis, 90 deg (half caps)", r == {'FINISHED'} and solid(V4)
           and abs(vol(V4) - math.pi / 2) < 1e-3, f"vol {vol(V4) if r == {'FINISHED'} else 0:.5f}")
+    # closed rectangle with a side ON the axis (the kernel refused its degenerate face): that side
+    # is left out, the rest revolved -- a disc, as Surface and as a solid (full and part turn)
+    for body, ang in (("SURFACE", 360.0), ("NEW", 360.0), ("NEW", 90.0)):
+        Q = poly("Q", [(-8, 9, 0), (0, 9, 0), (0, 9, 1), (-8, 9, 1)])   # the side x=0 lies on the axis
+        r = run(bpy.ops.nproto.revolve, inputs=ins((Q, "S0")), angle=ang, axis_point=(0, 9, 0),
+                axis_dir=(0, 0, 1), axis="PICKED", body=body)
+        V5 = ctx.active_object
+        want5 = math.pi * 64 * ang / 360.0
+        good = r == {'FINISHED'} and solid(V5) and abs(vol(V5) - want5) < 1e-3 * want5
+        check(f"[{tag}] revolve rectangle with a side on the axis, {body} {ang:.0f} deg", good,
+              f"vol {vol(V5) if r == {'FINISHED'} else 0:.4f} want {want5:.4f}")
 
 # --- draft: an outline with a hole, 5 deg; walls lean the same way (the hole narrows as the outline grows)
 import time
