@@ -142,5 +142,16 @@ check("a Blender surface: Convert Blender Surface lit, the curve and edge tools 
       s["nproto.from_blender_surface"] and not s["nproto.loft"] and not s["nproto.offset"]
       and s["Plane"] and s["Primitive"], str({k: v for k, v in s.items() if v}))
 
+select(curve)
+t = lit("TEXTURE")
+c = lit("CONVERT")
+check("Texture panel of its own: Plywood and Face Material, dim for a curve; gone from Convert",
+      set(t) == {"Plywood", "Face Material"} and not any(t.values())
+      and "Plywood" not in c and "Face Material" not in c, f"{t} {sorted(c)}")
+order = [bpy.types.VIEW3D_PT_nproto_surface_edit.bl_order, bpy.types.VIEW3D_PT_nproto_texture.bl_order,
+         bpy.types.VIEW3D_PT_nproto_convert.bl_order, bpy.types.VIEW3D_PT_nproto_analyze_side.bl_order]
+check("Texture sits after Surface Edit, before Convert and Analyze", order == sorted(order)
+      and tg.classes.index(tg.VIEW3D_PT_nproto_texture) < tg.classes.index(tg.VIEW3D_PT_nproto_convert), order)
+
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)

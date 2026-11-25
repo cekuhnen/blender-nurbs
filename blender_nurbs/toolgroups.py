@@ -1,4 +1,4 @@
-"""The tools, sorted into four groups: one table drives the sidebar panels, the
+"""The tools, sorted into groups: one table drives the sidebar panels, the
 NURBS header menu and the Add (Shift+A) menu, so they always list the same tools.
 
 A group is (key, title, sections); a section is (label, rows) or (label, rows,
@@ -155,13 +155,15 @@ GROUPS = (
             (_t("nproto.shell", icon='MOD_SOLIDIFY'),),
         ), {NURBS}),
     )),
+    ("TEXTURE", "Texture", (                                # materials and UVs on the NURBS object's own faces
+        ("", (
+            (_t("nproto.plywood", "Plywood", 'TEXTURE', needs={NURBS, MESH}),
+             _t("nproto.face_material", "Face Material", 'MATERIAL')),
+        ), {NURBS}),
+    )),
     ("CONVERT", "Convert", (
         ("To Mesh", (
             (_t("nproto.brep_to_mesh", "BREP to Mesh", 'MESH_DATA'),),
-        ), {NURBS}),
-        ("Texture", (
-            (_t("nproto.plywood", "Plywood", 'TEXTURE', needs={NURBS, MESH}),
-             _t("nproto.face_material", "Face Material", 'MATERIAL')),
         ), {NURBS}),
         ("To BREP", (
             (_t("nproto.mesh_to_brep", "Mesh to BREP", 'MESH_CUBE'),),
@@ -354,9 +356,15 @@ class VIEW3D_PT_nproto_surface_edit(_ToolPanel, bpy.types.Panel):
     hint = True
 
 
+class VIEW3D_PT_nproto_texture(_ToolPanel, bpy.types.Panel):
+    bl_label = "Texture"
+    bl_order = 5                                           # (Analyze is 6)
+    group = "TEXTURE"
+
+
 class VIEW3D_PT_nproto_convert(_ToolPanel, bpy.types.Panel):
     bl_label = "Convert"
-    bl_order = 5
+    bl_order = 5                                           # (after Texture: registered after it)
     group = "CONVERT"
     bl_options = {'DEFAULT_CLOSED'}
 
@@ -398,6 +406,11 @@ class VIEW3D_MT_nproto_surface_edit(_ToolMenu, bpy.types.Menu):
     group = "SURFACE_EDIT"
 
 
+class VIEW3D_MT_nproto_texture(_ToolMenu, bpy.types.Menu):
+    bl_label = "Texture"
+    group = "TEXTURE"
+
+
 class VIEW3D_MT_nproto_convert(_ToolMenu, bpy.types.Menu):
     bl_label = "Convert"
     group = "CONVERT"
@@ -430,6 +443,7 @@ class VIEW3D_MT_nproto_tools(bpy.types.Menu):
         lay.separator()
         lay.menu("VIEW3D_MT_nproto_curve_edit", icon='CURVE_DATA')
         lay.menu("VIEW3D_MT_nproto_surface_edit", icon='SURFACE_DATA')
+        lay.menu("VIEW3D_MT_nproto_texture", icon='TEXTURE')
         lay.menu("VIEW3D_MT_nproto_convert", icon='MESH_DATA')
         lay.menu("VIEW3D_MT_nproto_scan", icon='MOD_SHRINKWRAP')
         lay.separator()
@@ -453,9 +467,10 @@ def menu_add(self, context):
 
 
 classes = (VIEW3D_PT_nproto_curves, VIEW3D_PT_nproto_surfaces, VIEW3D_PT_nproto_curve_edit,
-           VIEW3D_PT_nproto_surface_edit, VIEW3D_PT_nproto_convert, VIEW3D_PT_nproto_scan, VIEW3D_MT_nproto_curves,
-           VIEW3D_MT_nproto_surfaces, VIEW3D_MT_nproto_curve_edit, VIEW3D_MT_nproto_surface_edit,
-           VIEW3D_MT_nproto_convert, VIEW3D_MT_nproto_scan, VIEW3D_MT_nproto_primitives, VIEW3D_MT_nproto_tools)
+           VIEW3D_PT_nproto_surface_edit, VIEW3D_PT_nproto_texture, VIEW3D_PT_nproto_convert, VIEW3D_PT_nproto_scan,
+           VIEW3D_MT_nproto_curves, VIEW3D_MT_nproto_surfaces, VIEW3D_MT_nproto_curve_edit,
+           VIEW3D_MT_nproto_surface_edit, VIEW3D_MT_nproto_texture, VIEW3D_MT_nproto_convert, VIEW3D_MT_nproto_scan,
+           VIEW3D_MT_nproto_primitives, VIEW3D_MT_nproto_tools)
 
 
 def register():

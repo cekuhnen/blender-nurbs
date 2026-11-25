@@ -109,16 +109,19 @@ everything built from it rebuilds.
 - **Display:** Edges, CVs / Hulls (surfaces, and selected curves outside Edit mode), Spans (every face's knot
   lines, clipped to its trims), Feature Labels, Fine Grid
 
-### Convert
+### Texture
 
-- **BREP to Mesh:** plain meshes for rendering, texturing and animation, at Low, Medium or High detail:
-  n-gons on flat faces and quads on curved ones (or all triangles), welded, with sharp creases, UVs and seams
 - **Plywood:** a bent plywood shell textured for rendering, on the NURBS object's own faces (kept through every edit)
   or on a render mesh: a veneer on the front and on the back, each unwrapped as one sheet with the grain running on
   over the bend, and the plies in a band along the rim (outer plies in the veneers' wood, cross-grain core plies, glue
   lines); procedural woods, veneer and edge photos, or your own material in any of the three slots
 - **Face Material:** materials on picked B-rep faces of a NURBS object, kept through rebuilds, with UVs in metres (each
   face its own island); also in Material Properties
+
+### Convert
+
+- **BREP to Mesh:** plain meshes for rendering, texturing and animation, at Low, Medium or High detail:
+  n-gons on flat faces and quads on curved ones (or all triangles), welded, with sharp creases, UVs and seams
 - **Mesh to BREP:** mesh bodies rebuilt as NURBS bodies: flat four-sided faces as untrimmed patches, other flat faces
   as planes cut tight to their trims, round holes and cylinders exact (also a hole cut through an edge or corner),
   bevels (Profile 0.5) as G1 fillets of the bevel's radius, editable afterwards, boxy bevels (Profile above 0.5) as

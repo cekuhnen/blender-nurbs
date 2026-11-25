@@ -19,13 +19,14 @@ Tools that don't fit the selection are dimmed: select a curve and the tools that
 | **Create Surfaces** | Plane, Box, Cylinder, **Primitive** ▾ (Plane, Disk, Box, Cylinder, Cone, Sphere, Torus) · through curves or edges: Loft, Loft Rails, Curve Network, Revolve, Rail Revolve, Sweep, Pipe · extrude and fill: Extrude (curves, edges or a face), Flange (and draft surface), Planar, Dome, Boundary, Patch · from surfaces: Offset, Thicken, Pattern, Mirror, Unroll, Flow, Convert Blender Surface |
 | **Curve Edit** | Rebuild / Extend Curve, Align Curve · Trim / Split Curves · Join / Unjoin Curves (in Surface Edit's order: shape, trim, join) |
 | **Surface Edit** | Rebuild Surface, Extend Surface, Surface Align, Match Surface, Refit to Trim, Merge Patches, Flip Normal · Trim, Split, Untrim, Untrim Region, Detach at Isoparm · Join, Unjoin · Surface Fillet, Edge Fillet, Remove Fillets, Remove All Fillets · solids: Union, Difference, Intersection, Push / Pull, Rotate Face, Move Face, Replace Face, Boundary Fill, Emboss, Shell. **Edit CVs** has no button: Tab on a NURBS surface (it is in the NURBS menu and F3 search too) |
-| **Convert** (closed at first) | BREP to Mesh, Plywood, Face Material, Mesh to BREP, SubD to BREP (BREP to Mesh, Mesh to BREP and SubD to BREP also in Object › Convert) |
+| **Texture** | Plywood, Face Material: materials and UVs on a NURBS object's own faces, kept through every edit (Face Material also in Material Properties) |
+| **Convert** (closed at first) | BREP to Mesh, Mesh to BREP, SubD to BREP (also in Object › Convert) |
 | **Scan** (closed at first) | Fitting surfaces to a scan: Cage from Scan, Fit Cage to Scan (with Add Loops, and Trim to Curve when a curve is selected), Drape Patch to Scan |
 | **Analyze** (closed at first) | Measure, Continuity Check and the overlays (also in the viewport header's Analyze popover) |
 | **Display** | **Edges**, **CVs / Hulls**, **Spans**, **Feature Labels** and **Fine Grid** on / off (also as icons in the 3D view header, next to the Analyze button, so they are always at hand); **CVs / Hulls** also draws the CV hulls of selected curves (NURBS and Poly CVs, Bezier points with their handles) outside Edit mode, where Blender draws its own; **Spans** draws the knot lines (isoparms) of every face of the visible NURBS surfaces, clipped to their trims, so you see each surface's layout at a glance; **Fine Grid** draws the floor grid's finer levels (mm, cm, 10 cm; inches) in a perspective or turned orthographic view, where Blender's floor grid stops at 1 m (1 ft); right under them how finely surfaces are meshed for display: **Quality** *Fast / Medium / Fine* sets the four values below at once (Fast: angle 10°, chord 0.001, edges 3°, max edge 1/20; Medium, the defaults: 5°, 0.0005, 2°, 1/30; Fine: 2.5°, 0.0002, 1°, 1/50), one retessellation of every body; it reads *Custom* once a value is set by hand: Chord / Angle Tolerance, Edge Angle, Max Edge. The display mesh is rebuilt after every edit, so Fast makes editing quicker (a 38-face SubD body: 0.16 s Fast, 0.37 s Medium, 1.2 s Fine, 12k / 40k / 144k triangles). The analysis overlays (zebra, curvature map) don't use it: they have their own mesh and quality. **Clip Start warning:** a 3D view's depth buffer spreads its precision between Clip Start and Clip End, so a tiny Clip Start (say 1 µm) leaves depth steps of about 8 mm at 0.37 m. Surfaces, edges and Face / Edge highlights then flicker against each other (blotchy fills, dashed edges). When the steps exceed 0.05 % of the view distance, the Display panel says so and a red ⚠ appears in the header: one click sets Clip Start to about a thousandth of the view distance. |
 | **History** (closed at first) | Construction History, Live Update, Pause Rebuild, Delete History, Collect Inputs, Rebuild / Re-tessellate |
 
-The same six tool groups are in the viewport header's **NURBS Proto** menu (Object Mode), so every tool is reachable without the sidebar and **F3** finds each one by name. **Add** (Shift+A) has **NURBS Curves** and **NURBS Surfaces**, the two Create groups. STEP import and export are under File > Import / Export. One table in `toolgroups.py` drives the panels and the menus, so they always list the same tools.
+The same seven tool groups are in the viewport header's **NURBS Proto** menu (Object Mode), so every tool is reachable without the sidebar and **F3** finds each one by name. **Add** (Shift+A) has **NURBS Curves** and **NURBS Surfaces**, the two Create groups. STEP import and export are under File > Import / Export. One table in `toolgroups.py` drives the panels and the menus, so they always list the same tools.
 
 ### Key hints (every interactive tool)
 
@@ -638,46 +639,14 @@ Measured (first show after an edit, mesh and GPU upload):
 
 The normals are as exact as before or more so: the angle between the interpolated and the exact normal inside the triangles stays below 0.1° at the 99th percentile (0.03° on the degree-6 SubD cube), and a sphere's poles are right (the kernel's mesh had a 33° error there).
 
-## Convert
+## Texture
 
-### BREP to Mesh
-
-Under Convert, and in Blender's **Object › Convert › Mesh (NURBS Proto)**. It turns the selected NURBS objects into plain
-mesh objects for rendering, texturing and animation. A dialog shows the settings first (**Convert** runs it); they stay
-adjustable afterwards in the Adjust Last Operation panel. Each object is meshed afresh at the detail you choose, not
-copied from the display mesh. The new object is called "‹name› Mesh"; it keeps the NURBS object's place, parent, collections,
-materials and modifiers. The NURBS object stays with its history, hidden in the viewport and in renders (switch
-**Hide NURBS Objects** off to keep it shown).
-
-* **Mesh: Light** (default) gives every face the lightest mesh that still shades like it:
-  * a **flat face is one n-gon**; a flat face with holes becomes a few n-gons, as Blender's faces can't have holes;
-  * a **curved face is a grid of quads** along its (u, v) lines, only as dense as the surface bends in each
-    direction. A cylinder's side is one strip of long quads, a box 6 quads, a sphere quads with triangle fans at its
-    poles. Where a trim crosses the grid, triangles meet the edge.
-  * The lines are **spread evenly by how much the surface bends** (each step's share of the angle and chord it
-    needs), so a symmetric shape gets a symmetric mesh and the spacing changes smoothly with the curvature.
-  * An **untrimmed face's grid sets the points on its edges**, so it meshes as pure quads: a loft's two rails get the
-    same columns, and a side split into several edges gets a grid line through each vertex.
-  * A NURBS cylinder at Medium is 2 n-gons and 48 quads (360° / 7.5°); its display mesh is 6,332 triangles.
-* **Mesh: Triangles**: the same mesh split into triangles, for game engines and glTF.
-* **Detail**: **Low** (chord 0.4 % of the object's size, 15°), **Medium** (0.1 %, 7.5°), **High** (0.025 %, 3°) or
-  **Custom**. Chord is the largest distance from the mesh to the surface; Angle the largest turn between neighbouring
-  edges or grid lines. Every change re-runs in the Adjust Last Operation panel, which shows the faces (n-gons, quads,
-  triangles), vertices, the triangles a renderer will draw and the display mesh's triangles for comparison.
-* **Welded:** every B-rep edge is sampled once and both faces use its points, so a joined body or a solid comes out
-  closed. Separate objects stay separate meshes; join their surfaces (Surface Edit › Join) first for one closed mesh.
-* **Shading:** each corner gets the exact normal of its own face, so creases stay sharp and tangent joins (fillets)
-  smooth. Edges between faces bending more than 30° are marked sharp as well (for modifiers and Smooth by Angle).
-* **UVs:** one island per face from its (u, v). **Real Size** (default) is in metres, so a texture keeps its scale
-  from face to face; **0-1 per Face** fills the UV square with every face; **None** leaves the UV map out. **Pack
-  Islands** lays the islands side by side in 0-1 for baking. B-rep edges are UV seams, so Unwrap starts from them.
-* **brep_face** (an integer face attribute) names each polygon's B-rep face: select by it in Edit Mode to give a face
-  its own material.
-* **Join** makes one mesh object of all the selected NURBS objects.
+Both tools texture the NURBS object itself: it stays a NURBS object you can keep editing, and the materials
+and UVs are written again after every rebuild. Press Z › Material Preview to see them.
 
 ### Plywood
 
-Under Convert › Texture, next to Face Material. It textures a bent plywood shell for rendering the way the real part
+In the **Texture** panel, next to Face Material. It textures a bent plywood shell for rendering the way the real part
 looks: a veneer on the front, one on the back, and the band of plies where the shell is cut along its rim. Select a
 NURBS solid of even thickness (a sheet after **Thicken**, a chair shell, a bent panel) or a plain mesh shell and click
 it.
@@ -719,7 +688,7 @@ it.
 
 ### Face Material
 
-Under Convert › Texture, and in **Material Properties** under the slot list of a NURBS object (**Assign to Picked
+In the **Texture** panel, and in **Material Properties** under the slot list of a NURBS object (**Assign to Picked
 Faces** / **Assign to All Faces**, **Clear**, ✕). It gives B-rep faces a material of their own, as Edit Mode's Assign
 does for a mesh: pick faces in **Face** mode, choose a slot in the material list, click Assign. With no faces picked,
 it assigns to all faces.
@@ -736,6 +705,43 @@ it assigns to all faces.
   (Remove Texture) drops the per-face materials, the Plywood sorting and the UVs; the slots stay.
 * Texturing costs a little at every rebuild (about a third more on a chair shell of 35 faces). Untextured objects
   don't pay it.
+
+## Convert
+
+### BREP to Mesh
+
+Under Convert, and in Blender's **Object › Convert › Mesh (NURBS Proto)**. It turns the selected NURBS objects into plain
+mesh objects for rendering, texturing and animation. A dialog shows the settings first (**Convert** runs it); they stay
+adjustable afterwards in the Adjust Last Operation panel. Each object is meshed afresh at the detail you choose, not
+copied from the display mesh. The new object is called "‹name› Mesh"; it keeps the NURBS object's place, parent, collections,
+materials and modifiers. The NURBS object stays with its history, hidden in the viewport and in renders (switch
+**Hide NURBS Objects** off to keep it shown).
+
+* **Mesh: Light** (default) gives every face the lightest mesh that still shades like it:
+  * a **flat face is one n-gon**; a flat face with holes becomes a few n-gons, as Blender's faces can't have holes;
+  * a **curved face is a grid of quads** along its (u, v) lines, only as dense as the surface bends in each
+    direction. A cylinder's side is one strip of long quads, a box 6 quads, a sphere quads with triangle fans at its
+    poles. Where a trim crosses the grid, triangles meet the edge.
+  * The lines are **spread evenly by how much the surface bends** (each step's share of the angle and chord it
+    needs), so a symmetric shape gets a symmetric mesh and the spacing changes smoothly with the curvature.
+  * An **untrimmed face's grid sets the points on its edges**, so it meshes as pure quads: a loft's two rails get the
+    same columns, and a side split into several edges gets a grid line through each vertex.
+  * A NURBS cylinder at Medium is 2 n-gons and 48 quads (360° / 7.5°); its display mesh is 6,332 triangles.
+* **Mesh: Triangles**: the same mesh split into triangles, for game engines and glTF.
+* **Detail**: **Low** (chord 0.4 % of the object's size, 15°), **Medium** (0.1 %, 7.5°), **High** (0.025 %, 3°) or
+  **Custom**. Chord is the largest distance from the mesh to the surface; Angle the largest turn between neighbouring
+  edges or grid lines. Every change re-runs in the Adjust Last Operation panel, which shows the faces (n-gons, quads,
+  triangles), vertices, the triangles a renderer will draw and the display mesh's triangles for comparison.
+* **Welded:** every B-rep edge is sampled once and both faces use its points, so a joined body or a solid comes out
+  closed. Separate objects stay separate meshes; join their surfaces (Surface Edit › Join) first for one closed mesh.
+* **Shading:** each corner gets the exact normal of its own face, so creases stay sharp and tangent joins (fillets)
+  smooth. Edges between faces bending more than 30° are marked sharp as well (for modifiers and Smooth by Angle).
+* **UVs:** one island per face from its (u, v). **Real Size** (default) is in metres, so a texture keeps its scale
+  from face to face; **0-1 per Face** fills the UV square with every face; **None** leaves the UV map out. **Pack
+  Islands** lays the islands side by side in 0-1 for baking. B-rep edges are UV seams, so Unwrap starts from them.
+* **brep_face** (an integer face attribute) names each polygon's B-rep face: select by it in Edit Mode to give a face
+  its own material.
+* **Join** makes one mesh object of all the selected NURBS objects.
 
 ### Mesh to BREP
 

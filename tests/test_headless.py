@@ -5280,13 +5280,14 @@ _subs = [e["menu"] for e in _drawn["VIEW3D_MT_nproto_tools"] if "menu" in e]
 _menu_kinds = sorted(e["props"].get("kind") for n, r in _drawn.items() if n.startswith("VIEW3D_MT")
                      and n != "VIEW3D_MT_nproto_tools" and n not in _DROPS for e in r
                      if e.get("op") == "nproto.add_primitive")
-check("UI: header menu holds the six groups, the same tools as the panels, and every shape (the curve shapes "
+check("UI: header menu holds the seven groups, the same tools as the panels, and every shape (the curve shapes "
       "only there: the panel draws them)",
       sorted(set(_menu_ops)) == sorted(set(_in_panels) | _menu_only) and _menu_only == {"nproto.edit_cvs"}
       and _menu_kinds == sorted(list(_prims.CURVE_KINDS) + list(_prims.SURFACE_KINDS))
       and _subs == ["VIEW3D_MT_nproto_curves", "VIEW3D_MT_nproto_surfaces",
                     "VIEW3D_MT_nproto_curve_edit", "VIEW3D_MT_nproto_surface_edit",
-                    "VIEW3D_MT_nproto_convert", "VIEW3D_MT_nproto_scan"], f"{_subs} {_menu_kinds}")
+                    "VIEW3D_MT_nproto_texture", "VIEW3D_MT_nproto_convert", "VIEW3D_MT_nproto_scan"],
+      f"{_subs} {_menu_kinds}")
 _prim_btn = [e["menu"] for e in _drawn["VIEW3D_PT_nproto_surfaces"] if "menu" in e]
 check("UI: the surface primitives are one Primitive dropdown in Create Surfaces (not seven buttons)",
       _prim_btn == ["VIEW3D_MT_nproto_primitives"]
