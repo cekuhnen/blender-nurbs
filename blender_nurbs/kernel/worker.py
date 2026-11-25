@@ -6645,6 +6645,13 @@ def _section_edge_fillet(b, sel, chord, shape, soft=None, setback=None):
             f, info = secfillet.build(sm, A, B, None, None, d0, d1, shape=shape, setback=True,
                                       curves=[_EdgeCurve(e) for e in es], on_faces=(fp, fq))
             dists += [d for pair in info["setback"] for d in pair]
+            if info.get("ring") is not None:
+                # a revolved rim: every section the same one turned, so the
+                # chamfer is exactly that section's surface of revolution (the
+                # skin through the sections bulges ~1e-6 between them)
+                rev = _revolved_ring(info["ring"], 1e-6 * size)
+                if rev is not None:
+                    f = ext.brep_from_surface(rev)
         else:
             f, info = secfillet.build(sm, A, B, None, None, chord, chord, chord=chord, shape=shape,
                                       curves=[_EdgeCurve(e) for e in es], on_faces=(fp, fq))
@@ -6706,6 +6713,7 @@ def _section_edge_fillet(b, sel, chord, shape, soft=None, setback=None):
             sm.unify_normals(r, max(r.faces(), key=lambda fc: fc.area()), 100)
         except Exception:
             pass
+        r = _healed_if_rejected(r)
     finally:
         for path in tmp:
             try:
@@ -6738,6 +6746,33 @@ def _edge_max_bend(e, n=7):
     except Exception:
         return 180.0
     return worst
+
+
+def _healed_if_rejected(r):
+    """r, healed (heal_brep) when the kernel rejects it as a solid although
+    it stitched closed: a ring built from sections round a revolved rim, its
+    seam away from the faces' seams, splits their rails there and the
+    kernel's mass properties fail (SM_ERR 1007; volume() then reads 0, and
+    later operations on the body go wrong). The heal is kept only when it
+    leaves the same faces and area, closed, with a volume the kernel can
+    compute; otherwise r as it was."""
+    if not _is_solid(r):
+        return r
+    try:
+        r.mass_properties()
+        return r
+    except Exception:
+        pass
+    try:
+        h = sm.heal_brep(r.copy())
+        h.mass_properties()
+        a0, a1 = r.area(1e-6), h.area(1e-6)
+        if (_is_solid(h) and h.face_count() == r.face_count() and abs(a1 - a0) <= 1e-6 * max(a0, 1e-12)
+                and abs(h.volume()) > 0.0):
+            return h
+    except Exception:
+        pass
+    return r
 
 
 def _edge_half_tans(sel):

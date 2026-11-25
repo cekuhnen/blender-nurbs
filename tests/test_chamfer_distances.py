@@ -190,6 +190,121 @@ r, info = efil(B, [(2, 0, 2)], radius=0.2, distance_b=0.5, same_distance=False)
 check("one box edge, two distances: A goes on the larger face (the top)",
       abs((12 - face_area(B, (2, 1.5, 2))) / 4 - 0.2) < 1e-4, f"top lost {(12 - face_area(B, (2, 1.5, 2))) / 4:.5f}")
 
+# --- rims: a cylinder's, and a revolved puck's three ---------------------------
+def kernel_ok(o):
+    """The kernel can measure the solid (mass properties: its volume() reads 0 when not)."""
+    try:
+        store.get_brep(o).mass_properties()
+        return True
+    except Exception:
+        return False
+
+def vol(o): return store.get_brep(o).volume(1e-8)
+
+def rim_edge(o, z, rad):
+    """The shared closed edge at height z and radius rad (world = local here)."""
+    es = store.get_brep(o).edges()
+    def d(i):
+        e = es[i]
+        t0, t1 = e.parameter_range()
+        q = np.array(e.point_at(0.5 * (t0 + t1)), float)
+        return abs(q[2] - z) + abs(math.hypot(q[0], q[1]) - rad) + (0 if len(e.faces()) == 2 else 1e3)
+    return min(range(len(es)), key=d)
+
+def rim_chamfer(o, i, **kw):
+    try:
+        return bpy.ops.nproto.edge_fillet(inputs=json.dumps([[o.name, f"E{i}"]]), shape="CHAMFER", **kw)
+    except RuntimeError as exc:
+        return str(exc)
+
+clear()
+bpy.ops.nproto.add_primitive(kind="CYLINDER", caps=True)
+C = ctx.active_object
+bb = np.array([list(v) for v in C.bound_box])
+R, H = float(bb[:, 0].max()), float(bb[:, 2].max())
+z0 = float(bb[:, 2].min())
+side0, cap0 = face_area(C, (R, 0, 0.5 * (z0 + H))), face_area(C, (0.3 * R, 0.2 * R, H))
+v0 = vol(C)
+r = rim_chamfer(C, rim_edge(C, H, R), radius=0.15, distance_b=0.3, same_distance=False)
+
+def chamfer_profile_gap(o, P, Q):
+    """The chamfer face's outline (its two rails and its seam) in (r, z): the
+    largest distance of its points from the segment P-Q (the exact chamfer's
+    profile), and how close they come to P and to Q (its rails)."""
+    P, Q = np.array(P, float), np.array(Q, float)
+    f = face_at(o, tuple(np.r_[0.5 * (P[0] + Q[0]), 0.0, 0.5 * (P[1] + Q[1])]))
+    gap, near_p, near_q = 0.0, 1.0, 1.0
+    for e in f.edges():
+        t0, t1 = e.parameter_range()
+        for k in range(17):
+            q = np.array(e.point_at(t0 + (t1 - t0) * k / 16.0), float)
+            x = np.array([math.hypot(q[0], q[1]), q[2]])
+            t = float(np.clip((x - P) @ (Q - P) / ((Q - P) @ (Q - P)), 0.0, 1.0))
+            gap = max(gap, float(np.linalg.norm(P + t * (Q - P) - x)))
+            near_p, near_q = min(near_p, float(np.linalg.norm(x - P))), min(near_q, float(np.linalg.norm(x - Q)))
+    return gap, near_p, near_q
+
+gap = chamfer_profile_gap(C, (R, H - 0.15), (R - 0.3, H))
+want_v = 0.5 * 0.15 * 0.3 * 2 * math.pi * (R - 0.3 / 3)                             # Pappus: the cut-off ring
+check("cylinder rim, two distances 0.15 / 0.3: A down the side (the larger face), 0.3 off the cap -- the "
+      "chamfer face is exactly that cone", r == {'FINISHED'} and max(gap) < 1e-7 and kernel_ok(C)
+      and abs((v0 - vol(C)) - want_v) < 1e-5 * v0,          # (the kernel measures this cylinder to ~2e-6)
+      f"profile gap / rails {gap}, volume {v0 - vol(C):.6f} (want {want_v:.6f})")
+
+clear()
+bpy.ops.nproto.add_primitive(kind="CYLINDER", caps=True)
+C = ctx.active_object
+v0 = vol(C)
+r = rim_chamfer(C, rim_edge(C, H, R), radius=0.2, flip_distances=True)
+want_v = 0.5 * 0.2 * 0.2 * 2 * math.pi * (R - 0.2 / 3)
+check("cylinder rim, one distance 0.2: the exact ring", r == {'FINISHED'} and abs((v0 - vol(C)) - want_v) < 1e-5
+      and kernel_ok(C), f"volume {v0 - vol(C):.6f} (want {want_v:.6f})")
+
+# the puck (top, side, a 26.6 deg bevel, bottom): two distances on each rim made
+# a body the kernel could not measure (volume 0) -- the chamfer ring's seam lies
+# away from the faces' seams and splits their rails there
+PUCK = [(0, 0, 0.508), (0.2032, 0, 0.508), (0.2032, 0, 0.4953), (0.1778, 0, 0.4826), (0, 0, 0.4826)]
+# per rim: (r, z) of the edge, the unit (r, z) directions along face A and face B
+# away from it (A: the larger face), its name
+BV = np.array([0.0254, 0.0127]) / math.hypot(0.0254, 0.0127)          # up the bevel, 26.6 deg
+RIMS = (((0.2032, 0.508), (-1.0, 0.0), (0.0, -1.0), "top | side"),     # A the top
+        ((0.2032, 0.4953), -BV, (0.0, 1.0), "side | bevel"),           # A the bevel
+        ((0.1778, 0.4826), (-1.0, 0.0), BV, "bevel | bottom"))         # A the bottom
+
+def ring_volume(P, ua, ub, da, db):
+    """Pappus: the triangle (edge, rail on A, rail on B) in (r, z) turned round the axis."""
+    P, ua, ub = np.array(P), np.array(ua), np.array(ub)
+    T = np.array([P, P + da * ua, P + db * ub])
+    area = 0.5 * abs((T[1] - T[0])[0] * (T[2] - T[0])[1] - (T[1] - T[0])[1] * (T[2] - T[0])[0])
+    return area * 2 * math.pi * T[:, 0].mean()
+
+for (rad, z), ua, ub, name in RIMS:
+    for flip in (False, True):
+        clear()
+        pr = poly("Puck", PUCK)
+        bpy.ops.nproto.revolve(inputs=json.dumps([[pr.name, "S0"]]), angle=360.0, axis="Z", pivot="WORLD",
+                               body="NEW")
+        V = ctx.active_object
+        v0, n0 = vol(V), store.get_brep(V).face_count()
+        r = rim_chamfer(V, rim_edge(V, z, rad), radius=0.003, distance_b=0.005, same_distance=False,
+                        flip_distances=flip)
+        lost = v0 - vol(V) if r == {'FINISHED'} else float("nan")
+        da, db = (0.005, 0.003) if flip else (0.003, 0.005)
+        cap = ring_volume((rad, z), ua, ub, da, db)
+        good = (n0 == 4 and r == {'FINISHED'} and store.get_brep(V).is_manifold_solid() and kernel_ok(V)
+                and store.get_brep(V).face_count() == 5 and abs(lost - cap) < 1e-3 * cap)
+        extra = ""
+        if name == "top | side" and good:       # A on the top (the larger face): its radius 0.003 less
+            top_r = math.sqrt(face_area(V, (0.05, 0.03, 0.508)) / math.pi)
+            want_top = 0.005 if flip else 0.003
+            good = good and abs((rad - top_r) - want_top) < 1e-6
+            lost_want = 0.5 * 0.003 * 0.005 * 2 * math.pi * (rad - want_top / 3)
+            good = good and abs(lost - lost_want) < 1e-8
+            extra = f", top cut back {rad - top_r:.6f}, volume {lost:.4e} (want {lost_want:.4e})"
+        check(f"puck rim {name}, two distances (flip {flip}): a solid the kernel measures, its volume cut "
+              "exactly by the chamfer ring", good, f"{n0} -> {store.get_brep(V).face_count()} faces, {r}, "
+              f"lost {lost:.5e} (want {cap:.5e}){extra}")
+
 # --- history: the step keeps the distances; editing them re-runs it --------------
 ctx.scene.nproto_settings.construction_history = True
 clear(); B = box()

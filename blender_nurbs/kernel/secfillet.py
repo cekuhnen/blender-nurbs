@@ -840,6 +840,8 @@ def build(sm, brep_a, brep_b, side_a, side_b, ra, rb, chord=None, shape="CIRCULA
     info = {"radius": (float(min(radii)), float(np.mean(radii)), float(max(radii))),
             "chord": (float(min(chords)), float(np.mean(chords)), float(max(chords))),
             "sections": len(secs)}
+    if cr.closed:           # the sections' rows (n, deg + 1, 4) round a closed crossing (a rim's exact ring)
+        info["ring"] = np.array([r for _, r in rows], float)
     if setback and not chord:
         sa_ = [float(np.linalg.norm(x.pa - x.P0)) for x in secs]
         sb_ = [float(np.linalg.norm(x.pb - x.P0)) for x in secs]
