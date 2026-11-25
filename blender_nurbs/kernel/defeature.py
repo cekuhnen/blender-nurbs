@@ -122,11 +122,14 @@ def _point(f):
     return [float(ip.x), float(ip.y), float(ip.z)] if hasattr(ip, "x") else [float(x) for x in ip]
 
 
-def find(sm, b):
+def find(sm, b, exclude=()):
     """The fillets of Brep b: {"fillets": [{face, point, radius, radius_min,
     radius_max, kind, chain}], "corners": [{face, point, chain}],
     "chains": [[face indices]], "skipped": [{face, point, why}]}. Face indices
-    are b.faces() order; points lie inside the faces (b's space)."""
+    are b.faces() order; points lie inside the faces (b's space). exclude:
+    face indices that are no fillet whatever they look like (Face CVs: a
+    sculpted face tangent to fillets all round reads as one, and then its
+    fillets -- their rails on it -- did not)."""
     ext = sm.blender_ext
     faces = list(b.faces())
     tol = max(1e-6, 1e-4 * _size(b))
@@ -136,7 +139,8 @@ def find(sm, b):
             info.append(ext.fillet_info(f, tol, TANGENCY_DEG))
         except Exception:
             info.append({"is_fillet": False})
-    cand = {i for i, d in enumerate(info) if d.get("is_fillet") and d.get("cross_section") != 2}
+    exclude = set(exclude)
+    cand = {i for i, d in enumerate(info) if d.get("is_fillet") and d.get("cross_section") != 2} - exclude
     skipped = [{"face": i, "why": "a straight (linear) section"} for i, d in enumerate(info)
                if d.get("is_fillet") and d.get("cross_section") == 2]
     nb = _neighbours(faces)
@@ -158,7 +162,7 @@ def find(sm, b):
         fillets.add(i)
     corners = set()
     for i, f in enumerate(faces):
-        if i in fillets or len(nb[i]) < 3 or not nb[i] <= fillets:
+        if i in fillets or i in exclude or len(nb[i]) < 3 or not nb[i] <= fillets:
             continue
         try:
             if f.surface().is_planar(tol):

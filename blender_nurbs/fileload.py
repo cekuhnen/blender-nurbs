@@ -16,7 +16,7 @@ import bpy
 from bpy.app.handlers import persistent
 
 from . import (anamesh, blendedit, brep_mesh, contlabels, cvnudge, cvs, curvejoin, curveoffset, diagnostics, draw,
-               drawtools, extend, feature_ui, flow, pattern, features, hints, history, isocombs, isodetach, loft_rails, loftslide, merge, ops, patch, refit,
+               drawtools, extend, facetex, feature_ui, flow, pattern, features, hints, history, isocombs, isodetach, loft_rails, loftslide, merge, ops, patch, refit,
                scanfit, scanpatch, sections, snapframes, snapping, square, steps, store, subd_brep, subsel, surfoffset, flange, network, railrevolve, measure, sweeps,
                symmetry, unroll, workplanes)
 
@@ -47,6 +47,7 @@ def _emptied():
         snapping._CENTERS, snapping._FACES, snapping._SURF_FLAT, snapping.MESH_CACHE, snapframes._FACE_KIND,
         scanfit._SCANS, scanfit._SAMPLERS, scanfit.DEV_CACHE, scanfit.DEV_BATCHES, scanfit.STATS,
         extend._EDGE_CACHE, blendedit._frames, isodetach._trim_cache, pattern._BUILD_CACHE, symmetry._last,
+        facetex._cache, facetex.LAST,
         subsel._valid, subsel._ftris, subsel._epts, subsel._stepf, subsel._mtris, subsel._cpoly,
     )
 

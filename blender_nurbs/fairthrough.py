@@ -159,10 +159,11 @@ def through_ends(S, deg, ends, extra=None):
         if e in ends:
             sp_ = specs[e]
             fr = ends[e][1]
-            if sp_.get("mode", "EDGE") in align.SQUARE:
+            side = align.orient_side(sp_)
+            if side == "curve":
                 Se = S if e == "0" else S[::-1]
                 fr = align.orient(sp_, fr, np.mean(Se[1:], axis=0) - Se[0])     # off on the curve's side
-            elif sp_.get("snap") == "NEAREST" and sp_.get("mode", "EDGE") == "EDGE":
+            elif side == "d1":
                 fr = align.orient(sp_, fr, d1)
             seg = align.align_start(seg, Ub, p, sp_, fr, I)
             if k:

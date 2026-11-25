@@ -3529,7 +3529,7 @@ dE = store.display(ARC)["edges"]
 ei = min(range(len(dE)), key=lambda i_: abs(np.mean(np.array(dE[i_])[:, 1])) + 10 * (np.ptp(np.array(dE[i_])[:, 2]) < 1e-6))
 clk = [(0.5, 0.0, 0.15), (1.1, -0.6, 0.35), (1.6, -1.4, 0.3), (2.0, -2.0, 0.0)]
 r, CS = _draw(clk, [ARC.name, f"E{ei}", "NEAREST"], None, mode="THROUGH", degree="3", start_cont="G2",
-              edge_mode="SURFACE")
+              edge_mode="SURFACE", start_dir="FREE")      # (Free: the clicks lead it across the arc, curved)
 kcs = features.input_curve(CS, "S0")
 ds = _al._k()[0].evaluate_curve(kcs, kcs.parameter_range()[0])
 c1, c2 = np.array(ds["tangent"], float), np.array(ds["curvature"], float)
@@ -3607,8 +3607,9 @@ bpy.ops.nproto.add_primitive(kind='CYLINDER', radius=0.5, height=1.2, caps=True)
 MCY = ctx.active_object
 fc = _FCtx()
 rim = 0.5 * np.array([math.cos(math.radians(30)), math.sin(math.radians(30))])
+# (Free: Square would run the curve down the cylinder's side, into the Line checks below)
 cv = _fake(_dt.NPROTO_OT_draw_curve, mode="CV", degree="3", closed=False, start_cont="G1", end_cont="G1",
-           edge_mode="SURFACE", keep_aligned=True)
+           edge_mode="SURFACE", keep_aligned=True, start_dir="FREE", end_dir="FREE")
 cv._edit, cv._pts, cv._snapinfo, cv._frames, cv._start_refs = None, [], [], {}, None
 cv.sketch_start(fc)
 cv.modal(fc, _ev('MOUSEMOVE', _wpx(*rim), 'NOTHING'))
@@ -5249,6 +5250,7 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cy
               "curve_degree", "fix_clip_start", "delete_faces", "move_pivot", "cv_nudge", "pattern_select",
               "measure",    # Measure: in the Analyze panel / header popover, with Continuity Check
               "remove_symmetry",    # Mirror's Make Symmetric: the Active Object panel's button
+              "face_cvs_refine",    # Face CVs' Add CVs / Rebuild: the open face cage's panel buttons
               "move", "rotate", "scale", "transform_hold",   # by Points: hold G / R / S (movetool keymap), no button
               "align_parts",    # Align Parts: Object > Transform and the NURBS Proto menu
               "square"}     # Square: merged into Patch (Quad Sided); kept for older files, off the menus
@@ -5279,13 +5281,14 @@ _subs = [e["menu"] for e in _drawn["VIEW3D_MT_nproto_tools"] if "menu" in e]
 _menu_kinds = sorted(e["props"].get("kind") for n, r in _drawn.items() if n.startswith("VIEW3D_MT")
                      and n != "VIEW3D_MT_nproto_tools" and n not in _DROPS for e in r
                      if e.get("op") == "nproto.add_primitive")
-check("UI: header menu holds the six groups, the same tools as the panels, and every shape (the curve shapes "
+check("UI: header menu holds the seven groups, the same tools as the panels, and every shape (the curve shapes "
       "only there: the panel draws them)",
       sorted(set(_menu_ops)) == sorted(set(_in_panels) | _menu_only) and _menu_only == {"nproto.edit_cvs"}
       and _menu_kinds == sorted(list(_prims.CURVE_KINDS) + list(_prims.SURFACE_KINDS))
       and _subs == ["VIEW3D_MT_nproto_curves", "VIEW3D_MT_nproto_surfaces",
                     "VIEW3D_MT_nproto_curve_edit", "VIEW3D_MT_nproto_surface_edit",
-                    "VIEW3D_MT_nproto_convert", "VIEW3D_MT_nproto_scan"], f"{_subs} {_menu_kinds}")
+                    "VIEW3D_MT_nproto_texture", "VIEW3D_MT_nproto_convert", "VIEW3D_MT_nproto_scan"],
+      f"{_subs} {_menu_kinds}")
 _prim_btn = [e["menu"] for e in _drawn["VIEW3D_PT_nproto_surfaces"] if "menu" in e]
 check("UI: the surface primitives are one Primitive dropdown in Create Surfaces (not seven buttons)",
       _prim_btn == ["VIEW3D_MT_nproto_primitives"]

@@ -19,13 +19,14 @@ Tools that don't fit the selection are dimmed: select a curve and the tools that
 | **Create Surfaces** | Plane, Box, Cylinder, **Primitive** ▾ (Plane, Disk, Box, Cylinder, Cone, Sphere, Torus) · through curves or edges: Loft, Loft Rails, Curve Network, Revolve, Rail Revolve, Sweep, Pipe · extrude and fill: Extrude (curves, edges or a face), Flange (and draft surface), Planar, Dome, Boundary, Patch · from surfaces: Offset, Thicken, Pattern, Mirror, Unroll, Flow, Convert Blender Surface |
 | **Curve Edit** | Rebuild / Extend Curve, Align Curve · Trim / Split Curves · Join / Unjoin Curves (in Surface Edit's order: shape, trim, join) |
 | **Surface Edit** | Rebuild Surface, Extend Surface, Surface Align, Match Surface, Refit to Trim, Merge Patches, Flip Normal · Trim, Split, Untrim, Untrim Region, Detach at Isoparm · Join, Unjoin · Surface Fillet, Edge Fillet, Remove Fillets, Remove All Fillets · solids: Union, Difference, Intersection, Push / Pull, Rotate Face, Move Face, Replace Face, Boundary Fill, Emboss, Shell. **Edit CVs** has no button: Tab on a NURBS surface (it is in the NURBS menu and F3 search too) |
-| **Convert** (closed at first) | BREP to Mesh, Mesh to BREP, SubD to BREP (all also in Object › Convert) |
+| **Texture** | Plywood, Face Material: materials and UVs on a NURBS object's own faces, kept through every edit (Face Material also in Material Properties) |
+| **Convert** (closed at first) | BREP to Mesh, Mesh to BREP, SubD to BREP (also in Object › Convert) |
 | **Scan** (closed at first) | Fitting surfaces to a scan: Cage from Scan, Fit Cage to Scan (with Add Loops, and Trim to Curve when a curve is selected), Drape Patch to Scan |
 | **Analyze** (closed at first) | Measure, Continuity Check and the overlays (also in the viewport header's Analyze popover) |
 | **Display** | **Edges**, **CVs / Hulls**, **Spans**, **Feature Labels** and **Fine Grid** on / off (also as icons in the 3D view header, next to the Analyze button, so they are always at hand); **CVs / Hulls** also draws the CV hulls of selected curves (NURBS and Poly CVs, Bezier points with their handles) outside Edit mode, where Blender draws its own; **Spans** draws the knot lines (isoparms) of every face of the visible NURBS surfaces, clipped to their trims, so you see each surface's layout at a glance; **Fine Grid** draws the floor grid's finer levels (mm, cm, 10 cm; inches) in a perspective or turned orthographic view, where Blender's floor grid stops at 1 m (1 ft); right under them how finely surfaces are meshed for display: **Quality** *Fast / Medium / Fine* sets the four values below at once (Fast: angle 10°, chord 0.001, edges 3°, max edge 1/20; Medium, the defaults: 5°, 0.0005, 2°, 1/30; Fine: 2.5°, 0.0002, 1°, 1/50), one retessellation of every body; it reads *Custom* once a value is set by hand: Chord / Angle Tolerance, Edge Angle, Max Edge. The display mesh is rebuilt after every edit, so Fast makes editing quicker (a 38-face SubD body: 0.16 s Fast, 0.37 s Medium, 1.2 s Fine, 12k / 40k / 144k triangles). The analysis overlays (zebra, curvature map) don't use it: they have their own mesh and quality. **Clip Start warning:** a 3D view's depth buffer spreads its precision between Clip Start and Clip End, so a tiny Clip Start (say 1 µm) leaves depth steps of about 8 mm at 0.37 m. Surfaces, edges and Face / Edge highlights then flicker against each other (blotchy fills, dashed edges). When the steps exceed 0.05 % of the view distance, the Display panel says so and a red ⚠ appears in the header: one click sets Clip Start to about a thousandth of the view distance. |
 | **History** (closed at first) | Construction History, Live Update, Pause Rebuild, Delete History, Collect Inputs, Rebuild / Re-tessellate |
 
-The same six tool groups are in the viewport header's **NURBS Proto** menu (Object Mode), so every tool is reachable without the sidebar and **F3** finds each one by name. **Add** (Shift+A) has **NURBS Curves** and **NURBS Surfaces**, the two Create groups. STEP import and export are under File > Import / Export. One table in `toolgroups.py` drives the panels and the menus, so they always list the same tools.
+The same seven tool groups are in the viewport header's **NURBS Proto** menu (Object Mode), so every tool is reachable without the sidebar and **F3** finds each one by name. **Add** (Shift+A) has **NURBS Curves** and **NURBS Surfaces**, the two Create groups. STEP import and export are under File > Import / Export. One table in `toolgroups.py` drives the panels and the menus, so they always list the same tools.
 
 ### Key hints (every interactive tool)
 
@@ -99,6 +100,7 @@ Both are under Create Curves. You click in the 3D view to draw.
   * Keys: **1-5** set the degree (with Blender's *Emulate Numpad* on, the top-row digits arrive as number-pad keys and still set the degree; the number pad then doesn't switch views during CV Curve). **K** shows the curvature comb on the curve while you draw it, with its knot ticks (the same switch as Analyze > Curvature Comb, so it stays on for the finished curve). **C**, or clicking the first point, closes the curve as a smooth periodic loop. **H / V** lock the next CV horizontal or vertical from the previous one.
   * **Start / End conditions.** An end snapped onto a curve or sketch (its end, its middle or any point on it), onto a surface edge, or onto a surface's face (face snapping on, **O**) is **G0**, **G1**, **G2** or **G3** to it. **S** and **E** step the start's and the end's condition G0 → G1 → G2 → G3 while you draw (G1 by default), and the preview shows the result live. G3 raises the curve to degree 4.
     * **Which edge or face** (as in Shapr3D): the edge the end follows is drawn white, and with Tangent to Surface its face is outlined in beige. The label names the reference only when that tells you something: a face (*Edge · Face 1/2 (T)*), or a choice (*End · Edge 1/2 (T)*); a single edge just reads *Edge*. Where there is a choice, **T** cycles it: the two faces along an edge, or the edges meeting at a corner. T works on the point under the cursor, or on the placed start when the cursor isn't on a snap. **F** steps through tangent to the face → perpendicular to it → symmetry plane → continuing the edge. The chosen face is kept in the Align history step.
+    * **Which way across the surface** (Tangent to Surface): **Square** (the default) leaves square to the edge; **Angle** at a set angle from it, turned round the surface normal (90 is square; on a face it is measured from the surface's u direction); **Along Curve** follows a curve lying on the surface through the end, such as a projected curve; **Free** follows the curve's own CVs, as before. Square, Angle and Along Curve add no sideways bend at G2 / G3, so seen down the normal the end starts out straight, and the curve meets the surface's cross-section there with G2 / G3. Along Curve takes the guide's own sideways bend (and its rate at G3) instead, and the guide becomes an input of the Align history. **R** aims an end: the hovered end when it snaps onto a surface edge or face (it is placed when you confirm), else the placed start. The mouse turns it round the normal, snapping to square, along the edge, the u / v lines and curves on the surface; **Shift** steps 15°, **Alt** turns snapping off, click / Enter / R sets it, Esc puts it back. R on an end snapped onto a curve that ends at a surface edge (a projected curve, whose end is often a hair off the edge) moves that end onto the edge and aims it along the curve. **D** switches both ends between Square and Free. The F9 panel and Align Curve have the same **Direction** / **Angle**; Blend Curve's Tangent to Surface sides have an **Angle** (90: square, as before).
     * **At a corner** where edges meet, the edge you slid along into it stays the reference. So running along a straight edge into its end keeps the straight edge, not the arc that meets it there.
     * **L locks onto the edge** (CV Curve and Draw Line): press L while an edge is highlighted, at a corner after picking it with T. The point then slides only along that edge, wherever the mouse is, and still snaps to its ends and middle. The reference is that edge alone (*End · locked (L)*). The lock holds for one point: placing it, or L again, releases it, and X / Y / Z / H / V replace it.
     * It is solved exactly as **Align Curve** solves it. On a curve's end the new curve continues that curve. Along a curve it leaves tangent to it, the way you drew it.
@@ -337,7 +339,7 @@ Under Create Curves, next to CV Curve and Draw Line: a section for Sweep or Pipe
 |---|---|---|
 | **Join Curves** (or **Join** with only curves selected) | 2+ curves (every spline of each selected curve object) | Chains them end to end, flipping pieces as needed. Ends within **Tolerance** (default 0.001) meet in the middle; curves further apart become separate splines of the result. **Exact** (default): every piece is cut into its Bezier spans, raised to the chain's highest degree and strung together, so the shape doesn't change, rational arcs included. Blender splines can't hold arbitrary knots, so this is stored as an endpoint + Bezier-knot spline with a knot at every span boundary, even where a joint is G1 / G2. When the result is exactly a plain uniform spline (e.g. two halves of one curve, or straight pieces forming a polyline), it's stored as that instead. **Rebuild**: one uniform spline fitted through the chain, with the chosen **Degree** and **CVs** (0 = fewest within 0.01% of the size). It has no internal knots, but a uniform spline spends CVs evenly, so a long straight run next to a tight blend needs many (line + blend + line: about 34 cubic CVs at 0.01%, 16 at 0.35%). With history the sources stay hidden and drive the result (edit the Blend Curve, the joined curve follows), and **Restore Inputs** brings them back. Without history the sources are removed. |
 | **Unjoin Curves** (or **Unjoin** with only curves selected) | Curves | Splits at the joints a Join Curves recorded and at every corner (tangent break > 1°). A curve object with several splines comes apart into one object per spline. Each piece is written in the lowest degree that holds it exactly (a joined line comes back as degree 1). Removes history. |
-| **Align Curve** | Click a curve near the end to align (any spline of a sketch), then an edge (surface edge, curve or sketch), or click inside a surface's face | Alias-style align: only the end CVs move. **G0** puts the end on the edge (**Snap**: the edge's nearest end, or the nearest point on it), **G1** sets the 2nd CV, **G2** the 3rd, **G3** the 4th (degree 4 or more). **Continue Edge**: curve and edge form one G1/G2/G3 curve. **Tangent to Surface**: the end tangent lies in the surface's tangent plane, G2 matches its normal curvature and G3 its rate. **Perpendicular to Surface**: the end leaves along the surface normal, on the side the curve is (**Flip**: the other side), and starts out straight: G2 / G3 add no curvature across it. **Symmetry Plane**: square to the plane too, but the curve keeps its bend there and joins its mirror image smoothly (G2: n·C'' = 0, curvature continuous through the mirror; G3: C''' has no part in the plane). Meant for planes; on a curved surface its tangent plane is the mirror. On a face the end goes where you clicked, and stays on the face (its nearest point) when the curve or the surface changes. **Weight** (tangent length) and **Flip**. Works on NURBS curves (endpoint), Bezier curves (through their handles; G3 refits them) and poly curves. A curve that has to be refitted (a degree raised, as G3 does, or too few CVs) gets the CVs its ends take on top of its own, so its shape holds: a 5-CV curve aligned G3 becomes 8 CVs of degree 4. Both ends are kept in one history feature: the ends follow when the surface changes, and stay locked when you edit the other CVs. |
+| **Align Curve** | Click a curve near the end to align (any spline of a sketch), then an edge (surface edge, curve or sketch), or click inside a surface's face | Alias-style align: only the end CVs move. **G0** puts the end on the edge (**Snap**: the edge's nearest end, or the nearest point on it), **G1** sets the 2nd CV, **G2** the 3rd, **G3** the 4th (degree 4 or more). **Continue Edge**: curve and edge form one G1/G2/G3 curve. **Tangent to Surface**: the end tangent lies in the surface's tangent plane, G2 matches its normal curvature and G3 its rate; **Direction** Square to the edge (the default), at an **Angle** from it, or Free (the way the curve's own CVs lead), as in CV Curve. **Perpendicular to Surface**: the end leaves along the surface normal, on the side the curve is (**Flip**: the other side), and starts out straight: G2 / G3 add no curvature across it. **Symmetry Plane**: square to the plane too, but the curve keeps its bend there and joins its mirror image smoothly (G2: n·C'' = 0, curvature continuous through the mirror; G3: C''' has no part in the plane). Meant for planes; on a curved surface its tangent plane is the mirror. On a face the end goes where you clicked, and stays on the face (its nearest point) when the curve or the surface changes. **Weight** (tangent length) and **Flip**. Works on NURBS curves (endpoint), Bezier curves (through their handles; G3 refits them) and poly curves. A curve that has to be refitted (a degree raised, as G3 does, or too few CVs) gets the CVs its ends take on top of its own, so its shape holds: a 5-CV curve aligned G3 becomes 8 CVs of degree 4. Both ends are kept in one history feature: the ends follow when the surface changes, and stay locked when you edit the other CVs. |
 
 ### Split / Trim Curves
 
@@ -637,6 +639,73 @@ Measured (first show after an edit, mesh and GPU upload):
 | Pipe (one surface, 65 x 9 CVs) | 14 s → 0.07 s | 1.6 s → 0.01 s |
 
 The normals are as exact as before or more so: the angle between the interpolated and the exact normal inside the triangles stays below 0.1° at the 99th percentile (0.03° on the degree-6 SubD cube), and a sphere's poles are right (the kernel's mesh had a 33° error there).
+
+## Texture
+
+Both tools texture the NURBS object itself: it stays a NURBS object you can keep editing, and the materials
+and UVs are written again after every rebuild. Press Z › Material Preview to see them.
+
+### Plywood
+
+In the **Texture** panel, next to Face Material. It textures a bent plywood shell for rendering the way the real part
+looks: a veneer on the front, one on the back, and the band of plies where the shell is cut along its rim. Select a
+NURBS solid of even thickness (a sheet after **Thicken**, a chair shell, a bent panel) or a plain mesh shell and click
+it.
+
+* **Texture: NURBS Object** (default) puts the materials and UVs on the NURBS object's **own B-rep faces**. It stays a
+  NURBS object you can keep editing: every rebuild (a history edit, CV moves, a new display detail) sorts the faces
+  again and writes the UVs again, and the materials stay. **Render Mesh** meshes it like BREP to Mesh (Light, at the
+  Detail you choose) into a separate "‹name› Plywood" and hides the NURBS object, for export, modifiers or texture
+  painting. A plain mesh is **textured in place** (its own mesh, before its modifiers).
+* **Which face is which:** a face is veneer when the other side of the shell lies straight behind it, at the
+  thickness, facing the other way. Everything else is **edge**: the rim walls, and a rounding or chamfer of the rim
+  too (sanding a rounded edge shows the plies, so it gets them). The veneer faces fall into two sides; the **front**
+  is the one facing up (most of its area). **Swap Sides** turns that round.
+* **Veneer UVs:** each side is unwrapped as **one sheet**, as a veneer is bent over the form, so the grain runs on
+  across patch boundaries and over the bend. The unwrap keeps the sheet's true size (in metres) and its shape as
+  closely as a doubly curved sheet allows; the sheet is turned so the grain runs along its length, and **Grain Angle**
+  turns it from there (90° across).
+* **Edge UVs:** u is the length along the rim in metres, v the **depth through the shell, 0 at the front, 1 at the
+  back**, measured from both veneers, so a rounded rim spreads the plies over its curve. Any edge texture whose height
+  is the full ply stack fits exactly, whatever the thickness. A hole's rim is its own strip.
+* **Materials** (slots 0 Front, 1 Back, 2 Edge):
+  * **Front Veneer** and **Back Veneer**: a procedural figure with fibres along u in the chosen wood (Birch, Beech,
+    Maple, Ash, Oak, Walnut, Teak), satin lacquer. **Back Veneer: Same as Front** puts the front's material on the
+    back. **Veneer Image** uses a photo instead (its grain along the image's width), **Image Width** the length of
+    veneer it covers.
+  * **Edge**: **Plies** stripes across v (0: about one per 1.5 mm, odd), the outer two in the veneers' woods, the
+    core plies alternating long grain and cross grain in the **Core Plies** wood, dark **Glue Lines** between. The
+    count, glue width and thickness are the object's `ply_count`, `ply_glue` and `ply_thickness` properties, so you
+    can change them without running the tool again. **Edge Image** uses a photo of a ply edge instead: its height spans the
+    thickness, its width runs along the rim in proportion.
+  * **Your own materials:** **Own Front**, **Own Back** and **Own Edge** put a material of yours in that slot. A
+    material you drop into one of the three slots yourself (Material Properties) is kept by later runs too; empty
+    the slot to get the tool's own back. The tool's materials are made once and kept, so your edits to them stay.
+    The UVs above are what your textures map to: real-size veneer sheets, and the edge band's 0–1 depth.
+* **Run it again** on the result (the textured NURBS object, the render mesh or its NURBS object) to change the
+  settings: the last run's settings come back for anything you don't set. The Adjust Last Operation panel shows the
+  thickness found and how many faces went where.
+* A shell it can't read (a lone sheet, no faces opposite each other) is refused with a message.
+
+### Face Material
+
+In the **Texture** panel, and in **Material Properties** under the slot list of a NURBS object (**Assign to Picked
+Faces** / **Assign to All Faces**, **Clear**, ✕). It gives B-rep faces a material of their own, as Edit Mode's Assign
+does for a mesh: pick faces in **Face** mode, choose a slot in the material list, click Assign. With no faces picked,
+it assigns to all faces.
+
+* The faces keep their material through every rebuild: each one is stored with a point on it and found again however
+  the rebuild numbers the faces. A face rebuilt somewhere else loses it.
+* The object gets **UVs in metres**: each face is its own island, unwrapped at its true size and turned so its long
+  side runs along u, the islands laid side by side, so a tiling texture keeps its scale from face to face. On a
+  Plywood object the veneer sheets and the edge band keep their Plywood UVs, and an assigned face only changes material
+  (an inlay, a painted patch).
+* The display mesh carries a face attribute `brep_face` (the B-rep face of every triangle), for shader tricks and
+  selection.
+* **Clear** puts the picked faces (all, when none are picked) back to slot 0, or to their Plywood material. **✕**
+  (Remove Texture) drops the per-face materials, the Plywood sorting and the UVs; the slots stay.
+* Texturing costs a little at every rebuild (about a third more on a chair shell of 35 faces). Untextured objects
+  don't pay it.
 
 ## Convert
 

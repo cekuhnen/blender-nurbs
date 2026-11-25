@@ -310,6 +310,9 @@ def _crease_pieces(surf, angle_deg, v_rows=None):
     return pieces
 
 
+LAST_RAW = [0]     # triangles the kernel gave the last _tessellate (facetex: which face each one is on)
+
+
 def _tessellate(brep, chord, angle, edge_angle=None, max_edge_rel=1.0 / 30.0, natural=False, diag=None):
     """edge_angle: separate (finer) angle tolerance for the edges. Neighbouring
     objects are tessellated independently; along a shared curved edge each
@@ -362,6 +365,7 @@ def _tessellate(brep, chord, angle, edge_angle=None, max_edge_rel=1.0 / 30.0, na
             c = int(f[i])
             tris.append(f[i + 1:i + 1 + c])
             i += 1 + c
+    LAST_RAW[0] = len(tris)      # the kernel's own triangles (one run per face), before the crack fills
     try:
         tris = _zip(pts, nrm, tris, edge_pts=lambda: _edge_samples(brep), tol=4.0 * chord * diag)
     except Exception as exc:
@@ -1083,11 +1087,16 @@ def _display_data(brep):
 
 def write_mesh(obj, brep, context=None):
     chord, angle = tess_settings(context)
-    pts, nrm, tris = _tessellate(brep, chord, angle, edge_angle_setting(context), max_edge_setting(context),
-                                 natural=is_natural(obj))
+    edge_angle, max_edge = edge_angle_setting(context), max_edge_setting(context)
+    if DRAFT[0]:                    # a live drag: half the triangles (27 -> 15 ms), exact once it settles
+        chord, angle, edge_angle, max_edge = 2.0 * chord, 1.5 * angle, 1.5 * edge_angle, 2.0 * max_edge
+    pts, nrm, tris = _tessellate(brep, chord, angle, edge_angle, max_edge, natural=is_natural(obj))
     me = obj.data
     me.clear_geometry()
     faces = tris.tolist() if isinstance(tris, np.ndarray) else [list(map(int, t)) for t in tris]
+    textured = "nproto_tex" in obj.keys()       # B-rep face materials and UVs (facetex), after the mesh
+    if textured:
+        all_faces, n_raw = faces, LAST_RAW[0]
     # a face using one vertex twice (the kernel's mesh of a closed seam can have
     # them) is not kept by Blender: drop it here so the per-corner normals
     # below count the same corners as the mesh
@@ -1105,11 +1114,19 @@ def write_mesh(obj, brep, context=None):
     except Exception as exc:
         print("NURBS normals:", exc)
     me.update()
+    if textured:
+        from . import facetex
+        LAST_RAW[0] = n_raw
+        facetex.apply(obj, brep, pts, all_faces)
     from .pivot import remember
     remember(obj)              # (Set Origin / Apply Transform move the mesh: pivot.py follows with the B-rep)
 
 
 CREASE_DEG = 30.0
+
+
+DRAFT = [False]     # a live drag (Face CVs): a coarser mesh, and crease corners take their triangle's own
+                    # normal (no kernel feet: ~90 ms on a body with curved faces); exact once it settles
 
 
 def _corner_normals(brep, pts, nrm, tris):
@@ -1187,6 +1204,12 @@ def _corner_normals(brep, pts, nrm, tris):
     lo_all, hi_all = np.array([b[0] for b in boxes]), np.array([b[1] for b in boxes])
     surf_cache, flat_n = {}, {}
     face_of = {}
+    if all(len(t) == 3 for t in T) and DRAFT[0]:     # a draft: sharp rims from the triangles themselves
+        A = np.array(T, int)
+        out = np.asarray(nrm, float)[A]
+        m = crease[A]
+        out[m] = np.repeat(tri_n[:, None, :], 3, axis=1)[m]
+        return out.reshape(-1, 3).tolist()
     if all(len(t) == 3 for t in T):                 # the smooth corners at once, the crease ones below
         out = np.asarray(nrm, float)[np.array(T, int)].reshape(-1, 3)
         for k in np.nonzero(crease[np.array(T, int)].any(1))[0]:

@@ -2858,6 +2858,8 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
             from . import subsel
             subsel.set_picks(obj, "EDGE", [])     # the picked edges are gone: no pick moves onto a rail
             msg = f"{name}: {info['edges']} edge(s) filleted" + (" (solid)" if info.get("solid") else "")
+            if info.get("exact"):
+                msg += " · exact rolling-ball fillets (the face is curved)"
             if info.get("chord"):
                 lo, mean, hi = info["chord"]
                 rr = info.get("radius_range") or (info["radius"],) * 3

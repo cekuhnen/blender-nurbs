@@ -9,7 +9,7 @@ import numpy as np
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
 from mathutils import Vector
 
-from . import draw, features, geom, store, sweeps, workplanes
+from . import draw, features, geom, imprint, store, sweeps, workplanes
 from . import hints
 from .kernel import load as load_kernel
 from .ops import (CHAIN_ITEMS, AskValue, PickMixin, SolidBody, _curve_inputs, _decode_inputs, _encode_inputs,
@@ -1240,73 +1240,204 @@ class NPROTO_OT_dup_edge(PickMixin, bpy.types.Operator):
         return {'FINISHED'}
 
 
+OUTPUT_ITEMS = [
+    ("CURVE", "Curve", "New curves lying on the surface; the surface itself is not changed"),
+    ("EDGE", "Edge", "Imprint: edges of the surface itself, its faces divided where they land. Nothing is "
+                     "removed and a solid stays closed; the new faces and edges take Push / Pull, Extrude Face, "
+                     "Blend, Fillet and the rest"),
+]
+
+
+def _project_inputs(context, target):
+    """What Project puts onto target: every spline of the selected curves (a
+    stray one-point spline, a click Draw Line left behind, is no curve and is
+    left out), and the edges picked (Edge mode) on other selected NURBS objects."""
+    from . import subsel
+    out = []
+    for o in context.selected_objects:
+        if o == target:
+            continue
+        if o.type == 'CURVE':
+            out += [(o, f"S{i}") for i, sp in enumerate(o.data.splines)
+                    if len(sp.bezier_points if sp.type == 'BEZIER' else sp.points) >= 2]
+        elif store.is_nurbs(o):
+            out += [(o, f"E{i}") for i in subsel.picks(o, "EDGE")]
+    return out
+
+
+def imprint_object(op, context, tgt, inputs, p, pre=None):
+    """Imprint tgt with inputs (params p, see imprint.run) and record the step.
+    pre: the result computed already (info, text). Returns the info, or None
+    (reported) when nothing was imprinted."""
+    from . import jobs, subsel
+    from .ops_trim import _frozen
+    try:
+        info, text = pre if pre is not None else imprint.run(tgt, inputs, p)
+    except jobs.JobError as exc:
+        op.report({'WARNING'}, f"Imprint on {tgt.name}: {exc}")
+        return None
+    base = tgt[store.PROP_BREP]
+    keep = features.history_enabled(context)
+    if not keep:
+        _frozen(tgt, op)
+    store.set_geometry_text(tgt, text, context)
+    subsel.set_picks(tgt, "FACE", [])          # the face numbers changed
+    subsel.set_picks(tgt, "EDGE", [])
+    if keep:                                   # the edges follow what made them
+        features.push_step(tgt, imprint.OP, inputs, p, base_text=base)
+    for msg in imprint.notes(info, inputs, tgt):
+        op.report({'INFO'}, msg)
+    return info
+
+
 class NPROTO_OT_project_curve(bpy.types.Operator):
-    """Project the selected curves onto the active surface (curves on the surface)"""
+    """Project the selected curves (and edges picked in Edge mode on other surfaces) onto the active surface
+    or solid. Output Curve: new curves lying on it. Output Edge (Imprint): edges of its own, its faces divided
+    where they land -- nothing is removed and a solid stays closed. Onto picks which faces take them: the
+    nearest ones seen from the curve, the faces picked in Face mode, or all the way through"""
     bl_idname = "nproto.project_curve"
-    bl_label = "Project Curve"
+    bl_label = "Project / Imprint"
     bl_options = {'REGISTER', 'UNDO'}
 
-    direction: EnumProperty(name="Direction", items=[
-        ("WORKPLANE", "Work Plane", "Along the active work plane's normal (World Z when the World is active)"),
-        ("VIEW", "View", "Along the view direction"),
-        ("X", "World X", ""), ("Y", "World Y", ""), ("Z", "World Z", "")], default="WORKPLANE")
+    output: EnumProperty(name="Output", items=OUTPUT_ITEMS, default="CURVE")
+    direction: EnumProperty(name="Direction", items=imprint.PROJECTIONS, default="WORKPLANE",
+                            description="Curve: along the work plane normal unless set. Edge: along each sketch's "
+                                        "normal (Sketch Normal) unless set")
+    scope: EnumProperty(name="Onto", items=imprint.SCOPES, default="NEAREST")
+    reach: EnumProperty(name="Reach", items=imprint.REACHES, default="BOTH")
+    extend: BoolProperty(name="Extend to Edges", default=False,
+                         description="An open curve that stops inside a face is carried on (its natural "
+                                     "continuation) until it reaches the face's edges")
     view_dir: bpy.props.FloatVectorProperty(subtype='XYZ', options={'HIDDEN'}, default=(0, 0, -1))
 
     def invoke(self, context, event):
+        from . import subsel
         rv3d = getattr(context, "region_data", None)
         if rv3d is not None:
             self.view_dir = rv3d.view_rotation @ Vector((0, 0, -1))
+        tgt = context.active_object
+        if self.output == "EDGE" and tgt is not None and store.is_nurbs(tgt) and subsel.picks(tgt, "FACE"):
+            self.scope = "FACES"                  # faces picked on the target: onto those
         return self.execute(context)
 
+    def draw(self, context):
+        lay = self.layout
+        lay.use_property_split = True
+        lay.prop(self, "output", expand=True)
+        lay.prop(self, "direction")
+        if self.output == "EDGE":
+            lay.prop(self, "scope")
+            lay.prop(self, "reach")
+            lay.prop(self, "extend")
+
     def execute(self, context):
+        from . import subsel
         surf = context.active_object
-        crv = [o for o in context.selected_objects if o.type == 'CURVE']
-        if not (_kernel_ok(self) and store.is_nurbs(surf) and crv):
+        if not (_kernel_ok(self) and store.is_nurbs(surf)):
             self.report({'WARNING'}, "Select curves, then the surface (active)")
             return {'CANCELLED'}
-        if self.direction == "WORKPLANE":
-            fr = workplanes.active_frame(context.scene)
-            d = Vector((0, 0, -1)) if fr is None else -Vector(tuple(map(float, fr[3])))
-        elif self.direction == "VIEW":
-            d = Vector(self.view_dir)
-        else:
-            d = Vector({"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}[self.direction])
-        try:
-            c = _new_curves(context, "Projected", "project_curve",
-                            [(o, "S0") for o in crv] + [(surf, "SURF")], {"dir": list(d.normalized())})
-        except sweeps.ProjectMiss:
-            # FINISHED with nothing made keeps Adjust Last Operation open, so
-            # the direction can be changed right there.
-            along = {"WORKPLANE": "the work plane normal", "VIEW": "the view"}.get(
-                self.direction, "World " + self.direction)
-            self.report({'WARNING'}, f"Project: the {'curve misses' if len(crv) == 1 else 'curves miss'} "
-                                     f"the surface along {along}; pick another Direction "
+        if self.output == "EDGE" and not self.properties.is_property_set("direction"):
+            self.direction = "CURVE"              # Imprint: a sketch drawn on a face goes along its normal
+        inputs = _project_inputs(context, surf)
+        if not inputs:
+            self.report({'WARNING'}, "Select curves (or pick edges of other surfaces in Edge mode), "
+                                     "then the surface (active)")
+            return {'CANCELLED'}
+        d = imprint.direction(self.direction, self.view_dir, imprint.plane_direction(context.scene))
+        along = {"CURVE": "the sketch normal", "WORKPLANE": "the work plane normal", "VIEW": "the view",
+                 "SURFACE": "the curve itself"}.get(self.direction, "World " + self.direction)
+        if self.output == "CURVE":
+            if self.direction == "SURFACE":
+                self.report({'WARNING'}, "Project: On Surface makes edges, not curves -- set Output to Edge")
+                return {'FINISHED'}
+            try:
+                c = _new_curves(context, "Projected", "project_curve", inputs + [(surf, "SURF")],
+                                {"dir": list(d.normalized()), "projection": self.direction,
+                                 "view": list(Vector(self.view_dir))})
+            except sweeps.ProjectMiss:
+                # FINISHED with nothing made keeps Adjust Last Operation open, so
+                # the direction can be changed right there.
+                self.report({'WARNING'}, f"Project: the {'curve misses' if len(inputs) == 1 else 'curves miss'} "
+                                         f"the surface along {along}; pick another Direction "
+                                         "in Adjust Last Operation")
+                return {'FINISHED'}
+            except Exception as exc:
+                self.report({'ERROR'}, f"Project failed: {exc}")
+                return {'CANCELLED'}
+            _select_only(context, [c])
+            return {'FINISHED'}
+        faces = imprint.face_points(surf, subsel.picks(surf, "FACE")) if self.scope == "FACES" else []
+        if self.scope == "FACES" and not faces:
+            self.report({'WARNING'}, "Imprint: Onto Picked Faces, but no faces are picked on "
+                                     f"{surf.name} (Face mode) -- pick them, or set Onto to Nearest Faces")
+            return {'FINISHED'}
+        p = imprint.local_params(surf, self.direction, self.view_dir, d, self.reach, self.scope, self.extend,
+                                 faces)
+        info = imprint_object(self, context, surf, inputs, p)
+        if info is None:
+            self.report({'WARNING'}, f"Imprint: nothing was imprinted along {along}; change Direction or Onto "
                                      "in Adjust Last Operation")
             return {'FINISHED'}
-        except Exception as exc:
-            self.report({'ERROR'}, f"Project failed: {exc}")
-            return {'CANCELLED'}
-        _select_only(context, [c])
+        n = int(info.get("edges", 0))
+        self.report({'INFO'}, f"Imprint: {n} edge{'s' if n != 1 else ''} on {surf.name}")
+        _select_only(context, [surf])
         return {'FINISHED'}
 
 
 class NPROTO_OT_intersect(bpy.types.Operator):
-    """Intersection curves of two selected surfaces"""
+    """Where two selected surfaces meet. Output Curve: intersection curves. Output Edge (Imprint): edges of
+    the surfaces themselves along the intersection, their faces divided there -- nothing is removed"""
     bl_idname = "nproto.intersect"
     bl_label = "Intersect"
     bl_options = {'REGISTER', 'UNDO'}
 
+    output: EnumProperty(name="Output", items=OUTPUT_ITEMS, default="CURVE")
+    onto: EnumProperty(name="Onto", items=[("BOTH", "Both", "Each surface takes the edges where the other "
+                                                            "meets it"),
+                                           ("ACTIVE", "Active", "Only the active surface")], default="BOTH")
+
+    def draw(self, context):
+        lay = self.layout
+        lay.use_property_split = True
+        lay.prop(self, "output", expand=True)
+        if self.output == "EDGE":
+            lay.prop(self, "onto")
+
     def execute(self, context):
+        from . import jobs
         sel = [o for o in context.selected_objects if store.is_nurbs(o)]
         if not (_kernel_ok(self) and len(sel) == 2):
             self.report({'WARNING'}, "Select two NURBS surfaces")
             return {'CANCELLED'}
-        try:
-            c = _new_curves(context, "Intersection", "intersect", [(sel[0], "SURF"), (sel[1], "SURF")], {})
-        except Exception as exc:
-            self.report({'ERROR'}, f"Intersect failed: {exc}")
-            return {'CANCELLED'}
-        _select_only(context, [c])
+        if self.output == "CURVE":
+            try:
+                c = _new_curves(context, "Intersection", "intersect", [(sel[0], "SURF"), (sel[1], "SURF")], {})
+            except Exception as exc:
+                self.report({'ERROR'}, f"Intersect failed: {exc}")
+                return {'CANCELLED'}
+            _select_only(context, [c])
+            return {'FINISHED'}
+        act = context.active_object if context.active_object in sel else sel[0]
+        pairs = [(act, sel[1] if act == sel[0] else sel[0])]
+        if self.onto == "BOTH":
+            pairs.append((pairs[0][1], act))
+        # both from the shapes as they are, then applied
+        done = []
+        for tgt, other in pairs:
+            p = imprint.local_params(tgt, "CURVE", (0, 0, -1), (0, 0, -1), "BOTH", "THROUGH", False)
+            try:
+                pre = imprint.run(tgt, [(other, "SURF")], p)
+            except jobs.JobError as exc:
+                self.report({'WARNING'}, f"Intersect on {tgt.name}: {exc}")
+                continue
+            done.append((tgt, other, p, pre))
+        made = [tgt for tgt, other, p, pre in done
+                if imprint_object(self, context, tgt, [(other, "SURF")], p, pre) is not None]
+        if not made:
+            self.report({'ERROR'}, "Intersect: the surfaces do not meet -- nothing was imprinted")
+            return {'FINISHED'}
+        self.report({'INFO'}, "Intersect: imprinted on " + ", ".join(o.name for o in made))
+        _select_only(context, made)
         return {'FINISHED'}
 
 

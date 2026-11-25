@@ -36,7 +36,7 @@ Features remember how they were built. Move a curve, change a setting or a cutte
 everything built from it rebuilds.
 
 - Live feature settings in the **Active Object** panel: continuity, weights, degree, spans
-- History steps on top: Trim, Edge Fillet, Fillet Trim, Refit to Trim, Merge Patches (edit, mute or remove each one)
+- History steps on top: Trim, Imprint, Edge Fillet, Fillet Trim, Refit to Trim, Merge Patches (edit, mute or remove each one)
 - Construction Tree: what an object is built from, and what uses it
 - Remove a feature to step back: its inputs return
 - Pause Rebuild, Delete History, Collect Inputs
@@ -49,8 +49,13 @@ everything built from it rebuilds.
   (curves or surface edges offset along the surface by a distance measured on it, across joined faces, cut at
   trims and free edges)
 - **Shapes:** in Shift+A every shape at the 3D cursor (sized to the view)
-- **From surfaces:** Iso Curve, Duplicate Edge, Project Curve, Intersect (Iso Curve and Duplicate Edge keep the
+- **From surfaces:** Iso Curve, Duplicate Edge, Project, Intersect (Iso Curve and Duplicate Edge keep the
   surface's own CVs, degree, knots and weights: a cylinder rim is its exact 8-CV rational circle)
+- **Imprint:** Project and Intersect with **Output: Edge** put a sketch, an edge or another surface onto a surface
+  or solid as edges of its own. The faces are divided where the projection lands, nothing is removed and a
+  solid stays closed, so you can Push / Pull the new faces or Blend and Fillet to the new edges. **Onto** chooses
+  which faces get the edges: the nearest faces seen from the sketch, the faces picked in Face mode, or Through.
+  An open curve may end inside a face, or Extend to Edges. The edges follow the sketch (a history step)
 - **Snapping:** to curves, NURBS surfaces and meshes (vertex, edge, edge center, face center; **O** onto the face), smart guides (aligned, tangent, parallel, perpendicular), sketches flat on the face you start on or on the world grid, **Alt** for a free point, **Ctrl** for the grid (a finer floor grid in perspective, on / off under Display)
 
 ### Curve Edit
@@ -103,6 +108,15 @@ everything built from it rebuilds.
 - **Combs and sections:** Curvature Comb, Surface Combs, Dynamic Section
 - **Display:** Edges, CVs / Hulls (surfaces, and selected curves outside Edit mode), Spans (every face's knot
   lines, clipped to its trims), Feature Labels, Fine Grid
+
+### Texture
+
+- **Plywood:** a bent plywood shell textured for rendering, on the NURBS object's own faces (kept through every edit)
+  or on a render mesh: a veneer on the front and on the back, each unwrapped as one sheet with the grain running on
+  over the bend, and the plies in a band along the rim (outer plies in the veneers' wood, cross-grain core plies, glue
+  lines); procedural woods, veneer and edge photos, or your own material in any of the three slots
+- **Face Material:** materials on picked B-rep faces of a NURBS object, kept through rebuilds, with UVs in metres (each
+  face its own island); also in Material Properties
 
 ### Convert
 

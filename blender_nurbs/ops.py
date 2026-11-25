@@ -2527,6 +2527,11 @@ ALIGN_MODES = [("EDGE", "Continue Edge", "The curve continues the edge (curve + 
                ("SYMMETRY", "Symmetry Plane", "The curve leaves square to the plane and joins its mirror image "
                                               "smoothly: G2 keeps its bend at the plane (curvature continuous "
                                               "through the mirror), G3 also its rate")]
+ALIGN_AIMS = [("SQUARE", "Square", "Square to the edge, with no sideways bend (G2 / G3): seen down the normal "
+                                   "the end starts out straight. On a face: Free"),
+              ("ANGLE", "Angle", "At an angle from the edge (on a face, from the surface's u direction), turned "
+                                 "round the normal, with no sideways bend (G2 / G3)"),
+              ("FREE", "Free", "Whichever way the curve's own CVs lead (only its bend off the surface is set)")]
 BLEND_MODES = [("EDGE", "Continue Edge", "On a surface edge the blend continues the edge itself, like a curve"),
                ("SURFACE", "Tangent to Surface", "The blend leaves the surface tangent to it, square to the edge "
                                                  "(G2 / G3: its normal curvature and rate carry on)"),
@@ -2638,6 +2643,11 @@ class NPROTO_OT_align_curve(PickMixin, bpy.types.Operator):
                        default="END")
     flip: BoolProperty(name="Flip", default=False, description="Reverse the edge direction used for G1 / G2 "
                                                                "(Perpendicular: leave on the other side)")
+    direction: EnumProperty(name="Direction", items=ALIGN_AIMS, default="SQUARE",
+                            description="Tangent to Surface: which way the end leaves across the surface")
+    angle: FloatProperty(name="Angle", default=90.0, soft_min=0.0, soft_max=180.0, precision=1,
+                         description="Degrees from the edge (on a face, from the surface's u direction), turned "
+                                     "round the normal. 90 is square")
     face_point: FloatVectorProperty(name="Face Point", size=3, subtype='XYZ', options={'HIDDEN'},
                                     description="Where a face target was clicked: the end goes there")
     use_face_point: BoolProperty(default=False, options={'HIDDEN'})
@@ -2697,26 +2707,34 @@ class NPROTO_OT_align_curve(PickMixin, bpy.types.Operator):
                     self.report({'INFO'}, f"{obj.name}: its construction history was replaced by Align")
                 inputs, ends = [(obj, sref)], {}
             # the other end keeps its alignment; this end gets the new edge
-            keep = {e: v for e, v in ends.items() if e != str(self.end)}
-            used = sorted({int(v["input"]) for v in keep.values()})
+            keep = {e: dict(v) for e, v in ends.items() if e != str(self.end)}
+            used = sorted({int(v[k]) for v in keep.values() for k in ("input", "guide") if v.get(k) is not None})
             new_inputs = [(obj, sref)] + [inputs[i] for i in used]
             remap = {old: k + 1 for k, old in enumerate(used)}
             for v in keep.values():
-                v["input"] = remap[int(v["input"])]
+                for k in ("input", "guide"):
+                    if v.get(k) is not None:
+                        v[k] = remap[int(v[k])]
             new_inputs.append(target)
             spec = {"input": len(new_inputs) - 1, "cont": self.cont, "weight": self.weight,
                     "mode": self.mode, "snap": self.snap, "flip": self.flip}
+            if align.solve_mode(self.mode, *target) == "SURFACE" and self.direction != "FREE" \
+                    and not (self.direction == "SQUARE" and align.is_face_ref(target[1])):
+                spec["dir"] = self.direction
+                if self.direction == "ANGLE":
+                    spec["angle"] = float(self.angle)
             if align.is_face_ref(target[1]) and self.use_face_point:
                 # the end goes where the face was clicked (rebuilds keep it: the
                 # point of the face nearest the end, as it is then)
                 align.move_end(obj, align.spline_index(new_inputs), self.end, np.array(self.face_point, float))
-            if align.solve_mode(self.mode, *target) in align.SQUARE:
-                # Perpendicular leaves on the side the curve is; Flip turns it to the other
+            if align.orient_side(dict(spec, mode=align.solve_mode(self.mode, *target))) == "curve":
+                # Perpendicular / an aimed surface end leaves on the side the curve is; Flip turns it
                 kind, p, Q, _ = align.curve_state(obj, align.spline_index(new_inputs))
                 M = np.array(geom.world_matrix(obj), float)
                 W = Q @ M[:3, :3].T + M[:3, 3]
                 W = W if self.end == 0 else W[::-1]
-                fr = align.end_frame(target[0], target[1], W[0], self.snap, self.mode, False)
+                fr = align.end_frame(target[0], target[1], W[0], self.snap, self.mode, False,
+                                     aim=align.spec_aim(spec))
                 if fr[1] @ (np.mean(W[1:], axis=0) - fr[0]) < 0:
                     spec["flip"] = not self.flip
             keep[str(self.end)] = spec
@@ -2743,6 +2761,11 @@ class NPROTO_OT_align_curve(PickMixin, bpy.types.Operator):
         row = lay.row()
         row.active = surf
         row.prop(self, "mode")
+        if surf and self.mode == "SURFACE":
+            row = lay.row(align=True)
+            row.prop(self, "direction")
+            if self.direction == "ANGLE":
+                row.prop(self, "angle", text="")
         row = lay.row()
         row.active = not face
         row.prop(self, "snap")
@@ -2782,6 +2805,12 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
     mode_a: EnumProperty(name="Surface A", items=BLEND_MODES, default="SURFACE",
                          description="How side A leaves a surface edge or face (a curve is always continued)")
     mode_b: EnumProperty(name="Surface B", items=BLEND_MODES, default="SURFACE")
+    ang_a: FloatProperty(name="Angle A", default=90.0, soft_min=0.0, soft_max=180.0, precision=1,
+                         description="Tangent to Surface on an edge: degrees from the edge, turned round the "
+                                     "normal (90: square to it). No sideways bend either way")
+    ang_b: FloatProperty(name="Angle B", default=90.0, soft_min=0.0, soft_max=180.0, precision=1,
+                         description="Tangent to Surface on an edge: degrees from the edge, turned round the "
+                                     "normal (90: square to it). No sideways bend either way")
     on_a: BoolProperty(name="Point Along A", default=False,
                        description="Start at a point along the curve / edge (Position) instead of its end")
     on_b: BoolProperty(name="Point Along B", default=False)
@@ -2887,6 +2916,9 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
         for s, (o, r) in zip("ab", inputs or []):
             if _is_surface_input(o, r):
                 p[f"bc_mode_{s}"] = getattr(self, f"mode_{s}")
+                ang = float(getattr(self, f"ang_{s}"))
+                if getattr(self, f"mode_{s}") == "SURFACE" and not r.startswith("F") and abs(ang - 90.0) > 1e-9:
+                    p[f"bc_ang_{s}"] = ang
             if r.startswith("F"):
                 p[f"uv_{s}"] = [float(x) for x in getattr(self, f"uv_{s}")]
             elif getattr(self, f"on_{s}"):
@@ -2929,6 +2961,8 @@ class NPROTO_OT_blend_curve(PickMixin, bpy.types.Operator):
             box.row().prop(self, f"cont_{side}", expand=True)
             if src is not None and _is_surface_input(*src):
                 box.prop(self, f"mode_{side}", text="Surface")
+                if getattr(self, f"mode_{side}") == "SURFACE" and not src[1].startswith("F"):
+                    box.prop(self, f"ang_{side}", text="Angle")
             if src is not None and not src[1].startswith("F"):
                 row = box.row(align=True)
                 row.prop(self, f"on_{side}", text="Point Along", toggle=True)
