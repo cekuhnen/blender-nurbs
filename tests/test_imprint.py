@@ -208,6 +208,29 @@ for hist in (True, False):
     check(f"{tag} cylinder: the rectangle lands on the front only (one face more)",
           nfaces(Y) == n0 + 1 and len(front) == 1, f"{n0} -> {nfaces(Y)}, small faces {len(front)}")
 
+    # ---- the same rectangle right across the tube's seam: still one face (the
+    # two pieces either side of the seam trimmed again as one, seam moved away)
+    clear()
+    bpy.ops.nproto.add_primitive(kind="CYLINDER")
+    Y = ctx.active_object
+    out = Vector((sp.x, sp.y, 0)).normalized()           # facing the seam
+    side = out.cross(Vector((0, 0, 1)))
+    c0 = out * 3 * rad + Vector((0, 0, zmid))
+    G = poly("G", [tuple(c0 + side * x + Vector((0, 0, z))) for x, z in ((-h, -h), (h, -h), (h, h), (-h, h))],
+             cyclic=True)
+    A0 = brep(Y).area(1e-6)
+    project([G], Y, direction="VIEW", view_dir=tuple(-out))
+    small = [f for f in brep(Y).faces() if f.area(1e-6) < 0.5 * rad * rad]
+    check(f"{tag} cylinder, across the seam: one face for the rectangle, not two",
+          nfaces(Y) == n0 + 1 and len(small) == 1 and abs(brep(Y).area(1e-6) - A0) < 1e-4 * A0,
+          f"{n0} -> {nfaces(Y)}, small faces {[round(f.area(1e-6), 4) for f in small]}")
+    if hist:
+        G.location = (0, 0, 0.1 * rad)
+        features.rebuild(Y, ctx, force=True)
+        small = [f for f in brep(Y).faces() if f.area(1e-6) < 0.5 * rad * rad]
+        check("[history] across the seam: the sketch moved, still one face", len(small) == 1,
+              str([round(f.area(1e-6), 4) for f in small]))
+
     # ---- Intersect with Output Edge: a plane through a box, each takes the other's edges
     clear()
     B = box()

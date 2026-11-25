@@ -273,6 +273,7 @@ def run(job, W):
             healed = len(left) == len(keep)
             if len(left) >= len(keep):
                 result = h
+    result = _merge_seam_splits(W, result, original, tol)
     try:
         solid = bool(result.is_manifold_solid())
     except Exception:
@@ -280,6 +281,183 @@ def run(job, W):
     W.save(W.to_local(result, job.get("xforms", {}).get("target")), job["out"]["result"])
     return {"edges": n, "dropped": max(0, made - n), "healed": healed, "solid": solid,
             "faces": result.face_count(), "extended": job.get("extended", [])}
+
+
+def _seam_dir(W, srf, pts):
+    """0 (u) or 1 (v): the closed direction of srf whose seam the points
+    lie on; None when they are on no seam."""
+    np = W._np()
+    (u0, u1), (v0, v1) = srf.u_domain(), srf.v_domain()
+    uv = []
+    for p in pts:
+        try:
+            _, uvs, _ = W.sm.surface_closest_point(srf, tuple(map(float, p)))
+            uv.append(W._uvxy(uvs[0]))
+        except Exception:
+            return None
+    uv = np.array(uv, float)
+    for k, (a, b) in enumerate(((u0, u1), (v0, v1))):
+        span = (b - a) or 1.0
+        x = (uv[:, k] - a) / span
+        if np.all(np.minimum(np.abs(x), np.abs(1.0 - x)) <= 1e-6):
+            return k
+    return None
+
+
+def _free_frac(W, srf, k, pts):
+    """A place for the seam in direction k (0..1 of its range) as far as
+    possible from the points: the middle of the widest gap between them."""
+    np = W._np()
+    a, b = (srf.u_domain(), srf.v_domain())[k]
+    xs = []
+    for p in pts:
+        _, uvs, _ = W.sm.surface_closest_point(srf, tuple(map(float, p)))
+        xs.append(((W._uvxy(uvs[0])[k] - a) / ((b - a) or 1.0)) % 1.0)
+    xs = np.sort(np.array(xs, float))
+    gaps = np.diff(np.concatenate([xs, [xs[0] + 1.0]]))
+    i = int(np.argmax(gaps))
+    if gaps[i] < 0.05:
+        return None                          # the region goes all the way round
+    return float((xs[i] + 0.5 * gaps[i]) % 1.0)
+
+
+def _merge_seam_splits(W, b, original, tol):
+    """One face again where the imprint left two on either side of a closed
+    surface's seam (a groove outline across a cylinder's seam): the kernel's
+    trims can not cross a seam, so they are trimmed again as one face on the
+    same surface with its seam moved away from them (worker._reseamed, exact),
+    and stitched back in. A region that goes all the way round keeps the seam.
+    Returns b unchanged when anything does not check out."""
+    np = W._np()
+    sm, ext = W.sm, W.ext
+    faces = b.faces()
+    ofaces = original.faces()
+    on_orig = W._near_edges(original, 10 * tol)
+    origin = [_face_origin(W, f, ofaces, tol) for f in faces]
+
+    def key(e):
+        m = W._edge_mid(e)
+        return None if m is None else tuple(round(float(v) / tol) for v in m)
+    uses, edge_of = {}, {}
+    for i, f in enumerate(faces):
+        for loop in f.boundary_loops():
+            for e, fw in loop:
+                k = key(e)
+                if k is None:
+                    return b
+                uses.setdefault(k, []).append((i, fw))
+                edge_of[k] = e
+    parent = list(range(len(faces)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    seams = set()
+    for k, us in uses.items():
+        if len(us) != 2 or us[0][0] == us[1][0]:
+            continue
+        i, j = us[0][0], us[1][0]
+        if origin[i] is None or origin[i] != origin[j]:
+            continue
+        pts = [np.asarray(p, float) for p in W._edge_poly(edge_of[k], 7)[1:-1]]
+        if not pts or not all(on_orig(p) for p in pts):
+            continue                                       # a cut edge, not a piece of the seam
+        if _seam_dir(W, ofaces[origin[i]].surface(), pts) is None:
+            continue
+        seams.add(k)
+        parent[find(i)] = find(j)
+    if not seams:
+        return b
+    clusters = {}
+    for i in range(len(faces)):
+        clusters.setdefault(find(i), []).append(i)
+    out = b.copy()
+    drop, made = [], []
+    for members in clusters.values():
+        if len(members) < 2:
+            continue
+        segs = []                                # (edge, forward, start, end): the union's boundary
+        for i in members:
+            for loop in faces[i].boundary_loops():
+                for e, fw in loop:
+                    if key(e) in seams:
+                        continue
+                    P = W._edge_poly(e, 3)
+                    a, z = (np.array(P[0]), np.array(P[-1])) if fw else (np.array(P[-1]), np.array(P[0]))
+                    segs.append((e, fw, a, z))
+        loops, todo = [], list(range(len(segs)))
+        while todo:
+            chain = [todo.pop(0)]
+            while np.linalg.norm(segs[chain[-1]][3] - segs[chain[0]][2]) > 100 * tol:
+                end = segs[chain[-1]][3]
+                nxt = min(todo, key=lambda j: np.linalg.norm(segs[j][2] - end), default=None)
+                if nxt is None or np.linalg.norm(segs[nxt][2] - end) > 100 * tol:
+                    return b
+                todo.remove(nxt)
+                chain.append(nxt)
+            loops.append(chain)
+        srf0 = ofaces[origin[members[0]]].surface()
+        seam_pts = [np.asarray(p, float) for k in seams if uses[k][0][0] in members
+                    for p in W._edge_poly(edge_of[k], 5)[1:-1]]
+        kdir = _seam_dir(W, srf0, seam_pts)
+        bpts = [p for j in range(len(segs)) for p in W._edge_poly(segs[j][0], 9)]
+        frac = None if kdir is None else _free_frac(W, srf0, kdir, bpts)
+        if frac is None:
+            continue
+        area = sum(faces[i].area(1e-6) for i in members)
+
+        def curves_of(lp, flip):
+            cs = []
+            for j in (reversed(lp) if flip else lp):
+                e, fw = segs[j][0], segs[j][1]
+                d = ext.curve_cvs(e.curve())
+                U, Pc, Wt = list(d["knots"]), list(d["points"]), d.get("weights")
+                if fw == flip:
+                    a0, a1 = U[0], U[-1]
+                    U = [a0 + a1 - u for u in reversed(U)]
+                    Pc, Wt = Pc[::-1], (list(Wt)[::-1] if Wt else None)
+                cs.append(ext.curve_from_cvs(d["degree"], Pc, U, list(Wt) if Wt else None))
+            return cs
+        face = None
+        for flip in (False, True):
+            G = W._reseamed(ext.surface_from_cvs(*W._srf_tuple(ext.surface_cvs(srf0))), "uv"[kdir], frac)
+            cs = [curves_of(lp, flip) for lp in loops]
+            try:
+                cand = ext.trim_surface_with_3d_curves_tol(G, [len(c) for c in cs], [c for l in cs for c in l],
+                                                           10 * tol, 100 * tol)
+            except Exception:
+                continue
+            if cand.face_count() == 1 and abs(cand.area(1e-6) - area) <= 1e-4 * max(area, 1e-12):
+                face = cand
+                break
+        if face is None:
+            continue
+        drop += members
+        made.append(face)
+    if not made:
+        return b
+    of = out.faces()
+    ext.delete_faces(out, [of[i] for i in drop])
+    for m in made:
+        ext.append_brep(out, m)
+    try:
+        solid = bool(b.is_manifold_solid())
+    except Exception:
+        solid = False
+    want = len(faces) - len(drop) + len(made)
+    for t in (tol, 10 * tol, 100 * tol):
+        st = sm.stitch_advanced(out.copy(), t, squeeze_small_edges=False, making_manifold_solid=solid)[0]
+        if st.face_count() != want:
+            continue
+        try:
+            ok = bool(st.is_manifold_solid()) if solid else W._open_edge_count(st) <= W._open_edge_count(b)
+        except Exception:
+            ok = False
+        if ok and abs(st.area(1e-6) - b.area(1e-6)) <= 1e-4 * max(b.area(1e-6), 1e-12):
+            return st
+    return b
 
 
 def _band_sheets(W, cutter, t0, t1):
