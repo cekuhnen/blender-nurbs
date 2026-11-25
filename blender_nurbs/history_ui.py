@@ -66,6 +66,7 @@ def _on_step_change(self, context):
         return
     p = raw[k]["params"]
     op = raw[k]["op"]
+    was = p.get("shape")
     for name in STEP_FIELDS.get(op, []):
         v = getattr(self, name)
         if name == "variable":
@@ -89,6 +90,10 @@ def _on_step_change(self, context):
             p[name] = int(v)
         else:
             p[name] = v
+    if op == "edge_fillet" and p.get("shape") == "CHAMFER" and was != "CHAMFER":
+        # a fillet turned into a chamfer: its size is the distance from the edge,
+        # as a new chamfer's (only chamfer steps made before distances keep the ball)
+        p["setback"] = True
     obj[features.PROP_STACK] = json.dumps(raw)
     err = _rebuild(obj, context)
     self.error = err or ""
@@ -469,7 +474,8 @@ def draw_steps(box, obj, only=None, bare=False):
                         continue
                     if name == "radius":
                         inner.prop(pg, name, text="Min Radius" if soft else "Chord" if pg.rail_type == "CHORD" else
-                                   ("Distance A" if two else "Distance") if pg.shape == "CHAMFER" else "Radius")
+                                   ("Distance A" if two else "Distance") if dist else
+                                   "Ball Radius" if pg.shape == "CHAMFER" else "Radius")
                         continue
                     if name == "thumbweight" and pg.shape != 'BLEND':
                         continue

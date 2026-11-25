@@ -2996,7 +2996,9 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
             if info.get("exact"):
                 msg += " · exact rolling-ball fillets (the face is curved)"
             if info.get("distances"):
-                msg += f" · distances {info['distances'][0]:.4g} / {info['distances'][1]:.4g} m"
+                da_, db_ = info["distances"]
+                msg += (f" · distance {da_:.4g} m on every edge" if abs(da_ - db_) <= 1e-9 * max(da_, db_)
+                        else f" · distances {da_:.4g} / {db_:.4g} m")
             elif self._setback() and info.get("setback"):
                 lo, hi = info["setback"]
                 msg += (f" · distance {lo:.4g}..{hi:.4g} m (one ball for edges at different angles)"
@@ -3017,6 +3019,10 @@ class NPROTO_OT_edge_fillet(ValueDrag, AskValue, PickMixin, bpy.types.Operator):
                 level = 'WARNING'
             if info.get("rings") and "class_a" not in info:
                 msg += " · " + ring_summary(info["rings"])
+            if info.get("skipped_tangent"):
+                msg += (f" · {info['skipped_tangent']} edge(s) left out: their faces meet tangent "
+                        "(a fillet's seam, no corner)")
+                level = 'WARNING'
             if "class_a" in info and not soft:
                 ca_msg, ok = class_a_summary(info["class_a"])
                 msg += " · " + ca_msg

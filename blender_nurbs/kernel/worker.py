@@ -6721,6 +6721,25 @@ def _section_edge_fillet(b, sel, chord, shape, soft=None, setback=None):
     return r, out
 
 
+TANGENT_DEG = 1.0      # an edge whose faces never bend more than this is smooth: nothing to fillet
+
+
+def _edge_max_bend(e, n=7):
+    """The largest angle (degrees) between the edge's two faces' normals at n
+    points along it; 180 where they cannot be found (left to the kernel)."""
+    np = _np()
+    t0, t1 = e.parameter_range()
+    worst = 0.0
+    try:
+        for t in np.linspace(t0, t1, n + 2)[1:-1]:
+            p = np.array(e.point_at(t), float)
+            n0, n1 = (_face_normal(fc, p) for fc in e.faces()[:2])
+            worst = max(worst, float(np.degrees(np.arccos(np.clip(n0 @ n1, -1.0, 1.0)))))
+    except Exception:
+        return 180.0
+    return worst
+
+
 def _edge_half_tans(sel):
     """tan(th / 2) sampled along the edges, th the angle between their two
     faces' normals (a chamfer's rail sits r tan(th / 2) from the edge for a
@@ -6959,7 +6978,15 @@ def _edge_fillet_out(job, b_ring, r, n_edges, exact=False):
 
 def job_edge_fillet(job):
     """Fillet / chamfer / blend the edges whose world-space midpoints are given.
-    Works on joined sheets and on solids; written back in the object's local space."""
+    Works on joined sheets and on solids; written back in the object's local space.
+    skipped_tangent in the result: picked edges left out (their faces meet tangent)."""
+    out = _edge_fillet_job(job)
+    if job.get("_skipped_tangent") and isinstance(out, dict):
+        out["skipped_tangent"] = job["_skipped_tangent"]
+    return out
+
+
+def _edge_fillet_job(job):
     np = _np()
     b = world_brep(job, "target")
     b_orig = b.copy() if job.get("class_a") else None
@@ -6988,6 +7015,16 @@ def job_edge_fillet(job):
         if i not in picked:
             picked.append(i)
     sel = [edges[i] for i in picked]
+    # an edge where the faces meet tangent (a fillet's or blend's seam) has no
+    # corner to round off: the kernel only says SM_ERR_INVALID_INPUT there
+    smooth = [e for e in sel if _edge_max_bend(e) < TANGENT_DEG]
+    if smooth:
+        if len(smooth) == len(sel):
+            raise RuntimeError(("the faces meet tangent along " + ("this edge" if len(sel) == 1 else "these edges")
+                                + ": no corner to fillet or chamfer (the seam of a fillet or blend -- "
+                                  "edit that fillet's step, or Remove Fillets first)"))
+        sel = [e for e in sel if all(e is not x for x in smooth)]
+        job["_skipped_tangent"] = len(smooth)
     if job.get("shape") == "SOFT":
         return _soft_edge_fillet(job, b, b_ring, sel)
     xsect = {"CHAMFER": 0, "CIRCULAR": 1, "BLEND": 2}[job.get("shape", "CIRCULAR")]
@@ -7004,6 +7041,14 @@ def job_edge_fillet(job):
         # from the edge (th the angle between the faces' normals)
         tans = _edge_half_tans(sel)
         k = float(np.mean(tans))
+        if float(max(tans)) - float(min(tans)) > 1e-3 * k and r1 is None:
+            # edges at different angles (a puck's square top rim and its bevelled
+            # bottom one): one ball would set each back a different distance --
+            # exact sections or planar prisms where they apply, the ball otherwise
+            try:
+                return _two_distance_chamfer(job, b, b_ring, sel, r0, r0, False)
+            except Exception:
+                pass
         setback = (r0 * float(min(tans)) / k, r0 * float(max(tans)) / k)
         r0, r1 = r0 / k, (float(r1) / k if r1 is not None else None)
     if job.get("chord") and not (r1 is not None and abs(float(r1) - r0) > 1e-12):

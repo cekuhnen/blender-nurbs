@@ -5,6 +5,7 @@ it later. An input is (object, ref) -- see geom.py for the ref strings.
 """
 
 import json
+import math
 
 import numpy as np
 from mathutils import Vector
@@ -1894,6 +1895,8 @@ def _revolve_side(obj, curve, p, solid=False):
     angle = float(p.get("angle", 360.0))
     seam = float(p.get("seam_angle", 0.0)) if abs(abs(angle) - 360.0) < 1e-9 else 0.0
     runs = _off_axis_runs(curve, origin, axis)
+    if p.get("split_kinks") and not solid:      # one face per smooth stretch: its corners become edges
+        runs = [q for c in runs for q in _split_at_kinks(c)]
     walls = [revolve_exact(c, tuple(origin), tuple(axis), angle, seam) for c in runs]
     if len(walls) == 1 or solid:
         return walls[0] if len(walls) == 1 else walls
@@ -1942,6 +1945,43 @@ def _off_axis_runs(curve, origin, axis, rel=1e-6):
     pieces = [_sub_curve(curve, a, b) for a, b in runs]
     if len(runs) > 1 and not flags[0] and not flags[-1] and is_closed_curve(curve):
         pieces = pieces[1:-1] + [_join_curves_c0(pieces[-1], pieces[0])]
+    return pieces
+
+
+def _turn_deg(curve, t, h):
+    """How far the curve's direction turns at t (degrees): the chords just
+    before and just after it. None where a chord has no length."""
+    a, m, b = (np.asarray(curve.evaluate(x), float) for x in (t - h, t, t + h))
+    u, v = m - a, b - m
+    lu, lv = np.linalg.norm(u), np.linalg.norm(v)
+    if lu <= 0.0 or lv <= 0.0:
+        return None
+    return math.degrees(math.acos(min(1.0, max(-1.0, float(u @ v) / (lu * lv)))))
+
+
+def _split_at_kinks(curve, min_deg=0.5):
+    """The curve cut at its corners (knots as multiple as its degree where it
+    turns by more than min_deg): a revolved polyline gets one face per stretch,
+    so its creases are edges that can be picked (fillets, chamfers) and shade
+    sharp. A closed curve smooth across its start keeps that stretch whole.
+    [curve] when it has no corner."""
+    sm, ext = _k()
+    d = ext.curve_cvs(curve)
+    U, deg = [float(k) for k in d["knots"]], int(d["degree"])
+    t0, t1 = U[0], U[-1]
+    h = 1e-6 * (t1 - t0)
+    kinks = [k for k in geom._corner_knots(U, deg, t0, t1) if (_turn_deg(curve, k, h) or 0.0) > min_deg]
+    if not kinks:
+        return [curve]
+    cuts = [t0] + kinks + [t1]
+    pieces = [_sub_curve(curve, a, b) for a, b in zip(cuts, cuts[1:])]
+    if is_closed_curve(curve):
+        a0, a1 = (np.asarray(curve.evaluate(x), float) for x in (t0, t0 + h))
+        b0, b1 = (np.asarray(curve.evaluate(x), float) for x in (t1 - h, t1))
+        u, v = b1 - b0, a1 - a0
+        if np.linalg.norm(u) > 0 and np.linalg.norm(v) > 0 and \
+                math.degrees(math.acos(min(1.0, max(-1.0, float(u @ v) / (np.linalg.norm(u) * np.linalg.norm(v)))))) <= min_deg:
+            pieces = pieces[1:-1] + [_join_curves_c0(pieces[-1], pieces[0])]
     return pieces
 
 
