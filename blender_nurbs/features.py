@@ -2210,8 +2210,10 @@ def build_planar(inputs, p):
 #                parameter) instead of its end (end_<s>)
 #   uv_<s>       a face input (F<i>): the point on it (fractions of its domain)
 #   face_<s>     an edge between two faces: which face SURFACE / NORMAL use
+#   bc_ang_<s>   SURFACE on an edge: degrees from the edge round the normal
+#                (missing: 90, square to it)
 BLEND_SIDE_KEYS = ("bc_mode_a", "bc_mode_b", "bc_on_a", "bc_on_b", "bc_at_a", "bc_at_b", "uv_a", "uv_b",
-                   "face_a", "face_b")
+                   "face_a", "face_b", "bc_ang_a", "bc_ang_b")
 
 
 def _blend_side(inputs, p, s):
@@ -2221,7 +2223,7 @@ def _blend_side(inputs, p, s):
     return obj, ref, dict(end=int(p.get(f"end_{s}", 1 if s == "a" else 0)),
                           at=float(p.get(f"bc_at_{s}", 0.5)) if on else None, uv=p.get(f"uv_{s}"),
                           mode=p.get(f"bc_mode_{s}", "EDGE"), face=int(p.get(f"face_{s}", 0) or 0),
-                          third=p.get(f"cont_{s}") == "G3")
+                          third=p.get(f"cont_{s}") == "G3", angle=p.get(f"bc_ang_{s}"))
 
 
 def blend_frames(inputs, p):

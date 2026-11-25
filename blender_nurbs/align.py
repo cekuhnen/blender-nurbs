@@ -16,6 +16,14 @@ Modes
            C''(0) matches the surface's normal curvature in that direction,
            and for G3 that of C''' the surface's third-order form (contact of
            order 3 with the surface).
+           Direction (spec "dir"; FREE when missing, as before): SQUARE
+           leaves square to the edge, ANGLE at spec "angle" degrees from it
+           (on a face: from the surface's u direction), turned round the
+           normal; CURVE along a guide curve lying on the surface (spec
+           "guide": its input). These solve as an edge: the surface's
+           section along that direction (aim_frame), so G2 / G3 add no
+           sideways bend (CURVE: the guide's own) -- seen down the normal
+           the end starts out straight, like the CVs of a hand-made one.
   NORMAL   perpendicular to the surface: the end continues the surface's
            normal line at that point (a straight line), so C' runs along the
            normal and G2 / G3 leave no curvature (nor its rate) across it.
@@ -42,6 +50,7 @@ from . import features, geom, store
 CONT = {"G0": 0, "G1": 1, "G2": 2, "G3": 3}
 MODES = ("EDGE", "SURFACE", "NORMAL", "SYMMETRY")
 SQUARE = ("NORMAL", "SYMMETRY")      # modes that leave along the surface normal
+AIMS = ("FREE", "SQUARE", "ANGLE", "CURVE")     # a Tangent to Surface end's direction (spec "dir")
 
 
 def is_face_ref(ref):
@@ -266,15 +275,147 @@ def _outward_across(f, obj, P, n, e):
     return -b if dm > dp else b         # +b goes back onto the face: off it is -b
 
 
-def end_frame(src_obj, ref, near, snap="END", mode="EDGE", flip=False, face=0):
+def aimed(spec):
+    """A Tangent to Surface end with its direction set (SQUARE / ANGLE /
+    CURVE), solved as the surface's section along it."""
+    return spec is not None and spec.get("mode", "SURFACE") == "SURFACE" and spec.get("dir", "FREE") in AIMS[1:]
+
+
+def spec_aim(spec, inputs=None):
+    """The aim end_frame takes from an end spec: {"dir", "angle"[, "guide":
+    (obj, ref)]} or None (FREE). inputs: the feature's, for a CURVE guide."""
+    d = spec.get("dir", "FREE") if spec else "FREE"
+    if d not in AIMS[1:]:
+        return None
+    a = {"dir": d, "angle": float(spec.get("angle", 90.0))}
+    g = spec.get("guide")
+    if d == "CURVE":
+        if inputs is None or g is None or not 0 <= int(g) < len(inputs):
+            return None
+        a["guide"] = tuple(inputs[int(g)])
+    return a
+
+
+def section_frame(P, n, Q, C, t, kg=0.0, j=0.0):
+    """The frame of a curve leaving the surface at P in tangent direction t,
+    as an edge to continue (arc length): C' = t; C'' = the surface's normal
+    curvature along t on n, plus kg sideways (s = n x t); C''' = what contact
+    of order 3 needs on n (3 Q(t, tangent part of C'') + C(t, t, t)), j
+    sideways, and minus |C''|^2 along t (arc length). kg = j = 0: the normal
+    section itself."""
+    n = np.asarray(n, float)
+    t = np.asarray(t, float)
+    t = t - (t @ n) * n
+    t /= np.linalg.norm(t) or 1.0
+    s = np.cross(n, t)
+    kn = float(t @ Q @ t)
+    c3 = float(np.einsum("ijk,i,j,k->", C, t, t, t)) if C is not None else 0.0
+    DD = kn * n + kg * s
+    DDD = (3.0 * kg * float(t @ Q @ s) + c3) * n + j * s - (kn * kn + kg * kg) * t
+    return frame(P, t, DD, None, DDD)
+
+
+def guide_jet(gobj, gref, P, n):
+    """(t, kg, j) of a guide curve at its point nearest P, in the tangent
+    plane of normal n: its unit direction there (along its parameter), and
+    the sideways (n x t) parts of its arc-length second and third derivatives."""
+    kc = features.input_curve(gobj, gref)
+    G = geom.curve_derivs(kc, curve_param_near(kc, np.asarray(P, float)), 3)
+    G1, G2, G3 = (np.asarray(x, float) for x in G[1:4])
+    a = float(np.linalg.norm(G1))
+    if a < 1e-300:
+        return None, 0.0, 0.0
+    a1 = float(G1 @ G2) / a
+    a2 = (float(G2 @ G2 + G1 @ G3) - a1 * a1) / a
+    X2 = (G2 - (a1 / a) * G1) / a ** 2
+    X3 = (G3 - 3.0 * (a1 / a) * G2 + (3.0 * a1 * a1 / (a * a) - a2 / a) * G1) / a ** 3
+    t = G1 - (G1 @ n) * n
+    if np.linalg.norm(t) < 1e-9 * a:
+        return None, 0.0, 0.0
+    t /= np.linalg.norm(t)
+    s = np.cross(n, t)
+    return t, float(X2 @ s), float(X3 @ s)
+
+
+def aim_axes(src_obj, ref, P, face=0):
+    """(n, e, b) world at P: the surface normal, the direction an aim's angle
+    is measured from (the edge, along its parameter; on a face the surface's
+    u direction), and b square to it in the tangent plane (90 degrees): on an
+    edge leading off the face, as Blend Curve's sides do; on a face n x e."""
+    if is_face_ref(ref):
+        n, e, _ = surface_iso(src_obj, ref, P, face)
+    else:
+        _, n, _, _, _, f = surface_jet(src_obj, ref, P, face)
+        kc = features.input_curve(src_obj, ref)
+        e = np.asarray(geom.curve_derivs(kc, curve_param_near(kc, np.asarray(P, float)), 1)[1], float)
+    e = e - (e @ n) * n
+    e /= np.linalg.norm(e) or 1.0
+    if is_face_ref(ref):
+        return n, e, np.cross(n, e)
+    return n, e, _outward_across(f, src_obj, np.asarray(P, float), n, e)
+
+
+def surface_iso(src_obj, ref, P, face=0):
+    """(n, Su, Sv) world at the surface point nearest P: the unit normal and
+    the unit u / v parameter directions (the iso lines through it)."""
+    from . import surfeval
+    _, n, _, _, uvf, f = surface_jet(src_obj, ref, P, face)
+    s = f.surface()
+    (u0, u1), (v0, v1) = s.u_domain(), s.v_domain()
+    u, v = u0 + uvf[0] * (u1 - u0), v0 + uvf[1] * (v1 - v0)
+    R = np.array(geom.world_matrix(src_obj), float)[:3, :3]
+    D = surfeval.Surf(s).at(np.array([u]), np.array([v]), 1)
+    out = []
+    for kl in ((1, 0), (0, 1)):
+        d = R @ np.asarray(D[kl][0], float)
+        out.append(d / (np.linalg.norm(d) or 1.0))
+    return n, out[0], out[1]
+
+
+def aim_direction(axes, angle):
+    """Unit tangent at `angle` degrees from e, turned round n toward b."""
+    _, e, b = axes
+    th = np.radians(float(angle))
+    return np.cos(th) * e + np.sin(th) * b
+
+
+def aim_frame(src_obj, ref, P, face, aim):
+    """end_frame of an aimed Tangent to Surface end at the surface point
+    nearest P (section_frame), or None where the aim doesn't apply (SQUARE
+    on a face: no edge to be square to; a guide that has no direction)."""
+    d = aim.get("dir", "FREE")
+    if d == "SQUARE" and is_face_ref(ref):
+        return None
+    P, n, Q, C, _, _ = surface_jet(src_obj, ref, P, face)
+    kg = j = 0.0
+    if d == "CURVE":
+        g = aim.get("guide")
+        if not g:
+            return None
+        t, kg, j = guide_jet(g[0], g[1], P, n)
+        if t is None:
+            return None
+    else:
+        t = aim_direction(aim_axes(src_obj, ref, P, face), 90.0 if d == "SQUARE" else aim.get("angle", 90.0))
+    return section_frame(P, n, Q, C, t, kg, j)
+
+
+def end_frame(src_obj, ref, near, snap="END", mode="EDGE", flip=False, face=0, aim=None):
     """World frame (P, D, DD, surf) of an align target, as solve() builds it
     (a Frame: .d3 holds the third derivative). NORMAL: the surface's normal
     line at the point (D = the unit normal, turned round by flip; DD = DDD = 0),
     solved like an edge. A face target (F<i>) lies at the point of the face
-    nearest `near`: NORMAL, or SURFACE (D then any tangent)."""
+    nearest `near`: NORMAL, or SURFACE (D then any tangent). aim (spec_aim):
+    a SURFACE end's set direction -- the surface's section along it, solved
+    as an edge (surf None), turned round by flip."""
     near = np.asarray(near, float)
     mode = solve_mode(mode, src_obj, ref)
     z = np.zeros(3)
+    if mode == "SURFACE" and aim:
+        Pa = near if is_face_ref(ref) else edge_frame(src_obj, ref, near, snap, False)[0]
+        fr = aim_frame(src_obj, ref, Pa, face, aim)
+        if fr is not None:
+            return flipped(fr) if flip else fr
     if is_face_ref(ref):
         P, n, _, _, _, _ = surface_jet(src_obj, ref, near)
         if mode == "SURFACE":
@@ -312,9 +453,20 @@ def orient(spec, fr, toward):
 
 def needs_orient(spec):
     """Ends whose direction is not fixed by the target alone: a point along an
-    edge (EDGE NEAREST) and the normal line (NORMAL)."""
+    edge (EDGE NEAREST), the normal line (NORMAL) and an aimed surface end."""
+    return orient_side(spec) is not None
+
+
+def orient_side(spec):
+    """How an end's frame is turned to the curve when it is first aligned:
+    "curve" -- toward the curve's CVs (the normal line, an aimed surface
+    end), "d1" -- the way the curve already heads (EDGE NEAREST), or None."""
     m = spec.get("mode", "EDGE")
-    return m in SQUARE or (m == "EDGE" and spec.get("snap") == "NEAREST")
+    if m in SQUARE or aimed(spec):
+        return "curve"
+    if m == "EDGE" and spec.get("snap") == "NEAREST":
+        return "d1"
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -332,15 +484,16 @@ def side_point(obj, ref, end=1, at=None, uv=None):
     return np.array(kc.evaluate(t), float)
 
 
-def side_frame(obj, ref, end=1, at=None, uv=None, mode="EDGE", face=0, third=False, toward=None):
+def side_frame(obj, ref, end=1, at=None, uv=None, mode="EDGE", face=0, third=False, toward=None, angle=None):
     """(P, C1, C2[, C3]) world of what a blend side carries on:
       EDGE     the curve / edge itself: at an end outward (as always), at a
                point along it (at) forward, or toward `toward` (the other
                side's point) when given;
       SURFACE  tangent to the edge's surface, square to the edge and off the
                face (C2 / C3 normal to it: the surface's normal curvature and
-               its rate in that direction, contact of order 2 / 3); on a face
-               (F<i>), the direction toward `toward` in its tangent plane;
+               its rate in that direction, contact of order 2 / 3) -- or
+               `angle` degrees from the edge toward that (90: square); on a
+               face (F<i>), the direction toward `toward` in its tangent plane;
       NORMAL   perpendicular to the surface: its normal line (toward the
                other side), C2 = C3 = 0."""
     mode = solve_mode(mode, obj, ref)
@@ -381,7 +534,12 @@ def side_frame(obj, ref, end=1, at=None, uv=None, mode="EDGE", face=0, third=Fal
     else:
         kc = features.input_curve(obj, ref)
         e = geom.curve_derivs(kc, curve_param_near(kc, P), 1)[1]
-        b = _outward_across(f, obj, P, n, e / (np.linalg.norm(e) or 1.0))
+        e = e - (e @ n) * n
+        e /= np.linalg.norm(e) or 1.0
+        b = _outward_across(f, obj, P, n, e)
+        if angle is not None:
+            th = np.radians(float(angle))
+            b = np.cos(th) * e + np.sin(th) * b
     DD = float(b @ Q @ b) * n
     if not third:
         return P, b, DD
@@ -764,9 +922,10 @@ def _align_ends(Q, p, ends, specs):
         spec = specs[e]
         fr = ends[e][1]
         seg, Ub = (Q, U) if e == "0" else _reverse(Q, U)
-        if spec.get("mode", "EDGE") in SQUARE:
+        side = orient_side(spec)
+        if side == "curve":
             fr = orient(spec, fr, np.mean(seg[1:], axis=0) - seg[0])
-        elif spec.get("snap") == "NEAREST" and spec.get("mode", "EDGE") == "EDGE":
+        elif side == "d1":
             fr = orient(spec, fr, _derivs(seg, Ub, p)[0])
         new = align_start(seg, Ub, p, spec, fr, I)
         Q = new if e == "0" else _reverse(new, Ub)[0]
@@ -856,7 +1015,7 @@ def solve(obj, ends, inputs, fresh=()):
             seg, Ub = (Q, U) if e == "0" else _reverse(Q, U)
         near = world_end(seg[0])
         fr = end_frame(src, ref, near, spec.get("snap", "END"), spec.get("mode", "EDGE"),
-                       spec.get("flip", False), spec.get("face", 0))
+                       spec.get("flip", False), spec.get("face", 0), aim=spec_aim(spec, inputs))
         if e not in fresh:
             spec = dict(spec, weight=1.0, keep=True)
         spec = dict(spec, mode=solve_mode(spec.get("mode", "EDGE"), src, ref))

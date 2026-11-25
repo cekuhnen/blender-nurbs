@@ -40,7 +40,11 @@ onto a curve or a surface edge is G0, G1 or G2 to it, solved exactly like
 Align Curve (align.py): only the end CVs move in CV mode, Through Points adds
 CVs so the curve still passes through every click. With G1 / G2 and
 Construction History on, the curve gets an Align Curve history step at once,
-so its ends stay locked to their targets when either one changes.
+so its ends stay locked to their targets when either one changes. Tangent to
+Surface ends leave Square to the edge (default), at an Angle from it, Along a
+curve lying on the surface, or Free (align.py aims); R aims an end with the
+mouse (snaps: square, the edge, u / v, curves on the surface), D switches
+both ends Square / Free.
 In curve Edit Mode the new splines go into the object being edited.
 """
 
@@ -1527,6 +1531,40 @@ CURVE_EDGE_MODES = EDGE_MODES + [
     ("SYMMETRY", "Symmetry Plane", "On a surface edge or face the curve leaves square to it and joins its mirror "
                                    "image smoothly: G2 keeps its bend there, G3 also its rate; curves are continued")]
 CURVE_MODE_NEXT = {"SURFACE": "NORMAL", "NORMAL": "SYMMETRY", "SYMMETRY": "EDGE", "EDGE": "SURFACE"}
+AIM_ITEMS = [("SQUARE", "Square", "Square to the edge it was snapped on, with no sideways bend (G2 / G3): seen "
+                                  "down the normal it starts out straight. On a face: Free"),
+             ("ANGLE", "Angle", "At an angle from the edge (on a face, from the surface's u direction), turned "
+                                "round the normal, with no sideways bend (G2 / G3)"),
+             ("CURVE", "Along Curve", "Along a curve lying on the surface through the end (R aims it), taking "
+                                      "its sideways bend too (G2 / G3)"),
+             ("FREE", "Free", "Whichever way the curve's own CVs lead (only its bend off the surface is set)")]
+AIM_TEXT = {"SQUARE": "square", "ANGLE": "angle", "CURVE": "along curve", "FREE": "free"}
+AIM_SNAP_DEG = 6.0              # R: the direction snaps to square, the edge, iso lines and curves this near
+
+
+def _aim_info(spec):
+    """", square to the edge" etc. for an end spec's direction (CV Curve's report)."""
+    d = spec.get("dir", "FREE")
+    if d == "SQUARE":
+        return ", square to the edge"
+    if d == "ANGLE":
+        return f", {spec.get('angle', 90.0):.1f}° from the edge"
+    if d == "CURVE":
+        return f", along {spec.get('guide_src', ('the curve',))[0]}"
+    return ""
+
+
+def _guide_data(op):
+    """{"start_guide" / "end_guide": (object name, ref)} of CV Curve's Along
+    Curve ends: while drawing (op._guides), else from its data (redo)."""
+    g = getattr(op, "_guides", None)
+    if g is not None:
+        return {f"{'start' if e == '0' else 'end'}_guide": v for e, v in g.items() if v}
+    try:
+        d = json.loads(op.data or "{}")
+    except ValueError:
+        d = {}
+    return {k: tuple(d[k]) for k in ("start_guide", "end_guide") if d.get(k)}
 LAST_INFO = {"text": ""}
 START_MODES = [("FREE", "Free", "The line leaves its start in any direction"),
                ("TANGENT", "Tangent", "A line started on an edge or curve leaves tangent to it, and slides along it "
@@ -1568,6 +1606,16 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
                                            "are aligned once, and the curve is a plain curve (Align Curve can "
                                            "add the step later)")
     edge_mode: EnumProperty(name="On Surfaces", items=CURVE_EDGE_MODES, default="SURFACE")
+    start_dir: EnumProperty(name="Start Direction", items=AIM_ITEMS, default="SQUARE",
+                            description="Tangent to Surface: which way the start leaves across the surface")
+    start_angle: FloatProperty(name="Start Angle", default=90.0, soft_min=0.0, soft_max=180.0, precision=1,
+                               description="Angle: degrees from the edge (on a face, from the surface's u "
+                                           "direction), turned round the normal. 90 is square")
+    end_dir: EnumProperty(name="End Direction", items=AIM_ITEMS, default="SQUARE",
+                          description="Tangent to Surface: which way the end arrives across the surface")
+    end_angle: FloatProperty(name="End Angle", default=90.0, soft_min=0.0, soft_max=180.0, precision=1,
+                             description="Angle: degrees from the edge (on a face, from the surface's u "
+                                         "direction), turned round the normal. 90 is square")
     show_cvs: draw.show_cvs_prop()
     show_comb: draw.show_comb_prop()
     data: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
@@ -1588,6 +1636,16 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
         col.row().prop(self, "end_cont", expand=True)
         col.prop(self, "keep_aligned")
         col.prop(self, "edge_mode")
+        if self.edge_mode == "SURFACE":
+            d = _guide_data(self)
+            for e, name in (("start", "Start"), ("end", "End")):
+                row = col.row(align=True)
+                row.prop(self, f"{e}_dir", text=f"{name} Direction")
+                if getattr(self, f"{e}_dir") == "ANGLE":
+                    row.prop(self, f"{e}_angle", text="")
+                elif getattr(self, f"{e}_dir") == "CURVE":
+                    g = d.get(f"{e}_guide")
+                    row.label(text=g[0] if g else "no guide: square")
         draw.draw_curve_show(lay, self)
         if LAST_INFO["text"]:
             for line in LAST_INFO["text"].split("\n"):
@@ -1602,6 +1660,8 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
         self._edit = _edit_target(context)
         self._pts, self._snapinfo = [], []
         self._frames = {}
+        self._guides = {}           # "0" / "1": (object name, ref) an Along Curve end follows (R)
+        self._aim = None            # R: the end whose direction the mouse turns (_aim_begin)
         self._start_refs = None     # the start's references (T cycles them once the start is placed)
         self.sketch_start(context)
         context.window_manager.modal_handler_add(self)
@@ -1619,6 +1679,23 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
             rows.append(("Ends", [hints.cycle("S", conts, self.start_cont, "start"),
                                   hints.cycle("E", conts, self.end_cont, "end"),
                                   hints.toggle("A", "keep aligned", self.keep_aligned)]))
+        a = getattr(self, "_aim", None)
+        if a is not None:
+            hints.show(context, "CV Curve", [f"aim the {'start' if a['e'] == '0' else 'end'}", a["label"]],
+                       [("Aim", [hints.note("move the mouse to turn the end round the surface normal; it snaps "
+                                            "to square, the edge, u / v and curves on the surface")]),
+                        ("Keys", [hints.key("Shift", "15°"), hints.key("Alt", "no snapping"),
+                                  hints.key("Enter R", "set"), hints.key("Esc", "cancel")])],
+                       [("MOUSE_LMB", "Set"), ("MOUSE_RMB", "Cancel")])
+            return
+        if self.edge_mode == "SURFACE" and not self.closed:
+            dirs = [AIM_TEXT[self.start_dir] + (f" {self.start_angle:.0f}°" if self.start_dir == "ANGLE" else ""),
+                    AIM_TEXT[self.end_dir] + (f" {self.end_angle:.0f}°" if self.end_dir == "ANGLE" else "")]
+            rows.append(("Across", [hints.cycle("D", ["square", "free"], "square" if self.start_dir == self.end_dir
+                                                == "SQUARE" else ("free" if self.start_dir == self.end_dir == "FREE"
+                                                                  else None), "surface ends"),
+                                    hints.key("R", "aim the end round the normal"),
+                                    hints.note(dirs[0] if dirs[0] == dirs[1] else f"start {dirs[0]} · end {dirs[1]}")]))
         rows += [("Snap", self.snap_hints()), ("Reference", self.reference_hints(self.edge_mode)),
                  ("Curve", [hints.cycle("M", ["CVs", "through points"],
                                         "CVs" if self.mode == "CV" else "through points"),
@@ -1628,9 +1705,27 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
         hints.show(context, "CV Curve", [f"{n} point(s)", self.lock_text().strip(" ·")], rows, MOUSE_SKETCH)
 
     # -- end conditions ---------------------------------------------------
-    def _cond(self, src, P, cont):
-        """(align end spec, world frame) for an end snapped onto src = (object
-        name, ref, END / NEAREST); None if it can't be evaluated."""
+    def _aim_spec(self, e, ref):
+        """{"dir"[, "angle"][, "guide_src"]} of end e ("0" / "1") on a surface
+        target ref, Tangent to Surface: Square on a face is Free, Along Curve
+        with no guide picked is Square."""
+        from . import align
+        d = self.start_dir if e == "0" else self.end_dir
+        g = _guide_data(self).get("start_guide" if e == "0" else "end_guide")
+        if d == "CURVE" and not (g and bpy.data.objects.get(g[0])):
+            d = "SQUARE"
+        if d == "SQUARE" and align.is_face_ref(ref):
+            d = "FREE"
+        out = {"dir": d}
+        if d == "ANGLE":
+            out["angle"] = float(self.start_angle if e == "0" else self.end_angle)
+        elif d == "CURVE":
+            out["guide_src"] = (g[0], g[1])
+        return out
+
+    def _cond(self, src, P, cont, e="0"):
+        """(align end spec, world frame) for an end e snapped onto src =
+        (object name, ref, END / NEAREST); None if it can't be evaluated."""
         from . import align, store
         name, ref, snap, face = (list(src) + [None])[:4]
         obj = bpy.data.objects.get(name)
@@ -1638,13 +1733,21 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
             return None
         mode = align.solve_mode(self.edge_mode, obj, ref)
         face = face if mode in ("SURFACE", "NORMAL", "SYMMETRY") else None
+        aim = self._aim_spec(e, ref) if mode == "SURFACE" else {}
         frames = getattr(self, "_frames", None)
         if frames is None:
             frames = self._frames = {}
-        key = (name, ref, snap, mode, face, tuple(np.round(np.asarray(P, float), 12)))
+        key = (name, ref, snap, mode, face, tuple(np.round(np.asarray(P, float), 12)),
+               json.dumps(aim, sort_keys=True))
         if key not in frames:
+            a = None
+            if aim.get("dir", "FREE") != "FREE":
+                a = dict(aim)
+                gs = a.pop("guide_src", None)
+                if gs:
+                    a["guide"] = (bpy.data.objects[gs[0]], gs[1])
             try:
-                frames[key] = align.end_frame(obj, ref, P, snap, mode, face=face or 0)
+                frames[key] = align.end_frame(obj, ref, P, snap, mode, face=face or 0, aim=a)
             except Exception as exc:
                 print("CV Curve: no frame on", name, ref, exc)
                 frames[key] = None
@@ -1652,6 +1755,8 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
         if fr is None:
             return None
         spec = {"cont": cont, "weight": 1.0, "mode": mode, "snap": snap, "flip": False}
+        if aim.get("dir", "FREE") != "FREE":
+            spec.update(aim)
         if face is not None:
             spec["face"] = int(face)
         return spec, fr
@@ -1666,7 +1771,7 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
         out = {}
         for e, src, P, cont in (("0", srcs[0], pts[0], self.start_cont), ("1", srcs[-1], pts[-1], self.end_cont)):
             if src:
-                c = self._cond(tuple(src), P, cont)
+                c = self._cond(tuple(src), P, cont, e)
                 if c is not None:
                     out[e] = c
         return out
@@ -1690,6 +1795,8 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
         ov["cursor"] = Vector(hover[0]) if hover and hover[0] is not None else None
         ov["curves"], ov["hull"], ov["cvs"] = [], [], [Vector(p) for p in self._pts]
         self.axis_guides(context, self._pts[-1] if self._pts else None)
+        if getattr(self, "_aim", None) is not None:
+            self._aim_overlay(context)
         st = getattr(self, "_start_refs", None)
         self.show_refs([st["cands"][st["i"]]] if st and st["cands"] and not self.closed else [])
         ov["comb"] = None
@@ -1711,11 +1818,254 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
         # Emulate Numpad sends the top-row 1-5 as number-pad keys: here they set the degree
         return event.type in DEGREE_PAD and bpy.context.preferences.inputs.use_emulate_numpad
 
+    # -- R: aim a Tangent to Surface end (turn it round the surface normal) --
+    def _aim_target(self, context, event):
+        """(end, point, snap, object, ref, face) R aims: the hovered point when
+        it snaps onto a surface edge or face (the end, placed on confirm), else
+        the start when it was; None if neither is on a surface."""
+        from . import align
+        if self.closed or not self._pts:
+            return None
+        first = [(self._pts[0], None, "first")] if len(self._pts) >= 3 else []
+        P, snap = self.pick_point(context, event, first, self._pts[-1])
+        cands = [("1", P, snap)] if P is not None and self._src(snap) else []
+        if self._snapinfo and self._src(self._snapinfo[0]):
+            cands.append(("0", self._pts[0], self._snapinfo[0]))
+        for e, P_, sn in cands:
+            name, ref, _, face = (list(self._src(sn)) + [None])[:4]
+            obj = bpy.data.objects.get(name)
+            if obj is not None and obj.type == 'CURVE':
+                # on a curve lying on a surface (a projected curve): the surface edge it
+                # ends at, aimed along the curve -- its end is often a little off the edge
+                hit = self._edge_under_curve(context, obj, ref, np.asarray(P_, float))
+                if hit is not None:
+                    P_e, obj_e, ref_e, k = hit
+                    sn_e = ("edge", None, (obj_e.name, ref_e, "NEAREST", k), "Edge · Face")
+                    return e, P_e, sn_e, obj_e, ref_e, k, {"guide": (obj.name, ref), "old": (P_, sn)}
+                continue
+            if obj is None or align.solve_mode("SURFACE", obj, ref) != "SURFACE":
+                continue
+            return e, np.asarray(P_, float), sn, obj, ref, int(face or 0), None
+        return None
+
+    def _edge_under_curve(self, context, cobj, cref, P):
+        """(point, object, "E<i>", face) of the visible surface edge nearest P
+        within 1 % of the surface's size, on the face the curve runs over;
+        None if there is none."""
+        from . import align, features, store
+        best = None
+        for o in context.visible_objects:
+            if o.type == 'CURVE' or not store.is_nurbs(o):
+                continue
+            tol = 0.01 * (float(max(o.dimensions)) or 1.0)
+            C = np.array([tuple(o.matrix_world @ Vector(c)) for c in o.bound_box], float)
+            if np.any(P < C.min(axis=0) - tol) or np.any(P > C.max(axis=0) + tol):
+                continue
+            try:
+                edges = store.get_brep(o).edges()
+            except Exception:
+                continue
+            for i in range(len(edges)):
+                try:
+                    kc = features.input_curve(o, f"E{i}")
+                    Q = np.array(kc.evaluate(align.curve_param_near(kc, P)), float)
+                except Exception:
+                    continue
+                d = float(np.linalg.norm(Q - P))
+                if d <= tol and (best is None or d < best[0]):
+                    best = (d, Q, o, i)
+        if best is None:
+            return None
+        _, Q, o, i = best
+        k = 0
+        try:
+            fs = list(store.get_brep(o).edges()[i].faces())
+            if len(fs) > 1:
+                # the face the curve runs over: nearest a point a little way along it
+                kc = features.input_curve(cobj, cref)
+                t0, t1 = kc.parameter_range()
+                tP = align.curve_param_near(kc, P)
+                X = np.array(kc.evaluate(tP + (0.1 if tP - t0 < t1 - tP else -0.1) * (t1 - t0)), float)
+                Mi = np.linalg.inv(np.array(geom.world_matrix(o), float))
+                xl = tuple(map(float, Mi[:3, :3] @ X + Mi[:3, 3]))
+                k = min(range(len(fs)), key=lambda j: fs[j].closest_point(xl)[1])
+        except Exception:
+            k = 0
+        return Q, o, f"E{i}", k
+
+    @staticmethod
+    def _aim_deg(e, b, d):
+        """Angle (degrees, 0..180: a direction and its reverse are one) of d from e toward b."""
+        return math.degrees(math.atan2(float(d @ b), float(d @ e))) % 180.0
+
+    def _aim_guides(self, context, obj, P, n, e, b):
+        """Snap directions along the visible curves lying on the surface through P:
+        [(angle, label, (object name, ref))]."""
+        from . import align, features
+        size = float(max(obj.dimensions)) or 1.0
+        tol = 0.01 * size
+        skip = {self._edit.name} if getattr(self, "_edit", None) else set()
+        out = []
+        for o in context.visible_objects:
+            if o.type != 'CURVE' or o.name in skip:
+                continue
+            C = np.array([tuple(o.matrix_world @ Vector(c)) for c in o.bound_box], float)
+            if np.any(P < C.min(axis=0) - tol) or np.any(P > C.max(axis=0) + tol):
+                continue
+            for i in range(len(o.data.splines)):
+                ref = f"S{i}"
+                try:
+                    kc = features.input_curve(o, ref)
+                    t = align.curve_param_near(kc, P)
+                    if np.linalg.norm(np.array(kc.evaluate(t), float) - P) > tol:
+                        continue
+                    T = np.asarray(geom.curve_derivs(kc, t, 1)[1], float)
+                    if abs(T @ n) > 0.25 * (np.linalg.norm(T) or 1.0):
+                        continue                # crosses the surface: not lying on it
+                    tg = align.guide_jet(o, ref, P, n)[0]
+                except Exception:
+                    continue
+                if tg is not None:
+                    out.append((self._aim_deg(e, b, tg), f"Along {o.name}", (o.name, ref)))
+        return out
+
+    def _aim_begin(self, context, tgt):
+        from . import align
+        e, P, sn, obj, ref, face, conv = tgt
+        if getattr(self, "_guides", None) is None:
+            self._guides = {}
+        try:
+            axes = align.aim_axes(obj, ref, P, face)
+        except Exception as exc:
+            self.report({'WARNING'}, f"CV Curve: can't aim on {obj.name}: {exc}")
+            return False
+        n, ae, ab = axes
+        cands = [] if align.is_face_ref(ref) else [(90.0, "Square", None), (0.0, "Along the edge", None)]
+        try:
+            _, su, sv = align.surface_iso(obj, ref, P, face)
+            cands += [(self._aim_deg(ae, ab, su), "Along u", None), (self._aim_deg(ae, ab, sv), "Along v", None)]
+        except Exception:
+            pass
+        cands += self._aim_guides(context, obj, P, n, ae, ab)
+        keep = {k: getattr(self, k) for k in ("start_dir", "start_angle", "end_dir", "end_angle", "edge_mode")}
+        keep["guide"] = self._guides.get(e)
+        keep["conv"] = None
+        self.edge_mode = "SURFACE"
+        d, ang = (self.start_dir, self.start_angle) if e == "0" else (self.end_dir, self.end_angle)
+        th = float(ang) if d == "ANGLE" else 90.0
+        g = None
+        if conv is not None:
+            # from a curve on the surface: the end moves onto the edge, aimed along the curve
+            g = next((c for c in cands if c[2] and tuple(c[2]) == tuple(conv["guide"])), None)
+            if g is not None:
+                th = g[0]
+                self._aim_set(e, "CURVE", guide=g[2])
+            if e == "0":
+                keep["conv"] = (self._pts[0], self._snapinfo[0], self._start_refs)
+                self._pts[0], self._snapinfo[0], self._start_refs = P, sn, None
+        self._aim = {"e": e, "P": P, "snap": sn, "axes": axes, "cands": cands, "keep": keep,
+                     "theta": th % 180.0, "label": ""}
+        if conv is not None and g is not None:
+            self._aim["label"] = f"{g[1]} · {th % 180.0:.1f}°"
+        return True
+
+    def _aim_set(self, e, d, angle=None, guide=None):
+        setattr(self, "start_dir" if e == "0" else "end_dir", d)
+        if angle is not None:
+            setattr(self, "start_angle" if e == "0" else "end_angle", float(angle))
+        if guide is not None:
+            self._guides[e] = guide
+
+    def _aim_update(self, context, event):
+        """The direction toward the mouse, in the tangent plane (through the
+        view: the plane's axes as seen on screen), snapped."""
+        a = self._aim
+        region, rv3d = self._win(context)
+        n, e, b = a["axes"]
+        P = a["P"]
+        L = 0.1 * max(float(getattr(rv3d, "view_distance", 10.0)), 1e-6)
+        p0 = view3d_utils.location_3d_to_region_2d(region, rv3d, Vector(P))
+        pe = view3d_utils.location_3d_to_region_2d(region, rv3d, Vector(P + L * e))
+        pb = view3d_utils.location_3d_to_region_2d(region, rv3d, Vector(P + L * b))
+        th = a["theta"]
+        if p0 is not None and pe is not None and pb is not None:
+            E, B, M = pe - p0, pb - p0, Vector(self._mouse(context, event)) - p0
+            det = E.x * B.y - E.y * B.x
+            if abs(det) > 1e-3 * (E.length * B.length + 1e-30) and M.length > 4.0:
+                c = (M.x * B.y - M.y * B.x) / det
+                s = (E.x * M.y - E.y * M.x) / det
+                th = math.degrees(math.atan2(s, c)) % 180.0
+        label, guide = None, None
+        if event.shift:
+            th = (round(th / 15.0) * 15.0) % 180.0
+        elif not event.alt and a["cands"]:
+            off = lambda c: abs(((th - c[0] + 90.0) % 180.0) - 90.0)
+            best = min(a["cands"], key=off)
+            if off(best) <= AIM_SNAP_DEG:
+                th, label, guide = best
+        if guide is not None:
+            self._aim_set(a["e"], "CURVE", guide=guide)
+        elif label == "Square":
+            self._aim_set(a["e"], "SQUARE")
+        else:
+            self._aim_set(a["e"], "ANGLE", th)
+        a["theta"] = th
+        a["label"] = (f"{label} · " if label else "") + f"{th:.1f}°"
+
+    def _aim_overlay(self, context):
+        a = self._aim
+        n, e, b = a["axes"]
+        _, rv3d = self._win(context)
+        L = 0.15 * max(float(getattr(rv3d, "view_distance", 10.0)), 1e-6)
+        t = math.cos(math.radians(a["theta"])) * e + math.sin(math.radians(a["theta"])) * b
+        P = a["P"]
+        ov = draw.sketch_overlay
+        ov["axes"] = list(ov.get("axes") or []) + [([Vector(P - L * t), Vector(P + L * t)], COL_TANGENT)]
+        ov["snap"] = Vector(P)
+        ov["snap_label"] = a["label"] or f"{a['theta']:.1f}°"
+
+    def _aim_preview(self, context):
+        a = self._aim
+        self._preview(context, (a["P"], a["snap"]) if a["e"] == "1" else None)
+        self._status(context)
+
+    def _aim_end(self, context, confirm):
+        a, self._aim = self._aim, None
+        if not confirm:
+            for k, v in a["keep"].items():
+                if k not in ("guide", "conv"):
+                    setattr(self, k, v)
+            if a["keep"]["conv"] is not None:
+                self._pts[0], self._snapinfo[0], self._start_refs = a["keep"]["conv"]
+            if a["keep"]["guide"] is None:
+                self._guides.pop(a["e"], None)
+            else:
+                self._guides[a["e"]] = a["keep"]["guide"]
+        elif a["e"] == "1":
+            self.fix_plane(context, a["P"])          # the aimed end is placed, as a click would
+            self._pts.append(a["P"])
+            self._snapinfo.append(a["snap"])
+            self._edge_lock = None
+        self._preview(context)
+        self._status(context)
+
+    def _aim_modal(self, context, event):
+        if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE', 'LEFT_SHIFT', 'RIGHT_SHIFT', 'LEFT_ALT', 'RIGHT_ALT'}:
+            self._aim_update(context, event)
+            self._aim_preview(context)
+        elif event.value == 'PRESS' and event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER', 'SPACE', 'R'}:
+            self._aim_end(context, True)
+        elif event.value == 'PRESS' and event.type in {'ESC', 'RIGHTMOUSE', 'BACK_SPACE'}:
+            self._aim_end(context, False)
+        return {'RUNNING_MODAL'}
+
     def modal(self, context, event):
         if self.passthrough(context, event):
             return {'PASS_THROUGH'}
         if self.hints_key(context, event):
             return {'RUNNING_MODAL'}
+        if getattr(self, "_aim", None) is not None:
+            return self._aim_modal(context, event)
         prev = self._pts[-1] if self._pts else None
         first = [(self._pts[0], None, "first")] if len(self._pts) >= 3 else []
         hover = lambda: self.pick_point(context, event, first, prev)
@@ -1778,6 +2128,20 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
             self._refs = None
             self._preview(context, hover())
             self._status(context)
+        elif event.value == 'PRESS' and event.type == 'R' and not self.closed:
+            tgt = self._aim_target(context, event)
+            if tgt is None:
+                self.report({'INFO'}, "CV Curve: R aims an end snapped onto a surface edge or face")
+            elif self._aim_begin(context, tgt):
+                if tgt[6] is None:          # (from a curve: along it until the mouse moves)
+                    self._aim_update(context, event)
+                self._aim_preview(context)
+        elif event.value == 'PRESS' and event.type == 'D' and not self.closed:
+            d = "FREE" if self.start_dir == "SQUARE" and self.end_dir == "SQUARE" else "SQUARE"
+            self.start_dir = self.end_dir = d
+            self.edge_mode = "SURFACE"
+            self._preview(context, hover())
+            self._status(context)
         elif event.value == 'PRESS' and event.type in {'S', 'E'}:
             prop = "start_cont" if event.type == 'S' else "end_cont"
             setattr(self, prop, {"G0": "G1", "G1": "G2", "G2": "G3", "G3": "G0"}[getattr(self, prop)])
@@ -1826,7 +2190,9 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
                                 "start": list(srcs[0]) if srcs and srcs[0] else None,
                                 "end": list(srcs[-1]) if len(srcs) > 1 and srcs[-1] else None,
                                 "edit": self._edit.name if self._edit else "",
-                                "normal": _plane_normal(self)})
+                                "normal": _plane_normal(self),
+                                **{f"{'start' if e == '0' else 'end'}_guide": list(g)
+                                   for e, g in getattr(self, "_guides", {}).items() if g}})
         self.sketch_end(context)
         return self.execute(context)
 
@@ -1868,7 +2234,8 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
                 src = d["start"] if e == "0" else d["end"]
                 lines.append(f"{'Start' if e == '0' else 'End'}: {specs[e]['cont']} to {src[0]} {src[1]}"
                              + ("" if specs[e]["mode"] == "EDGE" else
-                                {"SURFACE": " (tangent to the surface", "NORMAL": " (perpendicular to the surface",
+                                {"SURFACE": " (tangent to the surface" + _aim_info(specs[e]),
+                                 "NORMAL": " (perpendicular to the surface",
                                  "SYMMETRY": " (symmetry plane"}.get(specs[e]["mode"], " (") + (f", its face {specs[e]['face'] + 1})"
                                                                       if "face" in specs[e] else ")")))
         if any(align.CONT[s_["cont"]] >= 1 for s_ in specs.values()):
@@ -1884,9 +2251,13 @@ class NPROTO_OT_draw_curve(SketchMixin, bpy.types.Operator):
                     if e in specs:
                         src = d["start"] if e == "0" else d["end"]
                         inputs.append((bpy.data.objects[src[0]], src[1]))
-                        ends_h[e] = {k: specs[e][k] for k in ("cont", "weight", "mode", "snap", "flip", "face")
-                                     if k in specs[e]}
+                        ends_h[e] = {k: specs[e][k] for k in ("cont", "weight", "mode", "snap", "flip", "face",
+                                                              "dir", "angle") if k in specs[e]}
                         ends_h[e]["input"] = len(inputs) - 1
+                        gs = specs[e].get("guide_src")
+                        if gs and bpy.data.objects.get(gs[0]) is not None:
+                            inputs.append((bpy.data.objects[gs[0]], gs[1]))     # Along Curve: the guide too
+                            ends_h[e]["guide"] = len(inputs) - 1
                 try:
                     # once through Align's own solve, so geometry and history agree exactly
                     kind, deg_, Q, _ = align.solve(obj, ends_h, inputs)

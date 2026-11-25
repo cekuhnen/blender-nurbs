@@ -3529,7 +3529,7 @@ dE = store.display(ARC)["edges"]
 ei = min(range(len(dE)), key=lambda i_: abs(np.mean(np.array(dE[i_])[:, 1])) + 10 * (np.ptp(np.array(dE[i_])[:, 2]) < 1e-6))
 clk = [(0.5, 0.0, 0.15), (1.1, -0.6, 0.35), (1.6, -1.4, 0.3), (2.0, -2.0, 0.0)]
 r, CS = _draw(clk, [ARC.name, f"E{ei}", "NEAREST"], None, mode="THROUGH", degree="3", start_cont="G2",
-              edge_mode="SURFACE")
+              edge_mode="SURFACE", start_dir="FREE")      # (Free: the clicks lead it across the arc, curved)
 kcs = features.input_curve(CS, "S0")
 ds = _al._k()[0].evaluate_curve(kcs, kcs.parameter_range()[0])
 c1, c2 = np.array(ds["tangent"], float), np.array(ds["curvature"], float)
@@ -3607,8 +3607,9 @@ bpy.ops.nproto.add_primitive(kind='CYLINDER', radius=0.5, height=1.2, caps=True)
 MCY = ctx.active_object
 fc = _FCtx()
 rim = 0.5 * np.array([math.cos(math.radians(30)), math.sin(math.radians(30))])
+# (Free: Square would run the curve down the cylinder's side, into the Line checks below)
 cv = _fake(_dt.NPROTO_OT_draw_curve, mode="CV", degree="3", closed=False, start_cont="G1", end_cont="G1",
-           edge_mode="SURFACE", keep_aligned=True)
+           edge_mode="SURFACE", keep_aligned=True, start_dir="FREE", end_dir="FREE")
 cv._edit, cv._pts, cv._snapinfo, cv._frames, cv._start_refs = None, [], [], {}, None
 cv.sketch_start(fc)
 cv.modal(fc, _ev('MOUSEMOVE', _wpx(*rim), 'NOTHING'))

@@ -277,7 +277,7 @@ def constrain_align(obj):
         src, ref = inputs[int(spec["input"])]
         near = M[:3, :3] @ seg[0] + M[:3, 3]
         fw = align.end_frame(src, ref, near, spec.get("snap", "END"), spec.get("mode", "EDGE"),
-                             spec.get("flip", False), spec.get("face", 0))
+                             spec.get("flip", False), spec.get("face", 0), aim=align.spec_aim(spec, inputs))
         shape = align.EndShape(Ub, p, k, spec.get("mode", "EDGE"), fw, Mi[:3, :3], Mi[:3, 3], size)
         x0 = shape.numbers(seg)
         on = shape.rows(x0, seg)
