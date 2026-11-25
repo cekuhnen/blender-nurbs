@@ -394,7 +394,8 @@ def apply_edge_fillet(obj, text, inputs, p):
                         shape=p.get("shape", "CIRCULAR"), radius=p["radius"], end_radius=p.get("end_radius"),
                         chord=p["radius"] if (p.get("chord") and p.get("shape") != "SOFT") else None,
                         continuity=int(p.get("continuity", 1)), thumbweight=p.get("thumbweight", 1.0), loose=True,
-                        smoothing=float(p.get("smoothing", 0.6)),
+                        smoothing=float(p.get("smoothing", 0.6)), setback=bool(p.get("setback")),
+                        distance_b=p.get("distance_b"), flip=bool(p.get("flip")),
                         shrink_planes=bool(p.get("shrink_planes")),
                         **class_a_params(p))
     breps["result"] = soft_corners(obj, breps["result"], info, p)
@@ -446,7 +447,7 @@ def apply_fillet_trim(obj, text, inputs, p):
     res, breps = jobs.run("fillet", objs, ["fillet", "a", "b"], radius_a=p["radius_a"], radius_b=p["radius_b"],
                           xsect=p["xsect"], chord=abs(p["radius_a"]) if p.get("chord") else None,
                           blend=p.get("blend", 0), soft=p.get("soft"), tolerance=1e-4, trim_bases=trim,
-                          ends=p.get("ends", "NOTCH"), **fillet_radii(p))
+                          ends=p.get("ends", "NOTCH"), setback=bool(p.get("setback")), **fillet_radii(p))
     if role not in breps and not trim:
         return text                 # Extend without trimming: this side was not the one grown
     if role not in breps:
@@ -627,7 +628,10 @@ APPLY = {"replace_face": apply_replace_face, "push_pull": apply_push_pull, "rota
 LABEL = {
     "trim": lambda p: "Trim · " + {"KEEP": "Keep", "DELETE": "Discard"}.get(p.get("action"), p.get("action", "")),
     "edge_fillet": lambda p: f"Edge {p.get('shape', 'CIRCULAR').title()} · "
-                             + ("chord" if p.get("chord") else "r") + f" {p.get('radius', 0):.3g}"
+                             + ("chord" if p.get("chord") else "d" if (p.get("setback") and p.get("shape") == "CHAMFER")
+                                else "r") + f" {p.get('radius', 0):.3g}"
+                             + (f" / {p['distance_b']:.3g}" if p.get("distance_b") is not None
+                                and p.get("shape") == "CHAMFER" and p.get("setback") and not p.get("chord") else "")
                              + (" · Class-A" if p.get("class_a") else ""),
     "fillet_trim": lambda p: ("Fillet trim" if p.get("trim", True) else "Fillet extend"),
     "flip_normal": lambda p: "Flip Normal",
@@ -810,7 +814,7 @@ def _register():
                             radius_b=p["radius_b"], xsect=p["xsect"],
                             chord=abs(p["radius_a"]) if p.get("chord") else None, blend=p.get("blend", 0),
                             soft=p.get("soft"), tolerance=1e-4, trim_bases=False, ends=p.get("ends", "NOTCH"),
-                            **fillet_radii(p))
+                            setback=bool(p.get("setback")), **fillet_radii(p))
         return ("brep_text", breps["fillet"])
 
 

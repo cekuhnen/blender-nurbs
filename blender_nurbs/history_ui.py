@@ -19,7 +19,8 @@ _syncing = [False]
 # settings each step type exposes (in this order)
 STEP_FIELDS = {
     "trim": ["action", "scope", "projection", "reach", "through"],
-    "edge_fillet": ["shape", "rail_type", "radius", "variable", "end_radius", "continuity", "thumbweight",
+    "edge_fillet": ["shape", "rail_type", "same_distance", "radius", "distance_b", "flip_distances", "variable",
+                    "end_radius", "continuity", "thumbweight",
                     "smoothing", "fill_corners", "class_a", "ca_tolerance", "ca_angle", "ca_degree", "ca_continuity"],
     "rebuild_surface": ["degree_u", "degree_v", "spans_u", "spans_v"],
     "extend_surface": ["distance"],
@@ -72,6 +73,14 @@ def _on_step_change(self, context):
         if name == "rail_type":                 # chord: the size is the distance between the rails
             p["chord"] = self.radius if v == "CHORD" else None
             continue
+        if name == "same_distance":             # a chamfer's two distances: Distance B, else none
+            p["distance_b"] = None if v else self.distance_b
+            continue
+        if name == "distance_b":
+            continue
+        if name == "flip_distances":
+            p["flip"] = bool(v)
+            continue
         if name == "end_radius":
             p["end_radius"] = v if self.variable and self.rail_type != "CHORD" else None
         elif name in ("imprint_scope", "imprint_extend"):      # Imprint's own scope / extend
@@ -120,6 +129,9 @@ class NprotoStep(bpy.types.PropertyGroup):
     radius: FloatProperty(name="Radius", min=1e-4, soft_max=5.0, unit='LENGTH', **_S())
     variable: BoolProperty(name="Variable Radius", **_S())
     end_radius: FloatProperty(name="End Radius", min=1e-4, soft_max=5.0, unit='LENGTH', **_S())
+    same_distance: BoolProperty(name="Same Distance", default=True, **_S())
+    distance_b: FloatProperty(name="Distance B", min=1e-4, soft_max=5.0, unit='LENGTH', **_S())
+    flip_distances: BoolProperty(name="Flip A / B", **_S())
     continuity: EnumProperty(name="Continuity", items=[("1", "G1", ""), ("2", "G2", ""), ("3", "G3", "")], **_S())
     thumbweight: FloatProperty(name="Fullness", min=0.1, soft_max=3.0, **_S())
     smoothing: FloatProperty(name="Smoothing", min=0.1, max=1.0, subtype='FACTOR', **_S())
@@ -187,6 +199,12 @@ def sync_step(obj, k):
             try:
                 if name == "rail_type":
                     pg.rail_type = "CHORD" if p.get("chord") else "RADIUS"
+                elif name == "same_distance":
+                    pg.same_distance = p.get("distance_b") is None
+                elif name == "distance_b":
+                    pg.distance_b = p["distance_b"] if p.get("distance_b") is not None else p.get("radius", 0.1)
+                elif name == "flip_distances":
+                    pg.flip_distances = bool(p.get("flip"))
                 elif name == "variable":
                     pg.variable = p.get("end_radius") is not None
                 elif name == "end_radius":
@@ -434,9 +452,24 @@ def draw_steps(box, obj, only=None, bare=False):
                         continue
                     if name == "variable" and pg.rail_type == "CHORD":
                         continue
+                    # a chamfer's distances (steps made before them size it by the ball's radius)
+                    dist = (e["op"] == "edge_fillet" and pg.shape == "CHAMFER" and pg.rail_type == "RADIUS"
+                            and bool(e["params"].get("setback")))
+                    two = dist and not pg.same_distance
+                    if name in ("same_distance", "distance_b", "flip_distances") and not (
+                            dist and (name == "same_distance" or two)):
+                        continue
+                    if name in ("variable", "end_radius") and two:
+                        continue
+                    if name == "same_distance":
+                        inner.prop(pg, name, text="Two Distances", invert_checkbox=True)
+                        continue
+                    if name == "flip_distances":
+                        inner.prop(pg, name, toggle=True)
+                        continue
                     if name == "radius":
                         inner.prop(pg, name, text="Min Radius" if soft else "Chord" if pg.rail_type == "CHORD" else
-                                   ("Distance" if pg.shape == "CHAMFER" else "Radius"))
+                                   ("Distance A" if two else "Distance") if pg.shape == "CHAMFER" else "Radius")
                         continue
                     if name == "thumbweight" and pg.shape != 'BLEND':
                         continue

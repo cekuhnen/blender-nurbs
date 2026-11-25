@@ -1025,7 +1025,10 @@ def _job_fillet(job, A, B):
     # in it: SM_ERR_NULL_POINTER); its chamfer takes two
     two = int(job["xsect"]) != 0 and abs(abs(float(job["radius_a"])) - abs(float(job["radius_b"]))) > \
         1e-9 * max(abs(float(job["radius_a"])), abs(float(job["radius_b"])))
-    if chord or blend or radii or two:
+    # a chamfer sized by its distances (how far each rail sits from the
+    # crossing, on A and on B), not by the ball's radii: one ball per section
+    setback = bool(job.get("setback")) and int(job["xsect"]) == 0 and not chord and not blend
+    if chord or blend or radii or two or setback:
         # our own sections (secfillet.py): the kernel's fillet has one ball
         # radius, a chord or a variable radius (job['radii'] = start, end;
         # start at the crossing's end nearer job['start_point']) needs one
@@ -1036,13 +1039,29 @@ def _job_fillet(job, A, B):
         sa = 1.0 if float(job["radius_a"]) >= 0 else -1.0
         sb = 1.0 if float(job["radius_b"]) >= 0 else -1.0
         shape = {1: "G1", 2: "G2", 3: "G3"}.get(blend) or ("LINEAR" if int(job["xsect"]) == 0 else "CIRCULAR")
-        f, info = secfillet.build(sm, A, B, sa, sb, abs(float(job["radius_a"])), abs(float(job["radius_b"])),
-                                  chord=float(chord) if chord else None, shape=shape,
-                                  tolerance=float(job.get("tolerance", 1e-4)),
-                                  radii=[float(r) for r in radii] if radii else None,
-                                  start=job.get("start_point"))
+        try:
+            f, info = secfillet.build(sm, A, B, sa, sb, abs(float(job["radius_a"])), abs(float(job["radius_b"])),
+                                      chord=float(chord) if chord else None, shape=shape,
+                                      tolerance=float(job.get("tolerance", 1e-4)),
+                                      radii=[float(r) for r in radii] if radii else None,
+                                      start=job.get("start_point"), setback=setback)
+        except RuntimeError as exc:
+            if not setback or radii or two:
+                raise
+            # a rail running off a surface's edge near the crossing's end (no
+            # foot there for a section): the kernel's chamfer, its two ball
+            # radii those whose feet sit at the distances mid-crossing (exact
+            # between planes)
+            ra, rb = _setback_ball_radii(A, B, sa, sb, abs(float(job["radius_a"])), abs(float(job["radius_b"])))
+            job = dict(job, radius_a=sa * ra, radius_b=sb * rb, setback=False)
+            res = _job_fillet(job, A, B)
+            res["note"] = (f"chamfer by the kernel ({exc}): its distances are exact where the angle between "
+                           "the surfaces is the crossing's middle's")
+            return res
         f = _orient_fillet(f, (A, B))
         res = _fillet_finish(job, f, A, B)
+        if info.get("setback"):
+            res["setback"] = info["setback"]
         res["radius"] = info["radius"][1]
         res["radius_range"] = info["radius"]
         res["chord"] = info["chord"]
@@ -1068,6 +1087,25 @@ def _job_fillet(job, A, B):
         except Exception:
             pass
     return _fillet_finish(job, _surface_fillet(job, A, B), A, B)
+
+
+def _setback_ball_radii(A, B, sa, sb, da, db):
+    """(r_A, r_B): the ball whose feet sit da from the crossing on A and db
+    on B, at the middle of the longest crossing (secfillet.setback_radii)."""
+    np = _np()
+    import secfillet
+    curves, _ = sm.intersect_breps(A, B)
+    c = max(curves, key=lambda c: float(np.linalg.norm(np.subtract(c.end_point(), c.start_point())))
+            if not c.is_closed() else float("inf"))
+    t0, t1 = c.parameter_range()
+    q = c.evaluate(0.5 * (t0 + t1))
+    p = np.array([q.x, q.y, q.z] if hasattr(q, "x") else q, float)
+    _, na, _ = secfillet.Base(sm, A, sa).foot(p)
+    _, nb, _ = secfillet.Base(sm, B, sb).foot(p)
+    ra, rb = secfillet.setback_radii(da, db, float(na @ nb))
+    if min(ra, rb) <= 0:
+        raise RuntimeError("no chamfer of these distances fits between the surfaces")
+    return ra, rb
 
 
 def _surface_fillet(job, A, B):
@@ -6574,12 +6612,14 @@ def _section_groups(b, sel, tol):
     return list(groups.values())
 
 
-def _section_edge_fillet(b, sel, chord, shape, soft=None):
+def _section_edge_fillet(b, sel, chord, shape, soft=None, setback=None):
     """(body, info) with the picked edges filleted from exact sections at a
     constant chord, or None when the kernel has to do it (see _section_groups).
     soft = (R, smoothing): a soft fillet (shape SOFT2 / SOFT3) of minimum
     radius R instead (chord is then only the reach: how far to carry the
-    faces on and to stand the trim sheets)."""
+    faces on and to stand the trim sheets). setback(fp, fq, edges) -> (d on
+    fp, d on fq): a chamfer whose rails sit those distances from the edges
+    (chord again only the reach)."""
     np = _np()
     import os
     import tempfile
@@ -6589,7 +6629,7 @@ def _section_edge_fillet(b, sel, chord, shape, soft=None):
     groups = _section_groups(b, sel, 1e-5 * size)
     if groups is None:
         return None
-    fillets, radii, chords, sections, peaks = [], [], [], 0, []
+    fillets, radii, chords, sections, peaks, dists = [], [], [], 0, [], []
     for fp, fq, es in groups:
         # the faces' surfaces carried on past their edges: a face that ends at
         # the filleted edge has no foot for the ball there otherwise (nor a
@@ -6600,6 +6640,11 @@ def _section_edge_fillet(b, sel, chord, shape, soft=None):
             f, info = secfillet.build(sm, A, B, None, None, soft[0], soft[0], shape=shape, smoothing=soft[1],
                                       curves=[_EdgeCurve(e) for e in es], on_faces=(fp, fq))
             peaks += list(info["min_radius"])
+        elif setback is not None:
+            d0, d1 = setback(fp, fq, es)
+            f, info = secfillet.build(sm, A, B, None, None, d0, d1, shape=shape, setback=True,
+                                      curves=[_EdgeCurve(e) for e in es], on_faces=(fp, fq))
+            dists += [d for pair in info["setback"] for d in pair]
         else:
             f, info = secfillet.build(sm, A, B, None, None, chord, chord, chord=chord, shape=shape,
                                       curves=[_EdgeCurve(e) for e in es], on_faces=(fp, fq))
@@ -6671,7 +6716,169 @@ def _section_edge_fillet(b, sel, chord, shape, soft=None):
            "chord": (min(chords), float(np.mean(chords)), max(chords)), "sections": sections}
     if peaks:
         out["min_radius"] = (min(peaks), max(peaks))
+    if dists:
+        out["setback"] = (min(dists), max(dists))
     return r, out
+
+
+def _edge_half_tans(sel):
+    """tan(th / 2) sampled along the edges, th the angle between their two
+    faces' normals (a chamfer's rail sits r tan(th / 2) from the edge for a
+    ball of radius r: r at 90 deg)."""
+    np = _np()
+    out = []
+    for e in sel:
+        t0, t1 = e.parameter_range()
+        for t in np.linspace(t0, t1, 9)[1:-1]:
+            p = np.array(e.point_at(t), float)
+            n0, n1 = (_face_normal(fc, p) for fc in e.faces()[:2])
+            th = max(float(np.arccos(np.clip(n0 @ n1, -1.0, 1.0))), np.radians(1.0))
+            out.append(float(np.tan(0.5 * th)))
+    return np.array(out)
+
+
+def _two_distance_chamfer(job, b, b_ring, sel, da, db, flip):
+    """Chamfer the edges sel with their rails da from the edge on one face and
+    db on the other (secfillet.chamfer_sides says which face takes da; flip
+    turns them). Exact sections where the chamfers stand alone (a sheet's
+    edges, a rim); planar prisms on a solid whose chamfered edges are straight
+    between flat faces (they may meet at corners); otherwise an error (the
+    kernel's chamfer has one distance)."""
+    np = _np()
+    import secfillet
+    lo, hi = (np.array(v) for v in b.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    firsts = secfillet.chamfer_sides(sel, flip)
+    dists = [(da, db) if a else (db, da) for a in firsts]      # (on the edge's first face, on its second)
+    groups = _section_groups(b, sel, 1e-5 * size)
+    if groups is not None:
+        def setback(fp, fq, es):
+            e = es[0]
+            d0, d1 = next(d for x, d in zip(sel, dists) if x == e)
+            return (d0, d1) if e.faces()[0] == fp else (d1, d0)
+        r, info = _section_edge_fillet(b, sel, max(da, db), "LINEAR", setback=setback)
+        res = _edge_fillet_out(job, b_ring, r, len(sel))
+        res.update(sections=info["sections"], setback=info.get("setback"), distances=[da, db])
+        return res
+    if not _is_solid(b):
+        raise RuntimeError("two distances: these chamfers meet other faces or each other on an open "
+                           "sheet (only one distance there)")
+    r = _planar_chamfers(b, sel, dists, size)
+    res = _edge_fillet_out(job, b_ring, r, len(sel))
+    res.update(distances=[da, db], planar=True)
+    return res
+
+
+def _planar_chamfers(b, sel, dists, size):
+    """b (a solid) with the straight edges sel between flat faces chamfered
+    at two distances, dists[i] = (on sel[i]'s first face, on its second).
+    Each chamfer is a prism -- the triangle between the edge and its two
+    rails, run along the edge -- cut away at a convex edge, added in a
+    concave one. Its sides stand a little past the faces (so none of its
+    faces lies on one of the body's); its ends lie on the planes of the faces
+    at the edge's corners, carried a little past them where that reaches only
+    into empty space (a box's corner) or, for a concave edge, into material.
+    Where chamfers meet at a corner the prisms overlap: their planes mitre."""
+    np = _np()
+    import featregion
+    unit = lambda x: x / (np.linalg.norm(x) or 1.0)
+    cuts, adds = [], []
+    for e, (d0, d1) in zip(sel, dists):
+        fs = list(e.faces())[:2]
+        if not all(f.surface().is_planar() for f in fs):
+            raise RuntimeError("two distances: chamfers meeting at corners need flat faces on both sides "
+                               "(one distance works on curved ones)")
+        t0, t1 = e.parameter_range()
+        p0, p1 = np.array(e.point_at(t0), float), np.array(e.point_at(t1), float)
+        pm = np.array(e.point_at(0.5 * (t0 + t1)), float)
+        L = float(np.linalg.norm(p1 - p0))
+        if L <= 1e-9 * size:
+            raise RuntimeError("two distances: a closed edge on a solid (one distance works there)")
+        t = (p1 - p0) / L
+        if float(np.linalg.norm(np.cross(pm - p0, t))) > 1e-6 * L:
+            raise RuntimeError("two distances: chamfers meeting at corners need straight edges")
+        kind = featregion.edge_kind(e, size, sm)
+        if kind == "smooth":
+            raise RuntimeError("two distances: an edge between tangent faces has no chamfer")
+        sg = -1.0 if kind == "convex" else 1.0
+        ns, us = [], []
+        h = min(1e-3 * size, 0.1 * min(d0, d1))
+        for f in fs:
+            n = _face_normal(f, pm)
+            u = unit(np.cross(n, t))            # in the face, across the edge: into the face
+            if f.closest_point(tuple(pm - h * u))[1] < f.closest_point(tuple(pm + h * u))[1]:
+                u = -u
+            ns.append(n)
+            us.append(u)
+        q0, q1 = pm + d0 * us[0], pm + d1 * us[1]       # the rails, at the edge's middle
+        m = unit(np.cross(t, q1 - q0))
+        if float((pm - q0) @ m) < 0:
+            m = -m                                       # toward the edge
+        mg = 0.5 * min(d0, d1)
+        planes = [(q0, m)] + [(pm - sg * mg * n, sg * n) for n in ns]
+        for v_pt, w in ((p0, t), (p1, -t)):             # w: from the end along the edge
+            vert = min(e.vertices(), key=lambda v: float(np.linalg.norm(np.array(v.point(), float) - v_pt)))
+            others = []
+            for g in vert.faces():
+                if not any(g == f for f in fs) and not any(g == o for o in others):
+                    others.append(g)
+            if len(others) != 1 or not others[0].surface().is_planar():
+                raise RuntimeError("two distances: a chamfered edge ends at a corner of more than three "
+                                   "faces or at a curved face")
+            nC = _face_normal(others[0], v_pt)
+            c = float(nC @ w)
+            if abs(c) < 1e-6:
+                raise RuntimeError("two distances: a chamfered edge ends along a face")
+            keep = nC if c > 0 else -nC                 # the side the edge runs into
+            past = (c < 0) if kind == "convex" else (c > 0)     # past the face: empty / material
+            planes.append((v_pt - mg * keep if past else v_pt, keep))
+        pr = _plane_prism(planes[:3], planes[3:], pm, t, 1e-7 * size)
+        (cuts if kind == "convex" else adds).append(pr)
+    r = b
+    for pr in cuts:
+        r = sm.boolean_difference(r, pr)
+    for pr in adds:
+        r = sm.boolean_union(r, pr)
+    if r is None or r.face_count() == 0 or not _is_solid(r):
+        raise RuntimeError("two distances: the chamfers did not cut cleanly (distances too big for the faces?)")
+    return r
+
+
+def _plane_prism(sides, ends, p, t, tol):
+    """The closed triangular prism whose three side planes (point, normal:
+    each containing the direction t, the normal pointing inside) cut its
+    cross-section and whose two end planes close it (world). Built from its
+    six corners: two planar triangles and three planar quads, stitched."""
+    np = _np()
+    corners = []
+    for i in range(3):
+        (qa, na), (qb, nb) = sides[i], sides[(i + 1) % 3]
+        M = np.array([na, nb, t], float)
+        corners.append(np.linalg.solve(M, [float(na @ qa), float(nb @ qb), float(t @ p)]))
+    caps = []
+    for qe, ne in ends:
+        den = float(t @ ne)
+        caps.append([c + float((qe - c) @ ne) / den * t for c in corners])
+    line = lambda a, b: ext.curve_from_cvs(1, [tuple(map(float, a)), tuple(map(float, b))],
+                                           [0.0, 0.0, 1.0, 1.0], None)
+    loops = [caps[0], caps[1]] + [[caps[0][i], caps[0][(i + 1) % 3], caps[1][(i + 1) % 3], caps[1][i]]
+                                  for i in range(3)]
+    b = None
+    for loop in loops:
+        f = sm.create_planar_faces([line(loop[k], loop[(k + 1) % len(loop)]) for k in range(len(loop))])
+        if b is None:
+            b = f
+        else:
+            ext.append_brep(b, f)
+    b = sm.stitch_advanced(b, max(tol, 1e-7), squeeze_small_edges=False, making_manifold_solid=True)[0]
+    if not _is_solid(b):
+        raise RuntimeError("two distances: a chamfer's prism did not close")
+    try:
+        if b.volume() < 0:
+            sm.unify_normals(b, b.faces()[0], 100)
+    except Exception:
+        pass
+    return b
 
 
 def _measured_chords(before, r):
@@ -6787,6 +6994,18 @@ def job_edge_fillet(job):
     r0 = float(job["radius"])
     r1 = job.get("end_radius")
     chord_info = chord_note = None
+    setback = None
+    if xsect == 0 and job.get("setback") and not job.get("chord"):
+        # a chamfer sized by how far its rails sit from the edge on each face
+        db = job.get("distance_b")
+        if db is not None and abs(float(db) - r0) > 1e-9 * max(r0, float(db)):
+            return _two_distance_chamfer(job, b, b_ring, sel, r0, float(db), bool(job.get("flip")))
+        # one distance: the kernel's chamfer runs between a ball's feet, r / tan(th / 2)
+        # from the edge (th the angle between the faces' normals)
+        tans = _edge_half_tans(sel)
+        k = float(np.mean(tans))
+        setback = (r0 * float(min(tans)) / k, r0 * float(max(tans)) / k)
+        r0, r1 = r0 / k, (float(r1) / k if r1 is not None else None)
     if job.get("chord") and not (r1 is not None and abs(float(r1) - r0) > 1e-12):
         shape = {0: "LINEAR", 1: "CIRCULAR"}.get(xsect) or {1: "G1", 2: "G2", 3: "G3"}.get(int(job.get("continuity", 1)))
         sec, chord_note = None, None
@@ -6899,6 +7118,9 @@ def job_edge_fillet(job):
     save(to_local(r, job.get("xforms", {}).get("target")), job["out"]["result"])
     out = {"edges": len(sel), "faces": r.face_count(), "solid": solid, "new_faces": new_faces,
            "rings": [{k: v for k, v in g.items() if k != "at"} for g in rings], "rims_only": rims_only}
+    if setback is not None:
+        out["setback"] = setback
+        out["radius"] = r0
     if chord_info is not None:
         out["radius"] = r0
         if ch is not None:

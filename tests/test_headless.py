@@ -289,13 +289,15 @@ for _kind, _fa, _fb2, _shape, _ra, _rb in ((60, False, False, "CIRCULAR", 0.2, 0
     ctx.view_layer.update()
     _fr = _sff(_sa_o, _sb_o)
     _sg = (-1.0 if _fa else 1.0), (-1.0 if _fb2 else 1.0)
-    _Xs = [_sfs(P_, A_, B_, _ra, _rb, *_sg, _shape) for P_, A_, B_ in _fr]
     # the arrows stand on the rails and give back the value they show
     _f = _plain(_OpSF, _sf=_fr, flip_a=_fa, flip_b=_fb2, rail_type="RADIUS", same_radius=_ra == _rb, radius=_ra,
                 radius_b=_rb, shape=_shape)
+    # (a chamfer's values are its distances: the preview's ball radii come from them)
+    _Xs = [_sfs(P_, A_, B_, *_f._radii(P_, A_, B_), *_sg, _shape) for P_, A_, B_ in _fr]
     _j = len(_fr[0][0]) // 2
-    # one radius: on rail A; Radius A / B: each on the rail its value moves (A's on rail B, B's on rail A)
-    _rails = (_Xs[0][_j, 0], _Xs[0][_j, -1]) if _ra == _rb else (_Xs[0][_j, -1], _Xs[0][_j, 0])
+    # one radius: on rail A; Radius A / B: each on the rail its value moves (A's on rail B, B's on rail A);
+    # a chamfer's Distance A / B: each on its own rail
+    _rails = (_Xs[0][_j, 0], _Xs[0][_j, -1]) if (_ra == _rb or _shape == "CHAMFER") else (_Xs[0][_j, -1], _Xs[0][_j, 0])
     for _h, _rail in zip(_f.drag_handles(), _rails):
         _sf_arrow.append(max(float(np.linalg.norm(_vd.ValueDrag._pos(_h) - _rail)),
                              abs(_h["to_value"](_h["param"]) - getattr(_f, _h["field"]))))

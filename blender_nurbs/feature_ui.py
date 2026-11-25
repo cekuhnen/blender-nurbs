@@ -92,7 +92,7 @@ PRETTY = {"patch": "Patch", "dome": "Dome", "square": "Square", "sweep": "Sweep"
           "flow": "Flow Along Surface", "emboss": "Emboss"}
 
 
-_FILLET_KEYS = ("radius_a", "radius_b", "radii", "start_point", "xsect", "chord", "soft", "blend", "ends")
+_FILLET_KEYS = ("radius_a", "radius_b", "radii", "start_point", "xsect", "chord", "soft", "blend", "ends", "setback")
 
 
 def _fillet_partners(h, old, new):
@@ -814,8 +814,8 @@ def draw_feature(layout, context):
                          if prm.get("soft") is not None else
                          ("Blend G%d" % prm["blend"]) if prm.get("blend") else
                          ("Chamfer" if prm.get("xsect") == 0 else "Circular"))
-                box.label(text=f"Shape: {shape} · Rail: {'Chord' if prm.get('chord') else 'Rolling Ball'}",
-                          icon='MOD_BEVEL')
+                rail = "Chord" if prm.get("chord") else "Distance" if prm.get("setback") else "Rolling Ball"
+                box.label(text=f"Shape: {shape} · Rail: {rail}", icon='MOD_BEVEL')
                 from .steps import fillet_radii
                 var = fillet_radii(prm).get("radii")     # as history replays it (scaled with Radius A)
                 if var:
@@ -929,6 +929,8 @@ def draw_feature(layout, context):
                         col.row().prop(pg, name, expand=True)
                     elif name in ("jc_degree", "jc_cvs") and pg.jc_mode != "REBUILD":
                         continue
+                    elif op == "surface_fillet" and name in ("radius_a", "radius_b") and h["params"].get("setback"):
+                        col.prop(pg, name, text=f"Distance {name[-1].upper()} (signed: side)")   # a chamfer's
                     else:
                         col.prop(pg, name, text=LABELS.get(name, pg.bl_rna.properties[name].name))
                 if op == "join_curves" and obj.type == 'CURVE':
