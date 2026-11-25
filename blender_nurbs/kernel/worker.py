@@ -7343,7 +7343,11 @@ def _fix_coiled_faces(before, r):
                                                                [c for lp in loops for c in lp], 10 * tol, 1e2 * tol)
                 except Exception:
                     break
-                if cand.face_count() == 1 and abs(cand.area(1e-6) - f.area()) > 1e-3 * f.area():
+                # both areas to 1e-6: the default area() is ~0.1 % off on a curved face, so a sound
+                # face (the kernel's transposed copy of a revolve's disc) was swapped for a re-trim
+                # the kernel's next fillet crashed on
+                a = f.area(1e-6)
+                if cand.face_count() == 1 and abs(cand.area(1e-6) - a) > 1e-3 * a:
                     swap.append((i, cand))
                 break
         if not swap:
