@@ -1805,6 +1805,16 @@ def revolve_exact(curve, origin, axis, angle_deg, start_deg=0.0):
     # frame: x towards the profile's start point (projected off the axis)
     rel = P - O
     radial = rel - np.outer(rel @ z, z)
+    # CVs a hair off the axis go onto it: a profile end meant to lie there (a
+    # rectangle's corner, float32 in Blender and turned by a rotation not
+    # exactly 90 degrees, ends 2e-9 off) would revolve into a ring a few
+    # nanometres wide instead of a pole -- sliver triangles whose normals
+    # point anywhere: a bright spot at the axis
+    rl = np.linalg.norm(radial, axis=1)
+    on = rl <= 1e-6 * (float(np.ptp(P, axis=0).max()) or 1.0)
+    if on.any() and not on.all():
+        rel[on] -= radial[on]
+        radial[on] = 0.0
     k = int(np.argmax(np.linalg.norm(radial, axis=1)))
     x = radial[k] / (np.linalg.norm(radial[k]) or 1.0)
     if np.linalg.norm(radial[k]) < 1e-12:
