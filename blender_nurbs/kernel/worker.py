@@ -327,9 +327,14 @@ def _near_edges(brep, tol, skip=()):
     """Is a point on one of brep's edges (within tol; the edges skip left
     out)? Sampled finely: a 48-point polyline sags off a curved edge by more
     than tol."""
-    np = _np()
     skip = set(skip)
-    polys = [np.array(p) for p in (_edge_poly(e, 400) for e in brep.edges() if e not in skip) if len(p)]
+    return _near_polys([p for p in (_edge_poly(e, 400) for e in brep.edges() if e not in skip) if len(p)], tol)
+
+
+def _near_polys(polys, tol):
+    """Is a point on one of these polylines (within tol)?"""
+    np = _np()
+    polys = [np.asarray(p, float) for p in polys if len(p) > 1]
 
     def on(pt):
         for P in polys:
@@ -417,7 +422,7 @@ def _rejoin_runs(lp, segs, original, tol):
     return out
 
 
-def heal_cut_seams(b, original, skip_edges=()):
+def heal_cut_seams(b, original, skip_edges=(), keep=None):
     """Remove the cut edges that have kept surface on both sides: a trim
     imprints every cutter, and where a region on each side is kept (the far
     wall a projected circle also crossed) the imprint stayed as a seam -- two
@@ -428,8 +433,9 @@ def heal_cut_seams(b, original, skip_edges=()):
     kernel's split gave them different representations of it (a cubic plane
     split into bilinear patches): they are trimmed again on the original
     face's surface. skip_edges: original edges that do not count as such (a
-    moved notch's old rims). Returns b unchanged when anything does not check
-    out."""
+    moved notch's old rims). keep: polylines (world) of cut edges that stay,
+    like original edges (Imprint keeps the edges on the faces it was meant
+    for). Returns b unchanged when anything does not check out."""
     np = _np()
     lo, hi = (np.array(v) for v in original.bounding_box())
     size = float(np.linalg.norm(hi - lo)) or 1.0
@@ -437,6 +443,9 @@ def heal_cut_seams(b, original, skip_edges=()):
     from trimext import brep_tol
     btol = brep_tol(1e-5, size)      # not the kernel's 0.01: stitched below, short edges stay apart
     on_original = _near_edges(original, 10 * tol, skip_edges)
+    if keep is not None:          # cut edges that stay (Imprint): they count as original
+        on_old, on_keep = on_original, _near_polys(keep, 10 * tol)
+        on_original = lambda pt: on_old(pt) or on_keep(pt)  # noqa: E731
 
     def key(e):
         m = _edge_mid(e)
@@ -1907,6 +1916,13 @@ def job_split(job):
         areas.append(part.area())
     return {"regions": len(groups), "areas": areas, "extended": job.get("extended", []),
             "points": points, "sides": [list(sd) for sd in sides], "picked": picked}
+
+
+def job_imprint(job):
+    """Curves, edges or surfaces imprinted on the target as edges of its own
+    (Project with Output: Edge): kernel/imprint.py."""
+    import imprint
+    return imprint.run(job, sys.modules[__name__])
 
 
 def _shared_edges(b):
@@ -6909,7 +6925,7 @@ def job_mesh_to_brep(job):
 
 JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "untrim_region": job_untrim_region, "untrim_preview": job_untrim_preview, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean, "push_pull": job_push_pull, "rotate_face": job_rotate_face, "move_face": job_move_face, "replace_face": job_replace_face, "extrude_face": job_extrude_face,
         "flip": job_flip, "cap_solid": job_cap_solid, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken, "shell": job_shell, "remove_fillets": job_remove_fillets,
-        "mesh_to_brep": job_mesh_to_brep, "face_cvs": job_face_cvs}
+        "mesh_to_brep": job_mesh_to_brep, "face_cvs": job_face_cvs, "imprint": job_imprint}
 
 
 RESULT_MARK = "@@nproto-result@@ "   # (serve mode: the line that carries a job's result)

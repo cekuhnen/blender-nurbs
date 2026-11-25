@@ -74,6 +74,8 @@ def _on_step_change(self, context):
             continue
         if name == "end_radius":
             p["end_radius"] = v if self.variable and self.rail_type != "CHORD" else None
+        elif name in ("imprint_scope", "imprint_extend"):      # Imprint's own scope / extend
+            p[name[len("imprint_"):]] = v
         elif name in ("continuity", "ca_continuity", "ca_degree"):
             p[name] = int(v)
         else:
@@ -104,6 +106,12 @@ class NprotoStep(bpy.types.PropertyGroup):
                                            ("BACK", "Against Normal", "Only on the other side")], **_S())
     through: BoolProperty(name="Surfaces Through", description="A cutting surface is extended until it cuts "
                           "all the way through the part", **_S())
+    imprint_scope: EnumProperty(name="Onto", items=[
+        ("NEAREST", "Nearest Faces", "The faces the projection meets first, seen from the curve"),
+        ("FACES", "Picked Faces", "Only the faces picked when the imprint was made"),
+        ("THROUGH", "Through", "Every face the projection crosses")], **_S())
+    imprint_extend: BoolProperty(name="Extend to Edges", description="An open curve that stops inside a face "
+                                 "is carried on until it reaches the face's edges", **_S())
     shape: EnumProperty(name="Shape", items=[("CIRCULAR", "Circular", ""), ("CHAMFER", "Chamfer", ""),
                                              ("BLEND", "Blend", ""), ("SOFT", "Soft", "")], **_S())
     rail_type: EnumProperty(name="Rail", items=[
@@ -193,6 +201,10 @@ def sync_step(obj, k):
                     pg.fill_corners = bool(p.get("fill_corners", True))
                 elif name == "reach":
                     pg.reach = p.get("reach", "BOTH")
+                elif name == "imprint_scope":
+                    pg.imprint_scope = p.get("scope", "NEAREST")
+                elif name == "imprint_extend":
+                    pg.imprint_extend = bool(p.get("extend", False))
                 elif name == "through":
                     pg.through = bool(p.get("through", False))
                 elif name == "class_a":

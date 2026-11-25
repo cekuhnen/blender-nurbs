@@ -1478,12 +1478,17 @@ def _exact_planar_piece(kc, poly, planes, d):
 def build_project_curve(inputs, p):
     sm, _ = _k()
     *curves, (surf_obj, _) = inputs
-    d = p.get("dir", [0, 0, -1])
+    d0 = p.get("dir", [0, 0, -1])
     brep_w = _world_brep(surf_obj)
     planes = _brep_planes(brep_w)
     out = []
     for o, r in curves:
         kc = features.input_curve(o, r)
+        d = d0
+        if p.get("projection") == "CURVE":    # Sketch Normal: each curve along its own plane's normal
+            from . import steps
+            sk = steps.sketch_normal(o, kc, surf_obj, Vector(p.get("view", (0, 0, -1))))
+            d = list(sk if sk is not None else geom.cutter_direction(kc, Vector(d0)))
         try:
             pcs = sm.project_curve(brep_w, kc, tuple(d))
         except RuntimeError as exc:
