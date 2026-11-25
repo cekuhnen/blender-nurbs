@@ -6563,6 +6563,57 @@ def _measured_chords(before, r):
         return None
 
 
+def _is_solid(b):
+    try:
+        return bool(b.is_manifold_solid())
+    except Exception:
+        return False
+
+
+def _exact_tool_fillets(b, sel, r):
+    """b with the edges sel filleted exactly at radius r (_exact_face_fillets)
+    when they all lie on one curved face, or None (the kernel's then). The
+    kernel's circular fillet is only fitted on a free-form face (0.5-5 deg
+    off tangent on a sculpted top, and a steep one came out open)."""
+    np = _np()
+    if not sel:
+        return None
+    common = [f for f in sel[0].faces() if all(any(f == g for g in e.faces()) for e in sel[1:])]
+    common = [f for f in common if not f.surface().is_planar()]
+    if len(common) != 1:
+        return None
+    A = common[0]
+    lo, hi = (np.array(v, float) for v in b.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    try:
+        specs = [(np.array(e.point_at(0.5 * sum(e.parameter_range())), float), float(r)) for e in sel]
+        x = _exact_face_fillets(b, np.array(A.interior_point(), float), specs, size, 1e-6 * size)
+    except Exception:
+        return None
+    open0 = sum(1 for e in b.edges() if len(e.faces()) == 1)
+    if (x is None or x.face_count() != b.face_count() + len(sel) or _is_solid(b) != _is_solid(x)
+            or sum(1 for e in x.edges() if len(e.faces()) == 1) != open0
+            or (_is_solid(x) and _mesh_volume(x) <= 0)):
+        return None
+    return x
+
+
+def _edge_fillet_out(job, b_ring, r, n_edges, exact=False):
+    """job_edge_fillet's result for a finished fillet r (saved)."""
+    new_faces = []
+    try:
+        on_in = _input_test(b_ring)
+        for f in r.faces():
+            if not on_in(f):
+                q = f.interior_point()
+                new_faces.append([float(q.x), float(q.y), float(q.z)] if hasattr(q, "x") else [float(x) for x in q])
+    except Exception:
+        new_faces = []
+    save(to_local(r, job.get("xforms", {}).get("target")), job["out"]["result"])
+    return {"edges": n_edges, "faces": r.face_count(), "solid": _is_solid(r), "new_faces": new_faces,
+            "rings": [], "rims_only": False, "exact": exact}
+
+
 def job_edge_fillet(job):
     """Fillet / chamfer / blend the edges whose world-space midpoints are given.
     Works on joined sheets and on solids; written back in the object's local space."""
@@ -6651,6 +6702,11 @@ def job_edge_fillet(job):
         return sm.fillet_edges(bb, ss, radius=r0, xsect_type=xsect, continuity=int(job.get("continuity", 1)),
                                thumbweight=float(job.get("thumbweight", 1.0)))
     sel_mids = [_edge_mid(e) for e in sel]
+    if (xsect == 1 and (r1 is None or abs(float(r1) - r0) <= 1e-12) and chord_info is None
+            and not job.get("class_a") and job.get("exact", True)):
+        x = _exact_tool_fillets(b, sel, r0)       # edges of one curved face: exact rolling-ball fillets
+        if x is not None:
+            return _edge_fillet_out(job, b_ring, x, len(sel), exact=True)
     first = None
     try:
         r = call(b, sel)
@@ -6668,6 +6724,8 @@ def job_edge_fillet(job):
     if r is None or r.face_count() == 0:
         raise RuntimeError("the kernel returned no result (radius too large for the neighbouring faces?)")
     r = _fix_coiled_faces(b_ring, _fix_ring_faces(b_ring, r))
+    if _is_solid(b_ring) and not _is_solid(r):  # the kernel's corner slivers on a curved face: closed
+        r = _drop_ears(r, float(np.linalg.norm(hi - lo)) or 1.0)
     rings = []
     if r1 is None or abs(float(r1) - r0) <= 1e-12:
         # rims (Class-A or not): one smooth ring each; Class-A leaves them be
