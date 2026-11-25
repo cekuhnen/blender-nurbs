@@ -54,7 +54,8 @@ def editable_reason(obj):
         return "not a NURBS object"
     brep = store.get_brep(obj)
     if brep.face_count() != 1 and not _same_surface(brep):
-        return "joined objects have several different surfaces -- Unjoin first"
+        return ("joined objects have several different surfaces -- pick one face (Face mode) to sculpt it, "
+                "or Unjoin first")
     try:
         load_kernel().blender_ext.surface_cvs(brep.faces()[0].surface())
     except Exception:
@@ -79,9 +80,12 @@ def _same_surface(brep):
     return True
 
 
-def make_cage(context, obj):
+def make_cage(context, obj, d=None):
+    """d: the net to edit (surface_cvs layout, obj's local space); default
+    the object's own surface's."""
     ext = load_kernel().blender_ext
-    d = ext.surface_cvs(store.get_brep(obj).faces()[0].surface())
+    if d is None:
+        d = ext.surface_cvs(store.get_brep(obj).faces()[0].surface())
     nu, nv = d["count_u"], d["count_v"]
     verts = [tuple(p) for p in d["points"]]
     edges = []
@@ -184,6 +188,9 @@ def rebuild_from_cage(cage, context=None):
     # cage and surface may have different transforms: bring CVs into the surface's local space
     M = geom.world_matrix(surf_obj).inverted() @ geom.world_matrix(cage)
     pts, moved = _snap(cage, [tuple(M @ Vector(p)) for p in pts])
+    from . import facecvs
+    if facecvs.is_face_cage(cage):          # one face of a solid: the walls re-trimmed to it
+        return facecvs.rebuild(surf_obj, cage, pts, moved, context)
     if not moved:
         _restore(surf_obj, cage, context)
         return False
@@ -253,7 +260,11 @@ def finish_cage(cage, view_layer=None):
     """Keep the CV edit and remove the cage (no operator context needed)."""
     surf_obj = bpy.data.objects.get(cage[CAGE_OF])
     if surf_obj is not None:
-        if rebuild_from_cage(cage) and features.has_history(surf_obj):
+        from . import facecvs
+        changed = rebuild_from_cage(cage)
+        if changed and facecvs.is_face_cage(cage):
+            facecvs.keep_edit(surf_obj, cage)
+        elif changed and features.has_history(surf_obj):
             from . import cvtweak
             cvtweak.keep_edit(surf_obj, cage)
     _modes.pop(cage.name, None)
@@ -329,7 +340,13 @@ def _end(context, cage, keep):
         bpy.ops.object.mode_set(mode='OBJECT')
     dropped = None
     if surf_obj is not None:
-        if keep and rebuild_from_cage(cage, context):
+        from . import facecvs
+        changed = keep and rebuild_from_cage(cage, context)
+        if changed and facecvs.is_face_cage(cage):
+            dropped = facecvs.keep_edit(surf_obj, cage, context)
+            if cage.get(facecvs.CAGE_ERROR):
+                dropped = (dropped or "") + "+error"
+        elif changed:
             if features.has_history(surf_obj):
                 from . import cvtweak
                 dropped = cvtweak.keep_edit(surf_obj, cage, context)
@@ -377,6 +394,18 @@ class NPROTO_OT_edit_cvs(bpy.types.Operator):
                 self.report({'WARNING'}, "Select a NURBS surface")
                 return {'CANCELLED'}
             cage = cage_for(obj)
+            from . import facecvs
+            fi = facecvs.face_to_edit(obj) if cage is None else None
+            if fi is not None:
+                if context.object is not None and context.object.mode != 'OBJECT':
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                try:
+                    cage = facecvs.make_face_cage(context, obj, fi)
+                except Exception as exc:
+                    self.report({'WARNING'}, f"{obj.name}: this face can't be sculpted: {exc}")
+                    return {'CANCELLED'}
+                if features.history_enabled(context):
+                    self.report({'INFO'}, f"{obj.name}: sculpting one face -- Done adds a Face CVs step")
             if cage is None:
                 why = editable_reason(obj)
                 if why:
@@ -412,7 +441,13 @@ class NPROTO_OT_cvs_done(bpy.types.Operator):
         if cage is None:
             return {'CANCELLED'}
         surf_obj, kept = _end(context, cage, keep=True)
-        if kept == "step":
+        if kept and kept.endswith("+error"):
+            kept = kept[:-6]
+            self.report({'WARNING'}, f"{surf_obj.name}: the last CV move could not be built -- "
+                                     "the last shape that could is kept")
+        if kept == "face_step":
+            self.report({'INFO'}, f"{surf_obj.name}: Face CVs added to its history")
+        elif kept == "step":
             self.report({'INFO'}, f"{surf_obj.name}: CV Tweak added to its history")
         elif kept == "cleared":
             self.report({'WARNING'}, f"{surf_obj.name}: the CV edit could not be recorded -- "
@@ -453,7 +488,8 @@ class NPROTO_OT_tab_edit(bpy.types.Operator):
         obj = context.view_layer.objects.active
         if load_kernel() is None:
             return {'PASS_THROUGH'}
-        if cage_for(obj) is None:
+        from . import facecvs
+        if cage_for(obj) is None and facecvs.face_to_edit(obj) is None:
             why = editable_reason(obj)
             if why:
                 # never drop into Edit Mode on the tessellation mesh: it is display only
@@ -473,9 +509,13 @@ def register():
         _keymaps.append((km, km.keymap_items.new(NPROTO_OT_tab_edit.bl_idname, 'TAB', 'PRESS')))
     if _on_depsgraph not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph)
+    from . import facecvs
+    facecvs.register()
 
 
 def unregister():
+    from . import facecvs
+    facecvs.unregister()
     for km, kmi in _keymaps:
         try:
             km.keymap_items.remove(kmi)

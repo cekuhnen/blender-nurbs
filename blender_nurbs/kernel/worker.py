@@ -2145,6 +2145,27 @@ def _vol(b):
     return _volume(b, 1e-4)
 
 
+def _mesh_volume(b):
+    """The solid's volume from a coarse mesh of it, for its sign only: ~1 ms
+    where the kernel's volume took 5-20 ms (Face CVs' live rebuilds). The
+    kernel's own volume when the mesh fails."""
+    np = _np()
+    try:
+        lo, hi = (np.array(v, float) for v in b.bounding_box())
+        size = float(np.linalg.norm(hi - lo)) or 1.0
+        pb, fails = b.tessellate(chord_height_tolerance=0.02 * size, curve_angle_tolerance_deg=45.0,
+                                 surface_angle_tolerance_deg=45.0, max_edge_length=0.0,
+                                 allow_partial=True, return_failures=True)
+        a = pb.to_numpy_arrays()
+        P, f = np.asarray(a["points"], float), np.asarray(a["faces"])
+        if not fails and len(f) and len(f) % 4 == 0 and np.all(f[0::4] == 3):
+            T = f.reshape(-1, 4)[:, 1:]
+            return float(np.einsum("ij,ij->i", P[T[:, 0]], np.cross(P[T[:, 1]], P[T[:, 2]])).sum() / 6.0)
+    except Exception:
+        pass
+    return _vol(b)
+
+
 def _turned_wall(w):
     """A wall (one untrimmed face) with its normal turned over."""
     return ext.brep_from_surface(_reverse_v(w.faces()[0].surface()))
@@ -2420,7 +2441,9 @@ def _reversed_curve(c):
                               list(reversed(d["weights"])) if d.get("weights") else None)
 
 
-def _extended_curve(c, at_start, dist):
+def _extended_curve(c, at_start, dist, fast=False):
+    """c continued by dist past its start / end (fast: cvnet.extend_curve, ms,
+    instead of natext's arc-length search; natext when that can't)."""
     import natext
     np = _np()
     d = ext.curve_cvs(c)
@@ -2432,6 +2455,17 @@ def _extended_curve(c, at_start, dist):
         else:
             P[1] = P[1] + t
         return ext.curve_from_cvs(1, [tuple(map(float, q)) for q in P], [0.0, 0.0, 1.0, 1.0], None)
+    if fast:
+        import cvnet
+        try:
+            e = cvnet.extend_curve({"degree": d["degree"], "points": d["points"], "knots": d["knots"],
+                                    "weights": d.get("weights")}, at_start, dist, 1e-9 * (dist or 1.0))
+            K = e["knots"]
+            e["knots"] = [(k - K[0]) / (K[-1] - K[0]) for k in K]
+            return ext.curve_from_cvs(int(e["degree"]), [tuple(q) for q in e["points"]], e["knots"],
+                                      e["weights"] or None)
+        except Exception:
+            pass
     e = natext.extend_curve({"degree": d["degree"], "points": d["points"], "knots": d["knots"],
                              "weights": d.get("weights")}, at_start, dist)
     return ext.curve_from_cvs(int(e["degree"]), [tuple(q) for q in e["points"]], e["knots"], e["weights"])
@@ -2449,9 +2483,13 @@ def _closed_dirs(srf, tol):
     return cu, cv
 
 
-def _extended_surface(srf, dist, tol):
+def _extended_surface(srf, dist, tol, fast=False):
     """The surface continued as the same polynomial by dist past each side it
-    is open at (the old part stays exactly as it was)."""
+    is open at (the old part stays exactly as it was). fast: an open curved
+    surface by cvnet.extend (numpy, ms) instead of natext's arc-length search
+    (~0.15 s a side in pure Python: Face CVs' live drags stalled on a
+    sculpted neighbour); natext still for closed ones and for arcs that can't
+    run that far."""
     import natext
     np = _np()
     d = ext.surface_cvs(srf)
@@ -2474,8 +2512,21 @@ def _extended_surface(srf, dist, tol):
             return ext.surface_from_cvs(1, 1, [tuple(map(float, q)) for q in Q], [0.0, 0.0, 1.0, 1.0],
                                         [0.0, 0.0, 1.0, 1.0])
     cu, cv = _closed_dirs(srf, tol)
+    if fast and not cu and not cv:
+        import cvnet
+        net = {k: d[k] for k in ("degree_u", "degree_v", "count_u", "count_v", "knots_u", "knots_v")}
+        net["points"] = [list(map(float, q)) for q in d["points"]]
+        net["weights"] = list(d.get("weights") or [])
+        try:
+            x = _normalised(cvnet.extend(net, dist, 1e-3 * tol))
+            return ext.surface_from_cvs(x["degree_u"], x["degree_v"], [tuple(q) for q in x["points"]],
+                                        x["knots_u"], x["knots_v"], x["weights"] or None)
+        except Exception:
+            pass                                  # (an arc's weight would reach 0: natext skips that side)
     for side in [s for s, closed in (("U0", cu), ("U1", cu), ("V0", cv), ("V1", cv)) if not closed]:
         du, dv, pts, Ku, Kv, w = natext.extend_grid(d, side, dist)
+        if w and min(w) <= 1e-9:
+            continue        # an arc run that far would need a weight <= 0 (a fillet round its axis): left as is
         nu, nv = len(Ku) - du - 1, len(Kv) - dv - 1
         d = {"degree_u": du, "degree_v": dv, "count_u": nu, "count_v": nv, "points": pts,
              "knots_u": Ku, "knots_v": Kv, "weights": w}
@@ -2506,7 +2557,7 @@ def _chain(curves, tol):
     return out
 
 
-def _new_vertex(side, v, G, reach, tol):
+def _new_vertex(side, v, G, reach, tol, tight=False):
     """(new point, side curve from its far end to it) of the vertex v of the
     moved face: the side edge -- extended exactly past v -- meeting the new
     surface G nearest v."""
@@ -2515,12 +2566,27 @@ def _new_vertex(side, v, G, reach, tol):
     a, b = np.array(c.start_point(), float), np.array(c.end_point(), float)
     at_start = np.linalg.norm(a - v) < np.linalg.norm(b - v)
     far = b if at_start else a
-    cx = _extended_curve(c, at_start, reach)
+    cx = _extended_curve(c, at_start, reach, fast=tight)
     _, points = sm.intersect_curve_surface(cx, G)
     if not points:
         raise RuntimeError("a side edge does not reach the new face")
     q = min((np.array(x, float) for x in points), key=lambda x: float(np.linalg.norm(x - v)))
     _, tq, _ = sm.curve_closest_point(cx, tuple(map(float, q)))
+    if tight:                     # Newton along the side curve onto G (the kernel's point was ~2e-5 off)
+        c0, c1 = cx.parameter_range()
+        h, uv = 1e-7 * (c1 - c0), None
+        for _ in range(8):
+            pq = np.array(cx.evaluate(tq), float)
+            f, n, uv = _foot_and_normal(G, pq, uv)
+            g = float(n @ (pq - f))
+            if abs(g) <= 1e-3 * tol:
+                break
+            dh = h if tq + h <= c1 else -h
+            slope = float(n @ ((np.array(cx.evaluate(tq + dh), float) - pq) / dh))
+            if abs(slope) <= 1e-12:
+                break
+            tq = min(max(tq - g / slope, c0), c1)
+        q = np.array(cx.evaluate(tq), float)
     _, tf, _ = sm.curve_closest_point(cx, tuple(map(float, far)))
     _, tv, _ = sm.curve_closest_point(cx, tuple(map(float, v)))
     if (tq - tf) * (tv - tf) <= 0 or abs(tq - tf) <= 1e-9:
@@ -2545,6 +2611,105 @@ def _new_edge(srf_ext, G, qa, qb, closed, tol):
     if closed:
         return [p_ for p_ in (_curve_piece(c, t0, ta), _curve_piece(c, ta, t1)) if p_.length() > tol]
     return [_curve_piece(c, ta, tb)]
+
+
+def _foot_and_normal(srf, q, uv=None):
+    """(foot of q on srf, unit normal there, uv): a plane in closed form,
+    else the kernel's closest point polished by Gauss-Newton on srf.evaluate
+    (the kernel's own foot is only ~1e-4 exact in uv)."""
+    np = _np()
+    q = np.asarray(q, float)
+    if uv is None:
+        _, uvs, _ = sm.surface_closest_point(srf, tuple(map(float, q)))
+        uv = _uvxy(uvs[0])
+    u, v = uv
+    (u0, u1), (v0, v1) = srf.u_domain(), srf.v_domain()
+    h = 1e-7 * max(u1 - u0, v1 - v0)
+    E = lambda a, b: np.array(srf.evaluate(a, b), float)
+    for _ in range(4):
+        S = E(u, v)
+        du = h if u + h <= u1 else -h
+        dv = h if v + h <= v1 else -h
+        Su, Sv = (E(u + du, v) - S) / du, (E(u, v + dv) - S) / dv
+        r = q - S
+        a, b, c = Su @ Su, Su @ Sv, Sv @ Sv
+        det = a * c - b * b
+        if abs(det) <= 1e-30:
+            break
+        un = min(max(u + (c * (Su @ r) - b * (Sv @ r)) / det, u0), u1)
+        vn = min(max(v + (a * (Sv @ r) - b * (Su @ r)) / det, v0), v1)
+        still = abs(un - u) <= 1e-3 * h and abs(vn - v) <= 1e-3 * h
+        u, v = un, vn
+        if still:                                # (converged: a warm start takes one step)
+            break
+    S = E(u, v)
+    n = np.array(sm.evaluate_surface_normal(srf, u, v), float)
+    return S, n / (np.linalg.norm(n) or 1.0), (u, v)
+
+
+def _refined_curve(c, S1, S2, tol, ends=None):
+    """The intersection curve c of S1 and S2 made tight: points along it
+    pulled onto both surfaces (Newton on the two tangent planes), the ends
+    kept, and a curve interpolated through them -- denser until the points
+    between lie on it within tol. The kernel's intersect_surfaces left a
+    sculpted face's dipped edge 1.6e-3 off its surface. c unchanged when it
+    already lies on both."""
+    np = _np()
+    t0, t1 = c.parameter_range()
+
+    def on_both(p, uv1=None, uv2=None):
+        p = np.asarray(p, float)
+        for _ in range(6):
+            f1, n1, uv1 = _foot_and_normal(S1, p, uv1)
+            f2, n2, uv2 = _foot_and_normal(S2, p, uv2)
+            if max(np.linalg.norm(f1 - p), np.linalg.norm(f2 - p)) <= 1e-3 * tol:
+                break
+            A = np.array([[n1 @ n1, n1 @ n2], [n1 @ n2, n2 @ n2]])
+            rhs = np.array([n1 @ (f1 - p), n2 @ (f2 - p)])
+            try:
+                a, b = np.linalg.solve(A, rhs)
+            except np.linalg.LinAlgError:
+                break
+            p = p + a * n1 + b * n2
+        return p, uv1, uv2
+
+    qa, qb = np.array(c.evaluate(t0), float), np.array(c.evaluate(t1), float)
+    if ends is not None:                       # the corners as they were made (on the side edges too)
+        ea, eb = (np.asarray(x, float) for x in ends)
+        if np.linalg.norm(ea - qa) + np.linalg.norm(eb - qb) > np.linalg.norm(ea - qb) + np.linalg.norm(eb - qa):
+            ea, eb = eb, ea
+        moved_ends = max(np.linalg.norm(ea - qa), np.linalg.norm(eb - qb)) > 1e-3 * tol
+        qa, qb = ea, eb
+    else:
+        moved_ends = False
+    probe = [np.array(c.evaluate(t0 + (t1 - t0) * s), float) for s in (0.2, 0.4, 0.6, 0.8)]
+    off = max(max(np.linalg.norm(_foot_and_normal(S, p)[0] - p) for S in (S1, S2)) for p in probe)
+    if off <= 1e-3 * tol and not moved_ends:
+        return c
+    # points kept by their place on a 1/384 grid of c's range: a doubled n
+    # (and its check points, half way between) reuses them; each search
+    # starts from its neighbour's feet
+    done, M = {}, 384
+
+    def at(key, near):
+        if key not in done:
+            uv1, uv2 = done[near][1:] if near in done else (None, None)
+            done[key] = on_both(c.evaluate(t0 + (t1 - t0) * key / M), uv1, uv2)
+        return done[key][0]
+
+    n = 24
+    while True:
+        P, step = [qa], M // n
+        for k in range(1, n):
+            P.append(at(k * step, (k - 1) * step))
+        P.append(qb)
+        out = sm.create_curve_interp_points([tuple(map(float, p)) for p in P],
+                                            parameterization=sm.CurveParameterization.CHORD_LENGTH)
+        mids = [at(k * step + step // 2, k * step) for k in range(0, n, max(1, n // 8))]
+        err = max(sm.curve_closest_point(out, tuple(map(float, m)))[2] for m in mids)
+        if err <= tol or n >= 192:
+            return out
+        n *= 2
 
 
 def _surface_piece(srf, along_v, t0, t1):
@@ -2787,7 +2952,7 @@ def _exact_move_closed(body, p, G, reach, tol):
     return b, (built, piece)
 
 
-def _exact_move(body, p, G, reach, tol):
+def _exact_move(body, p, G, reach, tol, tight=False):
     """(solid, kept): body with the face at p replaced by the untrimmed surface
     G, each neighbour's own surface extended or cut back to meet it and each
     vertex slid along its side edge -- no walls along the normal, so a leaning
@@ -2808,7 +2973,7 @@ def _exact_move(body, p, G, reach, tol):
             if len(sides) != 1:
                 raise RuntimeError("a vertex of the face has more than three faces")
             q = np.array(v.point(), float)
-            new_v[v] = _new_vertex(sides[0], q, G, ext_d, tol) + (sides[0],)
+            new_v[v] = _new_vertex(sides[0], q, G, ext_d, tol, tight) + (sides[0],)
     side_of = {sd: (v, q, piece) for v, (q, piece, sd) in new_v.items()}
     nbrs = {}
     for e in Fedges:
@@ -2816,7 +2981,7 @@ def _exact_move(body, p, G, reach, tol):
         if len(others) != 1:
             raise RuntimeError("an edge of the face is not shared with one neighbour")
         nbrs.setdefault(others[0], []).append(e)
-    ext_srf = {N: _extended_surface(N.surface(), ext_d, tol) for N in nbrs}
+    ext_srf = {N: _extended_surface(N.surface(), ext_d, tol, fast=tight) for N in nbrs}
     new_c = {}                                   # face edge -> its new curve(s) (fresh copies made from these)
     iso_faces = {}                               # closed neighbour -> its new natural face
     for N, es in nbrs.items():
@@ -2838,6 +3003,9 @@ def _exact_move(body, p, G, reach, tol):
         va, vb = e.start_vertex(), e.end_vertex()
         closed = va == vb
         new_c[e] = _new_edge(ext_srf[N], G, new_v[va][0], new_v[vb][0], closed, tol)
+        if tight:                                # (Face CVs: the edges on the sculpted face to ~tol)
+            ends = None if closed else (new_v[va][0], new_v[vb][0])
+            new_c[e] = [_refined_curve(c, ext_srf[N], G, tol, ends) for c in new_c[e]]
     copy_c = lambda c: ext.curve_from_cvs(*_cv_tuple(ext.curve_cvs(c)))
 
     def side_piece(sd):
@@ -2864,7 +3032,8 @@ def _exact_move(body, p, G, reach, tol):
             if ch is None:
                 raise RuntimeError("a neighbour's new outline does not close")
             loops.append(ch)
-        srf = _extended_surface(N.surface(), ext_d, tol)
+        # the extension made above (a fresh copy: a trim adopts its surface)
+        srf = ext.surface_from_cvs(*_srf_tuple(ext.surface_cvs(ext_srf[N])))
         built.append(ext.trim_surface_with_3d_curves_tol(srf, [len(l) for l in loops],
                                                         [c for l in loops for c in l], 10 * tol, 1e2 * tol))
     # the new face: G trimmed to the new outline(s)
@@ -2895,7 +3064,7 @@ def _exact_move(body, p, G, reach, tol):
         pass
     if not b.is_manifold_solid():
         raise RuntimeError("the moved face and its neighbours do not close into a solid")
-    if _vol(b) <= 0:
+    if (_mesh_volume(b) if tight else _vol(b)) <= 0:
         raise RuntimeError("the moved face turned the body inside out")
     return b, (built, ext_srf)
 
@@ -3473,6 +3642,215 @@ def job_rotate_face(job):
         raise RuntimeError("the turned face turned the body inside out")
     save(to_local(body, job.get("xforms", {}).get(job.get("into"))), job["out"]["result"])
     return {"faces": body.face_count(), "volume": volume, "change": volume - V0, "how": hows, "lean": lean}
+
+
+# --------------------------------------------------------------------------
+# Face CVs: one face of a solid sculpted by its control points; the walls
+# round it keep their own surfaces and are re-trimmed to the new shape
+# --------------------------------------------------------------------------
+
+FACE_CVS_SMOOTH_DEG = 5.0       # faces meeting flatter than this along an edge: a fillet / smooth join
+
+
+def _face_cvs_refusal(F, tol):
+    """Why the face can't be sculpted (phase 1: sharp edges, three faces at
+    each corner, no seam), or None."""
+    np = _np()
+    Fedges = set(F.edges())
+    if any(not [f for f in e.faces() if f != F] for e in Fedges):
+        return "a closed face (with a seam) can't be sculpted yet"
+    cos_smooth = float(np.cos(np.radians(FACE_CVS_SMOOTH_DEG)))
+    for e in _loop_edges(F, tol):
+        others = [f for f in e.faces() if f != F]
+        if len(others) != 1:
+            return "an edge of the face is not shared with one neighbour"
+        t0, t1 = e.parameter_range()
+        for s in (0.25, 0.5, 0.75):
+            q = np.array(e.point_at(t0 + (t1 - t0) * s), float)
+            if float(_face_normal(F, q) @ _face_normal(others[0], q)) > cos_smooth:
+                return ("a fillet or a smooth face meets it along an edge -- Remove Fillets first "
+                        "(only sharp edges re-trim)")
+    for e in Fedges:
+        for v in e.vertices():
+            if len([x for x in v.edges() if x not in Fedges]) != 1:
+                return "a corner of the face has more than three faces"
+    return None
+
+
+def _face_region_net(F, srf, net, tol):
+    """The net cut back to the face's own uv box: a face sculpted before sits
+    on a surface continued far past its walls (for the re-trim); its CVs out
+    there are no use to edit. Its edges lie on the old net's sides, so the
+    cut gives that net back (to the closest-point accuracy); bounds within a
+    hair of a knot snap to it."""
+    np = _np()
+    import cvnet
+    Q, U, V = [], [], []
+    for e in _loop_edges(F, tol):
+        t0, t1 = e.parameter_range()
+        for k in range(17):
+            q = tuple(map(float, e.point_at(t0 + (t1 - t0) * k / 16.0)))
+            _, uvs, _ = sm.surface_closest_point(srf, q)
+            u, v = _uvxy(uvs[0])
+            Q.append(q)
+            U.append(u)
+            V.append(v)
+    if not U:
+        return net
+    U, V = cvnet.project(net, Q, U, V)        # (the kernel's feet are only ~1e-4 exact in uv)
+
+    def snap(x, K):
+        K = sorted(set(float(k) for k in K))
+        k = min(K, key=lambda k: abs(k - x))
+        return k if abs(k - x) <= 1e-6 * (K[-1] - K[0]) else x
+
+    Ku, Kv = net["knots_u"], net["knots_v"]
+    return cvnet.subpatch(net, snap(float(U.min()), Ku), snap(float(U.max()), Ku), snap(float(V.min()), Kv),
+                          snap(float(V.max()), Kv))
+
+
+def _even_counts(la, lb, deg):
+    """Default CV counts of a flat face la x lb: 5 x 5 when it is about square,
+    a longer face more CVs along its length (cells near square), the short
+    side 4 when the face is long."""
+    long_, short = max(la, lb), max(min(la, lb), 1e-30)
+    aspect = long_ / short
+    n_short = 5 if aspect < 1.5 else deg + 1
+    n_long = max(5, min(9, int(round((n_short - 1) * aspect)) + 1))
+    return (n_long, n_short) if la >= lb else (n_short, n_long)
+
+
+def _face_net(F, counts, degree, tol):
+    """The control net a face is sculpted with (world): a flat face gets a
+    fresh rectangle over its outline, along its longest straight edge, with
+    evenly spaced CVs (its edge CVs on its edges; exact, it is flat); a curved
+    one its own surface cut back to the face, refined exactly to degree x
+    degree with counts CVs (new knots spread evenly)."""
+    np = _np()
+    import cvnet
+    srf = F.surface()
+    planar = bool(srf.is_planar())
+    if planar:
+        ip = np.array(F.interior_point(), float)
+        n = _face_normal(F, ip)                    # outward: the net's normal (u x v) points out of the body
+        P, a, best = [], None, 0.0
+        for e in _loop_edges(F, tol):
+            t0, t1 = e.parameter_range()
+            Q = np.array([e.point_at(t0 + (t1 - t0) * k / 16.0) for k in range(17)], float)
+            P.append(Q)
+            ch = Q[-1] - Q[0]
+            L = float(np.linalg.norm(ch))
+            if L > best and L > 1e3 * tol:
+                off = np.linalg.norm(np.cross(Q - Q[0], ch / L), axis=1).max()
+                if off <= 1e-6 * L:
+                    best, a = L, ch / L
+        P = np.vstack(P)
+        if a is None:                              # no straight edge: the outline's long axis
+            R = P - P.mean(axis=0)
+            R -= np.outer(R @ n, n)
+            a = np.linalg.svd(R, full_matrices=False)[2][0]
+        a = a - (a @ n) * n
+        a /= np.linalg.norm(a)
+        b = np.cross(n, a)
+        x, y = (P - ip) @ a, (P - ip) @ b
+        la, lb = float(np.ptp(x)), float(np.ptp(y))
+        deg = int(degree or 3)
+        nu, nv = counts if counts else _even_counts(la, lb, deg)
+        nu, nv = max(int(nu), deg + 1), max(int(nv), deg + 1)
+        net = cvnet.even_plane_net(ip + x.min() * a + y.min() * b, a, b, la, lb, nu, nv, deg, deg)
+        net["plane"] = True
+        net["min_counts"] = [deg + 1, deg + 1]
+        return net
+    else:
+        d = ext.surface_cvs(srf)
+        net0 = {k: d[k] for k in ("degree_u", "degree_v", "count_u", "count_v", "knots_u", "knots_v")}
+        net0["points"] = [list(map(float, q)) for q in d["points"]]
+        net0["weights"] = list(d.get("weights") or [])
+        net0 = _face_region_net(F, srf, net0, tol)
+        dflt = [max(4, net0["count_u"]), max(4, net0["count_v"])]
+    deg = int(degree or 3)
+    du, dv = max(deg, net0["degree_u"]), max(deg, net0["degree_v"])
+    mu, mv = cvnet.min_counts(net0, du, dv)
+    nu, nv = counts if counts else dflt
+    net = cvnet.refine(net0, max(int(nu), mu), max(int(nv), mv), du, dv)
+    net["plane"] = planar
+    net["min_counts"] = [mu, mv]
+    return net
+
+
+def _normalised(net):
+    """The net with its knots mapped to [0, 1] each way (the same surface)."""
+    out = dict(net)
+    for k in ("knots_u", "knots_v"):
+        K = [float(x) for x in net[k]]
+        a, b = K[0], K[-1]
+        out[k] = [(x - a) / (b - a) for x in K]
+    return out
+
+
+def job_face_cvs(job):
+    """Face CVs (world space). The face of the solid job['target'] at
+    job['face_pt'] (job['face_normal'] / job['face_flat'] find a flat one
+    again after a rebuild):
+    - without job['cvs']: its control net for sculpting (_face_net, refined
+      to job['counts'] / job['degree']), result {'net': ...};
+    - with job['cvs'] (the net job['net'] with its CVs moved from
+      job['cvs0']): the solid with that face on the new surface, each
+      neighbour kept on its own surface, extended or cut back to meet it
+      (Push / Pull's exact move). Written in the local space of job['into']."""
+    np = _np()
+    import cvnet
+    body = world_brep(job, "target")
+    if not bool(body.is_manifold_solid()):
+        raise RuntimeError("Face CVs needs a closed solid (all edges shared by two faces)")
+    lo, hi = (np.array(v, float) for v in body.bounding_box())
+    size = float(np.linalg.norm(hi - lo)) or 1.0
+    tol = 1e-6 * size
+    F, p = _find_face(body, job["face_pt"], job.get("face_normal"), bool(job.get("face_flat")), size)
+    why = _face_cvs_refusal(F, tol)
+    if why:
+        raise RuntimeError(why)
+    if job.get("cvs") is None:
+        return {"net": _face_net(F, job.get("counts"), job.get("degree"), tol)}
+    net = dict(job["net"])
+    net["points"] = [list(map(float, q)) for q in job["cvs"]]
+    X0, X1 = np.asarray(job["cvs0"], float), np.asarray(job["cvs"], float)
+    moved = float(np.linalg.norm(X1 - X0, axis=1).max()) if len(X0) == len(X1) else size
+    out, why = None, ""
+    # a surface moves no further than its CVs (convex hull): the walls need to
+    # reach about that far (a short continuation first: less to intersect)
+    for r in (1.05 * moved + 0.01 * size, moved + 0.25 * size, moved + size):
+        try:
+            Gx = _normalised(cvnet.extend(net, 2.0 * r + 10.0 * tol, 1e-9 * size))
+            G = ext.surface_from_cvs(Gx["degree_u"], Gx["degree_v"], [tuple(q) for q in Gx["points"]],
+                                     Gx["knots_u"], Gx["knots_v"], Gx["weights"] or None)
+            out, _ = _exact_move(body, p, G, r, tol, tight=True)
+            if bool(out.is_manifold_solid()):
+                break
+            out, why = None, "the result is not a closed solid"
+        except Exception as exc:
+            out, why = None, str(exc)
+    if out is None:
+        raise RuntimeError(f"the face can't take that shape ({why})")
+    # the walls round it are re-trimmed, but nothing else stops the face from
+    # running through the rest of the body (a CV pushed through the floor)
+    mid = cvnet.evaluate(net, [0.5 * (net["knots_u"][0] + net["knots_u"][-1])],
+                         [0.5 * (net["knots_v"][0] + net["knots_v"][-1])])[0, 0]
+    Fn = _face_at(out, mid)
+    near = {f for e in Fn.edges() for f in e.faces()}
+    lo_h, hi_h = X1.min(axis=0) - 10 * tol, X1.max(axis=0) + 10 * tol      # the face lies in its CVs' hull
+    for f in out.faces():
+        if f in near:
+            continue
+        E = np.array([e.point_at(t) for e in f.edges() for t in np.linspace(*e.parameter_range(), 5)], float)
+        if len(E) and f.surface().is_planar() and (np.any(E.max(axis=0) < lo_h) or np.any(E.min(axis=0) > hi_h)):
+            continue                              # a flat face wholly outside that box can't be hit
+        hit = sm.intersect_faces(Fn, f)
+        if any(len(x) for x in hit if isinstance(x, (list, tuple))):
+            raise RuntimeError("the face would run through another face of the body")
+    # (_exact_move checked it is not inside out: the volume isn't wanted here, it took 10-20 ms)
+    save(to_local(out, job.get("xforms", {}).get(job.get("into"))), job["out"]["result"])
+    return {"faces": out.face_count()}
 
 
 def _loop_polygon(loop, k=24):
@@ -6403,7 +6781,7 @@ def job_mesh_to_brep(job):
 
 JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "untrim_region": job_untrim_region, "untrim_preview": job_untrim_preview, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean, "push_pull": job_push_pull, "rotate_face": job_rotate_face, "move_face": job_move_face, "replace_face": job_replace_face, "extrude_face": job_extrude_face,
         "flip": job_flip, "cap_solid": job_cap_solid, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken, "shell": job_shell, "remove_fillets": job_remove_fillets,
-        "mesh_to_brep": job_mesh_to_brep}
+        "mesh_to_brep": job_mesh_to_brep, "face_cvs": job_face_cvs}
 
 
 RESULT_MARK = "@@nproto-result@@ "   # (serve mode: the line that carries a job's result)

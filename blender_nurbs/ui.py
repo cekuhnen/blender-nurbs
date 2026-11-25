@@ -617,6 +617,9 @@ class VIEW3D_PT_nproto_active(_SidePanel, bpy.types.Panel):
             # A plain line like the object's own; Tab goes back to Object Mode
             box = lay.box()
             box.label(text=f"{cage[_cvs.CAGE_OF]}: editing CVs", icon='EDITMODE_HLT')
+            from . import facecvs as _fcv
+            if _fcv.is_face_cage(cage):
+                _fcv.draw_panel(box, context, cage)
             if cage.mode == 'EDIT':
                 from . import cvnudge
                 cvnudge.draw_panel(box, context)

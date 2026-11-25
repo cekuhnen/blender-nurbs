@@ -5249,6 +5249,7 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cy
               "curve_degree", "fix_clip_start", "delete_faces", "move_pivot", "cv_nudge", "pattern_select",
               "measure",    # Measure: in the Analyze panel / header popover, with Continuity Check
               "remove_symmetry",    # Mirror's Make Symmetric: the Active Object panel's button
+              "face_cvs_refine",    # Face CVs' Add CVs / Rebuild: the open face cage's panel buttons
               "move", "rotate", "scale", "transform_hold",   # by Points: hold G / R / S (movetool keymap), no button
               "align_parts",    # Align Parts: Object > Transform and the NURBS Proto menu
               "square"}     # Square: merged into Patch (Quad Sided); kept for older files, off the menus
