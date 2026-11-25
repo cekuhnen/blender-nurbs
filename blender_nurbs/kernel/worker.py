@@ -5496,6 +5496,119 @@ def _surface_extended(s, distance):
     return out
 
 
+def _surface_continued(s, dist, tol):
+    """A copy of s continued as the same polynomial about dist past each side,
+    its parameters kept (cvnet.extend moves only the end knots), so a face's
+    trims in (u, v) stay where they were. None for a surface closed round
+    (or one that can't be continued)."""
+    import cvnet
+    try:
+        if any(_closed_dirs(s, tol)):
+            return None
+        d = ext.surface_cvs(s)
+        net = {k: d[k] for k in ("degree_u", "degree_v", "count_u", "count_v", "knots_u", "knots_v")}
+        net["points"] = [list(map(float, q)) for q in d["points"]]
+        net["weights"] = list(d.get("weights") or [])
+        x = cvnet.extend(net, dist, 1e-2 * tol)
+        return ext.surface_from_cvs(x["degree_u"], x["degree_v"], [tuple(q) for q in x["points"]],
+                                    [float(k) for k in x["knots_u"]], [float(k) for k in x["knots_v"]],
+                                    x["weights"] or None)
+    except Exception:
+        return None
+
+
+def _fillet_on_continued(before, edge_mids, call, dists, tol):
+    """The kernel's edge fillet fails (SM_ERR 1001 / 1007) where the faces
+    round a fillet's ends stop exactly at the picked edge's vertices: the ball
+    has to roll a little past them to cut its end caps, and an untrimmed patch
+    (or a refit with a 1e-5 span at its side) can't be continued there. Seen
+    on Thicken's strips at a bent plywood shell's corners: the same corner
+    filleted at one radius and failed at the next, mirror images disagreeing.
+    Retry on a copy of `before` whose faces touching the picked edges' end
+    points sit on surfaces continued past their sides (trims unchanged), one
+    distance after another; then every face that stayed on the old part gets
+    its own surface back, so nothing but the fillet changes. call(brep, edges)
+    is the kernel call. Raises the last kernel error if every try fails."""
+    np = _np()
+    last = None
+    for dist in dists:
+        bx = before.copy()
+        sel = _edges_at_mids(bx, edge_mids, tol)
+        pts = []
+        for e in sel:
+            t0, t1 = e.parameter_range()
+            pts += [np.array(e.point_at(t0), float), np.array(e.point_at(t1), float)]
+        own, ss = [], []
+        for f in bx.faces():
+            s = f.surface()
+            near = any(min(float(np.linalg.norm(np.array(g.point_at(t), float) - p)) for p in pts) <= tol
+                       for g in f.edges() for t in g.parameter_range())
+            c = _surface_continued(s, dist, tol) if near else None
+            if c is not None:     # (its CVs read now: the brep adopts c below)
+                own.append((np.array(ext.surface_cvs(c)["points"], float), _surface_copy(s)))
+            ss.append(c if c is not None else _surface_copy(s))
+        if not own:
+            break
+        ext.replace_face_surfaces_keep_uv(bx, ss)
+        try:
+            r = call(bx, _edges_at_mids(bx, edge_mids, tol))
+        except Exception as exc:
+            last = exc
+            continue
+        if r is None or r.face_count() == 0:
+            continue
+        return _surfaces_back(r, own, tol)
+    if last is not None:
+        raise last
+    return None
+
+
+def _edges_at_mids(b, mids, tol):
+    np = _np()
+    edges = b.edges()
+    em = np.array([np.array(_edge_mid(e), float) if _edge_mid(e) is not None else np.full(3, np.inf)
+                   for e in edges])
+    out = []
+    for m in mids:
+        i = int(np.argmin(np.linalg.norm(em - np.array(m, float), axis=1)))
+        if i not in out:
+            out.append(i)
+    return [edges[i] for i in out]
+
+
+def _surfaces_back(r, own, tol):
+    """Faces of r still on a continued surface of `own` [(its CV points,
+    original surface)] get the original back where every edge of theirs lies
+    on it."""
+    np = _np()
+    out, changed = [], False
+    for f in r.faces():
+        s = f.surface()
+        try:
+            P = np.array(ext.surface_cvs(s)["points"], float)
+        except Exception:
+            return r
+        hit = next((o for K, o in own if K.shape == P.shape and float(np.abs(K - P).max()) <= 1e-12), None)
+        if hit is not None:
+            ok = True
+            for g in f.edges():
+                t0, t1 = g.parameter_range()
+                for t in np.linspace(t0, t1, 7):
+                    if sm.surface_closest_point(hit, tuple(map(float, g.point_at(t))))[2] > tol:
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if ok:
+                out.append(_surface_copy(hit))
+                changed = True
+                continue
+        out.append(_surface_copy(s))
+    if changed:
+        ext.replace_face_surfaces_keep_uv(r, out)
+    return r
+
+
 def _section_groups(b, sel, tol):
     """[(face P, face Q, [edges])]: the picked edges by the two faces they
     join, when every chain is closed or ends where no other face meets (a
@@ -5735,12 +5848,27 @@ def job_edge_fillet(job):
         rs = c / (2.0 * np.sin(0.5 * th))
         r0, r1 = float(np.mean(rs)), None
         chord_info = True             # measured on the kernel's fillet below
-    if r1 is not None and abs(float(r1) - r0) > 1e-12:
-        r = sm.variable_radius_fillet(b, sel, start_radius=r0, end_radius=float(r1), xsect_type=xsect,
-                                      continuity=int(job.get("continuity", 1)))
-    else:
-        r = sm.fillet_edges(b, sel, radius=r0, xsect_type=xsect, continuity=int(job.get("continuity", 1)),
-                            thumbweight=float(job.get("thumbweight", 1.0)))
+    def call(bb, ss):
+        if r1 is not None and abs(float(r1) - r0) > 1e-12:
+            return sm.variable_radius_fillet(bb, ss, start_radius=r0, end_radius=float(r1), xsect_type=xsect,
+                                             continuity=int(job.get("continuity", 1)))
+        return sm.fillet_edges(bb, ss, radius=r0, xsect_type=xsect, continuity=int(job.get("continuity", 1)),
+                               thumbweight=float(job.get("thumbweight", 1.0)))
+    sel_mids = [_edge_mid(e) for e in sel]
+    first = None
+    try:
+        r = call(b, sel)
+    except Exception as exc:
+        if "SM_ERR" not in str(exc):
+            raise
+        r, first = None, exc
+    if r is None or r.face_count() == 0:
+        # again with the faces round the fillets' ends continued past the picked edges' vertices
+        size = float(np.linalg.norm(hi - lo)) or 1.0
+        rmax = max(r0, float(r1) if r1 is not None else 0.0)
+        r = _fillet_on_continued(b_ring, sel_mids, call, (2.0 * rmax, 4.0 * rmax, rmax, 0.1 * size), 1e-6 * size)
+        if r is None and first is not None:
+            raise first
     if r is None or r.face_count() == 0:
         raise RuntimeError("the kernel returned no result (radius too large for the neighbouring faces?)")
     r = _fix_coiled_faces(b_ring, _fix_ring_faces(b_ring, r))
