@@ -185,5 +185,38 @@ n0 = brep(B).face_count()
 dt, ex = fillet(B, [(4, 0, 1)], 0.4)
 check("a vertical edge (between two flat walls): the kernel's", not ex and solid(B) and brep(B).face_count() == n0 + 1)
 
+def max_crease(B):
+    worst = 0.0
+    for e in brep(B).edges():
+        fs = e.faces()
+        if len(fs) != 2:
+            continue
+        t0, t1 = e.parameter_range()
+        for t in np.linspace(0.1, 0.9, 5):
+            q = np.array(e.point_at(t0 + (t1 - t0) * t), float)
+            na, nb = (np.array(f.outward_normal_at_uv(*_uv(f.surface(), q)), float) for f in fs)
+            worst = max(worst, float(np.degrees(np.arccos(min(1.0, na @ nb / np.linalg.norm(na) / np.linalg.norm(nb))))))
+    return worst
+
+ALL12 = TOP4 + [(2, 0, 0), (2, 3, 0), (0, 1.5, 0), (4, 1.5, 0), (0, 0, 1), (4, 0, 1), (4, 3, 1), (0, 3, 1)]
+
+# --- every edge of a domed box at once: twelve exact fillets, eight sphere corners
+for nm, fn in (("gently", gentle), ("steeply", steep)):
+    clear(); B = box(); sculpt_top(B, fn)
+    dt, ex = fillet(B, ALL12, 0.4)
+    cr = max_crease(B)
+    curved = [f for f in brep(B).faces() if not f.surface().is_planar()]
+    ks = [_kmax(f.surface(), *_uv(f.surface(), np.array(f.interior_point(), float))) * 0.4 for f in curved]
+    check(f"every edge of a {nm} domed box: exact, 8 sphere corners, no crease anywhere", ex and solid(B)
+          and brep(B).face_count() == 26 and cr < 0.05 and sum(abs(k - 1.0) < 0.01 for k in ks) == 20,
+          f"{brep(B).face_count()} faces, worst crease {cr:.4f} deg, {sum(abs(k - 1.0) < 0.01 for k in ks)} of 20 "
+          f"at 1/r, {dt * 1000:.0f} ms")
+
+# --- every edge of a flat box: the kernel's (exact between planes), the same result
+clear(); B = box()
+dt, ex = fillet(B, ALL12, 0.4)
+check("every edge of a flat box: the kernel's, closed, no crease", not ex and solid(B) and brep(B).face_count() == 26
+      and max_crease(B) < 0.05)
+
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)

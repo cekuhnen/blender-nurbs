@@ -349,6 +349,21 @@ def rounds(B, r, top_pt, ktol=0.05):
         n_ok += all(abs(k * r - 1.0) < ktol for k in ks)
     return n_ok, kink
 
+def max_crease(B):
+    """The largest angle (degrees) between two faces along any edge: 0 when
+    every edge is filleted tangent."""
+    worst = 0.0
+    for e in brep(B).edges():
+        fs = e.faces()
+        if len(fs) != 2:
+            continue
+        t0, t1 = e.parameter_range()
+        for t in np.linspace(0.1, 0.9, 5):
+            q = np.array(e.point_at(t0 + (t1 - t0) * t), float)
+            na, nb = (np.array(f.outward_normal_at_uv(*_uv(f.surface(), q)), float) for f in fs)
+            worst = max(worst, float(np.degrees(np.arccos(min(1.0, na @ nb / np.linalg.norm(na) / np.linalg.norm(nb))))))
+    return worst
+
 def round_faces(B, top_pt):
     """How many faces along the top's edges are curved (its fillets)."""
     top = brep(B).faces()[face_at(B, top_pt)]
@@ -488,8 +503,10 @@ fit("every edge filleted", B, 0.4, (2, 1.5, 2))
 if facecvs.is_face_cage(cage):
     facecvs.settle_now()
     fl = json.loads(cage.get(facecvs.CAGE_FILLETS, "null"))
-    check("... they meet three at a corner: still the kernel's when it pauses (tried, said in the panel)",
-          solid(B) and brep(B).face_count() == n0 and fl and not fl[2] and fl[3], f"panel {fl}")
+    crease = max_crease(B)
+    check("... once it pauses: all twelve exact, the eight corners spheres (three fillets meet there)",
+          solid(B) and brep(B).face_count() == n0 and fl and fl[2] and crease < 0.05,
+          f"panel {fl}, worst crease {crease:.4f} deg")
     bpy.ops.nproto.cvs_cancel()
 
 # --- a soft (blend) fillet along the top is still refused

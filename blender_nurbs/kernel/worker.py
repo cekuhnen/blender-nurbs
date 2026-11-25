@@ -4050,7 +4050,7 @@ def _sharpen_region(body, p, member_pts, reach, tol):
 
 
 # --------------------------------------------------------------------------
-# Exact fillets along one face (Face CVs: the fillets made again on a sculpted face)
+# Exact fillets (Face CVs' fillets made again on a sculpted face; the Fillet tool on curved faces)
 # --------------------------------------------------------------------------
 # The kernel's circular edge fillet is exact between planes but only fitted on a
 # free-form face (0.5-10 deg off tangent). Here each fillet is secfillet's exact
@@ -4061,9 +4061,12 @@ def _sharpen_region(body, p, member_pts, reach, tol):
 # - a mitre: two fillets cut each other along the curve where they cross, traced
 #   from the point their rails cross on the face down to where one of them meets
 #   its wall; the other goes on, cut by that wall, down to its own wall rail.
+# - a sphere corner: three of one radius meet; the one ball touching all three
+#   faces is where each of them ends, along a great-circle arc between two of its
+#   feet, so the corner is that ball's spherical triangle (exact, tangent to all).
 # Every face round them is trimmed again on its own surface, then all stitched.
-# Fillets that meet three at a corner, or that run on past the face, are the
-# kernel's (a corner patch).
+# Three of different radii at a corner, or more than three faces at one, are the
+# kernel's.
 
 def _xf_pt(c, t):
     np = _np()
@@ -4134,36 +4137,6 @@ def _xf_piece(c, qa, qb):
     a, b = (qa, qb) if ta <= tb else (qb, qa)
     P[0], P[-1] = list(map(float, a)), list(map(float, b))       # (snapped: within the tolerance already)
     return ext.curve_from_cvs(int(d["degree"]), [tuple(q) for q in P], list(d["knots"]), d.get("weights") or None)
-
-
-class _XfFillet:
-    def __init__(self, e, A, Wf, A_ext, r, size, tol):
-        np = _np()
-        self.e, self.A, self.W, self.r = e, A, Wf, r
-        self.W_ext = _extended_surface(Wf.surface(), 3 * r, tol, fast=True)
-        cs = sm.intersect_surfaces(A_ext, self.W_ext)
-        m = np.array(e.point_at(sum(e.parameter_range()) / 2), float)
-        c = min(cs, key=lambda c: sm.curve_closest_point(c, tuple(m))[2])
-        c = _refined_curve(c, A_ext, self.W_ext, tol)
-        c0, c1 = c.parameter_range()
-        e0, e1 = e.parameter_range()
-        ta, tb = sorted((_xf_param(c, e.point_at(e0)), _xf_param(c, e.point_at(e1))))
-        m_ = 2.5 * r * (tb - ta) / max(e.length(), 1e-12)
-        c = _curve_piece(c, max(c0, ta - m_), min(c1, tb + m_))
-        import secfillet
-        f, info = secfillet.build(sm, ext.brep_from_surface(A_ext), ext.brep_from_surface(self.W_ext),
-                                  -_surface_sign(A), -_surface_sign(Wf), r, r, curves=[c], tolerance=tol)
-        self.S = f.faces()[0].surface()
-        r0, r1 = _boundary_iso(self.S, True, False), _boundary_iso(self.S, True, True)
-        q0 = _xf_pt(r0, sum(r0.parameter_range()) / 2)
-        dA = float(np.linalg.norm(_foot_and_normal(A_ext, q0)[0] - q0))
-        dW = float(np.linalg.norm(_foot_and_normal(self.W_ext, q0)[0] - q0))
-        (v0, v1) = self.S.v_domain()
-        if dA <= dW:
-            self.railA, self.railW, self.vA, self.vW = r0, r1, v0, v1
-        else:
-            self.railA, self.railW, self.vA, self.vW = r1, r0, v1, v0
-        self.sections = info["sections"]
 
 
 def _xf_mitre(fi, fj, P, tol, n=24):
@@ -4263,91 +4236,240 @@ def _xf_mitre(fi, fj, P, tol, n=24):
     return _xf_interp(pts), pts[-1], end_on
 
 
-def _exact_face_fillets(b, A_pt, specs, size, tol):
-    """b (sharp solid) with the edges of the face at A_pt filleted exactly;
-    specs: [(point on the edge, radius)]."""
+def _featregion():
+    import featregion
+    return featregion
+
+
+class _XfFillet:
+    """One edge's exact fillet between its faces F1, F2 (rails, v per face)."""
+
+    def __init__(self, e, F1, F2, ext_of, r, size, tol):
+        np = _np()
+        self.e, self.r, self.faces = e, r, (F1, F2)
+        E1, E2 = ext_of(F1), ext_of(F2)
+        cs = sm.intersect_surfaces(E1, E2)
+        m = np.array(e.point_at(sum(e.parameter_range()) / 2), float)
+        c = min(cs, key=lambda c: sm.curve_closest_point(c, tuple(m))[2])
+        c = _refined_curve(c, E1, E2, tol)
+        c0, c1 = c.parameter_range()
+        e0, e1 = e.parameter_range()
+        ta, tb = sorted((_xf_param(c, e.point_at(e0)), _xf_param(c, e.point_at(e1))))
+        m_ = 2.5 * r * (tb - ta) / max(e.length(), 1e-12)
+        c = _curve_piece(c, max(c0, ta - m_), min(c1, tb + m_))
+        import secfillet
+        kind = _featregion().edge_kind(e, size, sm)
+        if kind == "smooth":
+            raise RuntimeError("a smooth edge has no fillet")
+        s = -1.0 if kind == "convex" else 1.0          # the ball inside the solid (convex) or outside
+        f, info = secfillet.build(sm, ext.brep_from_surface(E1), ext.brep_from_surface(E2),
+                                  s * _surface_sign(F1), s * _surface_sign(F2), r, r, curves=[c],
+                                  tolerance=tol)
+        self.S = f.faces()[0].surface()
+        r0, r1 = _boundary_iso(self.S, True, False), _boundary_iso(self.S, True, True)
+        q0 = _xf_pt(r0, sum(r0.parameter_range()) / 2)
+        d1 = float(np.linalg.norm(_foot_and_normal(E1, q0)[0] - q0))
+        d2 = float(np.linalg.norm(_foot_and_normal(E2, q0)[0] - q0))
+        v0, v1 = self.S.v_domain()
+        if d1 <= d2:
+            self.rail, self.v = {F1: r0, F2: r1}, {F1: v0, F2: v1}
+        else:
+            self.rail, self.v = {F1: r1, F2: r0}, {F1: v1, F2: v0}
+        self.ext = {F1: E1, F2: E2}
+
+    def other(self, F):
+        return self.faces[1] if F == self.faces[0] else self.faces[0]
+
+
+class _XfSide:
+    """A fillet seen from the face A two fillets share at a mitre (for _xf_mitre)."""
+
+    def __init__(self, f, A):
+        Wf = f.other(A)
+        self.S, self.r, self.W = f.S, f.r, Wf
+        self.vA, self.vW = f.v[A], f.v[Wf]
+        self.railA, self.railW = f.rail[A], f.rail[Wf]
+        self.W_ext = f.ext[Wf]
+
+
+def _xf_sphere(c, r, x, z):
+    """An exact rational sphere about c, its seam in the direction x, poles on z."""
+    np = _np()
+    x = np.asarray(x, float); x /= np.linalg.norm(x)
+    z = np.asarray(z, float); z = z - (z @ x) * x; z /= np.linalg.norm(z)
+    y = np.cross(z, x)
+    s = np.sqrt(0.5)
+    ring = [(1, 0, 1), (1, 1, s), (0, 1, 1), (-1, 1, s), (-1, 0, 1), (-1, -1, s), (0, -1, 1), (1, -1, s), (1, 0, 1)]
+    half = [(-1, 0, 1), (-1, 1, s), (0, 1, 1), (1, 1, s), (1, 0, 1)]   # (z, rho, w): south pole to north
+    pts, ws = [], []
+    for a, b, wu in ring:
+        for zz, rho, wv in half:
+            p = c + r * (rho * (a * x + b * y) + zz * z)
+            pts.append(tuple(map(float, p)))
+            ws.append(float(wu * wv))
+    Ku = [0, 0, 0, .25, .25, .5, .5, .75, .75, 1, 1, 1]
+    Kv = [0, 0, 0, .5, .5, 1, 1, 1]
+    return ext.surface_from_cvs(2, 2, pts, Ku, Kv, ws)
+
+
+def _xf_arc(c, p, q):
+    """The great-circle arc from p to q on the sphere about c (rational, exact)."""
+    np = _np()
+    a, b = np.asarray(p, float) - c, np.asarray(q, float) - c
+    r = float(np.linalg.norm(a))
+    th = float(np.arccos(np.clip(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)), -1.0, 1.0)))
+    m = a + b
+    m = c + m / np.linalg.norm(m) * r / np.cos(0.5 * th)
+    return ext.curve_from_cvs(2, [tuple(map(float, p)), tuple(map(float, m)), tuple(map(float, q))],
+                              [0.0, 0.0, 0.0, 1.0, 1.0, 1.0], [1.0, float(np.cos(0.5 * th)), 1.0])
+
+
+def _xf_ball(faces, ext_of, kinds, r, start, tol):
+    """The centre of the ball of radius r touching all three faces (inside the
+    corner): Newton on the signed distances."""
+    np = _np()
+    c = np.asarray(start, float)
+    uv = [None, None, None]
+    for _ in range(40):
+        rows, g = [], []
+        for k, F in enumerate(faces):
+            f, n, uv[k] = _foot_and_normal(ext_of(F), c, uv[k])
+            n = n * _surface_sign(F)              # outward
+            rows.append(n)
+            g.append(float(n @ (c - f)) + kinds[k] * r)
+        g = np.array(g)
+        if np.abs(g).max() < 1e-3 * tol:
+            break
+        c = c - np.linalg.solve(np.array(rows), g)
+    feet = [_foot_and_normal(ext_of(F), c)[0] for F in faces]
+    return c, feet
+
+
+def _exact_fillets(b, specs, size, tol):
+    """b (a solid) with the edges nearest the spec points filleted exactly at their radii."""
     np = _np()
     b = b.copy()
-    A = _face_at(b, A_pt)
-    A_ext = _extended_surface(A.surface(), 3 * max(r for _, r in specs), tol, fast=True)
-    Aedges = list(A.edges())
+    edges = list(b.edges())
+    ext_cache = {}
+
+    def ext_of(F):
+        for k, v in ext_cache.items():
+            if k == F:
+                return v
+        e_ = _extended_surface(F.surface(), 3.0 * max(r for _, r in specs), tol, fast=True)
+        ext_cache[F] = e_
+        return e_
     fil = {}
     for q, r in specs:
-        e = min(Aedges, key=lambda x: x.closest_point(tuple(map(float, q)))[2])
-        Wf = [f for f in e.faces() if f != A][0]
-        fil[e] = _XfFillet(e, A, Wf, A_ext, r, size, tol)
-    wall_of = {x: [f for f in x.faces() if f != A][0] for x in Aedges}
-    rail_ends = {e: {} for e in fil}    # fillet edge -> {"A": [pts], "W": [pts]}
-    short = {}           # original edge -> {vertex: new end point}
-    insert = {}          # face -> [curves]
-    S_loop = {e: [] for e in fil}       # fillet -> its end curves
-    for v in {v for x in Aedges for v in x.vertices()}:
-        ex = [x for x in Aedges if any(v == w for w in x.vertices())]
-        if len(ex) != 2:
-            raise RuntimeError("a corner of the face is not two of its edges")
-        sides = [x for x in v.edges() if not any(x == y for y in Aedges)]
-        if len(sides) != 1:
+        e = min(edges, key=lambda x: x.closest_point(tuple(map(float, q)))[2])
+        F1, F2 = e.faces()
+        fil[e] = _XfFillet(e, F1, F2, ext_of, r, size, tol)
+    rail_ends = {e: {F: [] for F in f.faces} for e, f in fil.items()}
+    short, insert, S_loop, patches = {}, [], {e: [] for e in fil}, []
+    verts = []
+    for e in fil:
+        for v in e.vertices():
+            if not any(v == w for w in verts):
+                verts.append(v)
+    for v in verts:
+        es = list(v.edges())
+        if len(es) != 3:
             raise RuntimeError("a corner with more than three faces")
-        L = sides[0]
+        fx = [x for x in es if x in fil]
         q_v = np.array(v.point(), float)
-        fx = [x for x in ex if x in fil]
-        if not fx:
-            continue
-        if len(fx) == 1:                                  # a wall end: the fillet cut off by the other wall
+        if len(fx) == 1:                                    # a wall end
             e = fx[0]
-            F = fil[e]
-            e2 = [x for x in ex if x != e][0]
-            C = wall_of[e2]
-            C_ext = _extended_surface(C.surface(), 3 * F.r, tol, fast=True)
-            E1 = _xf_curve_x_surface(F.railA, C_ext, q_v, tol)
-            E2 = _xf_curve_x_surface(F.railW, C_ext, q_v, tol)
-            arc = _new_edge(C_ext, F.S, E1, E2, False, tol)
-            arc = [_refined_curve(c, C_ext, F.S, tol, (E1, E2)) for c in arc]
-            rail_ends[e].setdefault("A", []).append(E1)
-            rail_ends[e].setdefault("W", []).append(E2)
-            short.setdefault(e2, {})[v] = E1
-            short.setdefault(L, {})[v] = E2
+            f = fil[e]
+            F1, F2 = f.faces
+            C = [g for x in es for g in x.faces() if not any(g == h for h in (F1, F2))][0]
+            CE = ext_of(C)
+            E1 = _xf_curve_x_surface(f.rail[F1], CE, q_v, tol)
+            E2 = _xf_curve_x_surface(f.rail[F2], CE, q_v, tol)
+            arc = _new_edge(CE, f.S, E1, E2, False, tol)
+            arc = [_refined_curve(c, CE, f.S, tol, (E1, E2)) for c in arc]
+            rail_ends[e][F1].append(E1)
+            rail_ends[e][F2].append(E2)
+            for x in es:
+                if x == e:
+                    continue
+                F = F1 if any(F1 == g for g in x.faces()) else F2
+                short.setdefault(x, {})[v] = E1 if F == F1 else E2
             S_loop[e] += arc
-            insert.setdefault(C, []).extend(arc)
-        else:                                             # a mitre between the two fillets
+            insert.append((C, v, arc))
+        elif len(fx) == 2:                                  # a mitre on the face the two share
             ei, ej = fx
-            Fi, Fj = fil[ei], fil[ej]
+            A = [g for g in ei.faces() if any(g == h for h in ej.faces())][0]
+            Fi, Fj = _XfSide(fil[ei], A), _XfSide(fil[ej], A)
+            L = [x for x in es if x not in fil][0]
             P = _xf_curve_x_curve(Fi.railA, Fj.railA, q_v)
             M, Q, end_on = _xf_mitre(Fi, Fj, P, tol)
-            if end_on is Fj:                               # S_j reached its wall first: swap the roles
+            if end_on is Fj:
                 Fi, Fj, ei, ej = Fj, Fi, ej, ei
-            # Q on W_i: S_i ends at the mitre, S_j goes on cut by W_i down to its own wall rail
-            Wi_ext = Fi.W_ext
-            R = _xf_curve_x_surface(Fj.railW, Wi_ext, q_v, tol)
+            R = _xf_curve_x_surface(Fj.railW, Fi.W_ext, q_v, tol)
             if float(np.linalg.norm(Q - R)) ** 2 < Fj.r * tol:
-                # both walls reached nearly at once (a corner the sculpt left about flat): one point.
-                # Each fillet is tangent to its wall there, so moving R to Q along the sharp edge
-                # moves it only ~|Q - R|^2 / 2r off the fillet -- under half the tolerance
                 R, X = Q, []
             else:
-                X = _new_edge(Wi_ext, Fj.S, Q, R, False, tol)
-                X = [_refined_curve(c, Wi_ext, Fj.S, tol, (Q, R)) for c in X]
-                if sum(c.length() for c in X) > 3.0 * float(np.linalg.norm(Q - R)) + 4.0 * Fj.r:
-                    raise RuntimeError("a fillet's cut at a corner went the long way round")
-            rail_ends[ei].setdefault("A", []).append(P)
-            rail_ends[ej].setdefault("A", []).append(P)
-            rail_ends[ei].setdefault("W", []).append(Q)
-            rail_ends[ej].setdefault("W", []).append(R)
+                X = _new_edge(Fi.W_ext, Fj.S, Q, R, False, tol)
+                X = [_refined_curve(c, Fi.W_ext, Fj.S, tol, (Q, R)) for c in X]
+            rail_ends[ei][A].append(P)
+            rail_ends[ej][A].append(P)
+            rail_ends[ei][Fi.W].append(Q)
+            rail_ends[ej][Fj.W].append(R)
             short.setdefault(L, {})[v] = R
             S_loop[ei] += [M]
             S_loop[ej] += [M] + X
-            insert.setdefault(Fi.W, []).extend(X)
-    # rail pieces
-    railA, railW = {}, {}
-    for e, F in fil.items():
-        a, w = rail_ends[e].get("A", []), rail_ends[e].get("W", [])
-        if len(a) != 2 or len(w) != 2:
-            raise RuntimeError("a fillet runs past the face's corner")
-        railA[e], railW[e] = _xf_piece(F.railA, a[0], a[1]), _xf_piece(F.railW, w[0], w[1])
+            if X:
+                insert.append((Fi.W, v, X))
+        else:                                               # three: a sphere corner
+            rs = {round(fil[x].r, 9) for x in fx}
+            if len(rs) != 1:
+                raise RuntimeError("three fillets of different sizes meet at a corner")
+            r = fil[fx[0]].r
+            faces = []
+            for x in es:
+                for g in x.faces():
+                    if not any(g == h for h in faces):
+                        faces.append(g)
+            kinds = []
+            for F in faces:
+                xs = [x for x in fx if any(F == g for g in x.faces())]
+                kinds.append(1.0 if _featregion().edge_kind(xs[0], size, sm) == "convex" else -1.0)
+            start = q_v.copy()
+            for F in faces:
+                n = _face_normal(F, q_v)
+                start = start - r * n * kinds[faces.index(F)]
+            c, feet = _xf_ball(faces, ext_of, kinds, r, start, tol)
+            foot = {k: feet[k] for k in range(3)}
+            arcs = []
+            for x in fx:
+                Fa, Fb = fil[x].faces
+                ia = next(k for k in range(3) if faces[k] == Fa)
+                ib = next(k for k in range(3) if faces[k] == Fb)
+                a = _xf_arc(c, foot[ia], foot[ib])
+                rail_ends[x][Fa].append(foot[ia])
+                rail_ends[x][Fb].append(foot[ib])
+                S_loop[x] += [a]
+                arcs.append(a)
+            d = sum(np.asarray(p, float) - c for p in feet)
+            d /= np.linalg.norm(d)
+            z = np.cross(d, [1.0, 0.0, 0.0])
+            if np.linalg.norm(z) < 0.1:
+                z = np.cross(d, [0.0, 1.0, 0.0])
+            patches.append((_xf_sphere(c, r, -d, z), arcs))
+    # rails cut to their ends
+    rail_piece = {}
+    for e, f in fil.items():
+        for F in f.faces:
+            pts = rail_ends[e][F]
+            if len(pts) != 2:
+                raise RuntimeError("a fillet's end is not at a corner")
+            rail_piece[(e, F)] = _xf_piece(f.rail[F], pts[0], pts[1])
 
-    def edge_curve(x, face):
+    def edge_curve(x, F):
         if x in fil:
-            return railA[x] if face == A else railW[x]
+            for (e, G), c in rail_piece.items():
+                if e == x and G == F:
+                    return c
         if x in short:
             t0, t1 = x.parameter_range()
             pa, pb = np.array(x.point_at(t0), float), np.array(x.point_at(t1), float)
@@ -4360,49 +4482,67 @@ def _exact_face_fillets(b, A_pt, specs, size, tol):
             return _xf_piece(_edge_copy(x), pa, pb)
         return _edge_copy(x)
     copy_c = lambda c: ext.curve_from_cvs(*_cv_tuple(ext.curve_cvs(c)))
-    touched = [A] + list(dict.fromkeys([F.W for F in fil.values()] + list(insert)))
+    touched = []
+    for e, f in fil.items():
+        for F in f.faces:
+            if not any(F == g for g in touched):
+                touched.append(F)
+    for C, v, cs in insert:
+        if not any(C == g for g in touched):
+            touched.append(C)
     built = []
-    for f in touched:
+    for F in touched:
         loops = []
-        for k, loop in enumerate(f.boundary_loops()):
-            cs = [edge_curve(x, f) for x, _ in loop]
-            if k == 0:
-                cs += [copy_c(c) for c in insert.get(f, [])]
+        for loop in F.boundary_loops():
+            cs = [edge_curve(x, F) for x, _ in loop]
+            for C, v, add in insert:
+                if C == F and any(any(v == w for w in x.vertices()) for x, _ in loop):
+                    cs += [copy_c(c) for c in add]
             ch = _chain(cs, 1e3 * tol)
             if ch is None:
                 raise RuntimeError("a face's outline does not close")
             loops.append(ch)
-        srf = ext.surface_from_cvs(*_srf_tuple(ext.surface_cvs(f.surface())))
+        srf = ext.surface_from_cvs(*_srf_tuple(ext.surface_cvs(F.surface())))
         built.append(ext.trim_surface_with_3d_curves_tol(srf, [len(l) for l in loops], [c for l in loops for c in l],
                                                         10 * tol, 10 * tol))
-    for e, F in fil.items():
-        cs = [copy_c(railA[e]), copy_c(railW[e])] + [copy_c(c) for c in S_loop[e]]
+    for e, f in fil.items():
+        cs = [copy_c(rail_piece[(e, F)]) for F in f.faces] + [copy_c(c) for c in S_loop[e]]
         ch = _chain(cs, 1e3 * tol)
         if ch is None:
             raise RuntimeError("a fillet's outline does not close")
-        srf = ext.surface_from_cvs(*_srf_tuple(ext.surface_cvs(F.S)))
-        nb = ext.trim_surface_with_3d_curves_tol(srf, [len(ch)], ch, 10 * tol, 10 * tol)
-        built.append(nb)
+        srf = ext.surface_from_cvs(*_srf_tuple(ext.surface_cvs(f.S)))
+        built.append(ext.trim_surface_with_3d_curves_tol(srf, [len(ch)], ch, 10 * tol, 10 * tol))
+    for S, arcs in patches:
+        ch = _chain([copy_c(a) for a in arcs], 1e3 * tol)
+        if ch is None:
+            raise RuntimeError("a corner patch's outline does not close")
+        built.append(ext.trim_surface_with_3d_curves_tol(S, [len(ch)], ch, 10 * tol, 10 * tol))
     keep = [np.array(f.interior_point(), float) for f in b.faces() if not any(f == g for g in touched)]
+    if not keep:          # every face rebuilt: one whose surface faces out (its trim keeps that way)
+        keep = [np.array(F.interior_point(), float) for F in touched if _surface_sign(F) > 0]
     ext.delete_faces(b, touched)
     for nb in built:
         ext.append_brep(b, nb)
     b = sm.stitch_advanced(b, 10 * tol, squeeze_small_edges=False, making_manifold_solid=True)[0]
     try:
-        sm.unify_normals(b, _face_at(b, keep[0]), 100)
+        sm.unify_normals(b, _face_at(b, keep[0]) if keep else b.faces()[0], 100)
     except Exception:
         pass
-    return b
+    return b, len(patches)
+
+
+def _exact_face_fillets(b, A_pt, specs, size, tol):
+    """(Face CVs' first form) b with the edges at the spec points filleted exactly."""
+    return _exact_fillets(b, specs, size, tol)[0]
 
 
 def _face_cvs_refillet(out, D, sharp, where, n_want, size, mid, exact=False):
     """(solid, kink, exact): the sculpted solid with the sharp edges of plan
     sharp filleted again -- each edge between the faces its fillet ran
     between, found again through where (_exact_move: old face -> new face),
-    with the fillet's radius. exact: when every one of them runs along the
-    sculpted (curved) face, our exact fillets (_exact_face_fillets: ~0.1-0.4
-    s); else, or when they can't be made, the kernel's (fitted on a curved
-    face; Face CVs' live drags)."""
+    with the fillet's radius. exact: when a face along them is curved, our
+    exact fillets (_exact_fillets: ~0.1-0.5 s); else, or when they can't be
+    made, the kernel's (fitted on a curved face; Face CVs' live drags)."""
     np = _np()
 
     def new_face(ip):
@@ -4421,13 +4561,12 @@ def _face_cvs_refillet(out, D, sharp, where, n_want, size, mid, exact=False):
             raise RuntimeError("an edge to round again was not found on the sculpted shape")
         edges += es
         radii += [r] * len(es)
-    if exact:
-        Fc = _face_at(c, mid)
-        if not Fc.surface().is_planar() and all(any(Fc == g for g in e.faces()) for e in edges):
+    if exact and any(not f.surface().is_planar() for e in edges for f in e.faces()):
+        if True:                                  # (all flat: the kernel's are exact there)
             try:
                 specs = [(np.array(e.point_at(0.5 * sum(e.parameter_range())), float), r)
                          for e, r in zip(edges, radii)]
-                x = _exact_face_fillets(out, mid, specs, size, 1e-6 * size)
+                x, _ = _exact_fillets(out, specs, size, 1e-6 * size)
                 if x.is_manifold_solid() and x.face_count() == n_want and _mesh_volume(x) > 0:
                     return x, _fillet_kink(x, mid), True
             except Exception:
@@ -6571,29 +6710,26 @@ def _is_solid(b):
 
 
 def _exact_tool_fillets(b, sel, r):
-    """b with the edges sel filleted exactly at radius r (_exact_face_fillets)
-    when they all lie on one curved face, or None (the kernel's then). The
-    kernel's circular fillet is only fitted on a free-form face (0.5-5 deg
-    off tangent on a sculpted top, and a steep one came out open)."""
+    """b (a solid) with the edges sel filleted exactly at radius r
+    (_exact_fillets) when a face along them is curved, or None (the kernel's
+    then: it is exact between planes). The kernel's circular fillet is only
+    fitted on a free-form face (0.5-5 deg off tangent on a sculpted top, and
+    a steep one came out open)."""
     np = _np()
-    if not sel:
+    if not sel or not _is_solid(b) or all(f.surface().is_planar() for e in sel for f in e.faces()):
         return None
-    common = [f for f in sel[0].faces() if all(any(f == g for g in e.faces()) for e in sel[1:])]
-    common = [f for f in common if not f.surface().is_planar()]
-    if len(common) != 1:
-        return None
-    A = common[0]
     lo, hi = (np.array(v, float) for v in b.bounding_box())
     size = float(np.linalg.norm(hi - lo)) or 1.0
     try:
         specs = [(np.array(e.point_at(0.5 * sum(e.parameter_range())), float), float(r)) for e in sel]
-        x = _exact_face_fillets(b, np.array(A.interior_point(), float), specs, size, 1e-6 * size)
+        x, corners = _exact_fillets(b, specs, size, 1e-6 * size)
     except Exception:
         return None
-    open0 = sum(1 for e in b.edges() if len(e.faces()) == 1)
-    if (x is None or x.face_count() != b.face_count() + len(sel) or _is_solid(b) != _is_solid(x)
-            or sum(1 for e in x.edges() if len(e.faces()) == 1) != open0
-            or (_is_solid(x) and _mesh_volume(x) <= 0)):
+    if x is None or not _is_solid(x) or x.face_count() != b.face_count() + len(sel) + corners:
+        return None
+    v0, v1 = _mesh_volume(b), _mesh_volume(x)
+    reach = sum(e.length() for e in sel) * float(r) ** 2      # (a fillet takes or adds < L r^2 (1 - pi / 4))
+    if v1 <= 0 or abs(v1 - v0) > reach + 0.02 * abs(v0):
         return None
     return x
 
