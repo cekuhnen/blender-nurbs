@@ -772,6 +772,10 @@ def _draw_preview_px(region, rv3d):
                 u = (b - q).normalized()
                 _draw_px_line(q - u * 22.0, q + u * 22.0, (*col[:3], 0.6), 1.5)
             r = 8.0 if h["hot"] else 6.5
+            if h["kind"] == "tilt":                          # a round knob: it swings, not slides
+                _disc(q, r + 1.5, (0.05, 0.05, 0.05, 0.9))
+                _disc(q, r, col)
+                continue
             _diamond(q, r + 1.5, (0.05, 0.05, 0.05, 0.9))
             _diamond(q, r, col)
     font = 0

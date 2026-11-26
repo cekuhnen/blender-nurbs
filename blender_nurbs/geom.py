@@ -942,20 +942,34 @@ def _square_to(h, L):
     return np.array([0.0, 0.0, 1.0])
 
 
-def profile_normal(curve, hint=None, n=32):
+def is_straight(P):
+    """True when the points P lie on one line (rounding aside)."""
+    P = np.asarray(P, float)
+    S = np.linalg.svd(P - P.mean(axis=0), compute_uv=False)
+    return bool(S[0] <= 1e-300 or len(S) < 2 or S[1] <= 1e-7 * S[0])
+
+
+def profile_normal(curve, hint=None, n=32, sketch=None):
     """The plane normal an extrude of `curve` goes along ("Curve Normal").
     A straight curve lies in every plane through it, so the plane alone picks
-    a direction at random (rounding decided it): it gets the hint (the work
-    plane's normal when the tool started, else world Z) made square to it, as
-    Rhino's ExtrudeCrv takes the CPlane's Z. A planar curve's normal is turned
-    to the hint's side when one is given (older extrudes without one keep the
-    plane's own sign)."""
+    a direction at random (rounding decided it): it takes the normal of the
+    plane it was drawn on (`sketch`, when known), turned to the hint's side,
+    else the hint (the work plane's normal when the tool started, else world
+    Z) made square to it, as Rhino's ExtrudeCrv takes the CPlane's Z. A planar
+    curve's normal is turned to the hint's side when one is given (older
+    extrudes without one keep the plane's own sign)."""
     P = sample_curve(curve, n)
     c = P.mean(axis=0)
     _, S, vt = np.linalg.svd(P - c)
     h = np.asarray(hint if hint is not None else (0.0, 0.0, 1.0), float)
     h = h / (np.linalg.norm(h) or 1.0)
     if S[0] <= 1e-300 or S[1] <= 1e-7 * S[0]:
+        if sketch is not None:
+            s = np.asarray(sketch, float)
+            s = s - (s @ vt[0]) * vt[0]
+            if np.linalg.norm(s) > 1e-6:
+                s = s / np.linalg.norm(s)
+                return Vector(-s if hint is not None and float(s @ h) < -1e-6 else s)
         return Vector(_square_to(h, vt[0]))
     nrm = vt[2]
     if hint is not None:

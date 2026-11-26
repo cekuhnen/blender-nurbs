@@ -1790,7 +1790,11 @@ def extrude_direction(obj, curve, p):
     preview uses it too, so the preview and the result always agree."""
     mode = p.get("direction", "NORMAL")
     if mode == "NORMAL":
-        d = geom.profile_normal(curve, p.get("normal_hint"))
+        sk = None
+        if p.get("sketch_hint") and curve is not None:   # newer extrudes: a line drawn in front view goes along Y
+            from .steps import sketch_normal
+            sk = sketch_normal(obj, curve)
+        d = geom.profile_normal(curve, p.get("normal_hint"), sketch=sk)
         if d.length < 0.5:
             d = Vector((0, 0, 1))
     elif mode == "VECTOR":
