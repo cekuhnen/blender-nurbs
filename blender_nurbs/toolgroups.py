@@ -139,6 +139,8 @@ GROUPS = (
         ), {NURBS}),
         ("Join", (
             (_t("nproto.join", icon='AUTOMERGE_ON'), _t("nproto.unjoin", icon='AUTOMERGE_OFF')),
+            (_t("nproto.remove_edges", icon='EDGESEL'),
+             ("nproto.remove_edges", "Remove Redundant Edges", 'X', {"all_edges": True})),
         ), {NURBS}),
         ("Fillets", (
             (_t("nproto.fillet", "Surface Fillet", 'MOD_BEVEL'), _t("nproto.edge_fillet", icon='MOD_BEVEL')),
