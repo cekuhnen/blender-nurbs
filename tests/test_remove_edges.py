@@ -136,7 +136,8 @@ check("a plain box: nothing to remove", out is None and not rep["refused"], str(
 slot = sm.boolean_union(sm.create_box((0, -0.5, 0), 1, 1, 0.4), sm.create_cylinder((1, 0, 0), 0.5, 0.4))
 out, rep = mf.merge(sm, slot, picked=[(1, 0.5, 0.2), (1, -0.5, 0.2)])
 check("slot: the flat sides' edges onto the round end (tangent) are kept, and say why",
-      out is None and len(rep["refused"]) == 2 and all(r["why"] == "a flat face meets a curved one"
+      out is None and len(rep["refused"]) == 2 and all(r["why"].startswith("a flat face meets a curved one")
+                                                       and "Fit Tolerance" in r["why"]
                                                        for r in rep["refused"]), f"{counts(slot)} {rep}")
 
 # --- Flat Tolerance: near-coplanar faces refitted onto one plane (planerefit) --------------
