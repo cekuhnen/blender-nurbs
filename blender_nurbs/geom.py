@@ -824,6 +824,107 @@ def sample_curve_kinks(curve, n):
     return np.array([curve.evaluate(t) for t in T])
 
 
+BEND_REL = 0.01           # a knot whose curvature jumps by this share of the curve's largest is a bend
+
+
+def curve_bend_points(curve, cv=None, rel=BEND_REL):
+    """World points inside `curve` where its curvature jumps: knots of
+    continuity C1 or less (multiplicity >= degree - 1) whose curvature
+    vectors on either side differ by more than `rel` of the curve's largest
+    (a slot's line meeting its arc, a Join's double knot between them). A
+    loft through such a curve must break its spans there: a smooth span
+    across the jump holds the position but its tangent swings (0.4° on a
+    slot)."""
+    t0, t1 = curve.parameter_range()
+    span = (t1 - t0) or 1.0
+    try:
+        cv = cv or _load_kernel().blender_ext.curve_cvs(curve)
+        deg, U = int(cv["degree"]), [float(k) for k in cv["knots"]]
+    except Exception:
+        return []
+    eps = 1e-9 * span
+    cand, i = [], 0
+    while i < len(U):
+        j = i
+        while j + 1 < len(U) and abs(U[j + 1] - U[i]) <= eps:
+            j += 1
+        if j - i + 1 >= deg - 1 and t0 + eps < U[i] < t1 - eps:
+            cand.append(U[i])
+        i = j + 1
+    if not cand:
+        return []
+    distinct = sorted({t0, t1, *cand})
+    ev = lambda t: np.array(curve.evaluate(t), float)
+
+    def kvec(t, s, h):
+        """The curvature vector at t from one side (s = +1 after, -1 before)."""
+        p0, p1, p2 = ev(t), ev(t + s * h), ev(t + 2 * s * h)
+        d1 = s * (-3 * p0 + 4 * p1 - p2) / (2 * h)
+        d2 = (p0 - 2 * p1 + p2) / (h * h)
+        n1 = float(d1 @ d1)
+        if n1 <= 1e-300:
+            return np.zeros(3)
+        return (d2 - (d2 @ d1) / n1 * d1) / n1
+
+    P = np.array([ev(t0 + span * k / 32) for k in range(33)])
+    size = float(np.linalg.norm(np.ptp(P, axis=0))) or 1.0
+    jumps, kref = [], 0.0
+    for t in cand:
+        k = distinct.index(t)
+        h = min(1e-5 * span, 0.25 * (t - distinct[k - 1]), 0.25 * (distinct[k + 1] - t))
+        ka, kb = kvec(t, -1.0, h), kvec(t, 1.0, h)
+        kref = max(kref, float(np.linalg.norm(ka)), float(np.linalg.norm(kb)))
+        jumps.append((t, float(np.linalg.norm(kb - ka))))
+    for k in range(1, 32):                    # the curvature between the knots too
+        t = t0 + span * k / 32
+        kref = max(kref, float(np.linalg.norm(kvec(t, 1.0, 1e-5 * span))))
+    if kref * size < 1e-6:                    # straight: nothing bends
+        return []
+    return [ev(t) for t, jmp in jumps if jmp > rel * kref]
+
+
+def polyline_index(P, q, tol):
+    """Where q lies along the polyline P as a fractional sample index (i + s
+    between samples i and i + 1), or None when q is farther than tol from it."""
+    P = np.asarray(P, float)
+    a, d = P[:-1], np.diff(P, axis=0)
+    dd = np.maximum(np.sum(d * d, axis=1), 1e-300)
+    s = np.clip(np.sum((q - a) * d, axis=1) / dd, 0.0, 1.0)
+    dist = np.linalg.norm(a + s[:, None] * d - q, axis=1)
+    i = int(np.argmin(dist))
+    if dist[i] > tol:
+        return None
+    f = i + float(s[i])
+    if len(P) < 4:
+        return f
+    # on the chord it is off along the curve (0.05 of a sample on a slot's
+    # arc: a knot that far from a curvature jump swings the tangent 0.06°);
+    # closest point on the cubic through the four samples around it, in the
+    # sample index -- the parameter the rows are fitted in
+    k0 = min(max(i - 1, 0), len(P) - 4)
+    Q = P[k0:k0 + 4]
+    nodes = np.arange(4.0)
+    for _ in range(8):
+        x = f - k0
+        L, dL, ddL = np.zeros(4), np.zeros(4), np.zeros(4)
+        for j in range(4):
+            others = [m for m in range(4) if m != j]
+            den = np.prod([nodes[j] - m for m in others])
+            r = [x - m for m in others]
+            L[j] = r[0] * r[1] * r[2] / den
+            dL[j] = (r[1] * r[2] + r[0] * r[2] + r[0] * r[1]) / den
+            ddL[j] = 2 * (r[0] + r[1] + r[2]) / den
+        c, dc, ddc = L @ Q - q, dL @ Q, ddL @ Q
+        den2 = float(dc @ dc + c @ ddc)
+        if den2 <= 0:
+            break
+        step = float(c @ dc) / den2
+        f = min(max(f - step, k0 + 0.0), k0 + 3.0)
+        if abs(step) < 1e-10:
+            break
+    return min(max(f, 0.0), len(P) - 1.0)
+
+
 def curve_plane_normal(curve, n=32):
     P = sample_curve(curve, n)
     c = P.mean(axis=0)
@@ -885,6 +986,7 @@ class EdgeSample:
         self.DD = DD
         self.joints = list(joints or [])     # sample indices where the pieces of a chained side meet
         self.N = None                        # the source's unit normals, when known (Align Edges / Surface)
+        self.T = None                        # the source's exact tangents along the side, when known (natural edges)
         self._DDD = DDD
         self._ddd_fn = None                  # () -> DDD, called on first use
 
@@ -919,12 +1021,14 @@ class EdgeSample:
         n = len(self.P)
         out = EdgeSample(self.P[::-1].copy(), r(self.D), r(self.DD), sorted(n - 1 - j for j in self.joints))
         out.N = r(self.N)
+        out.T = None if self.T is None else -r(self.T)
         return self._pass_ddd(out, r)
 
     def piece(self, i0, i1):
         c = lambda a: None if a is None else a[i0:i1 + 1].copy()
         out = EdgeSample(c(self.P), c(self.D), c(self.DD))
         out.N = c(self.N)
+        out.T = c(self.T)
         return self._pass_ddd(out, c)
 
 
@@ -935,7 +1039,7 @@ def sample_surface_edge(surface, which, matrix, n, share=None):
     M = np.array(matrix)
     R = M[:3, :3]
     T = M[:3, 3]
-    P, D, DD, UV = [], [], [], []
+    P, D, DD, UV, TT = [], [], [], [], []
     along_v = which in ("U0", "U1")
     span = (u1 - u0) if along_v else (v1 - v0)
     h = 1e-4 * span
@@ -945,7 +1049,8 @@ def sample_surface_edge(surface, which, matrix, n, share=None):
             u = u0 if which == "U0" else u1
             v = v0 + (v1 - v0) * s
             sign = -1.0 if which == "U0" else 1.0
-            pt, du, _ = surface.derivatives(u, v)
+            pt, du, dv_ = surface.derivatives(u, v)
+            TT.append(dv_)
             _, du2, _ = surface.derivatives(u - sign * h, v)
             d1 = np.array(du)
             d2 = (np.array(du) - np.array(du2)) / (sign * h)  # one-sided d2/du2
@@ -956,7 +1061,8 @@ def sample_surface_edge(surface, which, matrix, n, share=None):
             v = v0 if which == "V0" else v1
             u = u0 + (u1 - u0) * s
             sign = -1.0 if which == "V0" else 1.0
-            pt, _, dv = surface.derivatives(u, v)
+            pt, du_, dv = surface.derivatives(u, v)
+            TT.append(du_)
             _, _, dv2 = surface.derivatives(u, v - sign * h)
             d1 = np.array(dv)
             d2 = (np.array(dv) - np.array(dv2)) / (sign * h)
@@ -967,6 +1073,7 @@ def sample_surface_edge(surface, which, matrix, n, share=None):
         D.append(R @ d)
         DD.append(R @ dd)
     es = EdgeSample(np.array(P), np.array(D), np.array(DD))
+    es.T = np.array(TT, float) @ R.T * (s_hi - s_lo)    # d P / d share: along the samples' own direction
 
     def ddd():
         # the exact third derivative across (odd: outward is sign times it) --
@@ -1160,6 +1267,31 @@ def _pinned_fit(params, B, U, p, n_cvs, pins):
     return X, A
 
 
+BEND_GAP = 2.0            # samples: bends closer than this share one knot (the first given)
+
+
+def _piecewise_gradient(P, params, joints, bends):
+    """d P / d params, each stretch between the joints (sample indices, on
+    both stretches) and bends (fractional indices, between samples) on its
+    own: a difference across a curvature jump tilts the tangent (3° at a
+    slot's line-to-arc joint, 191 samples). A stretch of one sample keeps
+    the plain difference."""
+    N = len(P)
+    G = np.gradient(P, params, axis=0, edge_order=2)
+    starts = {0} | {int(j) for j in joints} | {int(f) + 1 for f in bends}
+    ends = {N - 1} | {int(j) for j in joints} | {int(f) for f in bends}
+    starts, ends = sorted(i for i in starts if 0 <= i < N), sorted(i for i in ends if 0 <= i < N)
+    for a_ in starts:
+        b_ = min((e for e in ends if e > a_), default=None)
+        if b_ is None:
+            continue
+        if b_ - a_ >= 2:
+            G[a_:b_ + 1] = np.gradient(P[a_:b_ + 1], params[a_:b_ + 1], axis=0, edge_order=2)
+        else:
+            G[a_:b_ + 1] = (P[b_] - P[a_]) / max(params[b_] - params[a_], 1e-300)
+    return G
+
+
 def _knot_vector(p, inner):
     """Clamped knot vector on 0..1 from {value: multiplicity}."""
     U = [0.0] * (p + 1)
@@ -1169,7 +1301,8 @@ def _knot_vector(p, inner):
 
 
 def blend_loft_spans(a, b, breaks, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.0, cur_a=0.0, cur_b=0.0,
-                     degree=5, tol_angle=0.1, tol_curv=0.05, tol_gap_rel=1e-4, scale=None, tol_rate=0.05):
+                     degree=5, tol_angle=0.1, tol_curv=0.05, tol_gap_rel=1e-4, scale=None, tol_rate=0.05,
+                     bends=()):
     """The G0 / G1 / G2 / G3 blend between two sides' samples as a few Bezier
     spans of one degree along the side, not a dense least-squares net.
     Knots go where they are needed, not where the samples are: full
@@ -1178,7 +1311,12 @@ def blend_loft_spans(a, b, breaks, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.
     that does not hold, until each holds half the labels' tolerances (gap,
     angle, curvature, curvature rate, as contlabels measures them). Symmetric sides give
     symmetric knots. Returns (surface, number of spans, worst error over its
-    tolerance)."""
+    tolerance). bends: fractional sample indices where a side's curvature
+    jumps inside one of its pieces (curve_bend_points), in priority order --
+    a full knot there too, not pinned (it lies between samples): a smooth
+    span across a slot's line-to-arc joint swung the tangent 0.4° whatever
+    the samples, and a C1 knot cannot follow either, the rows' speed jumps
+    there in the shared parameter (the two slots' lines differ in length)."""
     _, ext = _k()
     ka = CONT_ORDER[cont_a] if a.has_surface else 0
     kb = CONT_ORDER[cont_b] if b.has_surface else 0
@@ -1212,6 +1350,35 @@ def blend_loft_spans(a, b, breaks, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.
     params = row_params(rows)
     B = np.hstack(F)
     joints = sorted({int(j) for j in breaks if 0 < j < N - 1})
+    # bends (in priority order): away from the ends and the joints; both sides'
+    # bends at one place make one knot; two bends closer than BEND_GAP samples
+    # cannot both have one (a span without samples between them), the later loses
+    bend_at = []
+    for f in (float(f) for f in bends):
+        if not 1.0 <= f <= N - 2.0 or any(abs(f - j) < 1.5 for j in joints):
+            continue
+        if any(abs(f - g) < BEND_GAP for g in bend_at):
+            continue
+        bend_at.append(f)
+    bend_at.sort()
+    bend_ts = [float(np.interp(f, np.arange(N), params)) for f in bend_at]
+    # G1 / G2 sides: the edge row's tangent along the edge must stay in the
+    # source's tangent plane, else the loft's normal tilts with it. Its
+    # position alone did not tell: a span within 7 um of a slot's edge swung
+    # out of the plane 0.6° next to a curvature jump
+    lean_checks = []
+    for es, rows_s, kidx, kc in ((a, rows_a, 0, ka), (b, rows_b, len(F) - 1, kb)):
+        if kc < 1 or len(rows_s) < 2:
+            continue
+        # the source's exact tangent where known (a difference is 0.2° off at
+        # a joint, more than the half tolerance the fit holds)
+        Ts = getattr(es, "T", None)
+        Pt = Ts if Ts is not None and len(Ts) == N else _piecewise_gradient(rows_s[0], params, joints, bend_at)
+        Ns = np.cross(Pt, F[1] if kidx == 0 else F[-2])
+        nn = np.linalg.norm(Ns, axis=1, keepdims=True)
+        if np.any(nn < 1e-300):
+            continue
+        lean_checks.append((kidx, Ns / nn, np.tan(np.radians(0.5 * tol_angle))))
     # G2 sides that know their normals: the edge row must also bend like the
     # source along the edge -- a loft leaving at a lean measures its curvature
     # straight across partly along the edge (lean^2), and a span within 5 um
@@ -1241,7 +1408,8 @@ def blend_loft_spans(a, b, breaks, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.
     # edge stays 4 CVs); the span degree, splitting as needed, when they do not hold
     for q, may_split in (((3, False), (q, True)) if q > 3 else ((q, True),)):
         inner = {float(params[j]): q for j in joints}
-        res = _span_fit(q, inner, may_split, params, B, F, N, tols, joints, bend_checks)
+        inner.update({t: q for t in bend_ts})
+        res = _span_fit(q, inner, may_split, params, B, F, N, tols, joints, bend_checks, bend_at, lean_checks)
         if res[3] <= 1.0 or may_split:
             break
     U, X, inner, worst = res
@@ -1252,7 +1420,7 @@ def blend_loft_spans(a, b, breaks, cont_a="G0", cont_b="G0", tan_a=1.0, tan_b=1.
     return srf, len(sorted({0.0, 1.0, *inner})) - 1, worst
 
 
-def _span_fit(q, inner, may_split, params, B, F, N, tols, joints, bend_checks):
+def _span_fit(q, inner, may_split, params, B, F, N, tols, joints, bend_checks, bends=(), lean_checks=()):
     """The span loop of blend_loft_spans: fit on the knots `inner`, then split
     every span out of tolerance (when may_split), until all hold. Returns
     (knots, CV array, inner knots, worst error over its tolerance)."""
@@ -1288,7 +1456,28 @@ def _span_fit(q, inner, may_split, params, B, F, N, tols, joints, bend_checks):
                 r_ = np.where(inner_, np.maximum(np.abs(k_fit - k_src), np.abs(m_fit - m_src)) / ktol, 0.0)
                 for j in joints:                   # a joint's two sides bend as their faces do
                     r_[max(j - 1, 0):j + 2] = 0.0
+                for f in bends:                    # so do a bend's (the curvature jumps there)
+                    r_[max(int(f) - 1, 0):int(f) + 3] = 0.0
                 ratio = np.maximum(ratio, r_)
+        if lean_checks:
+            # one-sided differences on both sides of every sample: a sample on a
+            # full knot (a joint) has two tangents, and each must hold (checked
+            # centrally, the joint's own sample went unchecked and the loft
+            # kinked 0.25° there); a difference reaching over a knot is dropped
+            eps = 1e-9
+            full = np.array([t for t, m in inner.items() if m >= q])
+            for s_ in (-1.0, 1.0):
+                t1 = np.clip(params + s_ * eps, 0.0, 1.0)
+                t2 = np.clip(params + s_ * (eps + h), 0.0, 1.0)
+                A1, A2 = interp_matrix(t1, U, q, n_cvs), interp_matrix(t2, U, q, n_cvs)
+                lo_, hi_ = np.minimum(t1, t2), np.maximum(t1, t2)
+                over = np.zeros(N, bool) if not len(full) else \
+                    np.any((full[None, :] > lo_[:, None]) & (full[None, :] < hi_[:, None]), axis=1)
+                for kidx, Ns, ttol in lean_checks:
+                    Xe = X[:, 3 * kidx:3 * kidx + 3]
+                    Pt = A2 @ Xe - A1 @ Xe
+                    r_ = np.abs(np.sum(Pt * Ns, axis=1)) / np.maximum(np.linalg.norm(Pt, axis=1), 1e-300) / ttol
+                    ratio = np.maximum(ratio, np.where(over, 0.0, r_))
         worst = float(ratio.max())
         if worst <= 1.0 or not may_split:
             break

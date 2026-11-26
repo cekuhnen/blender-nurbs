@@ -713,6 +713,137 @@ def side_samples(side, n):
 
 
 # --------------------------------------------------------------------------
+# Paired breakpoints: both sides sampled stretch by stretch
+# --------------------------------------------------------------------------
+
+PAIR_MAX = 0.15    # breakpoints pair when their places along the two sides differ by at most this share
+PAIR_DENSE = 256   # samples a piece is located on (its curvature jumps found as shares of it)
+
+
+def _piece_sampler(o, r):
+    """(s0, s1, m) -> EdgeSample of m samples over shares s0..s1 of a loft
+    input's own parameter (a natural edge's surface parameter, as
+    input_samples takes it, or a curve's); None for a B-rep edge (square
+    samples those whole)."""
+    if is_edge_ref(r):
+        surf = store.get_surfaces(o)[0]
+        rng = edge_range(o, r)
+        lo, hi = (0.0, 1.0) if rng is None else _domain_share(surf, r, rng)
+        M = geom.world_matrix(o)
+        return lambda s0, s1, m: geom.sample_surface_edge(
+            surf, r, M, m, (lo + (hi - lo) * s0, lo + (hi - lo) * s1))
+    if is_brep_edge_ref(r):
+        return None
+    c = input_curve(o, r)
+    t0, t1 = c.parameter_range()
+    return lambda s0, s1, m: geom.EdgeSample(np.array(
+        [c.evaluate(t0 + (t1 - t0) * (s0 + (s1 - s0) * i / (m - 1))) for i in range(m)], float))
+
+
+def _side_stretches(side):
+    """A loft side cut at its breakpoints -- the joints between its pieces
+    and the curvature jumps inside them (geom.curve_bend_points) -- in chain
+    order: [(sampler, s0, s1, reversed, length)]; None when a piece cannot be
+    sampled by shares."""
+    out = []
+    for o, r, rev in chain_side(side):
+        smp = _piece_sampler(o, r)
+        if smp is None:
+            return None
+        P = smp(0.0, 1.0, PAIR_DENSE + 1).P
+        size = float(np.linalg.norm(np.ptp(P, axis=0))) or 1.0
+        shares = []
+        for q in geom.curve_bend_points(input_curve(o, r)):
+            f = geom.polyline_index(P, q, 1e-3 * size)
+            if f is None:
+                continue
+            # onto the point itself (located on the samples it was 0.19 mm
+            # into a slot's arc: the joint sample's tangent off 0.2°)
+            s, d = f / PAIR_DENSE, 1e-7
+            for _ in range(8):
+                e2 = smp(s, min(s + d, 1.0), 2)
+                p0, t_ = e2.P[0], (e2.P[1] - e2.P[0]) / max(min(s + d, 1.0) - s, 1e-300)
+                step = float((q - p0) @ t_) / max(float(t_ @ t_), 1e-300)
+                s = min(max(s + step, 0.0), 1.0 - d)
+                if abs(step) < 1e-13:
+                    break
+            if 1e-6 < s < 1.0 - 1e-6:
+                shares.append(s)
+        cuts = [0.0] + sorted(shares) + [1.0]
+        piece = []
+        for s0, s1 in zip(cuts[:-1], cuts[1:]):
+            Q = smp(s0, s1, 33).P
+            piece.append((smp, s0, s1, rev, float(np.sum(np.linalg.norm(np.diff(Q, axis=0), axis=1)))))
+        out += piece[::-1] if rev else piece
+    return out
+
+
+def _stretch_samples(stretches, counts):
+    """EdgeSample of a side's stretches end to end, counts[k] samples on the
+    k-th (its ends shared); every breakpoint a joint."""
+    parts = []
+    for (smp, s0, s1, rev, _), m in zip(stretches, counts):
+        es = smp(s0, s1, m)
+        parts.append(es.reversed() if rev else es)
+    cat = lambda key: None if getattr(parts[0], key) is None else np.vstack(
+        [getattr(parts[0], key)] + [getattr(e, key)[1:] for e in parts[1:]])
+    joints = [int(j) for j in np.cumsum([m - 1 for m in counts])[:-1]]
+    es = geom.EdgeSample(cat("P"), cat("D"), cat("DD"), joints)
+    if all(e.T is not None for e in parts):
+        # unit tangents: the stretches' parameter speeds differ
+        T = cat("T")
+        es.T = T / np.maximum(np.linalg.norm(T, axis=1, keepdims=True), 1e-300)
+    if es.D is not None:
+        es._ddd_fn = lambda: (None if any(e.DDD is None for e in parts) else
+                              np.vstack([parts[0].DDD] + [e.DDD[1:] for e in parts[1:]]))
+    return es
+
+
+def _paired_or(sides, n, p, a, b):
+    """paired_samples for the plain samples a, b (both in their own
+    direction) when the sides pair, else a, b as they are. The pair must
+    flip as the plain samples do (auto align decides on the samples)."""
+    flip = (bool(p.get("auto_align", True)) and geom.should_flip(a.P, b.P)) != bool(p.get("flip_b"))
+    pr = paired_samples(sides, n, flip)
+    if pr is None:
+        return a, b
+    if ((bool(p.get("auto_align", True)) and geom.should_flip(pr[0].P, pr[1].P)) != bool(p.get("flip_b"))) != flip:
+        return a, b
+    return pr
+
+
+def paired_samples(sides, n, flip):
+    """Both sides of a two-sided loft sampled stretch by stretch (see
+    _side_stretches), the k-th stretch of each with the same count: their
+    breakpoints land on the same samples, so one knot line runs from a
+    breakpoint on one side to its partner on the other. Sampled each by its
+    own parameter, a sketch's line-to-arc joints sat at 0.255 / 0.5 / 0.754
+    along it and its extrude's at 0.286 / 0.5 / 0.786: the knots one side
+    needs crossed the other's smooth stretch and the loft kinked 0.5° inside.
+    flip: side b runs the other way (auto align / Flip B). Returns (a, b), b
+    in its own direction (the caller flips it), or None when the sides have
+    no breakpoints, not as many, ones too far apart (PAIR_MAX), or a piece
+    sampled otherwise (a B-rep edge)."""
+    try:
+        la, lb = _side_stretches(sides[0]), _side_stretches(sides[1])
+    except Exception as exc:
+        print("Loft: sides not paired,", exc)
+        return None
+    if la is None or lb is None or len(la) != len(lb) or len(la) < 2:
+        return None
+    lb_ = lb[::-1] if flip else lb
+    wa = np.array([s[4] for s in la]); wb = np.array([s[4] for s in lb_])
+    if wa.sum() <= 0 or wb.sum() <= 0:
+        return None
+    wa, wb = wa / wa.sum(), wb / wb.sum()
+    if float(np.max(np.abs(np.cumsum(wa) - np.cumsum(wb)))) > PAIR_MAX:
+        return None
+    w = 0.5 * (wa + wb)
+    counts = [max(4, int(round((n - 1) * x)) + 1) for x in w]
+    return _stretch_samples(la, counts), _stretch_samples(lb, counts[::-1] if flip else counts)
+
+
+# --------------------------------------------------------------------------
 # Match Edges: a G1 / G2 side whose loft carries on the source's own edges
 # --------------------------------------------------------------------------
 
@@ -1062,6 +1193,11 @@ def build_loft(inputs, p):
 
 
 LAST_SPANS = [None]      # how many Bezier spans the last loft build made (None: not a span fit)
+# the last span fit's worst miss over its own target (half the labels'
+# tolerances) at all its samples: the labels look at 33 (a tangent swung 0.8°
+# between them next to a slot's curvature jump, the labels said 0.1°), and a
+# fit short of its target held a uniform-knot slot 0.015° where it can hold 0.001°
+LAST_FIT = [0.0]
 
 
 def _build_loft_with_rails(inputs, p):
@@ -1247,6 +1383,7 @@ def _build_loft(inputs, p):
     n = max(side_sample_count(sides[0], n), side_sample_count(sides[1], n))
     a = side_samples(sides[0], n)
     b = side_samples(sides[1], n)
+    a, b = _paired_or(sides, n, p, a, b)
     if p.get("auto_align", True) and geom.should_flip(a.P, b.P):
         b = b.reversed()
     if p.get("flip_b"):
@@ -1284,12 +1421,18 @@ def _build_loft(inputs, p):
     deg_in = max((s["deg"] for s in (sa, sb) if s is not None), default=3)
     if sa is None or sb is None:
         deg_in = max(deg_in, 3)
-    g = _sampled_blend(a, b, p, deg_in)
+    bends = (side_bend_points(sides[0]), side_bend_points(sides[1])) if p.get("fit") == "SPANS" else None
+    LAST_FIT[0] = 0.0
+    g = _sampled_blend(a, b, p, deg_in, bends)
     if deg_in == 3 and any(is_surface_edge(r) for _, r in inputs) and \
             {p.get("cont_a"), p.get("cont_b")} & {"G1", "G2", "G3"}:
-        # held as the labels check it, else with more samples
-        if _verify_sides(g, sides, (p.get("cont_a", "G0"), p.get("cont_b", "G0")))[0] > 1.0:
-            g2 = _build_matched(sides, int(p.get("samples", 24)) * 2, p, force=True)
+        # held as the labels check it (and the fit at all its samples), else with more samples
+        if max(_verify_sides(g, sides, (p.get("cont_a", "G0"), p.get("cont_b", "G0")))[0], LAST_FIT[0]) > 1.0:
+            # short of the labels, or of the fit's own target: more samples
+            m2 = int(p.get("samples", 24)) * 2
+            if p.get("fit") == "SPANS":
+                m2 = max(m2, SPAN_MIN_SAMPLES)   # fewer than a span fit starts with cannot do better
+            g2 = _build_matched(sides, m2, p, force=True)
             if g2 is not None:
                 g = g2
     return g
@@ -1332,6 +1475,7 @@ def _build_matched(sides, n, p, force=False):
     modes = side_edge_modes(p)
     best = None
     m = n
+    bends = (side_bend_points(sides[0]), side_bend_points(sides[1])) if p.get("fit") == "SPANS" else None
     while True:
         LOFT_NOTES.clear()
         k = max(side_sample_count(sides[0], m), side_sample_count(sides[1], m))
@@ -1340,6 +1484,8 @@ def _build_matched(sides, n, p, force=False):
                                 plain, conts, "AB"[i], modes[i]) for i in (0, 1))
         if ma is None and mb is None and not force:
             return best[1] if best else None
+        if ma is None and mb is None:
+            plain = list(_paired_or(sides, k, p, *plain))
         a = ma if ma is not None else plain[0]
         b = mb if mb is not None else plain[1]
         if p.get("auto_align", True) and geom.should_flip(a.P, b.P):
@@ -1347,12 +1493,18 @@ def _build_matched(sides, n, p, force=False):
         if p.get("flip_b"):
             b = b.reversed()
         p_ = _g3_ready(p, a, b)
-        g = _sampled_blend(a, b, p_, 3)
+        LAST_FIT[0] = 0.0
+        g = _sampled_blend(a, b, p_, 3, bends)
         worst, what = _verify_sides(g, sides, (p_.get("cont_a", "G0"), p_.get("cont_b", "G0")))
-        if best is None or worst < best[0]:
-            best = (worst, g, list(LOFT_NOTES), what)
+        # the labels' measure (between their samples too) decides the note; the
+        # fit's own target, half of that, whether more samples are worth it
+        if 0.5 * LAST_FIT[0] > worst:
+            worst, what = 0.5 * LAST_FIT[0], f"the fit between the labels' samples: {0.5 * LAST_FIT[0]:.2g}x the tolerance"
+        goal = max(worst, LAST_FIT[0])
+        if best is None or goal < best[4]:
+            best = (worst, g, list(LOFT_NOTES), what, goal)
         cap = SPAN_MAX_SAMPLES if p.get("fit") == "SPANS" else MATCH_MAX_SAMPLES
-        if worst <= 1.0 or 2 * k > cap:
+        if goal <= 1.0 or 2 * k > cap:
             break
         m *= 2
     LOFT_NOTES[:] = best[2]
@@ -1564,10 +1716,45 @@ def _matched_side(side, n, cont, tangent, curvature, plain, conts, name, mode="E
 SPAN_MIN_SAMPLES = 120   # Bezier spans: samples along a side at least (cheap; spans come from tolerance)
 
 
-def _sampled_blend(a, b, p, deg_in):
+def side_bend_points(side):
+    """World points inside the pieces of a loft side where the curvature
+    jumps (geom.curve_bend_points on each piece's exact curve): a slot's
+    line-to-arc joints, also when Extrude has joined them into one edge."""
+    out = []
+    for o, r in side:
+        try:
+            out += geom.curve_bend_points(input_curve(o, r))
+        except Exception as exc:
+            print("Loft: no bends for", o.name, r, exc)
+    return out
+
+
+def _bend_indices(es, pts):
+    """The bend points that lie on the samples es, as fractional sample indices."""
+    if not pts:
+        return []
+    size = float(np.linalg.norm(np.ptp(es.P, axis=0))) or 1.0
+    out = (geom.polyline_index(es.P, q, 1e-3 * size) for q in pts)
+    return [f for f in out if f is not None]
+
+
+def _ordered_bends(a, b, p, bends):
+    """Both sides' bends as fractional sample indices, the side that must hold
+    G1 / G2 first: where the two sides' bends crowd one another only one gets
+    a knot, and a G0 side's needs it least (only its position counts)."""
+    if not bends:
+        return []
+    out = [(_bend_indices(a, bends[0]), geom.CONT_ORDER.get(p.get("cont_a", "G0"), 0) if a.has_surface else 0),
+           (_bend_indices(b, bends[1]), geom.CONT_ORDER.get(p.get("cont_b", "G0"), 0) if b.has_surface else 0)]
+    out.sort(key=lambda t: -t[1])
+    return out[0][0] + out[1][0]
+
+
+def _sampled_blend(a, b, p, deg_in, bends=None):
     """The sampled G0 / G1 / G2 blend between two sides' samples. Fit
     "SPANS": a few Bezier spans of one degree, knots placed by tolerance
-    (geom.blend_loft_spans). Otherwise a least-squares net; a chained side
+    (geom.blend_loft_spans), full knots at the bends too (side_bend_points
+    of each side, `bends` = (side a's, side b's)). Otherwise a least-squares net; a chained side
     is then fitted piece by piece between its joints (a piece needs 4
     samples at least, else its joint is left to the fit)."""
     if p.get("fit") == "SPANS":
@@ -1577,8 +1764,10 @@ def _sampled_blend(a, b, p, deg_in):
             a, b, sorted(set(a.joints) | set(b.joints)), p.get("cont_a", "G0"), p.get("cont_b", "G0"),
             p.get("tan_a", 1.0), p.get("tan_b", 1.0), p.get("cur_a", 0.0), p.get("cur_b", 0.0),
             degree=int(p.get("span_degree", 5)), tol_angle=tol_a, tol_curv=tol_c, tol_gap_rel=contlabels.TOL_GAP_REL,
-            tol_rate=contlabels._tol_g3())
+            tol_rate=contlabels._tol_g3(),
+            bends=_ordered_bends(a, b, p, bends))
         LAST_SPANS[0] = nspans
+        LAST_FIT[0] = worst                  # over its own target: half the labels' tolerances
         return g
     breaks, last = [], 0
     for j in sorted(set(a.joints) | set(b.joints)):
