@@ -118,6 +118,29 @@ def _foot(surf, q, uv0=None):
         _, u, v = best
     else:
         u, v = uv0
+    u, v = _newton_foot(surf, q, u, v, u0, u1, v0, v1)
+    # a surface closed in position across a domain border (a loft round a
+    # closed outline, its seam at v = 0 and 1): a start on the wrong side of
+    # the seam clamps there (a point just before the seam stopped on its far
+    # side, 1.7 cm off) -- try again from the border opposite
+    for k in (0, 1):
+        lo, hi = (u0, u1) if k == 0 else (v0, v1)
+        at = u if k == 0 else v
+        if at not in (lo, hi):
+            continue
+        other = hi if at == lo else lo
+        uv2 = (other, v) if k == 0 else (u, other)
+        p1 = np.array(surf.evaluate(u, v), float)
+        p2 = np.array(surf.evaluate(*uv2), float)
+        if np.linalg.norm(p1 - p2) > 1e-9 * (np.linalg.norm(p1) + 1.0):
+            continue
+        alt = _newton_foot(surf, q, *uv2, u0, u1, v0, v1)
+        if np.linalg.norm(np.array(surf.evaluate(*alt)) - q) < np.linalg.norm(p1 - q):
+            u, v = alt
+    return u, v
+
+
+def _newton_foot(surf, q, u, v, u0, u1, v0, v1):
     for _ in range(40):
         pt, su, sv = surf.derivatives(u, v)
         r = np.array(pt) - q
