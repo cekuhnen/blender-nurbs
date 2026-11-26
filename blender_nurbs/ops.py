@@ -1373,7 +1373,8 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
         return {"distance": self.distance, "direction": self.direction, "dir_vec": list(self.dir_vec),
                 "tilt": self.tilt, "tilt_azimuth": self.tilt_azimuth, "draft": self.draft,
                 "draft_flip": self.draft_flip, "symmetric": self.symmetric,
-                "normal_hint": [float(x) for x in self.normal_hint], "sketch_hint": True}
+                "normal_hint": [float(x) for x in self.normal_hint], "sketch_hint": True,
+                "joint_faces": True}
 
     def invoke(self, context, event):
         from . import workplanes

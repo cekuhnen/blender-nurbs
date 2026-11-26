@@ -137,8 +137,11 @@ h, a = 0.5, 10.0
 off = h * math.tan(math.radians(a))
 r, objs = extrude((L1, "S0"), (A1, "S0"), (L2, "S0"), (A2, "S0"), distance=h, draft=a)
 f = store.get_brep(objs[0]).faces() if objs else []
-G, N = grid(f[0], 2, 401) if f else (None, None)
-far = G[-1] if G is not None and G[-1][:, 2].max() > 0.4 else (G[0] if G is not None else None)
+fars = []
+for fc in f:
+    G, N = grid(fc, 2, 101)
+    fars.append(G[-1] if G[-1][:, 2].max() > 0.4 else G[0])
+far = np.vstack(fars) if fars else None
 def slot_dist(q):
     """In-plane distance of q outside the slot |x| <= 1 (|y| <= 1) with round ends."""
     x, y = q[0], q[1]
@@ -146,14 +149,33 @@ def slot_dist(q):
         return abs(x) - 1.0
     return math.hypot(x, abs(y) - 1.0) - 1.0
 dd = np.array([slot_dist(q) for q in far]) if far is not None else np.array([9.0])
-check("two lines + two arcs: one surface, every side drafted outward by h tan(draft)",
-      r == {'FINISHED'} and len(objs) == 1 and len(f) == 1 and abs(dd - off).max() < 1e-5
+check("two lines + two arcs: one surface of a face per piece, every side drafted outward by h tan(draft)",
+      r == {'FINISHED'} and len(objs) == 1 and len(f) == 4 and abs(dd - off).max() < 1e-5
       and abs(far[:, 2] - h).max() < 1e-9, f"objects {len(objs)} faces {len(f)} off {dd.min():.6f}..{dd.max():.6f} want {off:.6f}")
 hist = features.history(objs[0]) if objs else None
 check("history: the chain's four inputs, rebuilt the same",
       hist is not None and len(hist["inputs"]) == 4 and features.rebuild(objs[0], ctx, force=True) is not False)
 r, objs = extrude((L1, "S0"), (A1, "S0"), (L2, "S0"), (A2, "S0"), distance=h, draft=a, chain=False)
 check("Chain off: one surface each, as before", len(objs) == 4)
+g_old = features.run("extrude", [(L1, "S0"), (A1, "S0"), (L2, "S0"), (A2, "S0")],
+                     {"distance": h, "direction": "Z"})
+sm_, _ = features._k()
+check("an extrude made before faces per piece rebuilds as one face", isinstance(g_old, sm_.Surface), type(g_old))
+# one object of four splines (two arcs as cubics, two lines), chained: a face each
+cu = bpy.data.curves.new("S4", 'CURVE'); cu.dimensions = '3D'
+def _spl(pts, order):
+    sp = cu.splines.new('NURBS'); sp.points.add(len(pts) - 1)
+    for q, c in zip(sp.points, pts): q.co = (*c, 1.0)
+    sp.order_u = order; sp.use_endpoint_u = True
+_spl([(1, 1, 0), (1, 1.4, 0), (0.6, 2, 0), (0, 2, 0), (-0.6, 2, 0), (-1, 1.4, 0), (-1, 1, 0)], 4)
+_spl([(-1, -1, 0), (-1, -1.4, 0), (-0.6, -2, 0), (0, -2, 0), (0.6, -2, 0), (1, -1.4, 0), (1, -1, 0)], 4)
+_spl([(-1, 1, 0), (-1, -1, 0)], 2)
+_spl([(1, -1, 0), (1, 1, 0)], 2)
+S4 = bpy.data.objects.new("S4", cu); ctx.collection.objects.link(S4)
+r, objs = extrude(*[(S4, f"S{i}") for i in range(4)], distance=h)
+check("a slot of four splines in one object: one surface, a face per spline",
+      r == {'FINISHED'} and len(objs) == 1 and len(store.get_brep(objs[0]).faces()) == 4,
+      f"objects {len(objs)} faces {len(store.get_brep(objs[0]).faces()) if objs else 0}")
 
 # --- 3. separate open curves drafted together lean out of their middle --------------
 r, objs = extrude((L1, "S0"), (L2, "S0"), distance=h, draft=a)
@@ -170,11 +192,12 @@ clear()
 bpy.ops.nproto.add_primitive(kind="PLANE", width=2, depth=2); PL = ctx.active_object
 sides = [s for s in ("U0", "V1", "U1")]
 r, objs = extrude(*[(PL, s) for s in sides], distance=h, draft=a)
-P, _ = cvs(objs[0]) if objs else (np.zeros((2, 1, 3)), None)
-top = P[1]
-corner_ok = sum(1 for q in top if abs(abs(q[0]) - (1 + off)) < 1e-9 and abs(abs(q[1]) - (1 + off)) < 1e-9)
-check("three edges of a plane: one surface, the far edge mitred at both corners",
-      r == {'FINISHED'} and len(objs) == 1 and corner_ok == 2 and abs(top[:, 2] - h).max() < 1e-9,
+top = np.vstack([cvs(objs[0], k)[0][1] for k in range(len(store.get_surfaces(objs[0])))]) if objs \
+    else np.zeros((1, 3))
+corners = {tuple(np.round(q[:2], 6)) for q in top if abs(abs(q[0]) - (1 + off)) < 1e-9 and abs(abs(q[1]) - (1 + off)) < 1e-9}
+corner_ok = len(corners)
+check("three edges of a plane: one surface (a face per edge), the far edge mitred at both corners",
+      r == {'FINISHED'} and len(objs) == 1 and len(store.get_brep(objs[0]).faces()) == 3 and corner_ok == 2 and abs(top[:, 2] - h).max() < 1e-9,
       f"objects {len(objs)} corners {corner_ok}")
 r, objs = extrude((PL, "U0"), distance=h)
 check("one edge still works", r == {'FINISHED'} and len(objs) == 1)

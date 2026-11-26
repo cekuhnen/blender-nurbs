@@ -1863,7 +1863,28 @@ def build_extrude(inputs, p):
     if p.get("caps"):
         return _solid(inputs, p, _extrude_side, joints=True)
     obj, ref = inputs[0]
-    return _extrude_side(obj, profile_curve(inputs), p)
+    w = _extrude_side(obj, profile_curve(inputs), p)
+    if p.get("joint_faces"):                 # newer extrudes: a face per sketch piece, as a solid's walls
+        w = join_pieces(split_wall_at_joints(w, profile_joint_points(inputs), shapes=False))
+    return w
+
+
+def join_pieces(pieces):
+    """Surfaces (world) that meet along their edges as one Brep of joined
+    faces; a lone surface (or anything else) is returned as it is."""
+    sm, _ = _k()
+    if not isinstance(pieces, list):
+        return pieces
+    if len(pieces) == 1:
+        return pieces[0]
+    from . import jobs
+    ident = {"loc": [0.0, 0.0, 0.0], "axis": [0.0, 0.0, 1.0], "angle": 0.0, "scale": [1.0, 1.0, 1.0]}
+    objs = {f"s{i}": (store.brep_to_text(store.to_brep(pc)), ident) for i, pc in enumerate(pieces)}
+    lo = np.min([np.array(store.to_brep(pc).bounding_box()[0], float) for pc in pieces], axis=0)
+    hi = np.max([np.array(store.to_brep(pc).bounding_box()[1], float) for pc in pieces], axis=0)
+    diag = float(np.linalg.norm(hi - lo)) or 1.0
+    _, breps = jobs.run("join", objs, ["joined"], order=list(objs), into="s0", tolerance=1e-6 * diag)
+    return store.brep_from_text(breps["joined"])
 
 
 def _extrude_side(obj, curve, p):
@@ -2358,7 +2379,7 @@ def _shape_changes(a, b, tol):
     return float(np.linalg.norm(a[1] - b[1])) > tol or abs(a[2] - b[2]) > tol
 
 
-def split_wall_at_joints(surf, joint_pts):
+def split_wall_at_joints(surf, joint_pts, shapes=True):
     """An extruded wall (u across the extrusion, degree 1; v along the
     profile) as pieces split exactly along its C0 profile knots where the
     profile's pieces meet: at joint_pts (a Join's joints, chained inputs) and
@@ -2366,7 +2387,9 @@ def split_wall_at_joints(surf, joint_pts):
     profile then gets a face of its own with its own edges, so an arc's rim is
     a true circular edge (its centre snaps) even where it joins a line
     tangentially -- Rhino / Shapr3D give one face per segment the same way.
-    Folds are split later (cap_walls). Anything else is returned as it is."""
+    Folds are split later (cap_walls). shapes=False: only at joint_pts (a
+    surface extrude: a face per sketch element, one spline stays whole).
+    Anything else is returned as it is."""
     from . import curvejoin
     sm, ext = _k()
     if not isinstance(surf, sm.Surface):
@@ -2396,7 +2419,7 @@ def split_wall_at_joints(surf, joint_pts):
         return surf
     if len(spans) != len(inner) + 1:
         return surf
-    shapes = [_span_shape(s, tol) for s in spans]
+    kinds = [_span_shape(s, tol) for s in spans] if shapes else None
     J = np.asarray(joint_pts, float).reshape(-1, 3)
 
     def near_joint(col):
@@ -2413,7 +2436,7 @@ def split_wall_at_joints(surf, joint_pts):
         if len(idx) != dv:
             continue                                   # smoother than C0: one piece of the profile
         col = P[:, idx[0] - 1]                         # the CVs the knot line passes through
-        if near_joint(col) or _shape_changes(shapes[i], shapes[i + 1], tol):
+        if near_joint(col) or shapes and _shape_changes(kinds[i], kinds[i + 1], tol):
             cuts.append(k)
     if not cuts:
         return surf

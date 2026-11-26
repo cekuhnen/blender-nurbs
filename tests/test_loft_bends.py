@@ -113,23 +113,35 @@ for bez, n_bends, max_spans in ((True, 3, 16), (False, 7, 32)):
               "; ".join(L["check"]["text"] for L in labs if L.get("check")) +
               f" | 401: {fine['angle']:.4f}°, inner kink {kink:.4f}°, spans {features.LAST_SPANS[0]} {features.LOFT_NOTES}")
 
-# 2. the slot as four pieces, extruded into one joined edge; the loft's side A
-# is the four pieces: G1 / G2 hold, and no gap is read at the closed chain's seam
+def low_edges(E):
+    """The B-rep edges (E<i>) along the bottom of a joined extrude, in order."""
+    zs = []
+    for e in store.get_brep(E).edges():
+        t0, t1 = e.parameter_range()
+        zs.append([e.point_at(t0 + (t1 - t0) * k / 8)[2] for k in range(9)])
+    zmin = min(min(z) for z in zs)                 # (the kernel's bounding box is padded)
+    return [(E, f"E{i}") for i, z in enumerate(zs) if max(abs(v - zmin) for v in z) < 1e-9]
+
+# 2. the slot as four pieces, extruded into a face per piece (a Surface extrude
+# of separate sketch pieces); the loft's side A is the four pieces, side B the
+# extrude's four bottom edges: G1 / G2 hold, and no gap is read at the closed
+# chain's seam
 P4 = slot_pieces("Slot4", 0.076, 0.05, 0.0)
 P4b = slot_pieces("Slot4b", 0.076, 0.05, 0.06)
 E4 = extrude(P4b, ["S0", "S1", "S2", "S3"], 0.12)
-check("extrude of the four pieces: one face", E4 is not None and len(list(store.get_brep(E4).faces())) == 1)
-e4 = low_closed_edge(E4)
+check("extrude of the four pieces: a face per piece", E4 is not None and len(list(store.get_brep(E4).faces())) == 4)
+side_b = low_edges(E4)
+check("the extrude's bottom: four edges", len(side_b) == 4, [r for _, r in side_b])
 side_a = [(P4, r) for r in ("S0", "S2", "S1", "S3")]
 base = dict(cont_a="G0", tan_a=1.0, tan_b=1.0, cur_a=0.0, cur_b=0.0, auto_align=True, flip_b=False,
             ruled=False, closed=False, samples=24, edges_a="EDGES", edges_b="EDGES", fit="SPANS",
-            span_degree=5, span_faces=False, sides=[4, 1])
-check("four-piece side and the joined edge pair their joints",
-      features.paired_samples([side_a, [(E4, e4)]], 120, False) is not None)
+            span_degree=5, span_faces=False, sides=[4, len(side_b)])
+# (paired_samples pairs the breakpoints inside one joined edge; four edges are
+# four pieces already, so the loft meets them piece by piece without it)
 for cont in ("G1", "G2"):
     features.LOFT_NOTES.clear()
-    g = features.build_loft(side_a + [(E4, e4)], dict(base, cont_b=cont))
-    worst, what = features._verify_sides(g, [side_a, [(E4, e4)]], ("G0", cont))
+    g = features.build_loft(side_a + side_b, dict(base, cont_b=cont))
+    worst, what = features._verify_sides(g, [side_a, side_b], ("G0", cont))
     kink = inner_kink(list(store.to_brep(g).faces())[0].surface())
     check(f"four-piece slot loft {cont}: holds (gap at the seam read right), no kink inside",
           worst <= 1.0 and not features.LOFT_NOTES and kink < 0.02,
