@@ -122,6 +122,35 @@ def _point(f):
     return [float(ip.x), float(ip.y), float(ip.z)] if hasattr(ip, "x") else [float(x) for x in ip]
 
 
+def _inner_point(f, n=9):
+    """A point well inside face f (the middle of a fillet's strip): of a grid
+    of (u, v) the face calls inside, the one farthest from its edges. The
+    kernel's interior_point() can lie a few microns off a rail: once the
+    fillet is gone the new sharp corner passes that close to it."""
+    try:
+        (u0, v0), (u1, v1) = f.uv_domain()
+        surf = f.surface()
+        E = []
+        for e in f.edges():
+            t0, t1 = e.parameter_range()
+            E += [e.point_at(float(t)) for t in np.linspace(t0, t1, 25)]
+        E = np.array(E, float) if E else None
+        best, best_d = None, -1.0
+        for u in np.linspace(u0, u1, n + 2)[1:-1]:
+            for v in np.linspace(v0, v1, n + 2)[1:-1]:
+                if f.classify_uv(float(u), float(v)) != "inside":
+                    continue
+                q = np.array(surf.evaluate(float(u), float(v)), float)
+                d = float(np.min(np.linalg.norm(E - q, axis=1))) if E is not None else 0.0
+                if d > best_d:
+                    best, best_d = q, d
+        if best is not None:
+            return [float(x) for x in best]
+    except Exception:
+        pass
+    return _point(f)
+
+
 def find(sm, b, exclude=()):
     """The fillets of Brep b: {"fillets": [{face, point, radius, radius_min,
     radius_max, kind, chain}], "corners": [{face, point, chain}],
@@ -248,7 +277,7 @@ def _defeatured(sm, b, groups_of, reaches, tol):
         groups = groups_of(c)
         if groups is None:
             return None, "its faces were not found again"
-        gone = [_point(f) for g in groups for f in g]
+        gone = [_inner_point(f) for g in groups for f in g]
         want = b.face_count() - len(gone)
         try:
             sm.blender_ext.defeature_faces(c, groups, d)
