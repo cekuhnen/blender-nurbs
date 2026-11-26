@@ -5271,7 +5271,7 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cy
               "patch_auto_corners", "patch_corner", "patch_remove_guide", "rebuild", "rebuild_waiting", "remove_step",
               "pipe_point_add", "pipe_point_remove",     # Pipe / Sweep points: Feature panel rows' buttons
               "restore_inputs", "sync_feature", "tab_edit", "continuity", "continuity_clear", "section_add", "section_orient",
-              "section_targets", "section_curves", "section_remove", "subsel_picker", "bake_feature", "delete_feature",
+              "section_targets", "section_curves", "section_remove", "subsel_picker", "curve_picker", "bake_feature", "delete_feature",
               "curve_degree", "fix_clip_start", "delete_faces", "move_pivot", "cv_nudge", "pattern_select",
               "measure",    # Measure: in the Analyze panel / header popover, with Continuity Check
               "remove_symmetry",    # Mirror's Make Symmetric: the Active Object panel's button

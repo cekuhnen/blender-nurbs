@@ -575,6 +575,11 @@ def _draw():
         subsel.draw_view(ctx, _draw_lines, _draw_tris, _edge_bias)
     except Exception as exc:
         print("NURBS select:", exc)
+    from . import curvesel
+    try:
+        curvesel.draw_view(ctx, _draw_lines)
+    except Exception as exc:
+        print("NURBS curve select:", exc)
     gpu.state.depth_test_set('LESS_EQUAL')
 
     if v is not None:
