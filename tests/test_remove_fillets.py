@@ -233,6 +233,47 @@ select(S)
 r = run(all_fillets=True)
 check("plain slot: nothing removed, body unchanged", r == {'CANCELLED'} and S[store.PROP_BREP] == text)
 
+# a revolved puck (top, side, a 26.6 deg bevel, bottom), its three rims filleted by
+# chord: the fillets were 150-CV skins the kernel's defeature could not take off
+# ("not a valid brep"), and the bevel | bottom one alone came back unchanged
+# (the faces' default extension too short at that shallow angle)
+def puck():
+    clear()
+    cu = bpy.data.curves.new("Puck", 'CURVE'); cu.dimensions = '3D'
+    PUCK = [(0, 0, 0.508), (0.2032, 0, 0.508), (0.2032, 0, 0.4953), (0.1778, 0, 0.4826), (0, 0, 0.4826)]
+    sp = cu.splines.new('POLY'); sp.points.add(len(PUCK) - 1)
+    for q, c in zip(sp.points, PUCK):
+        q.co = (*c, 1.0)
+    pr = bpy.data.objects.new("Puck", cu); ctx.collection.objects.link(pr)
+    bpy.ops.nproto.revolve(inputs=json.dumps([[pr.name, "S0"]]), angle=360.0, axis="Z", pivot="WORLD", body="NEW")
+    V = ctx.active_object
+    b = store.get_brep(V)
+    rims = [(0.2032, 0.508), (0.2032, 0.4953), (0.1778, 0.4826)]
+    idx = [min(range(b.edge_count()), key=lambda i: (lambda e, q: abs(q[2] - z) + abs(math.hypot(q[0], q[1]) - rr)
+                                                      + (0 if len(e.faces()) == 2 else 1e3))(
+               b.edges()[i], b.edges()[i].point_at(0.5 * sum(b.edges()[i].parameter_range())))) for rr, z in rims]
+    bpy.ops.nproto.edge_fillet(inputs=json.dumps([[V.name, f"E{i}"] for i in idx]), shape="CIRCULAR",
+                               rail_type="CHORD", radius=0.00635)
+    return V
+
+V = puck()
+fl = removefillets.find(V)["fillets"]
+cvs = [len(sm.blender_ext.surface_cvs(store.get_brep(V).faces()[f["face"]].surface())["points"]) for f in fl]
+check("puck: chord fillets on its rims are exact rings", nfaces(V) == 7 and len(fl) == 3 and max(cvs) <= 27,
+      f"faces {nfaces(V)} fillets {len(fl)} CVs {cvs}")
+select(V)
+r = run(all_fillets=True)
+h, R0, R1 = 0.0127, 0.2032, 0.1778
+want = math.pi * R0 * R0 * h + math.pi * h / 3 * (R0 * R0 + R0 * R1 + R1 * R1)
+check("puck: all chord fillets removed, the sharp profile back", r == {'FINISHED'} and nfaces(V) == 4 and solid(V)
+      and abs(vol(V) - want) < 1e-5 * want, f"faces {nfaces(V)} vol {vol(V):.9f} want {want:.9f}")
+V = puck()
+select(V)
+p = min(removefillets.find(V)["fillets"], key=lambda f: abs(f["point"][2] - 0.4829))["point"]
+r = run(faces=faces((V, p)))
+check("puck: the bevel | bottom fillet alone removed", r == {'FINISHED'} and nfaces(V) == 6 and solid(V),
+      f"faces {nfaces(V)}")
+
 # a free-form skin: every face tangent to its neighbours is no fillet
 clear()
 P = body("Ball", sm.create_sphere((0, 0, 0), 1.0))

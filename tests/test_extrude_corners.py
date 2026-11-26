@@ -76,6 +76,50 @@ r, (E,) = extrude((L, "S0"), distance=0.12)
 P, _ = cvs(E)
 check("Extrude of the line from the file: a wall standing up (Blender keeps curve points in single precision)",
       abs(P[1, :, 2] - 0.12).max() < 1e-6 and abs(P[:, :, 0] - 0.254).max() < 1e-6)
+# a line drawn in front view (the Line tool records its sketch normal, +Y): along Y, not Z
+F = nurbs("F", [(0.117, 0.0, -0.064), (0.454, 0.0, -0.064)])
+F[store.PROP_SKETCH_N] = [0.0, 1.0, 0.0]
+cf = features.input_curve(F, "S0")
+d_new = np.array(features.extrude_direction(F, cf, {"direction": "NORMAL", "normal_hint": [0, 0, 1.0], "sketch_hint": True}))
+d_flip = np.array(features.extrude_direction(F, cf, {"direction": "NORMAL", "normal_hint": [0, -1.0, 0], "sketch_hint": True}))
+d_prev = np.array(features.extrude_direction(F, cf, {"direction": "NORMAL", "normal_hint": [0, 0, 1.0]}))
+check("a straight line goes along the plane it was drawn on, to the work plane's side; older extrudes keep Z",
+      abs(d_new - [0, 1, 0]).max() < 1e-12 and abs(d_flip - [0, -1, 0]).max() < 1e-12
+      and abs(d_prev - [0, 0, 1]).max() < 1e-12, f"{d_new} {d_flip} {d_prev}")
+r, (EF,) = extrude((F, "S0"), distance=0.12)
+P, _ = cvs(EF)
+check("Extrude of the front-view line: a wall along Y", abs(np.ptp(P[:, :, 1]) - 0.12) < 1e-6 and np.ptp(P[:, :, 2]) < 1e-6,
+      str(np.ptp(P.reshape(-1, 3), axis=0)))
+# drafted together with an arc above it (both drawn in front view): the line leans up as the arc opens up
+AR = nurbs("AR", [(-0.77, 0.0, -0.045), (-0.427, 0.0, 0.295), (-0.114, 0.0, 0.038)], order=3)
+AR[store.PROP_SKETCH_N] = [0.0, 1.0, 0.0]
+r, objs = extrude((AR, "S0"), (F, "S0"), distance=0.3, draft=20.0, chain=False)
+by = {o.name: cvs(o)[0] for o in objs}
+PA = next(v for k, v in by.items() if np.ptp(v[0, :, 2]) > 0.1)        # the arc's wall
+PL = next(v for k, v in by.items() if np.ptp(v[0, :, 2]) < 1e-6)       # the line's
+top_a = PA[-1, :, 2].max() - PA[0, :, 2].max()
+lean_l = PL[-1, :, 2].mean() - PL[0, :, 2].mean()
+check("line + arc drafted together: both along Y, the line leans up as the arc opens up",
+      top_a > 0.05 and lean_l > 0.05 and abs(np.ptp(PL[:, :, 1]) - 0.3) < 1e-6, f"arc top +{top_a:.4f} line +{lean_l:.4f}")
+from blender_nurbs.ops import draft_centres, extrude_rows as _rows
+SA, SL = (geom.sample_curve(features.input_curve(o, "S0"), 33) for o in (AR, F))
+ctrs = draft_centres([SA, SL], [np.array([0, 1.0, 0])] * 2, [0, 0, 1.0])
+pv = _rows(np.array(SL), np.array([0, 1.0, 0]), 0.3, 20.0, smooth=False, centre=ctrs[1])
+check("the preview leans the line up too", pv[1][:, 2].mean() - pv[0][:, 2].mean() > 0.05)
+r, objs = extrude((F, "S0"), distance=0.3, draft=20.0)
+PL1 = cvs(objs[0])[0]
+check("a lone line drafted along Y leans to the work plane's normal (up), whichever way it was drawn",
+      PL1[-1, :, 2].mean() - PL1[0, :, 2].mean() > 0.05)
+pts = [tuple(p.co) for p in F.data.splines[0].points]
+for p, c in zip(F.data.splines[0].points, reversed(pts)):
+    p.co = c
+r, objs = extrude((F, "S0"), distance=0.3, draft=20.0)
+PL2 = cvs(objs[0])[0]
+check("... drawn the other way: still up", PL2[-1, :, 2].mean() - PL2[0, :, 2].mean() > 0.05)
+F.data.splines[0].points[1].co = (0.454, 0.3, -0.064, 1.0)     # moved off its sketch plane: the work plane decides
+d_off = np.array(features.extrude_direction(F, features.input_curve(F, "S0"),
+                                            {"direction": "NORMAL", "normal_hint": [0, 0, 1.0], "sketch_hint": True}))
+check("a line moved off its sketch plane falls back to the work plane", abs(d_off - [0, 0, 1]).max() < 1e-9, str(d_off))
 bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0); CI = ctx.active_object
 cc = features.input_curve(CI, "S0")
 dn = np.array(features.extrude_direction(CI, cc, {"direction": "NORMAL", "normal_hint": [0, 0, -1.0]}))
