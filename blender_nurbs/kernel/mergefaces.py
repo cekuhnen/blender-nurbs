@@ -42,6 +42,7 @@ except ImportError:          # the worker imports the kernel folder's modules to
 REL_TOL = 1e-5               # a share of the body's size: points this close are the same
 SMOOTH_DEG = 1e-3            # tangents / normals this close count as the same direction
 CREASE_DEG = 0.5             # a crease below this is reported as "tangent", above it as an angle
+FLAT_HINT_DEG = 10.0         # two flat faces closer than this to one plane: the report names the Flat Tolerance
 
 
 # -- small helpers ----------------------------------------------------------------
@@ -209,7 +210,11 @@ class _Body:
                 return ""
             if cos <= -math.cos(math.radians(SMOOTH_DEG)):
                 return "the faces meet back to back (a fin)"
-            return self._crease(cos)
+            why = self._crease(cos)
+            ang = math.degrees(math.acos(max(-1.0, min(1.0, cos))))
+            if ang <= FLAT_HINT_DEG:
+                why += f" (a Flat Tolerance of {math.ceil(ang * 100 - 1e-6) / 100:.3g}° or more merges them)"
+            return why
         if not same_dir:
             return self._crease(cos)
         if (pi is None) != (pj is None):
@@ -344,11 +349,12 @@ def _picked_edges(b, edges, pts, size):
     return out, miss
 
 
-def find(sm, b, picked=None):
+def find(sm, b, picked=None, flat_deg=0.0):
     """The edges of b that can go: {"edges": [{"edge": i, "point": mid,
-    "ok": bool, "why": str}]} -- every edge between two faces, or (picked:
-    points on edges) the edges nearest those points; "missed": picks near no
-    edge."""
+    "ok": bool, "why": str, "near": angle or None}]} -- every edge between
+    two faces, or (picked: points on edges) the edges nearest those points;
+    "near": the angle between two flat faces within flat_deg of one plane
+    (they can go by a refit, planerefit.py); "missed": picks near no edge."""
     body = _Body(sm, b)
     edges = b.edges()
     if picked is None:
@@ -362,8 +368,21 @@ def find(sm, b, picked=None):
         if picked is None and body.edge_faces(e) is None:
             continue
         why = body.why_not(e)
-        out.append({"edge": i, "point": [float(x) for x in _edge_mid(e)], "ok": not why, "why": why})
+        near = None
+        if why and flat_deg > 0:
+            from_mod = _planerefit()
+            near = from_mod.near_coplanar(body, e, flat_deg)
+        out.append({"edge": i, "point": [float(x) for x in _edge_mid(e)], "ok": not why, "why": why,
+                    "near": near})
     return {"edges": out, "missed": miss}
+
+
+def _planerefit():
+    try:
+        from . import planerefit
+    except ImportError:          # the worker imports the kernel folder's modules top-level
+        import planerefit
+    return planerefit
 
 
 # -- re-trimming --------------------------------------------------------------------
@@ -406,7 +425,8 @@ def _curve_ends(c):
 
 def _trim(sm, surf, loops, area, tol, btol):
     """surf trimmed by loops (lists of curves; the widest is taken as the
-    outer one), or None unless it is one face of the given area."""
+    outer one), or None unless it is one face of the given area (None: any
+    area above zero)."""
     ext = sm.blender_ext
     loops = sorted(loops, key=_span, reverse=True)
     sizes = [len(lp) for lp in loops]
@@ -419,7 +439,10 @@ def _trim(sm, surf, loops, area, tol, btol):
                 cand = sm.trim_surface_with_3d_curves(surf, sizes, curves)
         except Exception:
             continue
-        if cand.face_count() == 1 and abs(cand.area(1e-6) - area) <= 1e-4 * max(area, 1e-12):
+        if cand.face_count() != 1:
+            continue
+        a = cand.area(1e-6)
+        if (area is None and a > 0) or (area is not None and abs(a - area) <= 1e-4 * max(area, 1e-12)):
             return cand
     return None
 
@@ -443,9 +466,10 @@ def _volume(b):
         return 0.0
 
 
-def _replace(sm, b, drop, new_faces, tol, expect_faces):
+def _replace(sm, b, drop, new_faces, tol, expect_faces, volume_change=0.0):
     """b without faces `drop` (indices), with new_faces appended, stitched; None
-    unless it checks out (no new open edges, a solid stays one, same volume)."""
+    unless it checks out (no new open edges, a solid stays one, the same
+    volume -- or within volume_change of it, when faces moved)."""
     ext = sm.blender_ext
     out = b.copy()
     of = out.faces()
@@ -466,7 +490,7 @@ def _replace(sm, b, drop, new_faces, tol, expect_faces):
             if not st.is_manifold_solid():
                 continue
             v1 = _volume(st)
-            if abs(v1 - v0) > 1e-6 * max(v0, 1e-12) + 1e-9:
+            if abs(v1 - v0) > 1e-6 * max(v0, 1e-12) + 1e-9 + volume_change:
                 continue
         return st
     return None
@@ -961,26 +985,41 @@ def _reversed(ext, c):
 
 # -- the whole operation ------------------------------------------------------------
 
-def merge(sm, b, picked=None, vertices=True):
+def merge(sm, b, picked=None, vertices=True, flat_deg=0.0):
     """Remove edges of b: those nearest the picked points (world/brep space),
-    or every edge that can go (picked None). Then the vertices they leave
-    behind (vertices: also every other redundant vertex when nothing was
-    picked). Returns (brep or None, report): report has "removed" (edges),
-    "vertices" (removed), "refused" [{point, why}], "missed" (picks near no
-    edge), "failed" [{point, why}]."""
+    or every edge that can go (picked None). With flat_deg > 0 also edges
+    between flat faces within that angle of one plane: those faces are
+    refitted onto one plane (planerefit.py; the shape moves a little). Then
+    the vertices they leave behind (vertices: also every other redundant
+    vertex when nothing was picked). Returns (brep or None, report): report
+    has "removed" (edges), "refitted" (edges removed by a refit), "moved"
+    (largest corner move of a refit), "vertices" (removed), "refused" [{point,
+    why}], "missed" (picks near no edge), "failed" [{point, why}]."""
     if not _all_bsplines(sm, b):
         b = sm.turn_to_nurbs(b.copy())
-    found = find(sm, b, picked)
+    found = find(sm, b, picked, flat_deg)
     go = [x["edge"] for x in found["edges"] if x["ok"]]
-    rep = {"removed": 0, "vertices": 0, "missed": found["missed"], "failed": [],
+    near = [x for x in found["edges"] if not x["ok"] and x.get("near") is not None]
+    rep = {"removed": 0, "refitted": 0, "moved": 0.0, "vertices": 0, "missed": found["missed"], "failed": [],
            "refused": [] if picked is None else
-           [{"point": x["point"], "why": x["why"]} for x in found["edges"] if not x["ok"]]}
+           [{"point": x["point"], "why": x["why"]} for x in found["edges"]
+            if not x["ok"] and x.get("near") is None]}
     out = None
     ends = None
     if go:
         out, r = remove_edges(sm, b, go)
         rep["removed"], rep["failed"] = r["removed"], r["failed"]
         ends = r["ends"]
+    if near:
+        base = out if out is not None else b
+        r_out, r = _planerefit().refit(sm, base, [x["point"] for x in near], flat_deg)
+        if r_out is not None:
+            out = r_out
+            rep["removed"] += r["removed"]
+            rep["refitted"], rep["moved"] = r["removed"], r["moved"]
+            ends = None if picked is None else (ends or []) + r["corners"]
+        if picked is not None:
+            rep["refused"] += [{"point": f["point"], "why": "refit: " + f["why"]} for f in r["failed"]]
     if vertices and (out is not None or picked is None):
         base = out if out is not None else b
         v, n = remove_vertices(sm, base, None if picked is None else ends)

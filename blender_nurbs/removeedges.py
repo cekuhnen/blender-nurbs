@@ -5,7 +5,10 @@ Redundant Topology).
 
 Edge mode: pick edges, X / Delete (or Remove Edges). An edge whose faces are
 not on one surface (a crease, two faces that only touch tangentially, a flat
-face beside a curved one) stays picked and the report says why. Remove
+face beside a curved one) stays picked and the report says why. Flat
+Tolerance (F9): flat faces within that angle of one plane merge too, refitted
+onto one plane through them (kernel/planerefit.py: their corners move a
+little, the faces round them follow). Remove
 Redundant Edges: every edge of the selected bodies that can go, and the
 vertices left where two edges meet in a straight or smooth line.
 
@@ -22,7 +25,9 @@ kernel/healfaces.py, worker jobs merge_faces and remove_faces."""
 import json
 
 import bpy
-from bpy.props import BoolProperty, StringProperty
+import math
+
+from bpy.props import BoolProperty, FloatProperty, StringProperty
 from mathutils import Vector
 
 from . import features, geom, jobs, store, subsel
@@ -38,23 +43,25 @@ def edge_point(obj, i):
     return [float(x) for x in P[len(P) // 2]]
 
 
-def _merge(target, pts_world):
-    return jobs.run("merge_faces", {"target": target}, ["result"], edge_pts=pts_world, into="target")
+def _merge(target, pts_world, flat_deg=0.0):
+    return jobs.run("merge_faces", {"target": target}, ["result"], edge_pts=pts_world, flat_deg=flat_deg,
+                    into="target")
 
 
-class NPROTO_OT_remove_edges(bpy.types.Operator):
+class _RemoveEdges:
     """Remove the picked edges (Edge mode) where the faces either side lie on
     one surface: they become one face, the body stays closed and keeps its
     shape. All Edges: every edge of the selected bodies that is not needed
     (coplanar faces, pieces of one surface) and the vertices it leaves"""
-    bl_idname = "nproto.remove_edges"
-    bl_label = "Remove Edges"
-    bl_options = {'REGISTER', 'UNDO'}
-
     edges: StringProperty(options={'HIDDEN', 'SKIP_SAVE'},
                           description="The edges to remove: [[body name, a point on the edge (local)], ...]")
     all_edges: BoolProperty(name="All Edges", default=False, options={'SKIP_SAVE'},
                             description="Every edge of the selected bodies whose faces lie on one surface")
+    flat_tolerance: FloatProperty(name="Flat Tolerance", default=0.0, min=0.0, max=math.radians(10.0),
+                                  subtype='ANGLE', precision=3,
+                                  description="Flat faces within this angle of one plane merge too: they are "
+                                              "refitted onto one plane fitted through them, so their corners move "
+                                              "a little (0: exact merges only, the shape never changes)")
 
     @classmethod
     def description(cls, context, props):
@@ -96,15 +103,16 @@ class NPROTO_OT_remove_edges(bpy.types.Operator):
                         "Remove Edges: pick edges first (Edge mode), or use Remove Redundant Edges")
             return {'CANCELLED'}
         hist = features.history_enabled(context)
-        done, notes, warn = [], [], False
+        done, notes, warn, adjustable = [], [], False, False
         for o, pts in items.values():
             M = geom.world_matrix(o)
             world = None if pts is None else [list(M @ Vector(p)) for p in pts]
             try:
-                info, breps = _merge(o, world)
+                info, breps = _merge(o, world, math.degrees(self.flat_tolerance))
             except jobs.JobError as exc:
                 notes.append(f"{o.name}: {exc}")
                 warn = True
+                adjustable |= "Flat Tolerance" in str(exc)
                 continue
             pre = o[store.PROP_BREP]
             if not hist and features.has_history(o):
@@ -113,6 +121,8 @@ class NPROTO_OT_remove_edges(bpy.types.Operator):
             store.set_geometry_text(o, breps["result"], context, keep_untrimmed=False)
             if hist:
                 params = {"mode": "ALL"} if pts is None else {"mode": "PICKED", "edges_local": pts}
+                if self.flat_tolerance > 0:
+                    params["flat_tolerance"] = float(self.flat_tolerance)
                 features.push_step(o, "merge_faces", [], params, base_text=pre)
             refused = info.get("refused", [])
             if pts is not None:
@@ -128,6 +138,9 @@ class NPROTO_OT_remove_edges(bpy.types.Operator):
             msg = f"{o.name}: {n} edge{'s' if n != 1 else ''} removed"
             if v:
                 msg += f", {v} vertex{'es' if v != 1 else ''}"
+            if info.get("refitted"):
+                msg += (f"; {info['refitted']} by a plane refit, corners moved up to "
+                        f"{info.get('moved', 0.0) * geom.world_matrix(o).median_scale:.3g}")
             msg += f" ({info.get('faces_before', '?')} → {info.get('faces', '?')} faces)"
             if refused:
                 whys = list(dict.fromkeys(r["why"] for r in refused))
@@ -142,6 +155,10 @@ class NPROTO_OT_remove_edges(bpy.types.Operator):
         if notes:
             self.report({'WARNING'} if warn else {'INFO'}, " · ".join(notes))
         if not done:
+            if adjustable:
+                # nothing changed, but a Flat Tolerance would merge them: finish, so F9 can set it
+                self.report({'WARNING'}, " · ".join(notes) + " -- F9: raise Flat Tolerance")
+                return {'FINISHED'}
             return {'CANCELLED'}
         if self.all_edges:
             _select_only(context, done)
@@ -152,16 +169,12 @@ def _heal(target, pts_world):
     return jobs.run("remove_faces", {"target": target}, ["result"], face_pts=pts_world, into="target")
 
 
-class NPROTO_OT_remove_faces(bpy.types.Operator):
+class _RemoveFaces:
     """Remove the picked faces (Face mode) and heal the gap: the faces round it
     are extended until they meet, so the body stays closed (a hole's wall:
     the plate is whole again; a boss; a chamfer or a sliver: a sharp edge).
     Shift+X / Shift+Delete in Face mode. Delete Faces (X) opens the body
     instead"""
-    bl_idname = "nproto.remove_faces"
-    bl_label = "Remove Faces"
-    bl_options = {'REGISTER', 'UNDO'}
-
     faces: StringProperty(options={'HIDDEN', 'SKIP_SAVE'},
                           description="The faces to remove: [[body name, a point on the face (local)], ...]")
 
@@ -246,7 +259,7 @@ def apply_merge_faces(obj, text, inputs, p):
     if p.get("mode") != "ALL":
         pts = [list(M @ Vector(q)) for q in p.get("edges_local", [])]
     try:
-        _, breps = _merge((text, jobs.xform(obj)), pts)
+        _, breps = _merge((text, jobs.xform(obj)), pts, math.degrees(float(p.get("flat_tolerance", 0.0))))
     except jobs.JobError as exc:
         if "nothing removed" in str(exc):      # the edges are needed now (an earlier step changed): as it is
             return text
@@ -255,10 +268,12 @@ def apply_merge_faces(obj, text, inputs, p):
 
 
 def _label(p):
+    flat = float(p.get("flat_tolerance", 0.0))
+    tail = f" · flat {math.degrees(flat):.3g}°" if flat > 0 else ""
     if p.get("mode") == "ALL":
-        return "Remove Edges · all redundant"
+        return "Remove Edges · all redundant" + tail
     n = len(p.get("edges_local", []))
-    return f"Remove Edges · {n} picked"
+    return f"Remove Edges · {n} picked" + tail
 
 
 def _register_step():
@@ -271,4 +286,90 @@ def _register_step():
 
 _register_step()
 
-classes = (NPROTO_OT_remove_edges, NPROTO_OT_remove_faces)
+# -- X / Delete with picks: keymap items (not the picker's modal handler), so the
+#    operator is registered and F9 adjusts it (Flat Tolerance). Each runs only with
+#    the picks it takes; otherwise Blender's own X / Delete (delete the object) runs.
+
+def _picked(context, kind):
+    if not subsel.kinds(context) or context.mode != 'OBJECT':
+        return False
+    return any(store.is_nurbs(o) and subsel.picks(o, kind) for o in context.selected_objects)
+
+
+# (operators share code through mixins: registering a subclass of a registered
+#  operator class breaks the parent's execute)
+class NPROTO_OT_remove_edges(_RemoveEdges, bpy.types.Operator):
+    __doc__ = _RemoveEdges.__doc__
+    bl_idname = "nproto.remove_edges"
+    bl_label = "Remove Edges"
+    bl_options = {'REGISTER', 'UNDO'}
+
+
+class NPROTO_OT_remove_faces(_RemoveFaces, bpy.types.Operator):
+    __doc__ = _RemoveFaces.__doc__
+    bl_idname = "nproto.remove_faces"
+    bl_label = "Remove Faces"
+    bl_options = {'REGISTER', 'UNDO'}
+
+
+class NPROTO_OT_remove_edges_key(_RemoveEdges, bpy.types.Operator):
+    """Remove the picked edges where their faces merge into one (X / Delete in Edge mode)"""
+    bl_idname = "nproto.remove_edges_key"
+    bl_label = "Remove Edges"
+    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        return _picked(context, "EDGE") and not _picked(context, "FACE")
+
+
+class NPROTO_OT_remove_faces_key(_RemoveFaces, bpy.types.Operator):
+    """Remove the picked faces and heal the gap (Shift+X / Shift+Delete in Face mode)"""
+    bl_idname = "nproto.remove_faces_key"
+    bl_label = "Remove Faces"
+    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        return _picked(context, "FACE")
+
+
+def _delete_faces_key():
+    from .ops_trim import NPROTO_OT_delete_faces
+
+    class NPROTO_OT_delete_faces_key(bpy.types.Operator):
+        """Delete the picked faces; the body opens (X / Delete in Face mode)"""
+        bl_idname = "nproto.delete_faces_key"
+        bl_label = "Delete Faces"
+        bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
+        execute = NPROTO_OT_delete_faces.__dict__["execute"]     # (not a subclass: see above)
+
+        @classmethod
+        def poll(cls, context):
+            return _picked(context, "FACE")
+    return NPROTO_OT_delete_faces_key
+
+
+classes = (NPROTO_OT_remove_edges, NPROTO_OT_remove_faces, NPROTO_OT_remove_edges_key,
+           NPROTO_OT_remove_faces_key, _delete_faces_key())
+_keymaps = []
+
+
+def register():
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc is None:
+        return
+    km = kc.keymaps.new(name="Object Mode", space_type='EMPTY')
+    for key in ('X', 'DEL'):
+        _keymaps.append((km, km.keymap_items.new("nproto.delete_faces_key", key, 'PRESS')))
+        _keymaps.append((km, km.keymap_items.new("nproto.remove_edges_key", key, 'PRESS')))
+        _keymaps.append((km, km.keymap_items.new("nproto.remove_faces_key", key, 'PRESS', shift=True)))
+
+
+def unregister():
+    for km, kmi in _keymaps:
+        try:
+            km.keymap_items.remove(kmi)
+        except Exception:
+            pass
+    _keymaps.clear()
