@@ -1268,6 +1268,54 @@ def _smooth_draft_normals(P, d, closed, flip, centre=None):
     return -sgn * n if flip else sgn * n
 
 
+def draft_centres(samples, dirs, hint=None):
+    """Per profile extruded together, the point its draft opens away from
+    (geom.draft_reference's `centre`, None: its own). Open pieces share the
+    middle of them all. A straight line has no outward side of its own, so
+    that middle alone decided it by where the line happens to lie (a line
+    under an arc drafted down while the arc opened up): a straight line leans
+    the way the curved open pieces with it lean, when they agree; alone, to
+    the work plane's normal (`hint`) when that is not along its direction."""
+    n = len(samples)
+    S = [np.asarray(s, float) for s in samples]
+    shared = None
+    if n >= 2:
+        P = np.vstack(S)
+        shared = 0.5 * (P.min(axis=0) + P.max(axis=0))
+    out = [None if shared is None else [float(x) for x in shared] for _ in range(n)]
+
+    def closed(s):
+        return len(s) > 2 and np.linalg.norm(s[0] - s[-1]) < 1e-7 * (np.ptp(s, axis=0).max() or 1.0)
+
+    def unit(v):
+        return np.asarray(v, float) / (np.linalg.norm(v) or 1.0)
+
+    straight = [len(s) >= 2 and not closed(s) and geom.is_straight(s) for s in S]
+    if not any(straight):
+        return out
+    side, total = np.zeros(3), 0.0
+    for s, d, st in zip(S, dirs, straight):
+        if not st and not closed(s):
+            m = geom._draft_normals(s, unit(d), False, False, shared).mean(axis=0)
+            side += m
+            total += float(np.linalg.norm(m))
+    if total > 0.0 and np.linalg.norm(side) < 0.2 * total:
+        side = np.zeros(3)                   # the curved pieces lean every which way: the middle decides
+    elif total == 0.0 and shared is None and hint is not None:
+        side = unit(hint)
+    for i in range(n):
+        if not straight[i] or not np.linalg.norm(side):
+            continue
+        d, L = unit(dirs[i]), unit(S[i][-1] - S[i][0])
+        v = side - (side @ d) * d
+        v -= (v @ L) * L
+        if np.linalg.norm(v) <= 1e-6 * np.linalg.norm(side):
+            continue
+        size = float(np.linalg.norm(np.ptp(np.vstack(S), axis=0))) or 1.0
+        out[i] = [float(x) for x in S[i].mean(axis=0) - unit(v) * 10.0 * size]
+    return out
+
+
 def extrude_rows(P, d, h, draft=0.0, flip=False, symmetric=False, smooth=True, centre=None):
     """Rows of points of the extrude of samples P (world): what build_extrude
     makes, for its live preview -- the far row moved by h along d and, with a
@@ -1325,7 +1373,7 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
         return {"distance": self.distance, "direction": self.direction, "dir_vec": list(self.dir_vec),
                 "tilt": self.tilt, "tilt_azimuth": self.tilt_azimuth, "draft": self.draft,
                 "draft_flip": self.draft_flip, "symmetric": self.symmetric,
-                "normal_hint": [float(x) for x in self.normal_hint]}
+                "normal_hint": [float(x) for x in self.normal_hint], "sketch_hint": True}
 
     def invoke(self, context, event):
         from . import workplanes
@@ -1445,14 +1493,15 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
         _select_only(context, made)
         return {'FINISHED'}
 
-    @staticmethod
-    def _centre(curves):
-        """Where open pieces extruded together draft away from: the middle of all
-        of them (None for one profile: it uses its own centre)."""
-        if len(curves) < 2:
-            return None
-        P = np.vstack([geom.sample_curve(c, 33) for c in curves])
-        return [float(x) for x in 0.5 * (P.min(axis=0) + P.max(axis=0))]
+    def _centres(self, items, samples=None, dirs=None):
+        """Per profile (obj, curve) extruded together, where its draft opens
+        away from (draft_centres): None for one curved profile (its own centre)."""
+        if samples is None:
+            samples = [geom.sample_curve(c, 33) for _, c in items]
+        if dirs is None:
+            p = self.params()
+            dirs = [np.array(features.extrude_direction(o, c, p)) for o, c in items]
+        return draft_centres(samples, dirs, list(self.normal_hint))
 
     def execute(self, context):
         if not _kernel_ok(self):
@@ -1470,12 +1519,12 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
             return self.execute_solid(context)
         try:
             groups = self._groups(_decode_inputs(self.inputs))
-            centre = self._centre([features.profile_curve(g) for g in groups])
+            centres = self._centres([(g[0][0], features.profile_curve(g)) for g in groups])
         except Exception as exc:
             self.report({'ERROR'}, f"{self.bl_label} failed: {exc}")
             return {'CANCELLED'}
         made, failed = [], []
-        for g in groups:           # one profile that fails doesn't take the others with it
+        for g, centre in zip(groups, centres):   # one profile that fails doesn't take the others with it
             p = self.params()
             if centre is not None:
                 p["draft_centre"] = centre
@@ -1491,9 +1540,10 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
         return {'FINISHED'}
 
     # -- the live value stage (valuedrag.py) ----------------------------------
-    drag_fields = ("distance", "draft")
-    angle_fields = ("draft",)
+    drag_fields = ("distance", "draft", "tilt")
+    angle_fields = ("draft", "tilt")
     AXES = {"x": "X", "y": "Y", "z": "Z"}
+    TILT_MAX = 89.0
 
     def drag_setup(self, context, mouse):
         self._ex, self._exf = [], []         # (obj, curve, points, smooth); the face index of each (or None)
@@ -1520,7 +1570,8 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
             self._exf.append(None)
         if not self._ex:
             return False
-        self._ctr = None if faces else self._centre([c for _, c, _, _ in self._ex])
+        self._ctr_S = None if faces else [geom.sample_curve(c, 33) for _, c, _, _ in self._ex]
+        self._ctr_key = None
         # the handles stand on the first curve: the arrow where it was clicked
         # (when it was picked by a click), else halfway along it
         obj, curve, P, smooth = self._ex[0]
@@ -1559,17 +1610,28 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
                 out.append(memo[(obj.name, f)])
         return out
 
+    def _ctrs(self):
+        """The preview's draft_centres, one per profile, for the Direction now
+        (a straight line follows its neighbours' lean along that direction)."""
+        if self._ctr_S is None:
+            return [None] * len(self._ex)
+        dirs = self._dirs()
+        key = (tuple(np.round(np.ravel(dirs), 12)), tuple(self.normal_hint))
+        if self._ctr_key != key:
+            self._ctr_key, self._ctr_val = key, draft_centres(self._ctr_S, dirs, list(self.normal_hint))
+        return self._ctr_val
+
     def _draft_normal(self, d):
         """Outward direction of the draft at the diamond's foot (sample kd),
         the way the preview and the builder move the top edge there."""
         obj, curve, P, smooth = self._ex[0]
         S, k, closed = self._S, self._kd, self._closed
         if smooth:
-            nrm = _smooth_draft_normals(S[:-1] if closed else S, d, closed, self.draft_flip, self._ctr)
+            nrm = _smooth_draft_normals(S[:-1] if closed else S, d, closed, self.draft_flip, self._ctrs()[0])
             return nrm[k % len(nrm)]
         # a polyline: the normal of the side the foot is on, signed as the corners' mitres
         cl = len(P) > 2 and np.linalg.norm(P[0] - P[-1]) < 1e-7 * (np.ptp(P, axis=0).max() or 1.0)
-        mit = geom._draft_normals(P[:-1] if cl else P, d, cl, self.draft_flip, self._ctr)
+        mit = geom._draft_normals(P[:-1] if cl else P, d, cl, self.draft_flip, self._ctrs()[0])
         if cl:
             mit = np.vstack([mit, mit[:1]])
         q = S[k]
@@ -1592,12 +1654,63 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
         return [arrow,
                 {"field": "draft", "kind": "draft", "origin": foot, "dir": nd,
                  "param": h * np.tan(np.radians(self.draft)),
-                 "to_value": lambda t, h=h: draft_angle(t, h)}]
+                 "to_value": lambda t, h=h: draft_angle(t, h)}] + self._tilt_handles(B, h)
+
+    def _dir0(self):
+        """The first profile's direction before the tilt (unit)."""
+        p = dict(self.params(), tilt=0.0)
+        (obj, curve, _, _), f = self._ex[0], self._exf[0]
+        d = features.extrude_direction(obj, curve, p) if f is None else features.face_direction(obj, f, p)
+        d = np.array(d, float)
+        return d / (np.linalg.norm(d) or 1.0)
+
+    def _tilt_side(self, d0):
+        """Unit perpendicular to d0 the tilt leans towards (Tilt Around). While
+        there is no tilt it follows the view: the arrow swings in the plane
+        facing it (a side view tilts it up and down, a top view sideways)."""
+        a, b = geom._perp_frame(d0)
+        if abs(self.tilt) < 1e-9:
+            try:
+                q = self._win(bpy.context)[1].view_rotation
+                vd, up, right = (np.array(q @ Vector(v), float) for v in ((0, 0, -1.0), (0, 1.0, 0), (1.0, 0, 0)))
+            except Exception:
+                vd = None
+            if vd is not None:
+                z = vd - (vd @ d0) * d0
+                if np.linalg.norm(z) > 0.2:          # not looking down the arrow
+                    s = np.cross(z, d0)
+                    s /= np.linalg.norm(s)
+                    if (s @ up if abs(s @ up) > 0.05 else s @ right) < 0:
+                        s = -s                       # a positive tilt leans up on screen (else right)
+                    self.tilt_azimuth = math.degrees(math.atan2(float(s @ b), float(s @ a)))
+        az = math.radians(self.tilt_azimuth)
+        return math.cos(az) * a + math.sin(az) * b
+
+    def _tilt_handles(self, B, h):
+        """The tilt's knob halfway up the arrow, on an arc from the untilted
+        direction: dragging it swings the arrow around its foot."""
+        d0 = self._dir0()
+        s = self._tilt_side(d0)
+        sg = 1.0 if h >= 0 else -1.0
+        x, y = sg * d0, sg * s                       # angle 0 along the untilted arrow, + towards the side
+        z = np.cross(x, y)
+        R = 0.55 * abs(h)
+        t = float(self.tilt)
+        n = max(2, int(abs(t) / 3.0) + 1)
+        arc = np.array([B + R * (math.cos(math.radians(t * i / (n - 1))) * x
+                                 + math.sin(math.radians(t * i / (n - 1))) * y) for i in range(n)])
+        tr = math.radians(t)
+        tangent = -math.sin(tr) * x + math.cos(tr) * y
+        lim = self.TILT_MAX
+        return [{"field": "tilt", "kind": "tilt", "pos": arc[-1], "origin": B, "dir": tangent, "param": t,
+                 "path": arc if abs(t) > 1e-9 else None,
+                 "pick": lambda o, r, prev: angle_pick(B, x, y, z, o, r, prev),
+                 "to_value": lambda v: max(-lim, min(lim, v)), "snap": (5.0, 1.0)}]
 
     def drag_preview(self):
         lines, tris = [], []
-        for (obj, curve, P, smooth), d in zip(self._ex, self._dirs()):
-            rows = extrude_rows(P, d, self.distance, self.draft, self.draft_flip, self.symmetric, smooth, self._ctr)
+        for (obj, curve, P, smooth), d, ctr in zip(self._ex, self._dirs(), self._ctrs()):
+            rows = extrude_rows(P, d, self.distance, self.draft, self.draft_flip, self.symmetric, smooth, ctr)
             L, T = ruled_preview(rows, ribs=8 if smooth else len(P) - 1)
             lines += L
             tris.append(T)
@@ -1634,7 +1747,8 @@ class NPROTO_OT_extrude(SolidBody, ValueDrag, AskValue, _CurveTool, bpy.types.Op
         return True
 
     def drag_handle_hints(self):
-        return [hints.key("LMB drag", "arrow: distance"), hints.key("LMB drag", "diamond: draft")]
+        return [hints.key("LMB drag", "arrow: distance"), hints.key("LMB drag", "diamond: draft"),
+                hints.key("LMB drag", "dot: tilt")]
 
     def drag_rows(self):
         cur = {"NORMAL": "normal"}.get(self.direction, self.direction.replace("LOCAL_", "").lower())

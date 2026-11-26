@@ -296,6 +296,14 @@ class NprotoView(bpy.types.PropertyGroup):
                                                    "Shift+click Face too to pick both (an edge near the mouse wins). "
                                                    "Edge Fillet, Continuity Check, Loft, Square, Planar, Patch... "
                                                    "take the picked edges", 'EDGESEL', 4)])
+    curve_sel_mode: EnumProperty(
+        name="Curve Select", default="CV", update=lambda s, c: _curve_sel_mode(s, c),
+        items=[("CV", "CV", "Pick CVs (Blender's own). A click on a hull line away from the CVs picks that "
+                            "span, on the curve the whole curve; double-click a CV: its whole curve", 'VERTEXSEL', 0),
+               ("HULL", "Hull", "Pick hull spans: a click picks the span's two CVs (a Bezier curve: the piece "
+                                "between two points), Shift+click adds or removes", 'EDGESEL', 1),
+               ("CURVE", "Curve", "Pick whole curves: a click on a CV, hull line or the curve; box, lasso and "
+                                  "circle take every curve they touch", 'OUTLINER_DATA_CURVE', 2)])
     show_edges: BoolProperty(name="Edges", default=True, update=lambda s, c: _redraw_views(c))
     show_cvs: BoolProperty(name="CVs / Hulls", default=False, update=lambda s, c: _redraw_views(c),
                            description="CV nets of the selected surfaces and CV hulls of the selected curves, "
@@ -552,12 +560,18 @@ def _subsel_mode(view, context):
     subsel.mode_changed(view, context)
 
 
+def _curve_sel_mode(view, context):
+    from . import curvesel
+    curvesel.mode_changed(view, context)
+
+
 def header_analyze(self, context):
     v = getattr(context.window_manager, "nproto_view", None)
     if v is None:
         return
-    from . import subsel
+    from . import curvesel, subsel
     subsel.draw_mode_buttons(self.layout, context)
+    curvesel.draw_mode_buttons(self.layout, context)
     if load_kernel() is not None:
         draw_display_toggles(self.layout, v, icons_only=True)
         if clip_check(*_view_of(context)) is not None:      # a tiny Clip Start: one click fixes it
@@ -848,7 +862,7 @@ def _hook_tool_settings():
     after Options at the far right, a prepend before Blender's own. The
     header draws tool settings, spacer, mode settings, so its tool-settings
     step is wrapped (undone in unregister)."""
-    from . import subsel
+    from . import curvesel, subsel
     cls = bpy.types.VIEW3D_HT_tool_header
     if getattr(cls.draw_tool_settings, "_nproto_wrapped", False):
         return
@@ -857,6 +871,7 @@ def _hook_tool_settings():
     def draw_tool_settings(self, context):
         draw_tool_settings._nproto_orig(self, context)
         subsel.draw_tool_header(self, context)
+        curvesel.draw_tool_header(self, context)
     draw_tool_settings._nproto_wrapped = True
     draw_tool_settings._nproto_orig = orig
     cls.draw_tool_settings = draw_tool_settings
