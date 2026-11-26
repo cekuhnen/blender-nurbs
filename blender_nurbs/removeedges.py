@@ -8,8 +8,10 @@ not on one surface (a crease, two faces that only touch tangentially, a flat
 face beside a curved one) stays picked and the report says why. Flat
 Tolerance (F9): flat faces within that angle of one plane merge too, refitted
 onto one plane through them (kernel/planerefit.py: their corners move a
-little, the faces round them follow). Remove
-Redundant Edges: every edge of the selected bodies that can go, and the
+little, the faces round them follow). Fit Tolerance (F9): faces that meet
+tangentially on different surfaces merge onto one NURBS surface fitted
+through them within that distance (kernel/surfjoin.py). Remove Redundant
+Edges: every edge of the selected bodies that can go, and the
 vertices left where two edges meet in a straight or smooth line.
 
 Remove Faces (Face mode, Shift+X / Shift+Delete): the picked faces go and the
@@ -43,9 +45,9 @@ def edge_point(obj, i):
     return [float(x) for x in P[len(P) // 2]]
 
 
-def _merge(target, pts_world, flat_deg=0.0):
+def _merge(target, pts_world, flat_deg=0.0, fit_tol=0.0):
     return jobs.run("merge_faces", {"target": target}, ["result"], edge_pts=pts_world, flat_deg=flat_deg,
-                    into="target")
+                    fit_tol=fit_tol, into="target")
 
 
 class _RemoveEdges:
@@ -62,6 +64,12 @@ class _RemoveEdges:
                                   description="Flat faces within this angle of one plane merge too: they are "
                                               "refitted onto one plane fitted through them, so their corners move "
                                               "a little (0: exact merges only, the shape never changes)")
+    fit_tolerance: FloatProperty(name="Fit Tolerance", default=0.0, min=0.0, soft_max=1.0, unit='LENGTH',
+                                 precision=4, step=0.1,
+                                 description="Faces that meet tangentially but lie on different surfaces (split "
+                                             "patches, a flat side running into a round end) merge too: refitted "
+                                             "onto one new NURBS surface within this distance of them (0: exact "
+                                             "merges only)")
 
     @classmethod
     def description(cls, context, props):
@@ -108,11 +116,11 @@ class _RemoveEdges:
             M = geom.world_matrix(o)
             world = None if pts is None else [list(M @ Vector(p)) for p in pts]
             try:
-                info, breps = _merge(o, world, math.degrees(self.flat_tolerance))
+                info, breps = _merge(o, world, math.degrees(self.flat_tolerance), self.fit_tolerance)
             except jobs.JobError as exc:
                 notes.append(f"{o.name}: {exc}")
                 warn = True
-                adjustable |= "Flat Tolerance" in str(exc)
+                adjustable |= "Flat Tolerance" in str(exc) or "Fit Tolerance" in str(exc)
                 continue
             pre = o[store.PROP_BREP]
             if not hist and features.has_history(o):
@@ -123,6 +131,8 @@ class _RemoveEdges:
                 params = {"mode": "ALL"} if pts is None else {"mode": "PICKED", "edges_local": pts}
                 if self.flat_tolerance > 0:
                     params["flat_tolerance"] = float(self.flat_tolerance)
+                if self.fit_tolerance > 0:
+                    params["fit_tolerance"] = float(self.fit_tolerance)
                 features.push_step(o, "merge_faces", [], params, base_text=pre)
             refused = info.get("refused", [])
             if pts is not None:
@@ -137,10 +147,12 @@ class _RemoveEdges:
             n, v = int(info.get("removed", 0)), int(info.get("vertices", 0))
             msg = f"{o.name}: {n} edge{'s' if n != 1 else ''} removed"
             if v:
-                msg += f", {v} vertex{'es' if v != 1 else ''}"
+                msg += f", {v} {'vertices' if v != 1 else 'vertex'}"
             if info.get("refitted"):
-                msg += (f"; {info['refitted']} by a plane refit, corners moved up to "
-                        f"{info.get('moved', 0.0) * geom.world_matrix(o).median_scale:.3g}")
+                msg += f"; {info['refitted']} by a plane refit, corners moved up to {info.get('moved', 0.0):.3g}"
+            if info.get("fitted"):
+                msg += (f"; {info['fitted']} by a surface refit, within {info.get('deviation', 0.0):.3g} "
+                        f"of the faces")
             msg += f" ({info.get('faces_before', '?')} → {info.get('faces', '?')} faces)"
             if refused:
                 whys = list(dict.fromkeys(r["why"] for r in refused))
@@ -157,7 +169,8 @@ class _RemoveEdges:
         if not done:
             if adjustable:
                 # nothing changed, but a Flat Tolerance would merge them: finish, so F9 can set it
-                self.report({'WARNING'}, " · ".join(notes) + " -- F9: raise Flat Tolerance")
+                which = " / ".join(k for k in ("Flat Tolerance", "Fit Tolerance") if k in " ".join(notes))
+                self.report({'WARNING'}, " · ".join(notes) + f" -- F9: raise {which}")
                 return {'FINISHED'}
             return {'CANCELLED'}
         if self.all_edges:
@@ -259,7 +272,8 @@ def apply_merge_faces(obj, text, inputs, p):
     if p.get("mode") != "ALL":
         pts = [list(M @ Vector(q)) for q in p.get("edges_local", [])]
     try:
-        _, breps = _merge((text, jobs.xform(obj)), pts, math.degrees(float(p.get("flat_tolerance", 0.0))))
+        _, breps = _merge((text, jobs.xform(obj)), pts, math.degrees(float(p.get("flat_tolerance", 0.0))),
+                          float(p.get("fit_tolerance", 0.0)))
     except jobs.JobError as exc:
         if "nothing removed" in str(exc):      # the edges are needed now (an earlier step changed): as it is
             return text
@@ -268,8 +282,9 @@ def apply_merge_faces(obj, text, inputs, p):
 
 
 def _label(p):
-    flat = float(p.get("flat_tolerance", 0.0))
+    flat, fit = float(p.get("flat_tolerance", 0.0)), float(p.get("fit_tolerance", 0.0))
     tail = f" · flat {math.degrees(flat):.3g}°" if flat > 0 else ""
+    tail += f" · fit {fit:.3g}" if fit > 0 else ""
     if p.get("mode") == "ALL":
         return "Remove Edges · all redundant" + tail
     n = len(p.get("edges_local", []))

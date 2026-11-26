@@ -59,7 +59,9 @@ def _pt(p):
 
 def _edge_pts(e, n):
     t0, t1 = e.parameter_range()
-    return [_pt(e.point_at(t0 + (t1 - t0) * i / (n - 1))) for i in range(n)]
+    # the ends exactly (t0 + (t1 - t0) * 1.0 can land past t1, which an analytic line refuses)
+    return [_pt(e.point_at(t0 if i == 0 else t1 if i == n - 1 else t0 + (t1 - t0) * i / (n - 1)))
+            for i in range(n)]
 
 
 def _edge_mid(e):
@@ -216,9 +218,13 @@ class _Body:
                 why += f" (a Flat Tolerance of {math.ceil(ang * 100 - 1e-6) / 100:.3g}° or more merges them)"
             return why
         if not same_dir:
-            return self._crease(cos)
+            why = self._crease(cos)
+            ang = math.degrees(math.acos(max(-1.0, min(1.0, cos))))
+            if ang <= _surfjoin().TANGENT_DEG:
+                why += " (a Fit Tolerance refits them onto one surface)"
+            return why
         if (pi is None) != (pj is None):
-            return "a flat face meets a curved one"
+            return "a flat face meets a curved one (tangent: a Fit Tolerance refits them onto one surface)"
         ki, kj = self.cv_key(i), self.cv_key(j)
         if (ki is not None and ki == kj) or self.lies_on(j, i) or self.lies_on(i, j):
             return ""
@@ -228,7 +234,7 @@ class _Body:
                 return ""
         except Exception:
             pass
-        return "the faces are tangent but lie on different surfaces (needs a refit)"
+        return "the faces are tangent but lie on different surfaces (a Fit Tolerance refits them onto one surface)"
 
     @staticmethod
     def _crease(cos):
@@ -349,12 +355,15 @@ def _picked_edges(b, edges, pts, size):
     return out, miss
 
 
-def find(sm, b, picked=None, flat_deg=0.0):
+def find(sm, b, picked=None, flat_deg=0.0, fit_tol=0.0):
     """The edges of b that can go: {"edges": [{"edge": i, "point": mid,
-    "ok": bool, "why": str, "near": angle or None}]} -- every edge between
-    two faces, or (picked: points on edges) the edges nearest those points;
-    "near": the angle between two flat faces within flat_deg of one plane
-    (they can go by a refit, planerefit.py); "missed": picks near no edge."""
+    "ok": bool, "why": str, "near": angle or None, "fit": angle or None}]} --
+    every edge between two faces, or (picked: points on edges) the edges
+    nearest those points; "near": the angle between two flat faces within
+    flat_deg of one plane (they can go by a refit, planerefit.py); "fit" (with
+    fit_tol > 0): the angle between two tangent faces on different surfaces
+    (they can go by a surface refit, surfjoin.py); "missed": picks near no
+    edge."""
     body = _Body(sm, b)
     edges = b.edges()
     if picked is None:
@@ -372,8 +381,14 @@ def find(sm, b, picked=None, flat_deg=0.0):
         if why and flat_deg > 0:
             from_mod = _planerefit()
             near = from_mod.near_coplanar(body, e, flat_deg)
+        fit = None
+        if why and near is None and fit_tol > 0:
+            sj = _surfjoin()
+            fit = sj.tangent_angle(body, e)
+            if fit is not None and picked is None and sj.curvature_jump(body, e) > sj.G2_REL:
+                fit = None             # all edges: only curvature-continuous joints (never a fillet's edges)
         out.append({"edge": i, "point": [float(x) for x in _edge_mid(e)], "ok": not why, "why": why,
-                    "near": near})
+                    "near": near, "fit": fit})
     return {"edges": out, "missed": miss}
 
 
@@ -383,6 +398,14 @@ def _planerefit():
     except ImportError:          # the worker imports the kernel folder's modules top-level
         import planerefit
     return planerefit
+
+
+def _surfjoin():
+    try:
+        from . import surfjoin
+    except ImportError:
+        import surfjoin
+    return surfjoin
 
 
 # -- re-trimming --------------------------------------------------------------------
@@ -985,25 +1008,30 @@ def _reversed(ext, c):
 
 # -- the whole operation ------------------------------------------------------------
 
-def merge(sm, b, picked=None, vertices=True, flat_deg=0.0):
+def merge(sm, b, picked=None, vertices=True, flat_deg=0.0, fit_tol=0.0):
     """Remove edges of b: those nearest the picked points (world/brep space),
     or every edge that can go (picked None). With flat_deg > 0 also edges
     between flat faces within that angle of one plane: those faces are
-    refitted onto one plane (planerefit.py; the shape moves a little). Then
+    refitted onto one plane (planerefit.py; the shape moves a little); with
+    fit_tol > 0 edges between tangent faces on different surfaces, the faces
+    refitted onto one NURBS surface within fit_tol (surfjoin.py). Then
     the vertices they leave behind (vertices: also every other redundant
     vertex when nothing was picked). Returns (brep or None, report): report
     has "removed" (edges), "refitted" (edges removed by a refit), "moved"
-    (largest corner move of a refit), "vertices" (removed), "refused" [{point,
+    (largest corner move of a refit), "fitted" (edges removed by a surface
+    refit), "deviation" (its largest), "vertices" (removed), "refused" [{point,
     why}], "missed" (picks near no edge), "failed" [{point, why}]."""
     if not _all_bsplines(sm, b):
         b = sm.turn_to_nurbs(b.copy())
-    found = find(sm, b, picked, flat_deg)
+    found = find(sm, b, picked, flat_deg, fit_tol)
     go = [x["edge"] for x in found["edges"] if x["ok"]]
     near = [x for x in found["edges"] if not x["ok"] and x.get("near") is not None]
-    rep = {"removed": 0, "refitted": 0, "moved": 0.0, "vertices": 0, "missed": found["missed"], "failed": [],
+    fits = [x for x in found["edges"] if not x["ok"] and x.get("fit") is not None]
+    rep = {"removed": 0, "refitted": 0, "moved": 0.0, "fitted": 0, "deviation": 0.0, "vertices": 0,
+           "missed": found["missed"], "failed": [],
            "refused": [] if picked is None else
            [{"point": x["point"], "why": x["why"]} for x in found["edges"]
-            if not x["ok"] and x.get("near") is None]}
+            if not x["ok"] and x.get("near") is None and x.get("fit") is None]}
     out = None
     ends = None
     if go:
@@ -1020,6 +1048,19 @@ def merge(sm, b, picked=None, vertices=True, flat_deg=0.0):
             ends = None if picked is None else (ends or []) + r["corners"]
         if picked is not None:
             rep["refused"] += [{"point": f["point"], "why": "refit: " + f["why"]} for f in r["failed"]]
+    if fits:
+        base = out if out is not None else b
+        r_out, r = _surfjoin().refit(sm, base, [x["point"] for x in fits], fit_tol)
+        if r_out is not None:
+            out = r_out
+            rep["removed"] += r["removed"]
+            rep["fitted"], rep["deviation"] = r["removed"], r["deviation"]
+            if picked is not None:
+                ends = (ends or []) + r["ends"]
+        if picked is not None:
+            rep["refused"] += [{"point": f["point"], "why": "surface refit: " + f["why"]} for f in r["failed"]]
+        elif r["failed"]:
+            rep["failed"] += [{"point": f["point"], "why": "surface refit: " + f["why"]} for f in r["failed"]]
     if vertices and (out is not None or picked is None):
         base = out if out is not None else b
         v, n = remove_vertices(sm, base, None if picked is None else ends)
