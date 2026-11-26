@@ -7991,6 +7991,25 @@ def job_remove_fillets(job):
     return rep
 
 
+def job_merge_faces(job):
+    """Remove Edges (mergefaces.py): the edges nearest job['edge_pts'] (world
+    points), or every edge that can go when none are given, taken out where
+    the faces either side lie on one surface; the vertices they leave behind
+    go too. Written in the local space of job['into']."""
+    import mergefaces
+    body = world_brep(job, "target")
+    pts = job.get("edge_pts")
+    r, rep = mergefaces.merge(sm, body, picked=pts if pts else None)
+    if r is None:
+        whys = [x["why"] for x in rep["refused"] + rep["failed"]]
+        why = "; ".join(dict.fromkeys(whys)) or ("no edge picked" if rep["missed"] else
+                                                  "every edge is needed (no two faces on one surface)")
+        raise RuntimeError(f"nothing removed ({why})")
+    save(to_local(r, job.get("xforms", {}).get(job.get("into", "target"))), job["out"]["result"])
+    rep.update(faces_before=body.face_count(), faces=r.face_count(), solid=bool(r.is_manifold_solid()))
+    return rep
+
+
 def _flat_quad(loops, tol):
     """The four corners of a face outline that is one convex, flat loop of four
     straight sides (no holes, no curves), else None. Its bilinear patch is
@@ -8206,7 +8225,7 @@ def job_mesh_to_brep(job):
 
 
 JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "untrim_region": job_untrim_region, "untrim_preview": job_untrim_preview, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean, "push_pull": job_push_pull, "rotate_face": job_rotate_face, "move_face": job_move_face, "replace_face": job_replace_face, "extrude_face": job_extrude_face,
-        "flip": job_flip, "cap_solid": job_cap_solid, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken, "shell": job_shell, "remove_fillets": job_remove_fillets,
+        "flip": job_flip, "cap_solid": job_cap_solid, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken, "shell": job_shell, "remove_fillets": job_remove_fillets, "merge_faces": job_merge_faces,
         "mesh_to_brep": job_mesh_to_brep, "face_cvs": job_face_cvs, "imprint": job_imprint}
 
 

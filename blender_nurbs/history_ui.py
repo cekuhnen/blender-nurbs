@@ -532,7 +532,7 @@ def _deform_shows(pg, name, p):
     return True
 
 
-STEP_ICON = {"deform": 'MOD_SIMPLEDEFORM', "replace_face": 'FACE_MAPS', "push_pull": 'FACESEL', "shell": 'MOD_SOLIDIFY', "remove_fillets": 'SELECT_SUBTRACT', "rotate_face": 'DRIVER_ROTATIONAL_DIFFERENCE', "move_face": 'ORIENTATION_GLOBAL', "untrim_region": 'SELECT_SUBTRACT', "untrim": 'LOOP_BACK', "edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
+STEP_ICON = {"deform": 'MOD_SIMPLEDEFORM', "replace_face": 'FACE_MAPS', "push_pull": 'FACESEL', "shell": 'MOD_SOLIDIFY', "remove_fillets": 'SELECT_SUBTRACT', "merge_faces": 'EDGESEL', "rotate_face": 'DRIVER_ROTATIONAL_DIFFERENCE', "move_face": 'ORIENTATION_GLOBAL', "untrim_region": 'SELECT_SUBTRACT', "untrim": 'LOOP_BACK', "edge_fillet": 'MOD_BEVEL', "fillet_trim": 'MOD_BEVEL', "trim": 'MOD_BOOLEAN',
              "flip_normal": 'NORMALS_FACE', "surface_align": 'SNAP_EDGE', "match_surface": 'SNAP_FACE', "extend_surface": 'FULLSCREEN_ENTER',
              "rebuild_surface": 'MOD_REMESH', "refit_trim": 'MOD_LATTICE', "merge_patches": 'MESH_GRID'}
 
