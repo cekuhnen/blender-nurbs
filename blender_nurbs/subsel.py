@@ -20,7 +20,8 @@ renumbers them; they count while their body is selected. What follows them:
 * Unjoin splits the picked faces off; X / Delete removes the picked faces
   (the body opens), Shift+X / Shift+Delete removes them and heals the gap
   (Remove Faces), or (only edges picked) X / Delete removes the picked edges
-  where their faces merge into one (Remove Edges).
+  where their faces merge into one (Remove Edges). Those keys are keymap
+  items (removeedges.py), so F9 adjusts what they did.
 """
 
 import json
@@ -559,7 +560,7 @@ class NPROTO_OT_subsel_picker(bpy.types.Operator):
         ks = kinds(context)
         if not ks or not RUN["on"]:
             return self._stop(context)
-        if context.mode != 'OBJECT' or event.type not in ('MOUSEMOVE', 'LEFTMOUSE', 'X', 'DEL'):
+        if context.mode != 'OBJECT' or event.type not in ('MOUSEMOVE', 'LEFTMOUSE'):
             return {'PASS_THROUGH'}
         try:
             win = context.window
@@ -569,23 +570,6 @@ class NPROTO_OT_subsel_picker(bpy.types.Operator):
                     HOVER["key"] = None
                     _redraw(context)
                 return {'PASS_THROUGH'}             # the navigation gizmo / a label takes it
-            if event.type in ('X', 'DEL'):
-                # X / Delete with faces picked: those faces go, not the whole body; with
-                # edges picked (no faces): those edges go where their faces merge (Remove Edges)
-                if event.value != 'PRESS' or where is None or event.ctrl or event.alt or event.oskey:
-                    return {'PASS_THROUGH'}
-                if any(picks(o, "FACE") for o in context.selected_objects):
-                    # Shift: the faces go and the gap heals (Remove Faces); plain: they go, the body opens
-                    op = bpy.ops.nproto.remove_faces if event.shift else bpy.ops.nproto.delete_faces
-                elif any(picks(o, "EDGE") for o in context.selected_objects):
-                    op = bpy.ops.nproto.remove_edges
-                else:
-                    return {'PASS_THROUGH'}
-                area, region = where
-                with context.temp_override(window=win, area=area, region=region):
-                    op('EXEC_DEFAULT')
-                _redraw(context)
-                return {'RUNNING_MODAL'}
             if event.type == 'MOUSEMOVE':
                 key = None
                 if where is not None and (event.mouse_x, event.mouse_y) != RUN["last"]:

@@ -27,6 +27,7 @@ STEP_FIELDS = {
     "push_pull": ["distance"],
     "shell": ["thickness", "shell_side"],
     "remove_fillets": ["max_radius", "keep_others"],
+    "merge_faces": ["flat_tolerance"],
     "rotate_face": ["angle"],
     "move_face": ["move_x", "move_y", "slide", "turn", "tilt"],
     "refit_trim": ["refit_degree", "refit_spans_u", "refit_spans_v"],
@@ -156,6 +157,9 @@ class NprotoStep(bpy.types.PropertyGroup):
     shell_side: EnumProperty(name="Side", items=[("INSIDE", "Inside", ""), ("OUTSIDE", "Outside", "")], **_S())
     max_radius: FloatProperty(name="Max Radius (0 any)", min=0.0, soft_max=10.0, unit='LENGTH', **_S())
     keep_others: BoolProperty(name="Keep Others", **_S())
+    flat_tolerance: FloatProperty(name="Flat Tolerance", min=0.0, max=0.17453292519943295, subtype='ANGLE',
+                                  precision=3, description="Flat faces within this angle of one plane merge too "
+                                  "(refitted onto one plane: their corners move a little)", **_S())
     move_x: FloatProperty(name="X", unit='LENGTH', **_S())
     move_y: FloatProperty(name="Y", unit='LENGTH', **_S())
     slide: FloatProperty(name="Along", unit='LENGTH', **_S())
@@ -232,6 +236,8 @@ def sync_step(obj, k):
                     pg.through = bool(p.get("through", False))
                 elif name == "class_a":
                     pg.class_a = bool(p.get("class_a", False))
+                elif name == "flat_tolerance":
+                    pg.flat_tolerance = float(p.get("flat_tolerance", 0.0))
                 elif name in CA_DEFAULTS and name not in p:
                     setattr(pg, name, CA_DEFAULTS[name])
                 elif name in p:

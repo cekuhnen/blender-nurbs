@@ -54,6 +54,8 @@ def run(**kw):
         print("   ", exc)
         return {'CANCELLED'}
 
+def edge_at(b, p): return min(b.edges(), key=lambda e: e.closest_point(p)[2])
+
 def raw_union(a, c):          # the kernel's union without its clean-up: the seams stay
     return sm.boolean_with_options(a, c, operation=UNION, post_process=False)
 
@@ -137,6 +139,74 @@ check("slot: the flat sides' edges onto the round end (tangent) are kept, and sa
       out is None and len(rep["refused"]) == 2 and all(r["why"] == "a flat face meets a curved one"
                                                        for r in rep["refused"]), f"{counts(slot)} {rep}")
 
+# --- Flat Tolerance: near-coplanar faces refitted onto one plane (planerefit) --------------
+import math
+def polyhedron(V, F):
+    """A closed body of flat polygons (vertex list, faces as index loops)."""
+    def line(a, b): return ext.curve_from_cvs(1, [tuple(map(float, a)), tuple(map(float, b))], [0, 0, 1, 1], None)
+    out = None
+    for f in F:
+        P = np.array([V[i] for i in f], float); c = P.mean(0); n = np.zeros(3)
+        for i in range(len(P)): n += np.cross(P[i] - c, P[(i + 1) % len(P)] - c)
+        n /= np.linalg.norm(n); u = P[1] - P[0]; u -= (u @ n) * n; u /= np.linalg.norm(u); v = np.cross(n, u)
+        C = [c - 4 * u - 4 * v, c - 4 * u + 4 * v, c + 4 * u - 4 * v, c + 4 * u + 4 * v]
+        srf = ext.surface_from_cvs(1, 1, [tuple(map(float, q)) for q in C], [0, 0, 1, 1], [0, 0, 1, 1], None)
+        g = ext.trim_surface_with_3d_curves_tol(srf, [len(P)], [line(P[i], P[(i + 1) % len(P)]) for i in range(len(P))],
+                                                1e-7, 1e-5)
+        if out is None: out = g
+        else: ext.append_brep(out, g)
+    return sm.stitch_advanced(out, 1e-6, squeeze_small_edges=False, making_manifold_solid=True)[0]
+
+def roof(deg=0.3):
+    """A 2 x 1.5 x 1 box whose top is two faces meeting at a shallow ridge (deg each)."""
+    h = 0.75 * math.tan(math.radians(deg))
+    V = [(0, 0, 0), (2, 0, 0), (2, 1.5, 0), (0, 1.5, 0), (0, 0, 1), (2, 0, 1), (2, 1.5, 1), (0, 1.5, 1),
+         (0, 0.75, 1 + h), (2, 0.75, 1 + h)]
+    F = [[0, 3, 2, 1], [0, 1, 5, 4], [3, 7, 6, 2], [0, 4, 8, 7, 3], [1, 2, 6, 9, 5], [4, 5, 9, 8], [8, 9, 6, 7]]
+    return polyhedron(V, F), h
+
+def raised_tribox(dz=0.004):
+    """The triangulated box with its corner (2, 1.5, 1) raised by dz: three quads slightly folded."""
+    vi = lambda x, y, z: x * 4 + y * 2 + z
+    V = [[2 * x, 1.5 * y, z] for x in (0, 1) for y in (0, 1) for z in (0, 1)]
+    V[vi(1, 1, 1)][2] += dz
+    quads = [[vi(0,0,0), vi(0,1,0), vi(1,1,0), vi(1,0,0)], [vi(0,0,1), vi(1,0,1), vi(1,1,1), vi(0,1,1)],
+             [vi(0,0,0), vi(1,0,0), vi(1,0,1), vi(0,0,1)], [vi(0,1,0), vi(0,1,1), vi(1,1,1), vi(1,1,0)],
+             [vi(0,0,0), vi(0,0,1), vi(0,1,1), vi(0,1,0)], [vi(1,0,0), vi(1,1,0), vi(1,1,1), vi(1,0,1)]]
+    F = []
+    for q in quads: F += [[q[0], q[1], q[2]], [q[0], q[2], q[3]]]
+    return polyhedron(V, F)
+
+rf, h = roof(0.3)
+out, rep = mf.merge(sm, rf, flat_deg=0.2)
+check("roof (0.3° ridge), Flat Tolerance 0.2°: nothing (above it)", out is None, str(rep))
+out, rep = mf.merge(sm, rf, flat_deg=1.0)
+zs = sorted({round(float(v.point()[2]), 6) for v in out.vertices()}) if out is not None else None
+check("roof, Flat Tolerance 1°: one flat top, the plain box shape, corners moved h/2",
+      out is not None and counts(out) == (6, 12, 8) and out.is_manifold_solid()
+      and abs(vol_b(out) - vol_b(rf)) < 1e-6 and zs == [0.0, round(1 + h / 2, 6)]
+      and abs(rep["moved"] - h / 2) < 1e-6 and rep["refitted"] == 1, f"{out and counts(out)} z {zs} {rep}")
+out, rep = mf.merge(sm, rf, picked=[(1, 0.75, 1 + h)], flat_deg=1.0)
+check("roof, the ridge picked: the same box (its ends' vertices joined too)",
+      out is not None and counts(out) == (6, 12, 8) and rep["vertices"] == 2, f"{out and counts(out)} {rep}")
+out, rep = mf.merge(sm, rf, picked=[(1, 0.75, 1 + h)])
+check("roof, the ridge picked, no tolerance: kept, says its angle (0.6°) and the Flat Tolerance that merges it",
+      out is None and rep["refused"] and "0.6°" in rep["refused"][0]["why"]
+      and "Flat Tolerance of 0.6° or more" in rep["refused"][0]["why"], str(rep))
+tb4 = raised_tribox(0.004)
+out, rep = mf.merge(sm, tb4)
+check("raised corner, exact only: the unfolded quads merge, the folded ones stay", out is not None
+      and counts(out)[0] == 7, f"{out and counts(out)} {rep}")
+out, rep = mf.merge(sm, tb4, flat_deg=1.0)
+check("raised corner, Flat Tolerance 1°: a plain 6-face box (three planes meet at the corner)",
+      out is not None and counts(out) == (6, 12, 8) and out.is_manifold_solid() and 0 < rep["moved"] < 0.004,
+      f"{out and counts(out)} {rep}")
+rr, h = roof(0.3)
+sm.fillet_edges(rr, [edge_at(rr, (0, 0, 0.5))], radius=0.2)
+out, rep = mf.merge(sm, rr, picked=[(1, 0.75, 1 + h)], flat_deg=1.0)
+check("a fillet at a corner of the near-flat top: refused (a curved face would have to change)",
+      out is None and rep["refused"] and "curved face" in rep["refused"][0]["why"], str(rep))
+
 # --- the operator ------------------------------------------------------------------------
 def pick_edges(o, pts):
     """Pick the display edges of o nearest these local points (Edge mode)."""
@@ -181,6 +251,22 @@ for hist in (True, False):
         check("history: without the all step, 11 faces again", nfaces(B) == 11, f"faces {nfaces(B)}")
     else:
         check("no history: no steps recorded", not features.stack(B))
+
+    clear()
+    B = body("Raised", raised_tribox(0.004))
+    select(B)
+    r = run(all_edges=True, flat_tolerance=math.radians(1.0))
+    check(f"[{tag}] Remove Redundant Edges, Flat Tolerance 1°: the folded box flat", r == {'FINISHED'}
+          and nfaces(B) == 6 and solid(B), f"faces {nfaces(B)}")
+    if hist:
+        st = features.stack(B)
+        check("history: label shows the tolerance", steps.LABEL["merge_faces"](st[-1]["params"])
+              == "Remove Edges · all redundant · flat 1°", steps.LABEL["merge_faces"](st[-1]["params"]))
+        raw = json.loads(B[features.PROP_STACK]); raw[-1]["params"]["flat_tolerance"] = 0.0
+        B[features.PROP_STACK] = json.dumps(raw)
+        features.rebuild(B, ctx, force=True)
+        check("history: tolerance set to 0, the folded quads stay (exact merges only)", nfaces(B) == 7,
+              f"faces {nfaces(B)}")
 
     clear()
     B = body("Box", sm.create_box((0, 0, 0), 2, 1.5, 1))

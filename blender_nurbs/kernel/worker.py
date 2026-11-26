@@ -8014,11 +8014,14 @@ def job_merge_faces(job):
     """Remove Edges (mergefaces.py): the edges nearest job['edge_pts'] (world
     points), or every edge that can go when none are given, taken out where
     the faces either side lie on one surface; the vertices they leave behind
-    go too. Written in the local space of job['into']."""
+    go too. job['flat_deg'] > 0: flat faces within that angle of one plane are
+    refitted onto one (planerefit.py). Written in the local space of
+    job['into']."""
     import mergefaces
     body = world_brep(job, "target")
     pts = job.get("edge_pts")
-    r, rep = mergefaces.merge(sm, body, picked=pts if pts else None)
+    r, rep = mergefaces.merge(sm, body, picked=pts if pts else None,
+                              flat_deg=float(job.get("flat_deg") or 0.0))
     if r is None:
         whys = [x["why"] for x in rep["refused"] + rep["failed"]]
         why = "; ".join(dict.fromkeys(whys)) or ("no edge picked" if rep["missed"] else
