@@ -375,6 +375,14 @@ Rebuild, Extend, Split and Trim Curves also work in curve Edit Mode, so the CVs 
 * Pieces from Split and Trim stay splines of the same object.
 * Other visible curves still act as cutters and boundaries. Trim only changes the curves being edited.
 
+### Selecting curves in Edit Mode (CV / Hull / Curve)
+
+Blender's curve Edit Mode picks only CVs. In the tool settings bar (or in the viewport header when that bar is hidden) three modes add picking the lines, like a mesh's Vertex / Edge / Face. They work while a select or transform tool is active (Tweak, Select Box / Circle / Lasso, Move, Rotate, Scale, Transform). Shift+click adds or removes. What a click would pick lights up under the mouse.
+* **CV** (the default): a click near a CV is Blender's own. A click on a hull line away from the CVs selects that span's two CVs. A click on the drawn curve selects the whole curve; where the curve runs along its own hull (a straight piece), the curve wins. **Double-click a CV** to select its whole curve. Box and lasso stay Blender's.
+* **Hull**: a click picks the nearest hull span (its two CVs; on a Bezier curve, the piece between two points), even right at a CV. A click on nothing deselects.
+* **Curve**: a click on a CV, a hull line or the curve selects the whole curve. **Box, lasso and circle** select whole curves: every curve the box touches comes in, whether a CV is inside or only its line crosses it; a deselecting box (Ctrl) takes whole curves out. Switching to Curve turns curves that are partly selected into whole ones.
+* The picks are the CVs' own selection, so Edit Mode's undo, the transform tools and the curve tools (Rebuild, Split, Trim...) all see them.
+
 ## Create Surfaces
 
 | Tool | Inputs | Notes |
