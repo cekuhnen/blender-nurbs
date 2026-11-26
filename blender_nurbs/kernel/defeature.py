@@ -224,20 +224,56 @@ def _solid_ok(before, after):
     return after.face_count() < before.face_count()
 
 
-def _remove_chain(sm, b, pts, tol):
+def _reaches(rmax, size):
+    """Extension distances to try for the faces round a chain: the kernel's
+    own first, then longer ones. Its own is too short where the faces meet
+    at a shallow angle (a chamfer's cone and a flat face, 150 degrees apart):
+    the body comes back unchanged."""
+    return [0.0] + [d for d in (3.0 * rmax, 10.0 * rmax, 0.05 * size) if d > 0.0]
+
+
+def _defeatured(sm, b, groups_of, reaches, tol):
+    """b with the face groups removed (a new Brep) by the kernel's defeature,
+    trying each extension distance in turn; (None, why) when none works.
+    groups_of(copy) -> the groups as the copy's faces. A result must have
+    lost every face of the groups (a point inside each no longer on the body:
+    the kernel can come back with some of them left); one that kept a face
+    the extensions added (a bevel cone's strip down to the floor, with the
+    kernel's own distance) gives way to a later distance that leaves the
+    faces as they were but for the removed ones."""
+    why = "the faces round it could not be extended to meet"
+    best = None
+    for d in reaches:
+        c = b.copy()
+        groups = groups_of(c)
+        if groups is None:
+            return None, "its faces were not found again"
+        gone = [_point(f) for g in groups for f in g]
+        want = b.face_count() - len(gone)
+        try:
+            sm.blender_ext.defeature_faces(c, groups, d)
+        except Exception as exc:
+            why = str(exc).split(" at ")[0]
+            continue
+        if not _solid_ok(b, c) or any(_face_near(c, p, tol) is not None for p in gone):
+            continue
+        if c.face_count() <= want:
+            return c, ""
+        if best is None or c.face_count() < best.face_count():
+            best = c
+    return (best, "") if best is not None else (None, why)
+
+
+def _remove_chain(sm, b, pts, tol, reaches=(0.0,)):
     """b with the chain of faces at pts removed (a new Brep), or (None, why)."""
     ext = sm.blender_ext
-    why = "the faces round it could not be extended to meet"
-    c = b.copy()
-    faces = [_face_near(c, p, tol) for p in pts]
-    if any(f is None for f in faces):
-        return None, "its faces were not found again"
-    try:
-        ext.defeature_faces(c, [faces])
-        if _solid_ok(b, c):
-            return c, ""
-    except Exception as exc:
-        why = str(exc).split(" at ")[0]
+
+    def groups_of(c):
+        faces = [_face_near(c, p, tol) for p in pts]
+        return None if any(f is None for f in faces) else [faces]
+    c, why = _defeatured(sm, b, groups_of, reaches, tol)
+    if c is not None:
+        return c, ""
     if len(pts) == 1:
         c = b.copy()
         f = _face_near(c, pts[0], tol)
@@ -328,27 +364,24 @@ def remove(sm, b, picked=None, max_radius=0.0, keep_others=True):
         report["failed"].append({"point": None, "why": "no removable fillet" + (" picked" if picked else "")})
         return None, report
     chains = sorted({fil[i]["chain"] for i in want})
-    plan = []                                   # (points of the chain's faces, kept fillets, n removed)
+    plan = []                                   # (points of the chain's faces, kept fillets, n removed, reaches)
     for ch in chains:
         members = found["chains"][ch]
         kept = [fil[i] for i in members if i in fil and i not in want] if keep_others else []
-        plan.append(([_point(faces[i]) for i in members], kept, sum(1 for i in members if i in want)))
-    ext = sm.blender_ext
-    cur = None
-    try:                                        # all chains at once: one rebuild
-        c = b.copy()
-        cf = list(c.faces())
-        ext.defeature_faces(c, [[cf[i] for i in found["chains"][ch]] for ch in chains])
-        if _solid_ok(b, c):
-            cur = c
-            report["chains"] = len(chains)
-            report["removed"] = sum(n for _, _, n in plan)
-    except Exception:
-        cur = None
+        rmax = max((fil[i]["radius_max"] for i in members if i in fil), default=0.0)
+        plan.append(([_point(faces[i]) for i in members], kept, sum(1 for i in members if i in want),
+                     _reaches(rmax, size)))
+    # all chains at once: one rebuild
+    cur, _ = _defeatured(sm, b, lambda c: [[list(c.faces())[i] for i in found["chains"][ch]] for ch in chains],
+                         _reaches(max((f["radius_max"] for f in fil.values()), default=0.0), size)[:2],
+                         max(tol, 1e-5 * size))
+    if cur is not None:
+        report["chains"] = len(chains)
+        report["removed"] = sum(n for _, _, n, _ in plan)
     if cur is None:                             # chain by chain
         cur = b
-        for pts, kept, n in plan:
-            nxt, why = _remove_chain(sm, cur, pts, max(tol, 1e-5 * size))
+        for pts, kept, n, reaches in plan:
+            nxt, why = _remove_chain(sm, cur, pts, max(tol, 1e-5 * size), reaches)
             if nxt is None:
                 report["failed"].append({"point": pts[0], "why": why})
                 continue
@@ -357,7 +390,7 @@ def remove(sm, b, picked=None, max_radius=0.0, keep_others=True):
             report["removed"] += n
         if cur is b:
             return None, report
-    kept_all = [k for (pts, kept, n), ch in zip(plan, chains) for k in kept
+    kept_all = [k for (pts, kept, n, _), ch in zip(plan, chains) for k in kept
                 if not any(f["point"] == pts[0] for f in report["failed"])]
     if kept_all:
         res, n = _refillet(sm, cur, kept_all, max(tol, 1e-5 * size))

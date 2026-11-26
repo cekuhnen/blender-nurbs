@@ -6645,16 +6645,18 @@ def _section_edge_fillet(b, sel, chord, shape, soft=None, setback=None):
             f, info = secfillet.build(sm, A, B, None, None, d0, d1, shape=shape, setback=True,
                                       curves=[_EdgeCurve(e) for e in es], on_faces=(fp, fq))
             dists += [d for pair in info["setback"] for d in pair]
-            if info.get("ring") is not None:
-                # a revolved rim: every section the same one turned, so the
-                # chamfer is exactly that section's surface of revolution (the
-                # skin through the sections bulges ~1e-6 between them)
-                rev = _revolved_ring(info["ring"], 1e-6 * size)
-                if rev is not None:
-                    f = ext.brep_from_surface(rev)
         else:
             f, info = secfillet.build(sm, A, B, None, None, chord, chord, chord=chord, shape=shape,
                                       curves=[_EdgeCurve(e) for e in es], on_faces=(fp, fq))
+        if not soft and info.get("ring") is not None:
+            # a revolved rim (chord or chamfer): every section the same one
+            # turned, so the fillet is exactly that section's surface of
+            # revolution. The skin through the sections bulges ~1e-6 between
+            # them (150 CVs, C0 knots), and the kernel's defeature could not
+            # take it off again (Remove Fillets: "not a valid brep")
+            rev = _revolved_ring(info["ring"], 1e-6 * size)
+            if rev is not None:
+                f = ext.brep_from_surface(rev)
         fillets.append((f, A, B, fp, fq))
         radii += list(info["radius"])
         chords += list(info["chord"])
