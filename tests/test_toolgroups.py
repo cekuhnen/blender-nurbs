@@ -79,7 +79,7 @@ check("Surface Edit rows (Edit CVs only in the menus: Tab does it)", rows == [
     ["deform", "deform", "deform"], ["flip_normal"], ["trim", "split"], ["untrim", "untrim_region"], ["detach_iso"], ["join", "unjoin"],
     ["remove_edges", "remove_edges"], ["fillet", "edge_fillet"], ["remove_fillets", "remove_fillets"], ["boolean", "boolean", "boolean"],
     ["push_pull", "rotate_face"],
-    ["move_face", "replace_face"], ["boundary_fill", "emboss"], ["shell"]], rows)
+    ["move_face", "replace_face"], ["boundary_fill", "emboss"], ["shell", "remove_faces"]], rows)
 menu = []
 class _M:
     def separator(self, **k): pass

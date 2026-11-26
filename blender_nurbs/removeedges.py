@@ -9,9 +9,15 @@ face beside a curved one) stays picked and the report says why. Remove
 Redundant Edges: every edge of the selected bodies that can go, and the
 vertices left where two edges meet in a straight or smooth line.
 
-With history the removal is a step on the body (merge_faces: all, or the edges
-found again by a point on each); without it the body changes in place.
-Kernel side: kernel/mergefaces.py, worker job merge_faces."""
+Remove Faces (Face mode, Shift+X / Shift+Delete): the picked faces go and the
+faces round each gap are extended until they meet, so the body stays closed
+(a hole, a boss, a pocket, a chamfer, a sliver). A picked fillet goes by
+Remove Fillets' rules. X / Delete (Delete Faces) still opens the body.
+
+With history each is a step on the body (merge_faces: all, or the edges found
+again by a point on each; remove_faces: a point on each face); without it the
+body changes in place. Kernel side: kernel/mergefaces.py and
+kernel/healfaces.py, worker jobs merge_faces and remove_faces."""
 
 import json
 
@@ -142,6 +148,96 @@ class NPROTO_OT_remove_edges(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _heal(target, pts_world):
+    return jobs.run("remove_faces", {"target": target}, ["result"], face_pts=pts_world, into="target")
+
+
+class NPROTO_OT_remove_faces(bpy.types.Operator):
+    """Remove the picked faces (Face mode) and heal the gap: the faces round it
+    are extended until they meet, so the body stays closed (a hole's wall:
+    the plate is whole again; a boss; a chamfer or a sliver: a sharp edge).
+    Shift+X / Shift+Delete in Face mode. Delete Faces (X) opens the body
+    instead"""
+    bl_idname = "nproto.remove_faces"
+    bl_label = "Remove Faces"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    faces: StringProperty(options={'HIDDEN', 'SKIP_SAVE'},
+                          description="The faces to remove: [[body name, a point on the face (local)], ...]")
+
+    def _items(self, context):
+        """{body name: (body, [local points])}"""
+        out = {}
+        if self.faces:
+            for name, p in json.loads(self.faces):
+                o = bpy.data.objects.get(name)
+                if o is None:
+                    raise ValueError(f"{name} not found")
+                out.setdefault(name, (o, []))[1].append(list(map(float, p)))
+            return out
+        from .pushpull import face_frame
+        for o in context.selected_objects:
+            if not store.is_nurbs(o):
+                continue
+            pts = [[float(x) for x in face_frame(o, i)[0]] for i in subsel.picks(o, "FACE")]
+            if pts:
+                out[o.name] = (o, pts)
+        return out
+
+    def execute(self, context):
+        if not _kernel_ok(self):
+            return {'CANCELLED'}
+        try:
+            items = self._items(context)
+        except (ValueError, TypeError) as exc:
+            self.report({'ERROR'}, f"Remove Faces: {exc}")
+            return {'CANCELLED'}
+        if not items:
+            self.report({'WARNING'}, "Remove Faces: pick faces first (Face mode)")
+            return {'CANCELLED'}
+        hist = features.history_enabled(context)
+        done, notes, warn = [], [], False
+        for o, pts in items.values():
+            M = geom.world_matrix(o)
+            try:
+                info, breps = _heal(o, [list(M @ Vector(p)) for p in pts])
+            except jobs.JobError as exc:
+                notes.append(f"{o.name}: {exc} -- Delete Faces (X) opens the body there instead")
+                warn = True
+                continue
+            pre = o[store.PROP_BREP]
+            if not hist and features.has_history(o):
+                features.clear_history(o)
+                notes.append(f"{o.name}: construction history removed")
+            store.set_geometry_text(o, breps["result"], context, keep_untrimmed=False)
+            if hist:
+                features.push_step(o, "remove_faces", [], {"faces_local": pts}, base_text=pre)
+            subsel.set_picks(o, "FACE", [])
+            done.append(o)
+            n = int(info.get("removed", 0))
+            msg = f"{o.name}: {n} face{'s' if n != 1 else ''} removed and healed"
+            msg += f" ({info.get('faces_before', '?')} → {info.get('faces', '?')} faces)"
+            if info.get("added"):
+                msg += f", {info['added']} enclosed face{'s' if info['added'] != 1 else ''} taken along"
+            if info.get("failed"):
+                msg += "; kept: " + "; ".join(dict.fromkeys(f["why"] for f in info["failed"]))
+                warn = True
+            notes.append(msg)
+        for m in notes:
+            print("NURBS remove faces:", m)
+        if notes:
+            self.report({'WARNING'} if warn else {'INFO'}, " · ".join(notes))
+        return {'FINISHED'} if done else {'CANCELLED'}
+
+
+def apply_remove_faces(obj, text, inputs, p):
+    """Remove Faces on rebuild: the faces at the stored points again."""
+    M = geom.world_matrix(obj)
+    pts = [list(M @ Vector(q)) for q in p.get("faces_local", [])]
+    _, breps = _heal((text, jobs.xform(obj)), pts)
+    return breps["result"]
+
+
 def apply_merge_faces(obj, text, inputs, p):
     """Remove Edges on rebuild: every edge that can go (mode ALL), or the
     edges at the stored points (those that can't any more stay)."""
@@ -169,8 +265,10 @@ def _register_step():
     from . import steps
     steps.APPLY["merge_faces"] = apply_merge_faces
     steps.LABEL["merge_faces"] = _label
+    steps.APPLY["remove_faces"] = apply_remove_faces
+    steps.LABEL["remove_faces"] = lambda p: f"Remove Faces · {len(p.get('faces_local', []))} healed"
 
 
 _register_step()
 
-classes = (NPROTO_OT_remove_edges,)
+classes = (NPROTO_OT_remove_edges, NPROTO_OT_remove_faces)

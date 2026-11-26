@@ -7991,6 +7991,25 @@ def job_remove_fillets(job):
     return rep
 
 
+def job_remove_faces(job):
+    """Remove Faces with heal (healfaces.py): the faces nearest
+    job['face_pts'] (world points) taken away and each gap closed by
+    extending the faces round it. Written in the local space of job['into']."""
+    import healfaces
+    if not healfaces.has_kernel(sm):
+        raise RuntimeError("this kernel build has no face defeaturing: update the add-on (or restart Blender "
+                           "after building the kernel)")
+    body = world_brep(job, "target")
+    r, rep = healfaces.remove(sm, body, job.get("face_pts") or [])
+    if r is None:
+        why = "; ".join(dict.fromkeys(x["why"] for x in rep["failed"])) or "no face picked"
+        raise RuntimeError(f"nothing removed ({why})")
+    save(to_local(r, job.get("xforms", {}).get(job.get("into", "target"))), job["out"]["result"])
+    rep.update(faces_before=body.face_count(), faces=r.face_count(), solid=bool(r.is_manifold_solid()),
+               volume_before=abs(_vol(body)), volume=abs(_vol(r)))
+    return rep
+
+
 def job_merge_faces(job):
     """Remove Edges (mergefaces.py): the edges nearest job['edge_pts'] (world
     points), or every edge that can go when none are given, taken out where
@@ -8225,7 +8244,7 @@ def job_mesh_to_brep(job):
 
 
 JOBS = {"retarget": job_retarget, "edge_fillet": job_edge_fillet, "trim": job_trim, "untrim_region": job_untrim_region, "untrim_preview": job_untrim_preview, "fillet": job_fillet, "split": job_split, "join": job_join, "unjoin": job_unjoin, "boolean": job_boolean, "push_pull": job_push_pull, "rotate_face": job_rotate_face, "move_face": job_move_face, "replace_face": job_replace_face, "extrude_face": job_extrude_face,
-        "flip": job_flip, "cap_solid": job_cap_solid, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken, "shell": job_shell, "remove_fillets": job_remove_fillets, "merge_faces": job_merge_faces,
+        "flip": job_flip, "cap_solid": job_cap_solid, "boundary_fill": job_boundary_fill, "offset": job_offset, "thicken": job_thicken, "shell": job_shell, "remove_fillets": job_remove_fillets, "merge_faces": job_merge_faces, "remove_faces": job_remove_faces,
         "mesh_to_brep": job_mesh_to_brep, "face_cvs": job_face_cvs, "imprint": job_imprint}
 
 

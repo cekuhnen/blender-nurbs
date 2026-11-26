@@ -17,9 +17,10 @@ renumbers them; they count while their body is selected. What follows them:
   so do Loft, Planar, Square, Boundary, Patch, Loft Rails, Duplicate Edge,
   Extend Surface, Pipe and Revolve when the picks fit them (Alt+click a tool:
   pick by hand instead).
-* Unjoin splits the picked faces off; X / Delete removes the picked faces,
-  or (only edges picked) the picked edges where their faces merge into one
-  (Remove Edges).
+* Unjoin splits the picked faces off; X / Delete removes the picked faces
+  (the body opens), Shift+X / Shift+Delete removes them and heals the gap
+  (Remove Faces), or (only edges picked) X / Delete removes the picked edges
+  where their faces merge into one (Remove Edges).
 """
 
 import json
@@ -574,7 +575,8 @@ class NPROTO_OT_subsel_picker(bpy.types.Operator):
                 if event.value != 'PRESS' or where is None or event.ctrl or event.alt or event.oskey:
                     return {'PASS_THROUGH'}
                 if any(picks(o, "FACE") for o in context.selected_objects):
-                    op = bpy.ops.nproto.delete_faces
+                    # Shift: the faces go and the gap heals (Remove Faces); plain: they go, the body opens
+                    op = bpy.ops.nproto.remove_faces if event.shift else bpy.ops.nproto.delete_faces
                 elif any(picks(o, "EDGE") for o in context.selected_objects):
                     op = bpy.ops.nproto.remove_edges
                 else:
