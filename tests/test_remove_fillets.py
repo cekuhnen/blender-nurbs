@@ -273,6 +273,16 @@ p = min(removefillets.find(V)["fillets"], key=lambda f: abs(f["point"][2] - 0.48
 r = run(faces=faces((V, p)))
 check("puck: the bevel | bottom fillet alone removed", r == {'FINISHED'} and nfaces(V) == 6 and solid(V),
       f"faces {nfaces(V)}")
+# then the others one by one: after a removal the kernel's interior_point() of a
+# fillet lay microns off its rail, so the new sharp corner passed within the
+# "fillet gone" tolerance of it and every good result was turned down
+for z, n in ((0.4953, 5), (0.508, 4)):
+    p = min(removefillets.find(V)["fillets"], key=lambda f: abs(f["point"][2] - z))["point"]
+    r = run(faces=faces((V, p)))
+    check(f"puck: next fillet removed one by one ({n} faces)", r == {'FINISHED'} and nfaces(V) == n and solid(V),
+          f"faces {nfaces(V)}")
+check("puck: one by one ends at the sharp profile", abs(vol(V) - want) < 1e-5 * want,
+      f"vol {vol(V):.9f} want {want:.9f}")
 
 # a free-form skin: every face tangent to its neighbours is no fillet
 clear()
