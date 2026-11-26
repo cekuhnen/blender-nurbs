@@ -5,9 +5,14 @@ so the pieces lie exactly on the original curve:
 
 * Intersections -- every pair of spans is subdivided (convex-hull boxes)
   until the candidates are small, then refined by Newton on C1(s) = C2(t).
-  A pair is an intersection when the curves come within Tolerance. With
-  "Apparent" the curves are first flattened along the view direction, so
-  curves that only cross on screen (at different depths) count too.
+  A pair is an intersection when the curves come within Tolerance.
+* Apparent crossings -- curves at different depths that only cross as seen
+  in the view. The curves are flattened onto a plane facing the view (along
+  the view direction when orthographic, by central projection from the eye
+  when perspective: both are exact on the homogeneous CVs), intersected there,
+  and each curve is cut at its own parameter of the crossing. Crossings mode
+  Auto (default) uses them for a curve that meets no cutter in 3D; As Seen
+  always; In 3D never.
 * Cutting -- de Casteljau subdivision of the span holding each cut; the
   pieces go back to Blender as endpoint + Bezier-knot NURBS (exact).
   A closed curve cut at k points gives k pieces (the piece across the seam
@@ -74,6 +79,51 @@ def flatten(spans, direction):
         n[:, :3] = s[:, :3] @ L.T
         out.append(n)
     return out
+
+
+def project(spans, view, depth=None):
+    """Spans as seen in a view, flattened onto a plane facing it (exact).
+
+    view: a direction (orthographic: parallel projection), or a dict
+    {"dir", "eye"} for a perspective view: central projection from the eye onto
+    the plane `depth` in front of it. That map is projective, so on the
+    homogeneous CVs it is linear: P' = E (P - E w).d + depth (P - E w),
+    w' = (P - E w).d -- the projected spans are rational Beziers with the same
+    parameter as the originals. A span with a CV behind the eye falls back to
+    the parallel projection."""
+    if not isinstance(view, dict):
+        return flatten(spans, view)
+    d = np.asarray(view["dir"], float)
+    d = d / np.linalg.norm(d)
+    E = view.get("eye")
+    if E is None:
+        return flatten(spans, d)
+    E = np.asarray(E, float)
+    if depth is None:
+        depth = view_depth(spans, view)
+    out = []
+    for s in spans:
+        rel = s[:, :3] - np.outer(s[:, 3], E)
+        w = rel @ d
+        if np.any(w <= 1e-9 * max(1.0, depth)):
+            out.extend(flatten([s], d))
+            continue
+        n = np.empty_like(s)
+        n[:, :3] = np.outer(w, E) + depth * rel
+        n[:, 3] = w
+        out.append(n)
+    return out
+
+
+def view_depth(spans, view):
+    """Mean depth of the CVs in front of a perspective eye (the projection
+    plane: tolerance then is in world units at the curves)."""
+    d = np.asarray(view["dir"], float)
+    d = d / np.linalg.norm(d)
+    P = np.vstack([s[:, :3] / s[:, 3:4] for s in spans])
+    z = (P - np.asarray(view["eye"], float)) @ d
+    z = z[z > 0]
+    return float(z.mean()) if len(z) else 1.0
 
 
 def spans_size(spans):
@@ -273,12 +323,25 @@ from mathutils import Vector  # noqa: E402
 from . import draw  # noqa: E402
 
 
-class CurveSet:
-    """World-space spans of curve splines, keyed by (object name, spline index)."""
+CROSSINGS = [
+    ("AUTO", "Auto", "Where the curves meet in 3D; a curve that meets none of the others is cut where it "
+                     "crosses them as seen in the view (at different depths)"),
+    ("REAL", "In 3D", "Only where the curves actually meet (within Tolerance)"),
+    ("VIEW", "As Seen", "Where the curves cross as seen in the view, whatever their depth")]
 
-    def __init__(self, objs, direction=None, tol=TOL):
+
+class CurveSet:
+    """World-space spans of curve splines, keyed by (object name, spline index).
+
+    view: None, a view direction (orthographic) or {"dir", "eye"} (perspective).
+    mode: "REAL" (3D crossings), "VIEW" (apparent crossings in the view) or
+    "AUTO" (3D, and apparent for a curve that meets no cutter in 3D); default
+    VIEW with a view, REAL without."""
+
+    def __init__(self, objs, direction=None, tol=TOL, mode=None):
         self.tol = tol
-        self.direction = direction
+        self.view = direction
+        self.mode = "REAL" if direction is None else (mode or "VIEW")
         self.local, self.world, self.flat, self.closed = {}, {}, {}, {}
         for o in objs:
             self.add(o)
@@ -295,34 +358,74 @@ class CurveSet:
             key = (obj.name, i)
             self.local[key] = loc
             self.world[key] = curvejoin.transform_spans(loc, M)
-            self.flat[key] = flatten(self.world[key], self.direction) if self.direction is not None else self.world[key]
             self.closed[key] = is_closed(loc, sp.use_cyclic_u)
         self._cuts = {}
+        self._project()
+
+    def _project(self):
+        """Apparent (view-flattened) spans; one projection plane for all of them."""
+        self.flat = {}
+        if self.view is None or not self.world:
+            return
+        depth = None
+        if isinstance(self.view, dict) and self.view.get("eye") is not None:
+            depth = view_depth([s for w in self.world.values() for s in w], self.view)
+        self.flat = {k: project(w, self.view, depth) for k, w in self.world.items()}
+
+    def _raw(self, spans, key, cutters):
+        raw = []
+        for c in cutters:
+            if c == key or c not in spans:
+                continue
+            for gA, _, _ in intersect(spans[key], spans[c], self.tol):
+                k = min(int(gA), len(self.world[key]) - 1)
+                raw.append((gA, eval_d(self.world[key][k], gA - k)[0]))
+        return raw
+
+    def cuts_ex(self, key, cutters):
+        """(clean cut parameters of spline `key` against the cutter splines,
+        whether they are apparent crossings)."""
+        ck = (key, tuple(sorted(cutters)))
+        if ck not in self._cuts:
+            apparent = self.mode == "VIEW"
+            raw = self._raw(self.flat if apparent else self.world, key, cutters)
+            cuts = clean_cuts(self.world[key], raw, self.closed[key], self.tol)
+            if not cuts and self.mode == "AUTO" and self.flat:
+                cuts = clean_cuts(self.world[key], self._raw(self.flat, key, cutters), self.closed[key], self.tol)
+                apparent = bool(cuts)
+            self._cuts[ck] = (cuts, apparent)
+        return self._cuts[ck]
 
     def cuts(self, key, cutters):
         """Clean cut parameters of spline `key` against the cutter splines."""
-        ck = (key, tuple(sorted(cutters)))
-        if ck not in self._cuts:
-            raw = []
-            for c in cutters:
-                if c == key or c not in self.flat:
-                    continue
-                for gA, _, _ in intersect(self.flat[key], self.flat[c], self.tol):
-                    k = min(int(gA), len(self.world[key]) - 1)
-                    raw.append((gA, eval_d(self.world[key][k], gA - k)[0]))
-            self._cuts[ck] = clean_cuts(self.world[key], raw, self.closed[key], self.tol)
-        return self._cuts[ck]
+        return self.cuts_ex(key, cutters)[0]
 
 
 def _curve_objects(objs):
     return [o for o in objs if o.type == 'CURVE' and len(o.data.splines)]
 
 
-def _view_direction(context):
+def _rv3d(context):
+    """The 3D view's region data, also when the tool starts from a panel (its
+    region then is the sidebar, without region_data)."""
     rv3d = getattr(context, "region_data", None)
+    if rv3d is None and context.area is not None and context.area.type == 'VIEW_3D':
+        rv3d = getattr(context.area.spaces.active, "region_3d", None)
+    return rv3d
+
+
+def view_spec(rv3d):
+    """{"dir", "eye"} of a 3D view (eye None when it is orthographic)."""
     if rv3d is None:
         return None
-    return tuple(rv3d.view_rotation @ Vector((0.0, 0.0, -1.0)))
+    vi = rv3d.view_matrix.inverted()
+    d = tuple(vi.to_3x3() @ Vector((0.0, 0.0, -1.0)))
+    return {"dir": d, "eye": tuple(vi.translation) if rv3d.is_perspective else None}
+
+
+def _view_signature(rv3d):
+    return None if rv3d is None else (tuple(round(x, 9) for r in rv3d.perspective_matrix for x in r),
+                                      rv3d.is_perspective)
 
 
 def _object_mode(context):
@@ -488,9 +591,10 @@ class NPROTO_OT_split_curves(bpy.types.Operator):
                                    "the active curve stays whole")])
     tolerance: FloatProperty(name="Tolerance", default=TOL, min=1e-7, soft_max=0.01, precision=6, unit='LENGTH',
                              description="Curves closer than this count as crossing")
-    apparent: BoolProperty(name="Apparent (View)", default=False,
-                           description="Also cut where curves only cross as seen in the view (at different depths)")
+    crossings: EnumProperty(name="Crossings", default="AUTO", items=CROSSINGS)
     view_dir: FloatVectorProperty(size=3, options={'HIDDEN', 'SKIP_SAVE'})
+    view_eye: FloatVectorProperty(size=3, options={'HIDDEN', 'SKIP_SAVE'})
+    view_persp: BoolProperty(options={'HIDDEN', 'SKIP_SAVE'})
     names: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     active: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
 
@@ -498,10 +602,33 @@ class NPROTO_OT_split_curves(bpy.types.Operator):
         _object_mode(context)
         self.names = json.dumps([o.name for o in _curve_objects(context.selected_objects)])
         self.active = context.active_object.name if context.active_object else ""
-        d = _view_direction(context)
-        if d:
-            self.view_dir = d
+        v = view_spec(_rv3d(context))
+        if v:
+            self.view_dir = v["dir"]
+            self.view_persp = v["eye"] is not None
+            if v["eye"] is not None:
+                self.view_eye = v["eye"]
         return self.execute(context)
+
+    def _view(self):
+        """The view captured at invoke (None without one, or for In 3D)."""
+        if self.crossings == "REAL" or Vector(self.view_dir).length < 0.5:
+            return None
+        return {"dir": tuple(self.view_dir), "eye": tuple(self.view_eye) if self.view_persp else None}
+
+    def _no_view(self):
+        if self.crossings == "VIEW" and self._view() is None:
+            self.report({'WARNING'}, "As Seen needs a 3D view: run Split Curves from the 3D view")
+            return True
+        return False
+
+    def _report_done(self, what, n, npieces, apparent):
+        how = ""
+        if apparent and self.crossings == "AUTO":
+            how = f" ({len(apparent)} where they cross as seen in the view: they don't meet in 3D)"
+        elif self.crossings == "VIEW":
+            how = " (as seen in the view)"
+        self.report({'INFO'}, f"Split {n} {what} into {npieces} pieces{how}")
 
     def draw(self, context):
         lay = self.layout
@@ -510,8 +637,8 @@ class NPROTO_OT_split_curves(bpy.types.Operator):
             lay.label(text="Edit Mode: selected splines cut by every visible curve", icon='INFO')
         else:
             lay.row().prop(self, "cutter", expand=True)
+        lay.row().prop(self, "crossings", expand=True)
         lay.prop(self, "tolerance")
-        lay.prop(self, "apparent")
 
     def execute(self, context):
         from .ops import _select_only
@@ -528,22 +655,20 @@ class NPROTO_OT_split_curves(bpy.types.Operator):
         if nsplines < 2:
             self.report({'WARNING'}, "Select two or more curves (Split Curves cuts them where they cross)")
             return {'CANCELLED'}
-        direction = tuple(self.view_dir) if self.apparent and Vector(self.view_dir).length > 0.5 else None
-        cs = CurveSet(objs, direction, self.tolerance)
+        if self._no_view():
+            return {'CANCELLED'}
+        cs = CurveSet(objs, self._view(), self.tolerance, self.crossings)
         keys = list(cs.world)
         if self.cutter == "ACTIVE":
             cutters = [k for k in keys if k[0] == self.active]
             targets = [k for k in keys if k[0] != self.active]
         else:
             cutters, targets = keys, keys
-        plan = {}
-        for key in targets:
-            cuts = cs.cuts(key, [c for c in cutters if c != key])
-            if cuts:
-                plan[key] = split_spans(cs.local[key], cuts, cs.closed[key])
+        plan, apparent = self._plan(cs, targets, cutters)
         if not plan:
             self.report({'WARNING'}, "The curves don't cross (within Tolerance) -- nothing split"
-                        + ("" if self.apparent else "; try Apparent (View) for curves at different depths"))
+                        + ("; As Seen / Auto cut curves at different depths where they cross in the view"
+                           if self.crossings == "REAL" else " in 3D or as seen in the view"))
             return {'CANCELLED'}
         made, npieces = [], 0
         # highest spline index first, so the indices still to do stay valid
@@ -556,8 +681,19 @@ class NPROTO_OT_split_curves(bpy.types.Operator):
             if obj not in made:
                 made.append(obj)
         _select_only(context, made)
-        self.report({'INFO'}, f"Split {len(plan)} curve(s) into {npieces} pieces")
+        self._report_done("curve(s)", len(plan), npieces, apparent)
         return {'FINISHED'}
+
+    @staticmethod
+    def _plan(cs, targets, cutters):
+        plan, apparent = {}, []
+        for key in targets:
+            cuts, app = cs.cuts_ex(key, [c for c in cutters if c != key])
+            if cuts:
+                plan[key] = split_spans(cs.local[key], cuts, cs.closed[key])
+                if app:
+                    apparent.append(key)
+        return plan, apparent
 
     def _execute_edit(self, context):
         """Edit Mode: the selected splines (all, if none is selected) of the
@@ -567,17 +703,14 @@ class NPROTO_OT_split_curves(bpy.types.Operator):
         if not objs:
             self.report({'WARNING'}, "No curve in Edit Mode")
             return {'CANCELLED'}
-        direction = tuple(self.view_dir) if self.apparent and Vector(self.view_dir).length > 0.5 else None
+        if self._no_view():
+            return {'CANCELLED'}
         names = {o.name for o in objs}
         others = [o for o in _curve_objects(context.visible_objects) if o.name not in names]
-        cs = CurveSet(objs + others, direction, self.tolerance)
+        cs = CurveSet(objs + others, self._view(), self.tolerance, self.crossings)
         cutters = list(cs.world)
         targets = [(o.name, i) for o in objs for i in selected_splines(o) if (o.name, i) in cs.world]
-        plan = {}
-        for key in targets:
-            cuts = cs.cuts(key, [c for c in cutters if c != key])
-            if cuts:
-                plan[key] = split_spans(cs.local[key], cuts, cs.closed[key])
+        plan, apparent = self._plan(cs, targets, cutters)
         if not plan:
             self.report({'WARNING'}, "The selected splines don't cross another curve (within Tolerance) -- nothing split")
             return {'CANCELLED'}
@@ -590,7 +723,7 @@ class NPROTO_OT_split_curves(bpy.types.Operator):
             _drop_history(self, obj)
             put_back(obj, idx, [p[0] for p in plan[(name, idx)]], same_object=True)
             npieces += len(plan[(name, idx)])
-        self.report({'INFO'}, f"Split {len(plan)} spline(s) into {npieces} (selected)")
+        self._report_done("spline(s)", len(plan), npieces, apparent)
         return {'FINISHED'}
 
 
@@ -627,7 +760,7 @@ class NPROTO_OT_trim_curves(bpy.types.Operator):
         self._edit_names = {o.name for o in edit_objects(context)} if self._edit else None
         sel = [] if self._edit else _curve_objects(context.selected_objects)
         self._cutter_names = {o.name for o in sel} if sel else None   # None: every visible curve cuts
-        self._apparent = False
+        self._mode = "AUTO"
         self._undo = []          # [(obj name, curve copy, saved props, made names)]
         self._hover = None
         self._load(context)
@@ -640,8 +773,10 @@ class NPROTO_OT_trim_curves(bpy.types.Operator):
     # -- state ------------------------------------------------------------
     def _load(self, context):
         vis = _curve_objects(context.visible_objects)
-        direction = _view_direction(context) if self._apparent else None
-        self._cs = CurveSet(vis, direction, self.tolerance)
+        rv3d = _rv3d(context)
+        self._view_sig = _view_signature(rv3d)
+        view = view_spec(rv3d) if self._mode != "REAL" else None
+        self._cs = CurveSet(vis, view, self.tolerance, self._mode)
         self._samples = {k: sample_spans(w, 16) for k, w in self._cs.world.items()
                          if self._edit_names is None or k[0] in self._edit_names}   # what can be trimmed
         self._cutters = [k for k in self._cs.world
@@ -653,12 +788,18 @@ class NPROTO_OT_trim_curves(bpy.types.Operator):
     def _status(self, context, extra=""):
         from . import hints
         who = "all visible curves" if self._cutter_names is None else "the selected curves"
-        rows = [("Trim", [hints.toggle("V", "apparent (as seen in this view)", self._apparent),
+        label = {k: n for k, n, _ in CROSSINGS}
+        rows = [("Trim", [hints.cycle("V", [label[k] for k in self._MODES], label[self._mode], "crossings"),
                           hints.key("Backspace", "undo"), hints.key("Enter", "done")])]
+        if self._mode == "AUTO":
+            rows.append(("", [hints.note("Auto: a curve that meets no cutting curve in 3D is cut where it "
+                                         "crosses them as seen in this view.")]))
         if self._edit:
             rows.append(("", [hints.note("Edit Mode: only the curves being edited are trimmed.")]))
         hints.show(context, "Trim Curves", [f"click the part to delete (cut by {who})", extra.strip(" ·")], rows,
                    [("MOUSE_LMB", "Trim"), ("MOUSE_RMB", "Done"), ("EVENT_ESC", "Undo all")])
+
+    _MODES = ("AUTO", "VIEW", "REAL")
 
     def _hit(self, context, event, max_px=18.0):
         from bpy_extras import view3d_utils
@@ -682,22 +823,26 @@ class NPROTO_OT_trim_curves(bpy.types.Operator):
         if best is None:
             return None
         _, key, g = best
-        cuts = self._cs.cuts(key, [c for c in self._cutters if c != key])
+        cuts, apparent = self._cs.cuts_ex(key, [c for c in self._cutters if c != key])
         if not cuts:
             return {"key": key, "pieces": None, "index": None,
                     "poly": [Vector(p) for p in self._samples[key][0]]}
         pieces = split_spans(self._cs.world[key], cuts, self._cs.closed[key])
         k = piece_at(pieces, g, len(self._cs.world[key]))
-        return {"key": key, "g": g, "cuts": cuts, "index": k, "pieces": pieces,
+        return {"key": key, "g": g, "cuts": cuts, "index": k, "pieces": pieces, "apparent": apparent,
                 "poly": [Vector(p) for p in piece_polyline(pieces[k][0], 16)]}
 
     def _hover_update(self, context, event):
+        if self._mode != "REAL" and _view_signature(_rv3d(context)) != self._view_sig:
+            self._load(context)            # the view turned: apparent crossings move with it
         self._hover = self._hit(context, event)
         h = self._hover
         draw.pick_overlay["hover"] = h["poly"] if h else None
         extra = ""
         if h and h["pieces"] is None:
             extra = f"   [{h['key'][0]}: no crossing with a cutting curve]"
+        elif h and h.get("apparent") and self._mode == "AUTO":
+            extra = "   [cut where it crosses as seen in this view]"
         self._status(context, extra)
         context.area.tag_redraw()
 
@@ -706,7 +851,8 @@ class NPROTO_OT_trim_curves(bpy.types.Operator):
         if h is None:
             return
         if h["pieces"] is None:
-            self.report({'WARNING'}, f"{h['key'][0]} doesn't cross a cutting curve: nothing to trim")
+            self.report({'WARNING'}, f"{h['key'][0]} doesn't cross a cutting curve: nothing to trim"
+                        + (" (V: Auto / As Seen also cut where curves cross in the view)" if self._mode == "REAL" else ""))
             return
         name, idx = h["key"]
         obj = bpy.data.objects[name]
@@ -768,7 +914,8 @@ class NPROTO_OT_trim_curves(bpy.types.Operator):
         elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
             self._trim(context, event)
         elif event.type == 'V' and event.value == 'PRESS':
-            self._apparent = not self._apparent
+            i = self._MODES.index(self._mode) + (-1 if event.shift else 1)
+            self._mode = self._MODES[i % len(self._MODES)]
             self._load(context)
             self._hover_update(context, event)
         elif event.type == 'BACK_SPACE' and event.value == 'PRESS':

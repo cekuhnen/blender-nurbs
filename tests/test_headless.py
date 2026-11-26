@@ -3143,6 +3143,29 @@ B1 = bezier("TB1", [(0, 0), (1, 1), (2, 0), (3, 1)]); B2 = bezier("TB2", [(0, 0.
 cs4 = _ct.CurveSet([B1, B2]); h4 = _ct.intersect(cs4.world[("TB1", 0)], cs4.world[("TB2", 0)])
 err = max(abs(float(h[2][1]) - 0.5) for h in h4) if h4 else 1
 check("curves: Bezier x Bezier crossings on y=0.5", len(h4) == 3 and err < 1e-9, f"{len(h4)} {err:.1e}")
+# perspective: apparent crossings by central projection from the eye (exact), not along the view axis.
+# Eye above at z=4, line at z=1, y=-0.2: rays through the line meet the circle (z=0) at y = -0.2 - 0.5/3
+_pv = {"dir": (0.0, 0.0, -1.0), "eye": (0.3, 0.5, 4.0)}
+_cs5 = _ct.CurveSet([CIR, LN2], _pv)
+_c5 = _cs5.cuts(("TCircle", 0), [("TLineHigh", 0)])
+_py = [float(_ct.eval_d(_cs5.world[("TCircle", 0)][min(int(g), 7)], g - min(int(g), 7))[0][1]) for g in _c5]
+_ye = 0.5 + (LN2.data.splines[0].points[0].co[1] - 0.5) / 0.75     # the line's y as stored (float32)
+check("split curves: perspective apparent crossings lie on the eye's rays (exact)",
+      len(_c5) == 2 and max(abs(y - _ye) for y in _py) < 1e-9, f"{_py} vs {_ye:.6f}")
+# Auto: 3D crossings where a curve has them, apparent ones only for a curve that meets no cutter in 3D
+_cs6 = _ct.CurveSet([CIR, LN, LN2], (0, 0, -1), mode="AUTO")
+_a_cir = _cs6.cuts_ex(("TCircle", 0), [("TLine", 0), ("TLineHigh", 0)])
+_a_hi = _cs6.cuts_ex(("TLineHigh", 0), [("TCircle", 0), ("TLine", 0)])
+check("split curves: Auto keeps 3D crossings, falls back to apparent for a curve that meets nothing",
+      not _a_cir[1] and len(_a_cir[0]) == 2 and _a_hi[1] and len(_a_hi[0]) == 2, f"{_a_cir} {_a_hi}")
+# the operator: curves that don't touch split by default (Auto) in a perspective view captured at invoke
+bpy.ops.object.select_all(action='DESELECT'); CIR.select_set(True); LN2.select_set(True); ctx.view_layer.objects.active = CIR
+r = bpy.ops.nproto.split_curves(view_dir=(0, 0, -1), view_eye=(0.3, 0.5, 4.0), view_persp=True)
+_n5 = (len([o for o in bpy.data.objects if o.name.startswith("TCircle")]),
+       len([o for o in bpy.data.objects if o.name.startswith("TLineHigh")]))
+r2 = bpy.ops.nproto.split_curves(crossings="REAL", view_dir=(0, 0, -1))
+check("split curves: Auto splits curves at different depths (perspective), In 3D finds nothing",
+      r == {'FINISHED'} and _n5 == (2, 3) and r2 == {'CANCELLED'}, f"{r} {_n5} {r2}")
 
 # --- Rebuild / Extend Curve
 from blender_nurbs import curvetools as _cv
