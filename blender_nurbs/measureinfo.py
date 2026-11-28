@@ -40,6 +40,7 @@ _cache = {}                 # object name -> (key, reading)
 _errors = set()             # (object name, message) already printed
 _cost = {}                  # object name -> seconds its last reading took
 _seen = {}                  # object name -> (key, time first seen) of a change not yet measured
+_pairs = {}                 # what two picked things measure against each other: key -> reading
 
 
 # --------------------------------------------------------------------------
@@ -412,7 +413,51 @@ def gather(context, settle=False):
         else:
             info["sheets"].append(r["area"])
             info["sheet_radii"] += r.get("face_radii", [None])
+    if not info["stale"]:
+        try:
+            _pair_into(info, objs)
+        except Exception as exc:
+            msg = str(exc)
+            if ("pair", msg) not in _errors:
+                _errors.add(("pair", msg))
+                print("NURBS selection readout: two things:", msg)
     return info
+
+
+def _pair_into(info, objs):
+    """Two things selected (picked edges / faces, curve splines) or two whole
+    bodies: info["pair"] = what they measure against each other
+    (measurepair.relate), info["clearance"] = (gap, how) of two bodies."""
+    from . import measurepair
+    info["pair"], info["clearance"] = None, None
+    els, bodies = [], []
+    for o in sorted(objs, key=lambda o: o.name):
+        if store.is_nurbs(o):
+            f, e = _picked(o)
+            if f or e:
+                els += [("F", o, i) for i in f] + [("E", o, i) for i in e]
+            else:
+                bodies.append(o)
+        else:
+            els += [("S", o, f"S{k}") for k in range(len(o.data.splines))]
+        if len(els) > 2 or len(bodies) > 2:
+            return
+    if len(els) == 2 and not bodies:
+        k = ("pair",) + tuple((t, o.name, i, _key(o)) for t, o, i in els)
+        if k not in _pairs:
+            mk = {"F": measurepair.face_el, "E": measurepair.edge_el, "S": measurepair.spline_el}
+            a, b = (mk[t](o, i) for t, o, i in els)
+            _pairs.clear()
+            _pairs[k] = measurepair.relate(a, b)
+        info["pair"] = _pairs[k]
+    elif len(bodies) == 2 and not els:
+        k = ("bodies",) + tuple((o.name, _key(o)) for o in bodies)
+        if k not in _pairs:
+            A, B = (measurepair.world_brep(o) for o in bodies)
+            rel = A.relationship_to(B)
+            _pairs.clear()
+            _pairs[k] = (float(rel.get("distance", A.distance_to(B))), str(rel.get("relationship", "")))
+        info["clearance"] = _pairs[k]
 
 
 def centroid(info):
@@ -554,6 +599,12 @@ def rows(context, info):
         tiny = 1e-9 * sum(v for v, _, _ in info["solids"]) ** (1.0 / 3.0)
         out.append(("Centroid", "  ".join(f"{a} {fmt(context, 0.0 if abs(x) < tiny else float(x))}"
                                           for a, x in zip("XYZ", c))))
+    if info.get("pair") is not None:
+        from . import measurepair
+        out += measurepair.rows(context, info["pair"])
+    if info.get("clearance") is not None:
+        g, how = info["clearance"]
+        out.append(("Between", f"Clearance {fmt(context, g)}" if g > 0 else (how.replace("_", " ") or "touching")))
     for name, msg in info["errors"]:
         out.append((name, msg))
     if not out and info.get("stale"):
@@ -627,12 +678,44 @@ def draw_px(ctx, region, rv3d, box):
         blf.color(font, *(hints.COL_OFF if info.get("stale") else hints.COL_TEXT))   # dim: being measured
         blf.position(font, x + pad + wl + gap, yy, 0)
         blf.draw(font, b)
+    if info.get("pair") is not None:
+        _pair_lines(region, rv3d, info["pair"], s)
     c = centroid(info) if show_centroid(ctx) else None
     if c is not None:
         if centroid_style(ctx) == 'COG':
             _cog(region, rv3d, c, 9 * s)
         else:
             _cross(region, rv3d, c, 7 * s)
+
+
+def _pair_lines(region, rv3d, r, s):
+    """The shortest distance (and the centres' line) between two picked things."""
+    import gpu
+    from bpy_extras.view3d_utils import location_3d_to_region_2d
+    from gpu_extras.batch import batch_for_shader
+    segs = [r["min"][:2]]
+    if r.get("centres") is not None:
+        segs.append(r["centres"][:2])
+    pts = []
+    for A, B in segs:
+        if float(np.linalg.norm(np.asarray(B) - np.asarray(A))) <= 0.0:
+            continue
+        a = location_3d_to_region_2d(region, rv3d, tuple(float(x) for x in A))
+        b = location_3d_to_region_2d(region, rv3d, tuple(float(x) for x in B))
+        if a is not None and b is not None:
+            pts += [(a.x, a.y), (b.x, b.y)]
+    if not pts:
+        return
+    sh = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+    gpu.state.blend_set('ALPHA')
+    for col, lw in (((0.0, 0.0, 0.0, 0.6), 3.5 * s), ((1.0, 0.85, 0.2, 1.0), 1.5 * s)):
+        b = batch_for_shader(sh, 'LINES', {"pos": pts})
+        sh.bind()
+        sh.uniform_float("color", col)
+        sh.uniform_float("lineWidth", lw)
+        sh.uniform_float("viewportSize", (region.width, region.height))
+        b.draw(sh)
+    gpu.state.blend_set('NONE')
 
 
 def show_centroid(context):
