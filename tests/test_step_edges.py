@@ -49,6 +49,31 @@ check("picked Extend step outlines the grown side (the far x edge)", r == {'FINI
 nope = subsel.step_faces(E)
 check("... and no face fill for it", nope == [], str(nope))
 
+# --- Extend on a trimmed surface: only the picked boundary piece -----------------------------
+# a 4 x 4 plane with a round notch in its +x edge: two boundary pieces there (y -2..-1 and 1..2)
+from blender_nurbs import extend as _ext
+bpy.ops.nproto.add_primitive(kind="PLANE", width=4, depth=4, pl_degree_u=3, pl_degree_v=3, spans_u=4, spans_v=4)
+T = ctx.active_object; ctx.view_layer.update()
+xe = max(("U0", "U1", "V0", "V1"),
+         key=lambda w: np.mean([p[0] for p in geom.boundary_points(store.get_surfaces(T)[0], w, 8)]))
+bpy.ops.curve.primitive_bezier_circle_add(radius=1.0, location=(2, 0, 1)); C = ctx.active_object
+r0 = bpy.ops.nproto.trim(target=T.name, cutters=ins((C, "S0")), ref_point=(2, 0, 0), normal=(0, 0, 1),
+                         view_dir=(0, 0, -1), action="DELETE")
+eb = store.get_brep(T).edges()
+mid = lambda i: np.array(eb[i].point_at(sum(eb[i].parameter_range()) / 2))
+runs = sorted([i for i, v in _ext.boundary_edges(T).items() if v[0] == xe], key=lambda i: mid(i)[1])
+up = f"E{runs[-1]}" if len(runs) == 2 else None
+r = bpy.ops.nproto.extend(inputs=ins((T, up)), distance=1.0) if up else None
+st = features.stack(T)
+es, P = step_edge_hl(T, len(st) - 1) if st and st[-1]["op"] == "extend_surface" else ([], [])
+check("picked Extend step on a trimmed surface outlines only the grown piece (x = 3, y 1..2)",
+      r0 == {'FINISHED'} and r == {'FINISHED'} and not store.is_natural(T)
+      and st[-1]["params"].get("at") is not None and len(es) == 1
+      and np.abs(P[0][:, 0] - 3.0).max() < 1e-6 and abs(P[0][:, 1].min() - 1.0) < 1e-6
+      and abs(P[0][:, 1].max() - 2.0) < 1e-6,
+      f"{r0} {r} runs {runs} at {st[-1]['params'].get('at') if st else None} {es} "
+      f"{[(P_[:, 0].min().round(4), P_[:, 0].max().round(4), P_[:, 1].min().round(4), P_[:, 1].max().round(4)) for P_ in P]}")
+
 # --- Surface Align / Match Surface: the matched side -------------------------------------
 F = lambda x, y: 0.05 * x**3 - 0.1 * x * y**2 + 0.08 * y**3 + 0.2 * x * y - 0.1 * y**2
 bump = lambda x, y: F(x, y) + 0.4 * (x - 2) * (4 - x) * y * (2 - y) + 0.01 * math.sin(3 * y)
