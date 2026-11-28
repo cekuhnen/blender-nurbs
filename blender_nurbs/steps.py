@@ -285,11 +285,22 @@ def store_rims(obj, mids_local, info, Mi=None, text=None):
 PROP_MADE = "nproto_step_made"
 
 
-def _made_key(op, p):
-    """The id of a step by what it is (its op and settings, mute aside)."""
+def _made_key(op, p, inputs=()):
+    """The id of a step by what it is: its op, settings (mute aside) and the
+    names of its input objects (two Imprints with the same settings differ
+    by what they imprint)."""
     import hashlib
-    s = json.dumps({k: v for k, v in p.items() if k != "_off"}, sort_keys=True, default=str)
+    s = json.dumps([{k: v for k, v in p.items() if k != "_off"}, list(inputs)], sort_keys=True, default=str)
     return op + ":" + hashlib.md5(s.encode()).hexdigest()[:16]
+
+
+def step_input_names(obj, k, n):
+    """Names of the n input objects of stack step k of obj."""
+    names = []
+    for i in range(n):
+        src = obj.get(f"nproto_sin_{k}_{i}")
+        names.append(src.name if src is not None else "")
+    return names
 
 
 def changed_faces(text_in, text_out):
@@ -325,40 +336,66 @@ def changed_faces(text_in, text_out):
     return pts, keys
 
 
-def store_made(obj, op, p, text_in, text_out):
-    """Keep the faces a step made or changed (changed_faces), keyed by the
-    step: highlighted while it is open in the panel. Entries of steps no
-    longer in the stack are dropped."""
+def changed_edges(text_in, text_out):
+    """Local middle points of the edges of text_out that are new against
+    text_in: not an edge of text_in, nor a piece of one (an edge the new
+    ones split counts as old)."""
+    import numpy as np
+    bi, bo = store.brep_from_text(text_in), store.brep_from_text(text_out)
+    lo, hi = (np.array(v, float) for v in bo.bounding_box())
+    tol = 1e-6 * (float(np.linalg.norm(hi - lo)) or 1.0)
+    old = [(e, *(np.array(v, float) for v in e.bounding_box())) for e in bi.edges()]
+    out = []
+    for e in bo.edges():
+        t0, t1 = e.parameter_range()
+        Q = [np.array(e.point_at(t0 + f * (t1 - t0)), float) for f in (0.1, 0.3, 0.5, 0.7, 0.9)]
+        if not any(all(np.all(q >= blo - tol) and np.all(q <= bhi + tol) for q in Q)
+                   and all(f.closest_point(tuple(map(float, q)))[2] < tol for q in Q)    # (point, t, distance)
+                   for f, blo, bhi in old):
+            out.append([float(x) for x in Q[2]])
+    return out
+
+
+def store_made(obj, op, p, text_in, text_out, inputs=(), edges=False):
+    """Keep what a step made, keyed by the step (_made_key): the faces it
+    made or changed (changed_faces), or with edges the new edges
+    (changed_edges); highlighted while it is open in the panel. Entries of
+    steps no longer in the stack are dropped."""
     try:
         d = json.loads(obj.get(PROP_MADE, "{}"))
     except ValueError:
         d = {}
-    pts, keys = changed_faces(text_in, text_out)
-    d[_made_key(op, p)] = {"faces": pts, "keys": keys}
+    if edges:
+        entry = {"edges": changed_edges(text_in, text_out)}
+    else:
+        pts, keys = changed_faces(text_in, text_out)
+        entry = {"faces": pts, "keys": keys}
+    d[_made_key(op, p, inputs)] = entry
     try:
-        live = {_made_key(e["op"], e.get("params") or {}) for e in json.loads(obj.get("nproto_stack", "[]"))}
+        live = {_made_key(e["op"], e.get("params") or {}, step_input_names(obj, k, len(e.get("refs") or [])))
+                for k, e in enumerate(json.loads(obj.get("nproto_stack", "[]")))}
         d = {k: v for k, v in d.items() if k in live}
     except (ValueError, TypeError, KeyError):
         pass
     obj[PROP_MADE] = json.dumps(d)
 
 
-def made_of(obj, op, p):
-    """{"faces": [local points], "keys": [surface keys]} store_made kept for this step, or None."""
+def made_of(obj, op, p, inputs=()):
+    """What store_made kept for this step ({"faces", "keys"} or {"edges"}), or None."""
     try:
-        return json.loads(obj.get(PROP_MADE, "{}")).get(_made_key(op, p))
+        return json.loads(obj.get(PROP_MADE, "{}")).get(_made_key(op, p, inputs))
     except (ValueError, TypeError):
         return None
 
 
-def recording(op, apply):
-    """apply (a step's rebuild function) that also keeps the faces it made (store_made)."""
+def recording(op, apply, edges=False):
+    """apply (a step's rebuild function) that also keeps what it made (store_made)."""
     def run(obj, text, inputs, p):
         out = apply(obj, text, inputs, p)
         try:
-            store_made(obj, op, p, text, out)
+            store_made(obj, op, p, text, out, [o.name for o, _ in inputs], edges)
         except Exception as exc:
-            print(f"NURBS {op} faces:", exc)
+            print(f"NURBS {op} made:", exc)
         return out
     run.__wrapped__ = apply
     return run

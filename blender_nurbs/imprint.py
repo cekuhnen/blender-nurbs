@@ -161,7 +161,7 @@ def label(p):
 
 def _register_step():
     from . import history_ui
-    steps.APPLY[OP] = apply_imprint
+    steps.APPLY[OP] = steps.recording(OP, apply_imprint, edges=True)     # its new edges light up when picked
     steps.LABEL[OP] = label
     history_ui.STEP_ICON[OP] = 'MOD_SHRINKWRAP'
     history_ui.STEP_FIELDS[OP] = ["imprint_scope", "reach", "imprint_extend"]

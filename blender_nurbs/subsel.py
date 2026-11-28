@@ -444,6 +444,67 @@ def step_faces(obj):
     return idx
 
 
+_stepe = {}    # session_uid -> (key, [edge indices])
+STEP_EDGE_OPS = ("imprint", "extend_surface", "match_surface", "surface_align")
+
+
+def _iso_edges(obj, isos, at=None):
+    """Indices of obj's edges on its surface's own boundary sides isos
+    (U0/U1/V0/V1); with `at` (a point along that side, picked on a trimmed
+    surface) only the pieces there, all of the side when none is."""
+    from .kernel import trimext
+    on = [(i, a0, a1) for i, (iso, a0, a1) in trimext.boundary_edges(store.get_brep(obj)).items() if iso in isos]
+    if at is not None:
+        here = [i for i, a0, a1 in on if min(a0, a1) - 1e-9 <= float(at) <= max(a0, a1) + 1e-9]
+        if here:
+            return sorted(here)
+    return sorted(i for i, _, _ in on)
+
+
+def step_edges(obj):
+    """The edges the history step open in the panel made or acted on
+    (Imprint: its new edges, kept by steps.store_made; Extend: the side it
+    grew; Match / Align: the sides it matched), while that body is the
+    active one; [] otherwise."""
+    pg = getattr(obj, "nproto_step", None)
+    if (pg is None or not pg.focus or pg.index < 0 or obj != bpy.context.view_layer.objects.active
+            or not store.is_nurbs(obj)):
+        return []
+    try:
+        raw = json.loads(obj.get("nproto_stack", "[]"))
+        e = raw[pg.index]
+    except (ValueError, IndexError, TypeError):
+        return []
+    op = e.get("op")
+    if op not in STEP_EDGE_OPS:
+        return []
+    from . import steps
+    p = e.get("params") or {}
+    names = steps.step_input_names(obj, pg.index, len(e.get("refs") or []))
+    key = (obj.get(store.PROP_REV, 0), pg.index, json.dumps(e, sort_keys=True), tuple(names),
+           obj.get(steps.PROP_MADE, "") if op == "imprint" else "")
+    hit = _stepe.get(obj.session_uid)
+    if hit and hit[0] == key:
+        return hit[1]
+    idx = []
+    try:
+        if op == "imprint":
+            size = _size(obj)
+            for q in (steps.made_of(obj, op, p, names) or {}).get("edges") or []:
+                j = _locate(obj, "EDGE", -1, q, size)
+                if j is not None and j not in idx:
+                    idx.append(j)
+            idx.sort()
+        elif op == "extend_surface":
+            idx = _iso_edges(obj, {p.get("edge")}, p.get("at"))
+        else:
+            idx = _iso_edges(obj, set(p.get("edges") or ()))
+    except Exception as exc:
+        print("NURBS step edges:", exc)
+    _stepe[obj.session_uid] = (key, idx)
+    return idx
+
+
 def faces_shown(obj):
     """The faces whose CV nets CVs / Hulls shows on obj: the picked ones, else
     the ones the open history step made, else None for all."""
@@ -1081,6 +1142,11 @@ def draw_view(ctx, draw_lines, draw_tris, edge_bias):
                 _draw_face(ctx, act, i, COL_STEP, COL_STEP_LINE, 2.5, draw_lines, draw_tris, edge_bias)
             except Exception as exc:
                 print("NURBS step faces: draw", exc)
+        for i in step_edges(act):
+            try:
+                _draw_edge(ctx, act, i, COL_STEP_LINE, 4.0, draw_lines, edge_bias)
+            except Exception as exc:
+                print("NURBS step edges: draw", exc)
     key = HOVER["key"]
     if key is not None and key[1] in kinds(ctx):
         ob = bpy.data.objects.get(key[0])
