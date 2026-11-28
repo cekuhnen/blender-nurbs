@@ -105,6 +105,49 @@ check("Copy: one line a pin, stale ones marked", bpy.ops.nproto.measure_pin_copy
 bpy.ops.nproto.measure_pin_remove(index=len(ctx.scene.nproto_pins) - 1)
 check("Remove: one fewer", len(ctx.scene.nproto_pins) == n)
 
+# --- comb pins: on a curve, an edge, a trim; tightest and widest radius ---------------------------
+def P_(label):
+    return next(q for q in ctx.scene.nproto_pins if q.label == label)
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=0.7); CI = ctx.active_object
+CI.location = (0, -10, 0); ctx.view_layer.update()
+c1 = pn.add(ctx.scene, pn.element_ref(("S", CI.name, "S0")), comb=True).label
+c = pn.comb(P_(c1))
+check("comb on a circle: named C1, R 0.7 all round", c1 == "C1" and abs(c["rmin"] - 0.7) < 1e-6 and abs(c["rmax"] - 0.7) < 1e-6
+      and pn.is_comb(P_(c1)), T(c1))
+bpy.ops.nproto.add_primitive(kind="CIRCLE", radius=1.0, elliptic=True, radius2=0.6); EL = ctx.active_object
+EL.location = (0, -15, 0); ctx.view_layer.update()
+c2 = pn.add(ctx.scene, pn.element_ref(("S", EL.name, "S0")), comb=True).label
+c = pn.comb(P_(c2))
+check("comb on an ellipse: R min b²/a 0.36 at the major vertex, R max a²/b", abs(c["rmin"] - 0.36) < 1e-3
+      and abs(c["rmax"] - 1 / 0.6) < 2e-3 and abs(abs(c["at"][0]) - 1.0) < 1e-3, T(c2))
+EL.scale = (2, 2, 2); ctx.view_layer.update()
+check("the ellipse scaled x2: R min 0.72", abs(pn.comb(P_(c2))["rmin"] - 0.72) < 2e-3, T(c2))
+n0 = len(pn.comb(P_(c2))["P"])
+P_(c2).comb_samples = 50
+check("Samples: the comb has fewer hairs", len(pn.comb(P_(c2))["P"]) < n0)
+bpy.ops.nproto.add_primitive(kind="BOX", width=2, depth=1.5, height=1); BX = ctx.active_object
+BX.location = (0, -25, 0); ctx.view_layer.update()
+bx = np.array([list(v) for v in BX.bound_box]); blo, bhi = bx.min(0), bx.max(0)
+c3 = pn.add(ctx.scene, pn.element_ref(("E", BX.name, enear(BX, [0, blo[1], bhi[2]]))), comb=True).label
+check("comb on a straight edge: straight", T(c3) == ("straight", False), T(c3))
+bpy.ops.nproto.edge_fillet(inputs=json.dumps([[BX.name, f"E{enear(BX, [bhi[0], bhi[1], 0.0])}"]]), radius=0.25)
+BX = ctx.active_object
+check("a fillet elsewhere renumbers: the comb finds its edge again", T(c3) == ("straight", False), T(c3))
+rim = enear(BX, [bhi[0] - 0.25 + 0.25 * 0.7071, bhi[1] - 0.25 + 0.25 * 0.7071, bhi[2]])
+c4 = pn.add(ctx.scene, pn.element_ref(("E", BX.name, rim)), comb=True).label
+c = pn.comb(P_(c4))
+check("comb on the fillet's rim: R min 0.25 (fitted, within 0.1 %)", c is not None and abs(c["rmin"] - 0.25) < 2.5e-4, T(c4))
+only(BX)
+subsel.set_picks(BX, "EDGE", [enear(BX, [0, blo[1], blo[2]]), rim])
+k = len(ctx.scene.nproto_pins)
+r = bpy.ops.nproto.measure_pin_comb()
+check("Pin Curvature Comb: one comb a picked edge", r == {'FINISHED'} and len(ctx.scene.nproto_pins) == k + 2
+      and all(pn.is_comb(q) for q in list(ctx.scene.nproto_pins)[-2:]))
+subsel.set_picks(BX, "EDGE", [])
+check("nothing picked: no comb", bpy.ops.nproto.measure_pin_comb() == {'CANCELLED'})
+bpy.data.objects.remove(CI); ctx.view_layer.update()
+check("the circle deleted: its comb is stale, last radii kept", T(c1)[1] and T(c1)[0] == "R 0.7 m all along", T(c1))
+
 # --- saved with the file -----------------------------------------------------------------------------
 path = os.path.join(tempfile.mkdtemp(), "pins.blend")
 bpy.ops.wm.save_as_mainfile(filepath=path)

@@ -835,6 +835,8 @@ def draw_panel(col, context):
     sub.enabled = bool(lines)
     if info and info.get("pair") is not None:
         sub.operator("nproto.measure_pin_selection", text="", icon='PINNED', emboss=False)
+    if info and (info["edges"] or info["curves"]):
+        sub.operator("nproto.measure_pin_comb", text="", icon='IPO_ELASTIC', emboss=False)
     sub.operator("nproto.measure_copy", text="", icon='COPYDOWN', emboss=False)
     if not lines:
         box.label(text="Select curves, bodies, or pick faces / edges")

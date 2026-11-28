@@ -5279,7 +5279,7 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cy
               "move", "rotate", "scale", "transform_hold",   # by Points: hold G / R / S (movetool keymap), no button
               "align_parts",    # Align Parts: Object > Transform and the NURBS Proto menu
               "measure_copy",   # Copy Measurements: the Analyze panel's Selection box
-              "measure_pin_remove", "measure_pin_clear", "measure_pin_copy", "measure_pin_selection",   # Analyze > Measurements
+              "measure_pin_remove", "measure_pin_clear", "measure_pin_copy", "measure_pin_selection", "measure_pin_comb",   # Analyze > Measurements
               "delete_faces_key", "remove_edges_key", "remove_faces_key",   # X / Delete / Shift with picks (keymap)
               "square"}     # Square: merged into Patch (Quad Sided); kept for older files, off the menus
 _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto)

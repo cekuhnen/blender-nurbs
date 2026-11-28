@@ -17,7 +17,8 @@ whatever is under the mouse.
   Click the first thing again to keep its own reading.
 * D: radius / diameter. Alt: a plain point (no edge or face). Ctrl+C copies
   the last reading. P pins the reading under the mouse (else the last kept):
-  it stays in the file and follows the model (measurepin).
+  it stays in the file and follows the model (measurepin). K pins a
+  curvature comb on the curve or edge under the mouse.
 
 A kept reading stays on screen while the tool runs and goes to the Info log;
 Backspace drops the first pick or the last reading, Esc / right click ends.
@@ -405,6 +406,8 @@ class NPROTO_OT_measure(SketchMixin, bpy.types.Operator):
         self._P = P
         kind = snap[0] if snap is not None else None
         src = snap[2][0] if snap is not None and snap[2] is not None else None
+        self._snap_line = tuple(snap[2][:2]) if src is not None and len(snap[2]) > 1 and isinstance(snap[2][1], str) \
+            else None                        # the curve / edge a snapped point lies on (K combs it)
         self._snap_obj = bpy.data.objects.get(src if isinstance(src, str) else getattr(src, "name", "")) \
             if src is not None else None
         if P is not None and (event.alt or kind in POINT_KINDS or getattr(self, "_lock", None)):
@@ -541,6 +544,7 @@ class NPROTO_OT_measure(SketchMixin, bpy.types.Operator):
         if live and live.get("text"):
             state.append(live["text"])
         rows = [("Keep", [hints.key("LMB", "pick / keep"), hints.key("P", "pin (stays, follows the model)"),
+                          hints.key("K", "pin a comb on the curve / edge"),
                           hints.key("Backspace", "drop the last"), hints.key("Ctrl C", "copy"), hints.key("Esc", "done")]),
                 ("Show", [hints.toggle("D", "diameter", self.diameter)])]
         if self._A is not None and self._A["type"] == "point":
@@ -619,6 +623,23 @@ class NPROTO_OT_measure(SketchMixin, bpy.types.Operator):
         if self._A is not None and refs[1] is not None:
             self._set_first(None)
 
+    def _pin_comb(self, context, event):
+        """K: pin a curvature comb on the curve or edge under the mouse."""
+        from . import measurepin
+        tg = self._target(context, event)
+        if tg is not None and tg[0] == "point" and getattr(self, "_snap_line", None):
+            tg = ("L", ("L",) + self._snap_line, tg[1])          # a point snapped on an edge: that edge
+        if tg is None or tg[0] != "L":
+            self.report({'WARNING'}, "K pins a comb: move over a curve or an edge")
+            return
+        ref = measurepin.element_ref(tg[1])
+        if ref is None:
+            return
+        p = measurepin.add(context.scene, ref, comb=True)
+        txt, _ = measurepin.text(context, p)
+        bpy.ops.ed.undo_push(message="Pin Curvature Comb")
+        self.report({'INFO'}, f"Pinned {p.label}: {txt}")
+
     def modal(self, context, event):
         if self.passthrough(context, event):
             return {'PASS_THROUGH'}
@@ -631,6 +652,9 @@ class NPROTO_OT_measure(SketchMixin, bpy.types.Operator):
             self._update(context, event)
         elif event.value == 'PRESS' and event.type == 'P' and not event.ctrl:
             self._pin(context, event)
+            self._update(context, event)
+        elif event.value == 'PRESS' and event.type == 'K' and not event.ctrl:
+            self._pin_comb(context, event)
             self._update(context, event)
         elif event.value == 'PRESS' and event.type == 'D' and not event.ctrl:
             self.diameter = not self.diameter

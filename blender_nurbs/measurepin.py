@@ -17,6 +17,12 @@ header's ruler shows / hides them all). When what it measured is gone (the
 object deleted, the face no longer there) it says *stale* and keeps its last
 value. Pins live in the scene (Scene.nproto_pins), are saved with the file
 and take part in undo. Nothing in the model changes.
+
+A comb pin (K in Measure, or the comb in the Selection box) keeps a
+curvature comb on one curve, surface edge or trim edge, Alias's Curve
+Curvature locator: hairs, envelope and knot ticks (diagnostics' comb), its
+own Scale and Samples, and the tightest and widest radius along it, the
+tightest marked. It follows the edge through rebuilds like the other pins.
 """
 
 import json
@@ -25,7 +31,7 @@ import uuid
 import numpy as np
 
 import bpy
-from bpy.props import BoolProperty, CollectionProperty, IntProperty, StringProperty
+from bpy.props import BoolProperty, CollectionProperty, FloatProperty, IntProperty, StringProperty
 
 from . import store
 
@@ -45,6 +51,11 @@ class NPROTO_PG_measure_pin(bpy.types.PropertyGroup):
     visible: BoolProperty(name="Show", default=True, description="Show this measurement in the 3D view",
                           update=lambda s, c: _redraw())
     data: StringProperty(default="{}")
+    comb_scale: FloatProperty(name="Scale", default=1.0, min=0.01, soft_max=10.0,
+                              description="Comb length: at 1 the longest hair is a fifth of the curve's size",
+                              update=lambda s, c: _redraw())
+    comb_samples: IntProperty(name="Samples", default=200, min=8, max=2000, description="Hairs along the curve",
+                              update=lambda s, c: _redraw())
 
 
 def _redraw():
@@ -104,14 +115,23 @@ def element_ref(key, at=None):
     return ref
 
 
-def add(scene, a, b=None, diameter=False, label=""):
-    """Pin a reading of ref a (and b): the new pin."""
+def add(scene, a, b=None, diameter=False, label="", comb=False):
+    """Pin a reading of ref a (and b), or a curvature comb on ref a (a curve /
+    edge): the new pin."""
     p = scene.nproto_pins.add()
-    p.data = json.dumps({"id": uuid.uuid4().hex[:12], "a": a, "b": b, "dia": bool(diameter)})
-    n = 1 + max([int(q.label[1:]) for q in scene.nproto_pins if q.label[:1] == "M" and q.label[1:].isdigit()] or [0])
-    p.label = label or f"M{n}"
+    d = {"id": uuid.uuid4().hex[:12], "a": a, "b": b, "dia": bool(diameter)}
+    if comb:
+        d["comb"] = True
+    p.data = json.dumps(d)
+    c = "C" if comb else "M"
+    n = 1 + max([int(q.label[1:]) for q in scene.nproto_pins if q.label[:1] == c and q.label[1:].isdigit()] or [0])
+    p.label = label or f"{c}{n}"
     _redraw()
     return p
+
+
+def is_comb(p):
+    return bool(_data(p).get("comb"))
 
 
 def _data(p):
@@ -172,6 +192,69 @@ def resolve(ref):
     return measurepair.face_el(obj, i), at
 
 
+def resolve_curve(ref):
+    """The world kernel curve a curve / edge ref means now, or None when gone."""
+    from . import features, subsel
+    if ref is None or ref.get("t") != "L":
+        return None
+    obj = bpy.data.objects.get(ref.get("obj") or "")
+    if obj is None:
+        return None
+    r = str(ref["ref"])
+    if r.startswith("E") and store.is_nurbs(obj):
+        i = subsel._locate(obj, "EDGE", int(r[1:]), ref.get("anchor"), subsel._size(obj)) \
+            if ref.get("anchor") is not None else int(r[1:])
+        return None if i is None else features.input_curve(obj, f"E{i}")
+    if obj.type != 'CURVE' or int(r[1:] or 0) >= len(obj.data.splines):
+        return None
+    return features.input_curve(obj, r)
+
+
+def comb(p):
+    """{"P", "Kv", "marks", "rmin", "rmax", "at"} of a comb pin now (world
+    space; rmax inf: straight somewhere), or None when its curve is gone."""
+    from . import diagnostics
+    d = _data(p)
+    pid = d.get("id", p.data)
+    key = (p.data, int(p.comb_samples)) + tuple(_okey(bpy.data.objects.get(n)) for n in _objects(d))
+    hit = _cache.get(pid)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    c = None
+    try:
+        kc = resolve_curve(d.get("a"))
+        if kc is not None:
+            ks = diagnostics.interior_knots(kc)
+            P, Kv = diagnostics.curvature_samples(kc, int(p.comb_samples), ks)
+            kap = np.linalg.norm(Kv, axis=1)
+            size = float(np.linalg.norm(np.ptp(P, axis=0))) or 1.0
+            j = int(np.argmax(kap))
+            kmax, kmin = float(kap.max()), float(kap.min())
+            flat = 1e-9 / size
+            c = {"P": P, "Kv": Kv, "marks": diagnostics.knot_marks(kc, ks, kmax), "at": P[j],
+                 "rmin": 1.0 / kmax if kmax > flat else float("inf"),
+                 "rmax": 1.0 / kmin if kmin > flat else float("inf")}
+    except Exception as exc:
+        print("NURBS comb pin:", p.label, exc)
+        c = None
+    _cache[pid] = (key, c)
+    if c is not None:
+        _last[pid] = (c, c["at"])
+    return c
+
+
+def comb_text(context, c):
+    from .measureinfo import fmt
+    if c is None:
+        return ""
+    if c["rmin"] == float("inf"):
+        return "straight"
+    if c["rmax"] != float("inf") and c["rmax"] - c["rmin"] <= 1e-6 * c["rmax"]:
+        return f"R {fmt(context, c['rmin'])} all along"
+    lo = f"R min {fmt(context, c['rmin'])}"
+    return lo + ("  ·  straight in part" if c["rmax"] == float("inf") else f"  ·  R max {fmt(context, c['rmax'])}")
+
+
 def _single(el, at, ref):
     """One thing's own reading, as Measure shows it."""
     from . import features, linesolve
@@ -225,6 +308,12 @@ def text(context, p):
     """(the pin's value as text, stale)."""
     from .measure import label
     d = _data(p)
+    if d.get("comb"):
+        c = comb(p)
+        if c is not None:
+            return comb_text(context, c), False
+        old = _last.get(d.get("id", p.data))
+        return (comb_text(context, old[0]) if old else ""), True
     m = reading(p)
     if m is not None:
         return label(context, m, d.get("dia", False)), False
@@ -264,6 +353,9 @@ def draw_px(ctx, region, rv3d, box):
             continue
         d = _data(p)
         pid = d.get("id", p.data)
+        if d.get("comb"):
+            _draw_comb(ctx, p, d, pid, q2, line, flat, box, font, s, region)
+            continue
         m = reading(p)
         stale = m is None
         if not stale:
@@ -313,6 +405,60 @@ def draw_px(ctx, region, rv3d, box):
     gpu.state.blend_set('NONE')
 
 
+def _draw_comb(ctx, p, d, pid, q2, line, flat, box, font, s, region):
+    """A comb pin: hairs, envelope, knot ticks, the tightest point and its label."""
+    import blf
+    from gpu_extras.batch import batch_for_shader
+    from . import diagnostics, hints
+    c = comb(p)
+    stale = c is None
+    if stale:
+        if pid not in _last:
+            return
+        c = _last[pid][0]
+    hairs, env, ticks = diagnostics.comb_geometry(c["P"], c["Kv"], c["marks"], p.comb_scale)
+
+    def draw(vs, col, w):
+        pts = []
+        for a, b in zip(vs[0::2], vs[1::2]):
+            qa, qb = q2(a), q2(b)
+            if qa is not None and qb is not None:
+                pts += [(qa.x, qa.y), (qb.x, qb.y)]
+        if not pts:
+            return
+        bt = batch_for_shader(line, 'LINES', {"pos": pts})
+        line.bind()
+        line.uniform_float("color", col)
+        line.uniform_float("lineWidth", w * s)
+        line.uniform_float("viewportSize", (region.width, region.height))
+        bt.draw(line)
+
+    if stale:
+        draw(env, COL_STALE, diagnostics.COMB_ENV_W)
+    else:
+        draw(hairs, diagnostics.COMB_HAIR, diagnostics.COMB_HAIR_W)
+        draw(env, diagnostics.COMB_ENVELOPE, diagnostics.COMB_ENV_W)
+        for kind in ("smooth", "jump", "corner"):
+            draw(ticks.get(kind, []), diagnostics.KNOT_COL[kind], 1.5 if kind == "smooth" else 2.5)
+    q = q2(c["at"])
+    if q is None:
+        return
+    col = COL_STALE if stale else COL_PIN
+    r = 3.0 * s
+    bt = batch_for_shader(flat, 'TRIS', {"pos": [(q.x - r, q.y - r), (q.x + r, q.y - r), (q.x + r, q.y + r),
+                                                  (q.x - r, q.y - r), (q.x + r, q.y + r), (q.x - r, q.y + r)]})
+    flat.bind()
+    flat.uniform_float("color", col)
+    bt.draw(flat)
+    txt = f"{p.label}  {comb_text(ctx, c)}" + ("  (stale)" if stale else "")
+    w, h = blf.dimensions(font, txt)
+    x, y = q.x + 10 * s, q.y + 8 * s
+    box(x - 5 * s, y - 5 * s, w + 10 * s, h + 10 * s, hints.COL_BG)
+    blf.color(font, *col)
+    blf.position(font, x, y, 0)
+    blf.draw(font, txt)
+
+
 # --------------------------------------------------------------------------
 # Panel and operators
 # --------------------------------------------------------------------------
@@ -332,7 +478,7 @@ def draw_panel(col, context):
         head.operator("nproto.measure_pin_copy", text="", icon='COPYDOWN', emboss=False)
         head.operator("nproto.measure_pin_clear", text="", icon='TRASH', emboss=False)
     else:
-        box.label(text="P in Measure pins a reading here")
+        box.label(text="P in Measure pins a reading here, K a comb")
         return
     for k, p in enumerate(sc.nproto_pins):
         r = box.row(align=True)
@@ -343,6 +489,11 @@ def draw_panel(col, context):
         sub.label(text=f"{p.label}  {txt}" + ("  (stale)" if stale else ""))
         op = r.operator("nproto.measure_pin_remove", text="", icon='X', emboss=False)
         op.index = k
+        if is_comb(p) and p.visible:
+            r = box.row(align=True)
+            r.separator(factor=2.0)
+            r.prop(p, "comb_scale")
+            r.prop(p, "comb_samples")
 
 
 def header(layout, context):
@@ -429,7 +580,34 @@ class NPROTO_OT_measure_pin_selection(bpy.types.Operator):
         return {'FINISHED'}
 
 
-classes = (NPROTO_PG_measure_pin, NPROTO_OT_measure_pin_remove, NPROTO_OT_measure_pin_clear,
+class NPROTO_OT_measure_pin_comb(bpy.types.Operator):
+    """Pin a curvature comb on each picked edge and each selected curve: it
+    stays in the view with the tightest and widest radius, and follows the
+    model"""
+    bl_idname = "nproto.measure_pin_comb"
+    bl_label = "Pin Curvature Comb"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        from . import measureinfo
+        refs = []
+        for o in context.selected_objects:
+            if not measureinfo.measurable(o):
+                continue
+            if store.is_nurbs(o):
+                refs += [element_ref(("E", o.name, i)) for i in measureinfo._picked(o)[1]]
+            else:
+                refs += [element_ref(("S", o.name, f"S{k}")) for k in range(len(o.data.splines))]
+        refs = [r for r in refs if r is not None]
+        if not refs:
+            self.report({'WARNING'}, "Pick edges or select curves to pin a comb on")
+            return {'CANCELLED'}
+        made = [add(context.scene, r, comb=True).label for r in refs]
+        self.report({'INFO'}, "Pinned " + ", ".join(made))
+        return {'FINISHED'}
+
+
+classes = (NPROTO_PG_measure_pin, NPROTO_OT_measure_pin_comb, NPROTO_OT_measure_pin_remove, NPROTO_OT_measure_pin_clear,
            NPROTO_OT_measure_pin_copy, NPROTO_OT_measure_pin_selection)
 
 
