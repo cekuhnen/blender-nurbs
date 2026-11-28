@@ -244,7 +244,7 @@ for hist in (True, False):
         st = features.stack(o)
         lab = steps.LABEL["merge_faces"](st[-1]["params"])
         check("history: one step, the label shows the tolerance", [x["op"] for x in st] == ["merge_faces"]
-              and lab == "Remove Edges · 1 picked · fit 0.001", lab)
+              and lab == "Remove Edges · 1 picked · fit 0.001 m", lab)
         features.rebuild(o, ctx, force=True)
         check("history: rebuilds to one top face", nfaces(o) == 9, f"{nfaces(o)}")
         raw = json.loads(o[features.PROP_STACK]); raw[-1]["params"]["fit_tolerance"] = 0.0

@@ -26,6 +26,19 @@ def clear():
 def ins(*objs): return json.dumps([[o.name, "S0"] for o in objs])
 def vol(o): return abs(store.get_brep(o).volume(1e-6))
 def nfaces(o): return store.get_brep(o).face_count()
+
+def step_hl(o, k):
+    """Faces the history panel outlines in blue with step k of o picked."""
+    from blender_nurbs import subsel as _ss
+    ctx.view_layer.objects.active = o
+    bpy.ops.nproto.tree_step(name=o.name, root=o.name, index=k)
+    out = sorted(_ss.step_faces(o))
+    o.nproto_step.focus = False
+    return out
+
+def near_face(o, q):
+    fs = store.get_brep(o).faces()
+    return min(range(len(fs)), key=lambda j: fs[j].closest_point(tuple(map(float, q)))[1])
 def solid(o): return bool(store.get_brep(o).is_manifold_solid())
 def faces(*items): return json.dumps([[o.name, list(p)] for o, p in items])
 
@@ -133,6 +146,10 @@ check("tilted on over the pole", r == {'FINISHED'} and solid(B) and nfaces(B) ==
       and float(np.dot(c3[:2], c2[:2])) < 0, f"{c3} vs {want}")
 features.rebuild(B, ctx)
 check("all three replay on rebuild", np.allclose(floor_centre(B), c3, atol=1e-6) and solid(B))
+hl = step_hl(B, len(features.stack(B)) - 1)
+check("picked sphere Move Face step highlights the moved feature (its floor too)",
+      near_face(B, c3) in hl and len(hl) == nfaces(B) - 1
+      and max(range(nfaces(B)), key=lambda j: store.get_brep(B).faces()[j].area(1e-6)) not in hl, f"{hl} floor {near_face(B, c3)} of {nfaces(B)}")
 st = features.stack(B)
 st[-1]["params"]["tilt"] = 40.0
 features._write_stack(B, st)

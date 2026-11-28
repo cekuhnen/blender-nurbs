@@ -282,9 +282,10 @@ def apply_merge_faces(obj, text, inputs, p):
 
 
 def _label(p):
+    from . import steps
     flat, fit = float(p.get("flat_tolerance", 0.0)), float(p.get("fit_tolerance", 0.0))
     tail = f" · flat {math.degrees(flat):.3g}°" if flat > 0 else ""
-    tail += f" · fit {fit:.3g}" if fit > 0 else ""
+    tail += f" · fit {steps.length_text(fit)}" if fit > 0 else ""
     if p.get("mode") == "ALL":
         return "Remove Edges · all redundant" + tail
     n = len(p.get("edges_local", []))

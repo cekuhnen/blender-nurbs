@@ -31,6 +31,19 @@ def poly(name, pts):
 def ins(*objs): return json.dumps([[o.name, "S0"] for o in objs])
 def vol(o): return abs(store.get_brep(o).volume(1e-6))
 def nfaces(o): return store.get_brep(o).face_count()
+
+def step_hl(o, k):
+    """Faces the history panel outlines in blue with step k of o picked."""
+    from blender_nurbs import subsel as _ss
+    ctx.view_layer.objects.active = o
+    bpy.ops.nproto.tree_step(name=o.name, root=o.name, index=k)
+    out = sorted(_ss.step_faces(o))
+    o.nproto_step.focus = False
+    return out
+
+def near_face(o, q):
+    fs = store.get_brep(o).faces()
+    return min(range(len(fs)), key=lambda j: fs[j].closest_point(tuple(map(float, q)))[1])
 def solid(o): return bool(store.get_brep(o).is_manifold_solid())
 def faces(*items): return json.dumps([[o.name, list(p)] for o, p in items])
 
@@ -86,6 +99,10 @@ for hist in (True, False):
         features.rebuild(P, ctx)
         check("[history] the move replays on rebuild", np.allclose(curved_centre(P), [3.5, 2], atol=1e-6),
               curved_centre(P))
+        hl = step_hl(P, len(st) - 1)
+        fs = store.get_brep(P).faces()
+        wall = sorted(j for j, f in enumerate(fs) if not f.surface().is_planar())
+        check("[history] picked Move Face step highlights the moved hole", hl == wall and wall, f"{hl} want {wall}")
         st[-1]["params"]["move_y"] = 0.75
         features._write_stack(P, st)
         features.rebuild(P, ctx)

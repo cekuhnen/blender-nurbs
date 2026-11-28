@@ -110,6 +110,19 @@ for hist in (True, False):
 
 # --- a drafted box's top replaced by a tilted sheet: its sides keep their draft up to it
 import numpy as np
+
+def step_hl(o, k):
+    """Faces the history panel outlines in blue with step k of o picked."""
+    from blender_nurbs import subsel as _ss
+    ctx.view_layer.objects.active = o
+    bpy.ops.nproto.tree_step(name=o.name, root=o.name, index=k)
+    out = sorted(_ss.step_faces(o))
+    o.nproto_step.focus = False
+    return out
+
+def near_face(o, q):
+    fs = store.get_brep(o).faces()
+    return min(range(len(fs)), key=lambda j: fs[j].closest_point(tuple(map(float, q)))[1])
 def drafted_under(t, z, w=4.0, h=3.0, n=1200):
     """Volume of the w x h rectangle drafted outward (tan t) cut by the surface z(x, y): midpoint grid."""
     X = np.linspace(-4, 4, n, endpoint=False) + 4.0 / n
@@ -151,6 +164,10 @@ S.location.z += 0.5
 ctx.view_layer.update()
 features.rebuild(B, ctx)
 check("history: the surface moved, the body rebuilt", abs(vol(B) - 36) < 1e-6, f"vol {vol(B):.5f}")
+hl = step_hl(B, 0)
+k = near_face(B, (0, 0, 3))
+check("picked Replace Face step highlights the face on the surface (moved)",
+      hl == [k] and store.get_brep(B).faces()[k].closest_point((0, 0, 3))[1] < 1e-6, f"{hl} want [{k}]")
 # ... and the extrude under it made taller: its top is still the face replaced
 raw = json.loads(B[features.PROP_HIST]); raw["params"]["distance"] = 2.5
 B[features.PROP_HIST] = json.dumps(raw)

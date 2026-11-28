@@ -95,7 +95,7 @@ for hist in (True, False):
     if hist:
         st = features.stack(B)
         check("history: one shell step", len(st) == 1 and st[0]["op"] == "shell"
-              and steps.LABEL["shell"](st[0]["params"]) == "Shell · 0.2 · 1 face open", str(st))
+              and steps.LABEL["shell"](st[0]["params"]) == "Shell · 0.2 m · 1 face open", str(st))
         # the step's thickness edited: the walls follow
         raw = json.loads(B[features.PROP_STACK]); raw[0]["params"]["thickness"] = 0.5
         B[features.PROP_STACK] = json.dumps(raw)

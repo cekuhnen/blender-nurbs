@@ -30,6 +30,7 @@ import numpy as np
 
 import bpy
 from bpy_extras import view3d_utils
+from mathutils import Vector
 
 from . import store
 from .kernel import load as _load_kernel
@@ -241,9 +242,110 @@ def face_keys(brep, pts):
     return out
 
 
+def _pushed_points(obj, p):
+    """Local points on the faces a Push / Pull step moved, where they are now:
+    each stored face point carried the distance along its outward normal (in
+    world, as the step moves them), as Push / Pull re-picks them."""
+    from mathutils import Vector
+    from . import geom
+    M = geom.world_matrix(obj)
+    Mi, N = M.inverted(), M.to_3x3().inverted().transposed()
+    d = float(p.get("distance", 0.0))
+    nrm = p.get("normals_local") or []
+    out = []
+    for k, q in enumerate(p.get("faces_local", [])):
+        w = M @ Vector(q)
+        if k < len(nrm):
+            w = w + d * (N @ Vector(nrm[k])).normalized()
+        out.append([float(x) for x in Mi @ w])
+    return out
+
+
+def _turned(P, O, z, deg):
+    """World points P turned deg degrees about the axis through O along unit z."""
+    from .pushpull import _rot3
+    return O + (np.asarray(P, float) - O) @ _rot3(z, deg).T
+
+
+def _step_world(obj, p, key):
+    """The stored local points p[key] in world, and the body's matrix."""
+    from . import geom
+    M = geom.world_matrix(obj)
+    return np.array([list(M @ Vector(q)) for q in p.get(key, [])], float).reshape(-1, 3), M
+
+
+def _rotated_points(obj, p):
+    """Local points on the faces a Rotate Face step turned, where they are
+    now: turned about the stored hinge, as Rotate Face re-picks them."""
+    W, M = _step_world(obj, p, "faces_local")
+    O = np.array(M @ Vector(p["axis_point_local"]), float)
+    z = np.array((M.to_3x3() @ Vector(p["axis_dir_local"])).normalized(), float)
+    Mi = M.inverted()
+    return [[float(x) for x in Mi @ Vector(q)] for q in _turned(W, O, z, float(p.get("angle", 0.0)))]
+
+
+def _moved_points(obj, p):
+    """Local points on the faces a Move Face step moved, where they are now:
+    carried as the step moves the feature (steps.apply_move_face): slid on a
+    flat face; tilted, turned and slid on a curved one; carried by the frames
+    over a free-form seat (the seat surface stays, so its frames are found
+    on the body as it is now)."""
+    W, M = _step_world(obj, p, "faces_local")
+    L = M.to_3x3()
+    O = np.array(M @ Vector(p["axis_point_local"]), float)
+    mode = p.get("mode", "PLANE")
+    if mode in ("PLANE", "FREE"):
+        v = np.array(L @ (float(p.get("move_x", 0.0)) * Vector(p["axis_x_local"])
+                          + float(p.get("move_y", 0.0)) * Vector(p["axis_y_local"])), float)
+        if mode == "FREE":
+            from .pushpull import free_frame
+            faces = store.get_brep(obj).faces()
+            q = tuple(p["axis_point_local"])
+            s = min(range(len(faces)), key=lambda k: faces[k].closest_point(q)[1])
+            R, A, A2, _ = free_frame(obj, s, O, v, bool(p.get("follow", True)))
+            W = (W - A) @ R.T + A2
+        else:
+            W = W + v
+    else:
+        z = np.array((L @ Vector(p["axis_x_local"])).normalized(), float)
+        if mode == "SPHERE" and abs(float(p.get("tilt", 0.0))) > 0.0:
+            W = _turned(W, O, np.array((L @ Vector(p["axis_y_local"])).normalized(), float), float(p["tilt"]))
+        if abs(float(p.get("turn", 0.0))) > 0.0:
+            W = _turned(W, O, z, float(p["turn"]))
+        W = W + float(p.get("slide", 0.0)) * z
+    Mi = M.inverted()
+    return [[float(x) for x in Mi @ Vector(q)] for q in W]
+
+
+def _replaced_points(obj, p, surf):
+    """Local points on the faces a Replace Face step put in: each stored
+    point's foot on the replacement surface (the step's input) as it is now."""
+    from . import geom
+    W, M = _step_world(obj, p, "faces_local")
+    if surf is None or not store.is_nurbs(surf):
+        return []
+    S = geom.world_matrix(surf)
+    Si, Mi = S.inverted(), M.inverted()
+    sf = store.get_brep(surf).faces()
+    out = []
+    for q in W:
+        ql = tuple(Si @ Vector(q))
+        best = min((f.closest_point(ql) for f in sf), key=lambda r: r[1], default=None)
+        if best is not None:
+            c = best[0]
+            c = Vector((c.x, c.y, c.z) if hasattr(c, "x") else tuple(c))
+            out.append([float(x) for x in Mi @ (S @ c)])
+    return out
+
+
+STEP_FACE_OPS = ("edge_fillet", "push_pull", "rotate_face", "move_face", "replace_face")
+
+
 def step_faces(obj):
-    """The faces the history step open in the panel made (an edge fillet:
-    its fillet faces), while that body is the active one; [] otherwise."""
+    """The faces the history step open in the panel made or moved (an edge
+    fillet: its fillet faces; Push / Pull, Rotate Face, Replace Face: the
+    faces it moved or put in; Move Face: the whole feature it moved), while
+    that body is the active one; [] otherwise."""
     pg = getattr(obj, "nproto_step", None)
     if (pg is None or not pg.focus or pg.index < 0 or obj != bpy.context.view_layer.objects.active
             or not store.is_nurbs(obj)):
@@ -253,16 +355,37 @@ def step_faces(obj):
         e = raw[pg.index]
     except (ValueError, IndexError, TypeError):
         return []
-    if e.get("op") != "edge_fillet":
+    op = e.get("op")
+    if op not in STEP_FACE_OPS:
         return []
     from . import steps
-    info = steps.rims_of(obj, e["params"].get("mids_local", [])) or {}
-    pts = info.get("faces") or []
-    skeys = info.get("keys") or []
-    key = (obj.get(store.PROP_REV, 0), pg.index, json.dumps(pts), json.dumps(skeys))
+    p = e.get("params") or {}
+    surf = obj.get(f"nproto_sin_{pg.index}_0") if op == "replace_face" else None
+    key = (obj.get(store.PROP_REV, 0), pg.index, json.dumps(e, sort_keys=True),
+           tuple(tuple(r) for r in obj.matrix_world),
+           obj.get(steps.PROP_RIMS, "") if op == "edge_fillet" else "",
+           (surf.name, surf.get(store.PROP_REV, 0), tuple(tuple(r) for r in surf.matrix_world))
+           if surf is not None else None)
     hit = _stepf.get(obj.session_uid)
     if hit and hit[0] == key:
         return hit[1]
+    skeys = []
+    try:
+        if op == "edge_fillet":
+            info = steps.rims_of(obj, p.get("mids_local", [])) or {}
+            pts = info.get("faces") or []
+            skeys = info.get("keys") or []
+        elif op == "push_pull":
+            pts = _pushed_points(obj, p)
+        elif op == "rotate_face":
+            pts = _rotated_points(obj, p)
+        elif op == "move_face":
+            pts = _moved_points(obj, p)
+        else:
+            pts = _replaced_points(obj, p, surf)
+    except Exception as exc:
+        print("NURBS step faces:", exc)
+        pts = []
     idx = []
     try:
         size = _size(obj)
@@ -276,6 +399,11 @@ def step_faces(obj):
                 j = _locate(obj, "FACE", -1, p, size)
                 js = [] if j is None else [j]
             idx += [j for j in js if j not in idx]
+        if op == "move_face" and idx:        # the whole feature lights up, as when it is picked
+            from .pushpull import feature_of
+            feat = feature_of(obj, idx)
+            if feat is not None:
+                idx = sorted(set(idx) | set(feat[0]))
     except Exception as exc:
         print("NURBS step faces:", exc)
     _stepf[obj.session_uid] = (key, idx)

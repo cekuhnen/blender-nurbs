@@ -441,8 +441,9 @@ def apply_shell(obj, text, inputs, p):
 
 
 def _shell_label(p):
+    from . import steps
     n = len(p.get("faces_local", []))
-    return (f"Shell · {float(p.get('thickness', 0)):.3g}" + (" out" if p.get("shell_side") == "OUTSIDE" else "")
+    return (f"Shell · {steps.length_text(p.get('thickness', 0))}" + (" out" if p.get("shell_side") == "OUTSIDE" else "")
             + (f" · {n} face{'s' if n != 1 else ''} open" if n else " · closed"))
 
 

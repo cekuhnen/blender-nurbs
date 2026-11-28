@@ -383,9 +383,10 @@ def apply_remove_fillets(obj, text, inputs, p):
 
 
 def _label(p):
+    from . import steps
     if p.get("mode") == "ALL":
         r = float(p.get("max_radius", 0.0))
-        return "Remove Fillets · all" + (f" ≤ {r:.3g}" if r > 0 else "")
+        return "Remove Fillets · all" + (f" ≤ {steps.length_text(r)}" if r > 0 else "")
     n = len(p.get("faces_local", []))
     return f"Remove Fillets · {n} picked" + ("" if p.get("keep_others", True) else " · whole chains")
 

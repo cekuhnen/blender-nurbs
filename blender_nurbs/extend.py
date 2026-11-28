@@ -108,7 +108,7 @@ def apply_extend_surface(obj, text, inputs, p):
 def _register_step():
     from . import steps
     steps.APPLY["extend_surface"] = apply_extend_surface
-    steps.LABEL["extend_surface"] = lambda p: f"Extend · {p['edge']} {p['distance']:+.3g}"
+    steps.LABEL["extend_surface"] = lambda p: f"Extend · {p['edge']} {steps.length_text(p['distance'], signed=True)}"
 
 
 _register_step()

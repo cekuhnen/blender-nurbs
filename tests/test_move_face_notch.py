@@ -101,7 +101,7 @@ check("the notch slid 1.5 along the edge", r == {'FINISHED'} and solid(P) and nf
 check("move time", dt < 2.0, f"{dt * 1000:.0f} ms")
 st = features.stack(P)
 check("the slide is a step", st[-1]["op"] == "move_face" and st[-1]["params"]["mode"] == "SLIDE"
-      and steps.LABEL["move_face"](st[-1]["params"]) == "Move Face · 1.5", steps.LABEL["move_face"](st[-1]["params"]))
+      and steps.LABEL["move_face"](st[-1]["params"]) == "Move Face · 1.5 m", steps.LABEL["move_face"](st[-1]["params"]))
 features.rebuild(P, ctx)
 check("it replays on rebuild", wall_at(P, (3.5, 0.5, 0.5), [1, 0, 0]) and solid(P))
 st[-1]["params"]["slide"] = -1.0

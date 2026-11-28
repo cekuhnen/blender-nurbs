@@ -68,6 +68,27 @@ for hist in (True, False):
         st = features.stack(B)
         check("[history] each push / pull is a step", [e["op"] for e in st] == ["push_pull"] * 3,
               [e["op"] for e in st])
+        # the row label in the scene's units, as the feature panel shows the distance
+        from blender_nurbs import steps as _steps, subsel as _subsel
+        us = ctx.scene.unit_settings
+        lab_m = _steps.LABEL["push_pull"](st[1]["params"])
+        us.system, us.length_unit = 'IMPERIAL', 'INCHES'
+        lab_in = _steps.LABEL["push_pull"](st[1]["params"])
+        us.system, us.length_unit = 'METRIC', 'METERS'
+        check("[history] Push / Pull label in scene units", lab_m == "Push · 0.5 m" and lab_in == 'Push · 19.69"',
+              f"{lab_m!r} {lab_in!r}")
+        # the picked step highlights the faces it moved, where they are now;
+        # the first step's top was moved again by the second: nothing for it
+        hl = []
+        for k in range(3):
+            bpy.ops.nproto.tree_step(name=B.name, root=B.name, index=k)
+            hl.append(sorted(_subsel.step_faces(B)))
+        bf = store.get_brep(B).faces()
+        at = lambda q: min(range(len(bf)), key=lambda j: bf[j].closest_point(q)[1])
+        want2 = sorted({at((2, 1.5, 3.5)), at((5, 1.5, 1))})
+        check("[history] picked Push / Pull step highlights its moved faces",
+              hl[0] == [] and hl[1] == [] and hl[2] == want2, f"{hl} want {want2}")
+        B.nproto_step.focus = False
     # a pocket floor pushed deeper, and a face with a hole pulled
     clear()
     B, _ = box(0, 0, 4, 3, 2)

@@ -26,6 +26,19 @@ def clear():
 def ins(*objs): return json.dumps([[o.name, "S0"] for o in objs])
 def vol(o): return abs(store.get_brep(o).volume(1e-6))
 def nfaces(o): return store.get_brep(o).face_count()
+
+def step_hl(o, k):
+    """Faces the history panel outlines in blue with step k of o picked."""
+    from blender_nurbs import subsel as _ss
+    ctx.view_layer.objects.active = o
+    bpy.ops.nproto.tree_step(name=o.name, root=o.name, index=k)
+    out = sorted(_ss.step_faces(o))
+    o.nproto_step.focus = False
+    return out
+
+def near_face(o, q):
+    fs = store.get_brep(o).faces()
+    return min(range(len(fs)), key=lambda j: fs[j].closest_point(tuple(map(float, q)))[1])
 def solid(o): return bool(store.get_brep(o).is_manifold_solid())
 def faces(*items): return json.dumps([[o.name, list(p)] for o, p in items])
 
@@ -159,10 +172,18 @@ check("the hole slid over the bump, square to it where it lands", r == {'FINISHE
 check("move time", dt < 4.0, f"{dt * 1000:.0f} ms")
 st = features.stack(B)
 check("the move is a step", st[-1]["params"]["mode"] == "FREE"
-      and steps.LABEL["move_face"](st[-1]["params"]) == "Move Face · 0.671", steps.LABEL["move_face"](st[-1]["params"]))
+      and steps.LABEL["move_face"](st[-1]["params"]) == "Move Face · 0.6708 m", steps.LABEL["move_face"](st[-1]["params"]))
 features.rebuild(B, ctx)
 p2, a2 = hole_axis(B)
 check("it replays on rebuild", line_dist(p2, a2, p, a) < 1e-6 and solid(B))
+hl = step_hl(B, len(st) - 1)
+fs = store.get_brep(B).faces()
+def _off_axis(j):
+    lo, hi = (np.array(v, float) for v in fs[j].bounding_box())
+    c = (lo + hi) / 2 - p2
+    return float(np.linalg.norm(c - (c @ a2) * a2))
+check("picked free-form Move Face step highlights the moved hole", hl and top_index(B) not in hl
+      and all(not fs[j].surface().is_planar() and _off_axis(j) < 0.3 for j in hl), f"{hl} top {top_index(B)}")
 st[-1]["params"]["follow"] = False
 features._write_stack(B, st)
 features.rebuild(B, ctx)

@@ -14,6 +14,33 @@ def _world(obj):
     return geom.world_matrix(obj)
 
 
+_UNIT = {"METERS": (1.0, " m"), "KILOMETERS": (1e3, " km"), "CENTIMETERS": (1e-2, " cm"),
+         "MILLIMETERS": (1e-3, " mm"), "MICROMETERS": (1e-6, " µm"), "MILES": (1609.344, " mi"),
+         "FEET": (0.3048, "'"), "INCHES": (0.0254, '"'), "THOU": (2.54e-5, " thou")}
+
+
+def length_text(x, signed=False):
+    """A length (metres) in the scene's units, as the feature panel shows it
+    (2" not 0.0508): the history rows' labels. The scene's Length unit when
+    it is fixed, else Blender's adaptive / separate units. signed: a leading
+    '+' on positive lengths."""
+    import bpy
+    x = float(x)
+    try:
+        us = bpy.context.scene.unit_settings
+        if us.system == 'NONE':
+            raise LookupError
+        v = x * (us.scale_length or 1.0)
+        u = _UNIT.get(us.length_unit)
+        if u is not None and not us.use_separate:
+            s = f"{v / u[0]:.4g}{u[1]}"
+        else:
+            s = bpy.utils.units.to_string(us.system, 'LENGTH', v, precision=4, split_unit=us.use_separate)
+    except Exception:
+        s = f"{x:.4g}"
+    return "+" + s if signed and x > 0 else s
+
+
 def untrimmed_cutters(cutters):
     """Cutting surfaces as their UNTRIMMED surface. Used when cutting with the
     trimmed one fails -- e.g. two surfaces trimmed by each other: the cutter's
@@ -604,10 +631,10 @@ def apply_move_face(obj, text, inputs, p):
 
 def _move_face_label(p):
     if p.get("mode", "PLANE") in ("PLANE", "FREE"):
-        return f"Move Face · {math.hypot(float(p.get('move_x', 0)), float(p.get('move_y', 0))):.3g}"
+        return f"Move Face · {length_text(math.hypot(float(p.get('move_x', 0)), float(p.get('move_y', 0))))}"
     bits = [f"{float(p.get('turn', 0)):.3g}°" if abs(float(p.get("turn", 0))) > 0 else "",
             f"tilt {float(p.get('tilt', 0)):.3g}°" if abs(float(p.get("tilt", 0))) > 0 else "",
-            f"{float(p.get('slide', 0)):.3g}" if abs(float(p.get("slide", 0))) > 0 else ""]
+            length_text(p.get('slide', 0)) if abs(float(p.get("slide", 0))) > 0 else ""]
     return " · ".join(["Move Face"] + [b for b in bits if b])
 
 
@@ -629,8 +656,8 @@ LABEL = {
     "trim": lambda p: "Trim · " + {"KEEP": "Keep", "DELETE": "Discard"}.get(p.get("action"), p.get("action", "")),
     "edge_fillet": lambda p: f"Edge {p.get('shape', 'CIRCULAR').title()} · "
                              + ("chord" if p.get("chord") else "d" if (p.get("setback") and p.get("shape") == "CHAMFER")
-                                else "r") + f" {p.get('radius', 0):.3g}"
-                             + (f" / {p['distance_b']:.3g}" if p.get("distance_b") is not None
+                                else "r") + f" {length_text(p.get('radius', 0))}"
+                             + (f" / {length_text(p['distance_b'])}" if p.get("distance_b") is not None
                                 and p.get("shape") == "CHAMFER" and p.get("setback") and not p.get("chord") else "")
                              + (" · Class-A" if p.get("class_a") else ""),
     "fillet_trim": lambda p: ("Fillet trim" if p.get("trim", True) else "Fillet extend"),
@@ -643,7 +670,7 @@ LABEL = {
     "rotate_face": lambda p: f"Rotate Face · {float(p.get('angle', 0)):.3g}°"
                              + (f" · {len(p.get('faces_local', []))} faces" if len(p.get("faces_local", [])) > 1 else ""),
     "push_pull": lambda p: ("Pull" if float(p.get("distance", 0)) > 0 else "Push")
-                           + f" · {abs(float(p.get('distance', 0))):.3g}"
+                           + f" · {length_text(abs(float(p.get('distance', 0))))}"
                            + (f" · {len(p.get('faces_local', []))} faces" if len(p.get("faces_local", [])) > 1 else ""),
 }
 
