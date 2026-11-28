@@ -282,6 +282,88 @@ def store_rims(obj, mids_local, info, Mi=None, text=None):
         del obj[PROP_RIMS]
 
 
+PROP_MADE = "nproto_step_made"
+
+
+def _made_key(op, p):
+    """The id of a step by what it is (its op and settings, mute aside)."""
+    import hashlib
+    s = json.dumps({k: v for k, v in p.items() if k != "_off"}, sort_keys=True, default=str)
+    return op + ":" + hashlib.md5(s.encode()).hexdigest()[:16]
+
+
+def changed_faces(text_in, text_out):
+    """(local points, surface keys) of the faces of text_out that are new or
+    changed against text_in: a face counts as unchanged when a face of
+    text_in has the same surface, as many edges and the same corners (its
+    vertices; a hole healed or a rim cut changes the edges, a face grown or
+    merged its corners)."""
+    import numpy as np
+    from . import subsel
+
+    def faces_of(text):
+        b = store.brep_from_text(text)
+        out = []
+        for f in b.faces():
+            V = np.array([v.point() for v in f.vertices()], float).reshape(-1, 3)
+            out.append((f, (subsel.surface_key(f), len(f.edges()), len(V)), V[np.lexsort(V.T[::-1])]))
+        return b, out
+    _, before = faces_of(text_in)
+    b, after = faces_of(text_out)
+    lo, hi = (np.array(v, float) for v in b.bounding_box())
+    tol = 1e-6 * (float(np.linalg.norm(hi - lo)) or 1.0)
+
+    def same(V, W):         # the same corners, in any order
+        return all(float(np.linalg.norm(W - v, axis=1).min()) < tol for v in V) if len(V) else True
+    pts, keys = [], []
+    for f, k, V in after:
+        if any(k == k0 and same(V, V0) for _, k0, V0 in before):
+            continue
+        ip = f.interior_point()
+        pts.append([float(x) for x in ((ip.x, ip.y, ip.z) if hasattr(ip, "x") else ip)])
+        keys.append(k[0])
+    return pts, keys
+
+
+def store_made(obj, op, p, text_in, text_out):
+    """Keep the faces a step made or changed (changed_faces), keyed by the
+    step: highlighted while it is open in the panel. Entries of steps no
+    longer in the stack are dropped."""
+    try:
+        d = json.loads(obj.get(PROP_MADE, "{}"))
+    except ValueError:
+        d = {}
+    pts, keys = changed_faces(text_in, text_out)
+    d[_made_key(op, p)] = {"faces": pts, "keys": keys}
+    try:
+        live = {_made_key(e["op"], e.get("params") or {}) for e in json.loads(obj.get("nproto_stack", "[]"))}
+        d = {k: v for k, v in d.items() if k in live}
+    except (ValueError, TypeError, KeyError):
+        pass
+    obj[PROP_MADE] = json.dumps(d)
+
+
+def made_of(obj, op, p):
+    """{"faces": [local points], "keys": [surface keys]} store_made kept for this step, or None."""
+    try:
+        return json.loads(obj.get(PROP_MADE, "{}")).get(_made_key(op, p))
+    except (ValueError, TypeError):
+        return None
+
+
+def recording(op, apply):
+    """apply (a step's rebuild function) that also keeps the faces it made (store_made)."""
+    def run(obj, text, inputs, p):
+        out = apply(obj, text, inputs, p)
+        try:
+            store_made(obj, op, p, text, out)
+        except Exception as exc:
+            print(f"NURBS {op} faces:", exc)
+        return out
+    run.__wrapped__ = apply
+    return run
+
+
 def rims_of(obj, mids_local):
     """{"rings": [...], "only": bool, "faces": [points]} for the fillet step
     on these edges (keys present when they apply), or None."""

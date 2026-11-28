@@ -39,6 +39,23 @@ def brep(o): return store.get_brep(o)
 def vol(o): return abs(brep(o).volume(1e-6))
 def solid(o): return bool(brep(o).is_manifold_solid())
 
+def step_hl(o, k):
+    """Faces the history panel outlines in blue with step k of o picked."""
+    from blender_nurbs import subsel as _ss
+    ctx.view_layer.objects.active = o
+    bpy.ops.nproto.tree_step(name=o.name, root=o.name, index=k)
+    out = sorted(_ss.step_faces(o))
+    o.nproto_step.focus = False
+    return out
+
+def near_face(o, q):
+    fs = store.get_brep(o).faces()
+    return min(range(len(fs)), key=lambda j: fs[j].closest_point(tuple(map(float, q)))[1])
+
+def face_info(o, js):
+    fs = store.get_brep(o).faces()
+    return [(j, [round(float(x), 3) for x in fs[j].centroid()], round(fs[j].area(), 3)) for j in js]
+
 def face_at(o, p):
     fs = brep(o).faces()
     return min(range(len(fs)), key=lambda k: fs[k].closest_point(tuple(map(float, p)))[1])
@@ -216,6 +233,8 @@ check("Done adds a Face CVs step", r == {'FINISHED'} and cvs.cage_for(B) is None
 P_done = P.copy()
 fs = brep(B).faces()
 itop = max(range(len(fs)), key=lambda k: fs[k].area(1e-6) if fs[k].closest_point((2, 1.5, 2.5))[1] < 1.5 else 0)
+hl = step_hl(B, 0)
+check("picked Face CVs step highlights the sculpted face", hl == [itop], f"{face_info(B, hl)} want {itop}")
 for x in ctx.selected_objects: x.select_set(False)
 B.select_set(True); ctx.view_layer.objects.active = B
 subsel.set_picks(B, "FACE", [itop])

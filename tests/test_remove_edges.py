@@ -34,6 +34,23 @@ def counts(b): return (b.face_count(), b.edge_count(), b.vertex_count())
 def vol_b(b): return abs(b.volume(1e-6))
 def vol(o): return vol_b(store.get_brep(o))
 def nfaces(o): return store.get_brep(o).face_count()
+
+def step_hl(o, k):
+    """Faces the history panel outlines in blue with step k of o picked."""
+    from blender_nurbs import subsel as _ss
+    ctx.view_layer.objects.active = o
+    bpy.ops.nproto.tree_step(name=o.name, root=o.name, index=k)
+    out = sorted(_ss.step_faces(o))
+    o.nproto_step.focus = False
+    return out
+
+def near_face(o, q):
+    fs = store.get_brep(o).faces()
+    return min(range(len(fs)), key=lambda j: fs[j].closest_point(tuple(map(float, q)))[1])
+
+def face_info(o, js):
+    fs = store.get_brep(o).faces()
+    return [(j, [round(float(x), 3) for x in fs[j].centroid()], round(fs[j].area(), 3)) for j in js]
 def solid(o): return bool(store.get_brep(o).is_manifold_solid())
 
 def body(name, b, matrix=None):
@@ -228,6 +245,11 @@ for hist in (True, False):
     select(B)
     pick_edges(B, [(1, 0.75, 1), (1, 0, 1)])           # the top diagonal and a box edge
     r = run()
+    if hist:
+        hl = step_hl(B, 0)
+        check("history: picked Remove Edges step highlights the merged top", hl == [near_face(B, (1, 0.75, 1))]
+              and abs(store.get_brep(B).faces()[hl[0]].area(1e-6) - 3.0) < 1e-6 if hl else False,
+              f"{face_info(B, hl)}")
     check(f"[{tag}] two picks: the diagonal goes, the box edge stays picked",
           r == {'FINISHED'} and nfaces(B) == 11 and solid(B) and abs(vol(B) - 3.0) < 1e-7
           and len(subsel.picks(B, "EDGE")) == 1, f"faces {nfaces(B)} picks {subsel.picks(B, 'EDGE')}")

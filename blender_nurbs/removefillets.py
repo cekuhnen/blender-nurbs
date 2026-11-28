@@ -346,6 +346,7 @@ class NPROTO_OT_remove_fillets(_FacePicking, bpy.types.Operator):
             store.set_geometry_text(o, breps["result"], context, keep_untrimmed=False)
             if hist:
                 features.push_step(o, "remove_fillets", [], params, base_text=pre)
+                _record_made(o, "remove_fillets", params, pre, breps["result"])
             if subsel.picks(o, "FACE"):
                 subsel.set_picks(o, "FACE", [])
             done.append(o)
@@ -391,9 +392,18 @@ def _label(p):
     return f"Remove Fillets · {n} picked" + ("" if p.get("keep_others", True) else " · whole chains")
 
 
+def _record_made(o, op, params, pre, result):
+    """Keep the faces the new step made, for its highlight in the history panel."""
+    from . import steps
+    try:
+        steps.store_made(o, op, params, pre, result)
+    except Exception as exc:
+        print(f"NURBS {op} faces:", exc)
+
+
 def _register_step():
     from . import steps
-    steps.APPLY["remove_fillets"] = apply_remove_fillets
+    steps.APPLY["remove_fillets"] = steps.recording("remove_fillets", apply_remove_fillets)
     steps.LABEL["remove_fillets"] = _label
 
 

@@ -134,6 +134,7 @@ class _RemoveEdges:
                 if self.fit_tolerance > 0:
                     params["fit_tolerance"] = float(self.fit_tolerance)
                 features.push_step(o, "merge_faces", [], params, base_text=pre)
+                _record_made(o, "merge_faces", params, pre, breps["result"])
             refused = info.get("refused", [])
             if pts is not None:
                 # the edges that stayed stay picked; the removed ones are gone
@@ -238,6 +239,7 @@ class _RemoveFaces:
             store.set_geometry_text(o, breps["result"], context, keep_untrimmed=False)
             if hist:
                 features.push_step(o, "remove_faces", [], {"faces_local": pts}, base_text=pre)
+                _record_made(o, "remove_faces", {"faces_local": pts}, pre, breps["result"])
             subsel.set_picks(o, "FACE", [])
             done.append(o)
             n = int(info.get("removed", 0))
@@ -292,11 +294,20 @@ def _label(p):
     return f"Remove Edges · {n} picked" + tail
 
 
+def _record_made(o, op, params, pre, result):
+    """Keep the faces the new step made, for its highlight in the history panel."""
+    from . import steps
+    try:
+        steps.store_made(o, op, params, pre, result)
+    except Exception as exc:
+        print(f"NURBS {op} faces:", exc)
+
+
 def _register_step():
     from . import steps
-    steps.APPLY["merge_faces"] = apply_merge_faces
+    steps.APPLY["merge_faces"] = steps.recording("merge_faces", apply_merge_faces)
     steps.LABEL["merge_faces"] = _label
-    steps.APPLY["remove_faces"] = apply_remove_faces
+    steps.APPLY["remove_faces"] = steps.recording("remove_faces", apply_remove_faces)
     steps.LABEL["remove_faces"] = lambda p: f"Remove Faces · {len(p.get('faces_local', []))} healed"
 
 

@@ -338,14 +338,39 @@ def _replaced_points(obj, p, surf):
     return out
 
 
-STEP_FACE_OPS = ("edge_fillet", "push_pull", "rotate_face", "move_face", "replace_face")
+def _sculpted_face(obj, p):
+    """Index of the face a Face CVs step sculpted: the face nearest its stored
+    point whose surface has the step's CV layout (nu x nv, its degrees; u
+    and v either way round)."""
+    deg = tuple(p.get("deg") or ())
+    want = (p["nu"], p["nv"]) + (deg if len(deg) == 2 else (3, 3))
+    faces = store.get_brep(obj).faces()
+    k = store._k()[1]
+    q = tuple(float(x) for x in p["face_local"])
+    best = None
+    for j, f in enumerate(faces):
+        d = k.surface_cvs(f.surface())
+        lay = (d["count_u"], d["count_v"], d["degree_u"], d["degree_v"])
+        if lay not in (want, (want[1], want[0], want[3], want[2])):     # u and v may come back swapped
+            continue
+        dist = f.closest_point(q)[1]
+        if best is None or dist < best[0]:
+            best = (dist, j)
+    return None if best is None else best[1]
+
+
+STEP_FACE_OPS = ("edge_fillet", "push_pull", "rotate_face", "move_face", "replace_face", "face_cvs",
+                 "shell", "remove_fillets", "merge_faces", "remove_faces")
+MADE_OPS = ("shell", "remove_fillets", "merge_faces", "remove_faces")   # faces kept by steps.store_made
 
 
 def step_faces(obj):
     """The faces the history step open in the panel made or moved (an edge
     fillet: its fillet faces; Push / Pull, Rotate Face, Replace Face: the
-    faces it moved or put in; Move Face: the whole feature it moved), while
-    that body is the active one; [] otherwise."""
+    faces it moved or put in; Move Face: the whole feature it moved; Face
+    CVs: the sculpted face; Shell, Remove Fillets / Edges / Faces: the faces
+    it made or changed, kept by steps.store_made), while that body is the
+    active one; [] otherwise."""
     pg = getattr(obj, "nproto_step", None)
     if (pg is None or not pg.focus or pg.index < 0 or obj != bpy.context.view_layer.objects.active
             or not store.is_nurbs(obj)):
@@ -363,7 +388,7 @@ def step_faces(obj):
     surf = obj.get(f"nproto_sin_{pg.index}_0") if op == "replace_face" else None
     key = (obj.get(store.PROP_REV, 0), pg.index, json.dumps(e, sort_keys=True),
            tuple(tuple(r) for r in obj.matrix_world),
-           obj.get(steps.PROP_RIMS, "") if op == "edge_fillet" else "",
+           obj.get(steps.PROP_RIMS, "") if op == "edge_fillet" else obj.get(steps.PROP_MADE, "") if op in MADE_OPS else "",
            (surf.name, surf.get(store.PROP_REV, 0), tuple(tuple(r) for r in surf.matrix_world))
            if surf is not None else None)
     hit = _stepf.get(obj.session_uid)
@@ -381,8 +406,17 @@ def step_faces(obj):
             pts = _rotated_points(obj, p)
         elif op == "move_face":
             pts = _moved_points(obj, p)
-        else:
+        elif op == "replace_face":
             pts = _replaced_points(obj, p, surf)
+        elif op == "face_cvs":
+            j = _sculpted_face(obj, p)
+            idx = [] if j is None else [j]
+            _stepf[obj.session_uid] = (key, idx)
+            return idx
+        else:
+            info = steps.made_of(obj, op, p) or {}
+            pts = info.get("faces") or []
+            skeys = info.get("keys") or []
     except Exception as exc:
         print("NURBS step faces:", exc)
         pts = []

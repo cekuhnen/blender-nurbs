@@ -30,6 +30,23 @@ def clear():
 def vol_b(b): return abs(b.volume(1e-6))
 def vol(o): return vol_b(store.get_brep(o))
 def nfaces(o): return store.get_brep(o).face_count()
+
+def step_hl(o, k):
+    """Faces the history panel outlines in blue with step k of o picked."""
+    from blender_nurbs import subsel as _ss
+    ctx.view_layer.objects.active = o
+    bpy.ops.nproto.tree_step(name=o.name, root=o.name, index=k)
+    out = sorted(_ss.step_faces(o))
+    o.nproto_step.focus = False
+    return out
+
+def near_face(o, q):
+    fs = store.get_brep(o).faces()
+    return min(range(len(fs)), key=lambda j: fs[j].closest_point(tuple(map(float, q)))[1])
+
+def face_info(o, js):
+    fs = store.get_brep(o).faces()
+    return [(j, [round(float(x), 3) for x in fs[j].centroid()], round(fs[j].area(), 3)) for j in js]
 def solid(o): return bool(store.get_brep(o).is_manifold_solid())
 
 def body(name, b, matrix=None):
@@ -117,6 +134,10 @@ for hist in (True, False):
         st_ = features.stack(B)
         check("history: one remove_faces step", [e["op"] for e in st_] == ["remove_faces"]
               and steps.LABEL["remove_faces"](st_[0]["params"]) == "Remove Faces · 1 healed", str(st_)[:200])
+        hl = step_hl(B, 0)
+        want = sorted({near_face(B, (1, 0.75, 1)), near_face(B, (1, 0.75, 0))})
+        check("history: picked Remove Faces step highlights the healed top and bottom", hl == want,
+              f"{face_info(B, hl)} want {want}")
         B.location.x = 10; ctx.view_layer.update()
         features.rebuild(B, ctx, force=True)
         check("history: moved body rebuilds healed", nfaces(B) == 6 and abs(vol(B) - 3.0) < 1e-7, f"faces {nfaces(B)}")
