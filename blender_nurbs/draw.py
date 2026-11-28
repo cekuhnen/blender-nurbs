@@ -68,22 +68,32 @@ def _lines_from_polylines(polys, M, bias=None):
     out = []
     for pl in polys:
         w = [M @ Vector(p) for p in pl]
-        if bias is not None:
-            eye, vdir, amount = bias
-            if eye is not None:
-                w = [p + (eye - p).normalized() * amount for p in w]
-            else:
-                w = [p + vdir * amount for p in w]
+        if bias is not None and w:
+            w = [Vector(q) for q in pull_toward_viewer([tuple(p) for p in w], bias)]
         for i in range(len(w) - 1):
             out += [w[i], w[i + 1]]
     return out
+
+
+EDGE_PULL_PX = 3.0      # edges are pulled toward the viewer by at least this many pixels' worth
 
 
 def _edge_bias(ctx, obj, chord):
     """Exact B-rep edges lie ON the surface, but the shaded mesh is a tessellation
     whose flat triangles bulge up to the chord tolerance off it -- on convex areas
     (fillets, cylinders, seams) the mesh then hides parts of the edges. Pull the
-    edge lines toward the viewer by a bit more than that chord error."""
+    edge lines toward the viewer by a bit more than that chord error.
+
+    That fixed amount is not enough on an outline: there the face beside the
+    edge is seen almost edge-on, so a pixel inward it already lies nearer
+    than the edge, the inner half of the (wide) line fails the depth test and
+    what is left tangles with Blender's own outline in a broken dash. So the
+    pull is also at least EDGE_PULL_PX pixels' worth of world size at each
+    point's depth (see pull_toward_viewer).
+
+    (eye, view_dir, amount, px): eye in perspective else None, view_dir in
+    orthographic else None, the chord pull, and the pull per unit distance
+    from the eye (perspective) or in world units (orthographic)."""
     rv3d = ctx.region_data
     if rv3d is None:
         return None
@@ -92,10 +102,29 @@ def _edge_bias(ctx, obj, chord):
     lo = Vector([min(c[i] for c in corners) for i in range(3)])
     hi = Vector([max(c[i] for c in corners) for i in range(3)])
     amount = 1.5 * chord * ((hi - lo).length or 1.0) + 1e-5
+    region = ctx.region
+    h = max(region.height, 1) if region is not None else 1000
+    # one pixel's world size: 2 / (winmat[1][1] * height), times the distance in perspective
+    px = EDGE_PULL_PX * 2.0 / (max(abs(rv3d.window_matrix[1][1]), 1e-12) * h)
     vinv = rv3d.view_matrix.inverted()
     if rv3d.is_perspective:
-        return vinv.translation.copy(), None, amount
-    return None, (vinv.to_3x3() @ Vector((0.0, 0.0, 1.0))).normalized(), amount
+        return vinv.translation.copy(), None, amount, px
+    return None, (vinv.to_3x3() @ Vector((0.0, 0.0, 1.0))).normalized(), amount, px
+
+
+def pull_toward_viewer(W, bias):
+    """World points W (n, 3) pulled toward the viewer by `bias` (from
+    _edge_bias): along each point's own view ray, so it stays where it is on
+    screen, by max(chord pull, pixel pull at that depth)."""
+    W = np.asarray(W, np.float64).reshape(-1, 3)
+    if bias is None:
+        return W
+    eye, vdir, amount, px = bias
+    if eye is not None:
+        D = np.asarray(eye, np.float64) - W
+        ln = np.linalg.norm(D, axis=1, keepdims=True)
+        return W + D / np.where(ln > 0, ln, 1.0) * np.maximum(amount, px * ln)
+    return W + np.asarray(vdir, np.float64) * max(amount, px)
 
 
 def _draw_lines(coords, color, width):
@@ -291,15 +320,7 @@ def _world_biased(L, M, bias):
     import numpy as np
     A = np.array(M, np.float64)
     W = L.astype(np.float64) @ A[:3, :3].T + A[:3, 3]
-    if bias is not None:
-        eye, vdir, amount = bias
-        if eye is not None:
-            D = np.asarray(eye, np.float64) - W
-            ln = np.linalg.norm(D, axis=1, keepdims=True)
-            W += D / np.where(ln > 0, ln, 1.0) * amount
-        else:
-            W += np.asarray(vdir, np.float64) * amount
-    return W.astype(np.float32)
+    return pull_toward_viewer(W, bias).astype(np.float32)
 
 
 def curve_cage(obj):

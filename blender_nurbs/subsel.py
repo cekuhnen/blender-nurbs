@@ -737,11 +737,8 @@ def _biased(P, M, bias):
     W = P @ np.array(M.to_3x3()).T + np.array(M.translation)
     if bias is None:
         return W
-    eye, vdir, amount = bias
-    if eye is not None:
-        d = np.array(eye) - W
-        return W + d / np.maximum(np.linalg.norm(d, axis=1), 1e-300)[:, None] * amount
-    return W + np.array(vdir) * amount
+    from .draw import pull_toward_viewer
+    return pull_toward_viewer(W, bias)
 
 
 def _draw_face(ctx, ob, i, fill, line, width, draw_lines, draw_tris, edge_bias):
