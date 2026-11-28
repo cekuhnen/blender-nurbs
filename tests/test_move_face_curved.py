@@ -112,7 +112,7 @@ check("turn time", dt < 3.0, f"{dt * 1000:.0f} ms")
 st = features.stack(R)
 check("the turn is a step on a cylinder", st[-1]["op"] == "move_face" and st[-1]["params"]["mode"] == "AXIS"
       and abs(st[-1]["params"]["turn"] - 90) < 1e-9, st[-1]["params"].get("mode"))
-check("the labels", [steps.LABEL["move_face"](e["params"]) for e in st[-2:]] == ["Move Face · 0.75", "Move Face · 90°"],
+check("the labels", [steps.LABEL["move_face"](e["params"]) for e in st[-2:]] == ["Move Face · 0.75 m", "Move Face · 90°"],
       [steps.LABEL["move_face"](e["params"]) for e in st[-2:]])
 features.rebuild(R, ctx)
 (q, a), = hole_axes(R)

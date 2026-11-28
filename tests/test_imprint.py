@@ -69,6 +69,24 @@ def box(name="Box", h=2.0):
     o = ctx.active_object; o.name = name
     return o
 
+def step_edge_hl(o, k):
+    """(edge indices, their world polylines) the history panel outlines in blue with step k of o picked."""
+    import numpy as np
+    ctx.view_layer.objects.active = o
+    bpy.ops.nproto.tree_step(name=o.name, root=o.name, index=k)
+    es = sorted(subsel.step_edges(o))
+    o.nproto_step.focus = False
+    M = np.array(o.matrix_world)
+    return es, [np.asarray(subsel._edge_polys(o)[i]) @ M[:3, :3].T + M[:3, 3] for i in es]
+
+def on_rect(P, x0, y0, x1, y1, z, tol=1e-4):
+    """Every point of polyline P on the outline of the rectangle [x0,x1] x [y0,y1] at height z."""
+    import numpy as np
+    P = np.asarray(P, float)
+    inside = (P[:, 0] > x0 - tol) & (P[:, 0] < x1 + tol) & (P[:, 1] > y0 - tol) & (P[:, 1] < y1 + tol)
+    edge = (np.minimum(np.abs(P[:, 0] - x0), np.abs(P[:, 0] - x1)) < tol) | (np.minimum(np.abs(P[:, 1] - y0), np.abs(P[:, 1] - y1)) < tol)
+    return bool(np.all(inside & edge & (np.abs(P[:, 2] - z) < tol)))
+
 def project(curves, target, **kw):
     select(curves + [target], target)
     return bpy.ops.nproto.project_curve(output="EDGE", **kw)
@@ -92,6 +110,9 @@ for hist in (True, False):
     if hist:
         st = features.stack(B)
         check("[history] the imprint is a step on the box", [e["op"] for e in st] == ["imprint"], str(st))
+        es, P = step_edge_hl(B, 0)
+        check("[history] picked Imprint step outlines its four new edges (not the box's)",
+              len(es) == 4 and all(on_rect(W, 1, 1, 3, 2, 2.0) for W in P), f"{es}")
         # move the sketch: the edges follow
         K.location = (0.5, 0.5, 0.0)
         features.rebuild(B, ctx, force=True)
@@ -102,6 +123,9 @@ for hist in (True, False):
         check("[history] the sketch moved: the imprinted face moved with it",
               len(top) == 2 and c is not None and abs(c[0] - 2.5) < 1e-4 and abs(c[1] - 2.0) < 1e-4,
               str(c))
+        es, P = step_edge_hl(B, 0)
+        check("[history] after the rebuild the outline follows the moved sketch",
+              len(es) == 4 and all(on_rect(W, 1.5, 1.5, 3.5, 2.5, 2.0) for W in P), f"{es}")
         K.location = (0, 0, 0)
         features.rebuild(B, ctx, force=True)
 

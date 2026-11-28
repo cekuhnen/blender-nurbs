@@ -1285,6 +1285,11 @@ def imprint_object(op, context, tgt, inputs, p, pre=None):
     subsel.set_picks(tgt, "EDGE", [])
     if keep:                                   # the edges follow what made them
         features.push_step(tgt, imprint.OP, inputs, p, base_text=base)
+        try:                                   # its new edges, outlined while the step is picked
+            from . import steps
+            steps.store_made(tgt, imprint.OP, p, base, text, [o.name for o, _ in inputs], edges=True)
+        except Exception as exc:
+            print("NURBS imprint edges:", exc)
     for msg in imprint.notes(info, inputs, tgt):
         op.report({'INFO'}, msg)
     return info

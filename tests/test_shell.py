@@ -35,6 +35,23 @@ def solid(o): return bool(store.get_brep(o).is_manifold_solid())
 def faces(*items): return json.dumps([[o.name, list(p)] for o, p in items])
 def nfaces(o): return store.get_brep(o).face_count()
 
+def step_hl(o, k):
+    """Faces the history panel outlines in blue with step k of o picked."""
+    from blender_nurbs import subsel as _ss
+    ctx.view_layer.objects.active = o
+    bpy.ops.nproto.tree_step(name=o.name, root=o.name, index=k)
+    out = sorted(_ss.step_faces(o))
+    o.nproto_step.focus = False
+    return out
+
+def near_face(o, q):
+    fs = store.get_brep(o).faces()
+    return min(range(len(fs)), key=lambda j: fs[j].closest_point(tuple(map(float, q)))[1])
+
+def face_info(o, js):
+    fs = store.get_brep(o).faces()
+    return [(j, [round(float(x), 3) for x in fs[j].centroid()], round(fs[j].area(), 3)) for j in js]
+
 def run(op, *a, **kw):
     try:
         return op(*a, **kw)
@@ -95,13 +112,23 @@ for hist in (True, False):
     if hist:
         st = features.stack(B)
         check("history: one shell step", len(st) == 1 and st[0]["op"] == "shell"
-              and steps.LABEL["shell"](st[0]["params"]) == "Shell · 0.2 · 1 face open", str(st))
+              and steps.LABEL["shell"](st[0]["params"]) == "Shell · 0.2 m · 1 face open", str(st))
+        outer = {near_face(B, q) for q in ((2, 1.5, 0), (2, 0, 1), (2, 3, 1), (0, 1.5, 1), (4, 1.5, 1))}
+        want = sorted(set(range(nfaces(B))) - outer)
+        hl = step_hl(B, 0)
+        check("history: picked Shell step highlights the inner walls and the rim", hl == want and len(want) == 6,
+              f"{face_info(B, hl)} want {want}")
         # the step's thickness edited: the walls follow
         raw = json.loads(B[features.PROP_STACK]); raw[0]["params"]["thickness"] = 0.5
         B[features.PROP_STACK] = json.dumps(raw)
         features.rebuild(B, ctx, force=True)
         want = 24 - 3.0 * 2.0 * 1.5
         check("history: thickness 0.5 on rebuild", abs(vol(B) - want) < 1e-5, f"vol {vol(B):.5f} want {want:.5f}")
+        outer = {near_face(B, q) for q in ((2, 1.5, 0), (2, 0, 1), (2, 3, 1), (0, 1.5, 1), (4, 1.5, 1))}
+        hl = step_hl(B, 0)
+        check("history: the edited step's highlight follows its new walls (recorded on rebuild)",
+              hl == sorted(set(range(nfaces(B))) - outer) and len(hl) == 6
+              and len(json.loads(B[steps.PROP_MADE])) == 1, f"{face_info(B, hl)}")
         # the body before the step changed (moved): the step follows
         B.location.x = 10; ctx.view_layer.update()
         features.rebuild(B, ctx, force=True)

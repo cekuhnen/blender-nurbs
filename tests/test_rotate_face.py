@@ -32,6 +32,19 @@ def poly(name, pts):
 def ins(*objs): return json.dumps([[o.name, "S0"] for o in objs])
 def vol(o): return abs(store.get_brep(o).volume(1e-6))
 def nfaces(o): return store.get_brep(o).face_count()
+
+def step_hl(o, k):
+    """Faces the history panel outlines in blue with step k of o picked."""
+    from blender_nurbs import subsel as _ss
+    ctx.view_layer.objects.active = o
+    bpy.ops.nproto.tree_step(name=o.name, root=o.name, index=k)
+    out = sorted(_ss.step_faces(o))
+    o.nproto_step.focus = False
+    return out
+
+def near_face(o, q):
+    fs = store.get_brep(o).faces()
+    return min(range(len(fs)), key=lambda j: fs[j].closest_point(tuple(map(float, q)))[1])
 def solid(o): return bool(store.get_brep(o).is_manifold_solid())
 def faces(*items): return json.dumps([[o.name, list(p)] for o, p in items])
 
@@ -78,6 +91,12 @@ for hist in (True, False):
         features.rebuild(B, ctx)
         check("[history] the turn replays on rebuild", abs(vol(B) - (24 + wedge(4, 3, 10))) < 1e-6,
               f"vol {vol(B):.6f}")
+        a10 = math.radians(10.0)
+        hl = step_hl(B, 0)
+        k = near_face(B, (2, 1.5 * math.cos(a10), 2 + 1.5 * math.sin(a10)))
+        check("[history] picked Rotate Face step highlights the tilted top",
+              hl == [k] and abs(store.get_brep(B).faces()[k].area(1e-6) - 12 / math.cos(a10)) < 1e-4,
+              f"{hl} want [{k}] area {store.get_brep(B).faces()[k].area(1e-6):.6f}")
         st[0]["params"]["angle"] = -20.0
         features._write_stack(B, st)
         features.rebuild(B, ctx)

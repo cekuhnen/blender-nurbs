@@ -414,9 +414,10 @@ class NPROTO_OT_shell(_FacePicking, ValueDrag, AskValue, bpy.types.Operator):
                 self.report({'INFO'}, f"{o.name}: construction history removed")
             store.set_geometry_text(o, breps["result"], context, keep_untrimmed=False)
             if hist:
-                features.push_step(o, "shell", [], {
-                    "faces_local": [[float(x) for x in f[0]] for f in frames],
-                    "thickness": float(self.thickness), "shell_side": self.side}, base_text=pre)
+                params = {"faces_local": [[float(x) for x in f[0]] for f in frames],
+                          "thickness": float(self.thickness), "shell_side": self.side}
+                features.push_step(o, "shell", [], params, base_text=pre)
+                _record_made(o, "shell", params, pre, breps["result"])
             if subsel.picks(o, "FACE"):
                 subsel.set_picks(o, "FACE", [])           # the picked faces are gone
             done.append(o)
@@ -441,14 +442,24 @@ def apply_shell(obj, text, inputs, p):
 
 
 def _shell_label(p):
+    from . import steps
     n = len(p.get("faces_local", []))
-    return (f"Shell · {float(p.get('thickness', 0)):.3g}" + (" out" if p.get("shell_side") == "OUTSIDE" else "")
+    return (f"Shell · {steps.length_text(p.get('thickness', 0))}" + (" out" if p.get("shell_side") == "OUTSIDE" else "")
             + (f" · {n} face{'s' if n != 1 else ''} open" if n else " · closed"))
+
+
+def _record_made(o, op, params, pre, result):
+    """Keep the faces the new step made, for its highlight in the history panel."""
+    from . import steps
+    try:
+        steps.store_made(o, op, params, pre, result)
+    except Exception as exc:
+        print(f"NURBS {op} faces:", exc)
 
 
 def _register_step():
     from . import steps
-    steps.APPLY["shell"] = apply_shell
+    steps.APPLY["shell"] = steps.recording("shell", apply_shell)
     steps.LABEL["shell"] = _shell_label
 
 

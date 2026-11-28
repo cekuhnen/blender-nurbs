@@ -14,6 +14,33 @@ def _world(obj):
     return geom.world_matrix(obj)
 
 
+_UNIT = {"METERS": (1.0, " m"), "KILOMETERS": (1e3, " km"), "CENTIMETERS": (1e-2, " cm"),
+         "MILLIMETERS": (1e-3, " mm"), "MICROMETERS": (1e-6, " µm"), "MILES": (1609.344, " mi"),
+         "FEET": (0.3048, "'"), "INCHES": (0.0254, '"'), "THOU": (2.54e-5, " thou")}
+
+
+def length_text(x, signed=False):
+    """A length (metres) in the scene's units, as the feature panel shows it
+    (2" not 0.0508): the history rows' labels. The scene's Length unit when
+    it is fixed, else Blender's adaptive / separate units. signed: a leading
+    '+' on positive lengths."""
+    import bpy
+    x = float(x)
+    try:
+        us = bpy.context.scene.unit_settings
+        if us.system == 'NONE':
+            raise LookupError
+        v = x * (us.scale_length or 1.0)
+        u = _UNIT.get(us.length_unit)
+        if u is not None and not us.use_separate:
+            s = f"{v / u[0]:.4g}{u[1]}"
+        else:
+            s = bpy.utils.units.to_string(us.system, 'LENGTH', v, precision=4, split_unit=us.use_separate)
+    except Exception:
+        s = f"{x:.4g}"
+    return "+" + s if signed and x > 0 else s
+
+
 def untrimmed_cutters(cutters):
     """Cutting surfaces as their UNTRIMMED surface. Used when cutting with the
     trimmed one fails -- e.g. two surfaces trimmed by each other: the cutter's
@@ -253,6 +280,125 @@ def store_rims(obj, mids_local, info, Mi=None, text=None):
         obj[PROP_RIMS] = json.dumps(d)
     elif PROP_RIMS in obj:
         del obj[PROP_RIMS]
+
+
+PROP_MADE = "nproto_step_made"
+
+
+def _made_key(op, p, inputs=()):
+    """The id of a step by what it is: its op, settings (mute aside) and the
+    names of its input objects (two Imprints with the same settings differ
+    by what they imprint)."""
+    import hashlib
+    s = json.dumps([{k: v for k, v in p.items() if k != "_off"}, list(inputs)], sort_keys=True, default=str)
+    return op + ":" + hashlib.md5(s.encode()).hexdigest()[:16]
+
+
+def step_input_names(obj, k, n):
+    """Names of the n input objects of stack step k of obj."""
+    names = []
+    for i in range(n):
+        src = obj.get(f"nproto_sin_{k}_{i}")
+        names.append(src.name if src is not None else "")
+    return names
+
+
+def changed_faces(text_in, text_out):
+    """(local points, surface keys) of the faces of text_out that are new or
+    changed against text_in: a face counts as unchanged when a face of
+    text_in has the same surface, as many edges and the same corners (its
+    vertices; a hole healed or a rim cut changes the edges, a face grown or
+    merged its corners)."""
+    import numpy as np
+    from . import subsel
+
+    def faces_of(text):
+        b = store.brep_from_text(text)
+        out = []
+        for f in b.faces():
+            V = np.array([v.point() for v in f.vertices()], float).reshape(-1, 3)
+            out.append((f, (subsel.surface_key(f), len(f.edges()), len(V)), V[np.lexsort(V.T[::-1])]))
+        return b, out
+    _, before = faces_of(text_in)
+    b, after = faces_of(text_out)
+    lo, hi = (np.array(v, float) for v in b.bounding_box())
+    tol = 1e-6 * (float(np.linalg.norm(hi - lo)) or 1.0)
+
+    def same(V, W):         # the same corners, in any order
+        return all(float(np.linalg.norm(W - v, axis=1).min()) < tol for v in V) if len(V) else True
+    pts, keys = [], []
+    for f, k, V in after:
+        if any(k == k0 and same(V, V0) for _, k0, V0 in before):
+            continue
+        ip = f.interior_point()
+        pts.append([float(x) for x in ((ip.x, ip.y, ip.z) if hasattr(ip, "x") else ip)])
+        keys.append(k[0])
+    return pts, keys
+
+
+def changed_edges(text_in, text_out):
+    """Local middle points of the edges of text_out that are new against
+    text_in: not an edge of text_in, nor a piece of one (an edge the new
+    ones split counts as old)."""
+    import numpy as np
+    bi, bo = store.brep_from_text(text_in), store.brep_from_text(text_out)
+    lo, hi = (np.array(v, float) for v in bo.bounding_box())
+    tol = 1e-6 * (float(np.linalg.norm(hi - lo)) or 1.0)
+    old = [(e, *(np.array(v, float) for v in e.bounding_box())) for e in bi.edges()]
+    out = []
+    for e in bo.edges():
+        t0, t1 = e.parameter_range()
+        Q = [np.array(e.point_at(t0 + f * (t1 - t0)), float) for f in (0.1, 0.3, 0.5, 0.7, 0.9)]
+        if not any(all(np.all(q >= blo - tol) and np.all(q <= bhi + tol) for q in Q)
+                   and all(f.closest_point(tuple(map(float, q)))[2] < tol for q in Q)    # (point, t, distance)
+                   for f, blo, bhi in old):
+            out.append([float(x) for x in Q[2]])
+    return out
+
+
+def store_made(obj, op, p, text_in, text_out, inputs=(), edges=False):
+    """Keep what a step made, keyed by the step (_made_key): the faces it
+    made or changed (changed_faces), or with edges the new edges
+    (changed_edges); highlighted while it is open in the panel. Entries of
+    steps no longer in the stack are dropped."""
+    try:
+        d = json.loads(obj.get(PROP_MADE, "{}"))
+    except ValueError:
+        d = {}
+    if edges:
+        entry = {"edges": changed_edges(text_in, text_out)}
+    else:
+        pts, keys = changed_faces(text_in, text_out)
+        entry = {"faces": pts, "keys": keys}
+    d[_made_key(op, p, inputs)] = entry
+    try:
+        live = {_made_key(e["op"], e.get("params") or {}, step_input_names(obj, k, len(e.get("refs") or [])))
+                for k, e in enumerate(json.loads(obj.get("nproto_stack", "[]")))}
+        d = {k: v for k, v in d.items() if k in live}
+    except (ValueError, TypeError, KeyError):
+        pass
+    obj[PROP_MADE] = json.dumps(d)
+
+
+def made_of(obj, op, p, inputs=()):
+    """What store_made kept for this step ({"faces", "keys"} or {"edges"}), or None."""
+    try:
+        return json.loads(obj.get(PROP_MADE, "{}")).get(_made_key(op, p, inputs))
+    except (ValueError, TypeError):
+        return None
+
+
+def recording(op, apply, edges=False):
+    """apply (a step's rebuild function) that also keeps what it made (store_made)."""
+    def run(obj, text, inputs, p):
+        out = apply(obj, text, inputs, p)
+        try:
+            store_made(obj, op, p, text, out, [o.name for o, _ in inputs], edges)
+        except Exception as exc:
+            print(f"NURBS {op} made:", exc)
+        return out
+    run.__wrapped__ = apply
+    return run
 
 
 def rims_of(obj, mids_local):
@@ -604,10 +750,10 @@ def apply_move_face(obj, text, inputs, p):
 
 def _move_face_label(p):
     if p.get("mode", "PLANE") in ("PLANE", "FREE"):
-        return f"Move Face · {math.hypot(float(p.get('move_x', 0)), float(p.get('move_y', 0))):.3g}"
+        return f"Move Face · {length_text(math.hypot(float(p.get('move_x', 0)), float(p.get('move_y', 0))))}"
     bits = [f"{float(p.get('turn', 0)):.3g}°" if abs(float(p.get("turn", 0))) > 0 else "",
             f"tilt {float(p.get('tilt', 0)):.3g}°" if abs(float(p.get("tilt", 0))) > 0 else "",
-            f"{float(p.get('slide', 0)):.3g}" if abs(float(p.get("slide", 0))) > 0 else ""]
+            length_text(p.get('slide', 0)) if abs(float(p.get("slide", 0))) > 0 else ""]
     return " · ".join(["Move Face"] + [b for b in bits if b])
 
 
@@ -629,8 +775,8 @@ LABEL = {
     "trim": lambda p: "Trim · " + {"KEEP": "Keep", "DELETE": "Discard"}.get(p.get("action"), p.get("action", "")),
     "edge_fillet": lambda p: f"Edge {p.get('shape', 'CIRCULAR').title()} · "
                              + ("chord" if p.get("chord") else "d" if (p.get("setback") and p.get("shape") == "CHAMFER")
-                                else "r") + f" {p.get('radius', 0):.3g}"
-                             + (f" / {p['distance_b']:.3g}" if p.get("distance_b") is not None
+                                else "r") + f" {length_text(p.get('radius', 0))}"
+                             + (f" / {length_text(p['distance_b'])}" if p.get("distance_b") is not None
                                 and p.get("shape") == "CHAMFER" and p.get("setback") and not p.get("chord") else "")
                              + (" · Class-A" if p.get("class_a") else ""),
     "fillet_trim": lambda p: ("Fillet trim" if p.get("trim", True) else "Fillet extend"),
@@ -643,7 +789,7 @@ LABEL = {
     "rotate_face": lambda p: f"Rotate Face · {float(p.get('angle', 0)):.3g}°"
                              + (f" · {len(p.get('faces_local', []))} faces" if len(p.get("faces_local", [])) > 1 else ""),
     "push_pull": lambda p: ("Pull" if float(p.get("distance", 0)) > 0 else "Push")
-                           + f" · {abs(float(p.get('distance', 0))):.3g}"
+                           + f" · {length_text(abs(float(p.get('distance', 0))))}"
                            + (f" · {len(p.get('faces_local', []))} faces" if len(p.get("faces_local", [])) > 1 else ""),
 }
 

@@ -30,6 +30,7 @@ import numpy as np
 
 import bpy
 from bpy_extras import view3d_utils
+from mathutils import Vector
 
 from . import store
 from .kernel import load as _load_kernel
@@ -241,9 +242,135 @@ def face_keys(brep, pts):
     return out
 
 
+def _pushed_points(obj, p):
+    """Local points on the faces a Push / Pull step moved, where they are now:
+    each stored face point carried the distance along its outward normal (in
+    world, as the step moves them), as Push / Pull re-picks them."""
+    from mathutils import Vector
+    from . import geom
+    M = geom.world_matrix(obj)
+    Mi, N = M.inverted(), M.to_3x3().inverted().transposed()
+    d = float(p.get("distance", 0.0))
+    nrm = p.get("normals_local") or []
+    out = []
+    for k, q in enumerate(p.get("faces_local", [])):
+        w = M @ Vector(q)
+        if k < len(nrm):
+            w = w + d * (N @ Vector(nrm[k])).normalized()
+        out.append([float(x) for x in Mi @ w])
+    return out
+
+
+def _turned(P, O, z, deg):
+    """World points P turned deg degrees about the axis through O along unit z."""
+    from .pushpull import _rot3
+    return O + (np.asarray(P, float) - O) @ _rot3(z, deg).T
+
+
+def _step_world(obj, p, key):
+    """The stored local points p[key] in world, and the body's matrix."""
+    from . import geom
+    M = geom.world_matrix(obj)
+    return np.array([list(M @ Vector(q)) for q in p.get(key, [])], float).reshape(-1, 3), M
+
+
+def _rotated_points(obj, p):
+    """Local points on the faces a Rotate Face step turned, where they are
+    now: turned about the stored hinge, as Rotate Face re-picks them."""
+    W, M = _step_world(obj, p, "faces_local")
+    O = np.array(M @ Vector(p["axis_point_local"]), float)
+    z = np.array((M.to_3x3() @ Vector(p["axis_dir_local"])).normalized(), float)
+    Mi = M.inverted()
+    return [[float(x) for x in Mi @ Vector(q)] for q in _turned(W, O, z, float(p.get("angle", 0.0)))]
+
+
+def _moved_points(obj, p):
+    """Local points on the faces a Move Face step moved, where they are now:
+    carried as the step moves the feature (steps.apply_move_face): slid on a
+    flat face; tilted, turned and slid on a curved one; carried by the frames
+    over a free-form seat (the seat surface stays, so its frames are found
+    on the body as it is now)."""
+    W, M = _step_world(obj, p, "faces_local")
+    L = M.to_3x3()
+    O = np.array(M @ Vector(p["axis_point_local"]), float)
+    mode = p.get("mode", "PLANE")
+    if mode in ("PLANE", "FREE"):
+        v = np.array(L @ (float(p.get("move_x", 0.0)) * Vector(p["axis_x_local"])
+                          + float(p.get("move_y", 0.0)) * Vector(p["axis_y_local"])), float)
+        if mode == "FREE":
+            from .pushpull import free_frame
+            faces = store.get_brep(obj).faces()
+            q = tuple(p["axis_point_local"])
+            s = min(range(len(faces)), key=lambda k: faces[k].closest_point(q)[1])
+            R, A, A2, _ = free_frame(obj, s, O, v, bool(p.get("follow", True)))
+            W = (W - A) @ R.T + A2
+        else:
+            W = W + v
+    else:
+        z = np.array((L @ Vector(p["axis_x_local"])).normalized(), float)
+        if mode == "SPHERE" and abs(float(p.get("tilt", 0.0))) > 0.0:
+            W = _turned(W, O, np.array((L @ Vector(p["axis_y_local"])).normalized(), float), float(p["tilt"]))
+        if abs(float(p.get("turn", 0.0))) > 0.0:
+            W = _turned(W, O, z, float(p["turn"]))
+        W = W + float(p.get("slide", 0.0)) * z
+    Mi = M.inverted()
+    return [[float(x) for x in Mi @ Vector(q)] for q in W]
+
+
+def _replaced_points(obj, p, surf):
+    """Local points on the faces a Replace Face step put in: each stored
+    point's foot on the replacement surface (the step's input) as it is now."""
+    from . import geom
+    W, M = _step_world(obj, p, "faces_local")
+    if surf is None or not store.is_nurbs(surf):
+        return []
+    S = geom.world_matrix(surf)
+    Si, Mi = S.inverted(), M.inverted()
+    sf = store.get_brep(surf).faces()
+    out = []
+    for q in W:
+        ql = tuple(Si @ Vector(q))
+        best = min((f.closest_point(ql) for f in sf), key=lambda r: r[1], default=None)
+        if best is not None:
+            c = best[0]
+            c = Vector((c.x, c.y, c.z) if hasattr(c, "x") else tuple(c))
+            out.append([float(x) for x in Mi @ (S @ c)])
+    return out
+
+
+def _sculpted_face(obj, p):
+    """Index of the face a Face CVs step sculpted: the face nearest its stored
+    point whose surface has the step's CV layout (nu x nv, its degrees; u
+    and v either way round)."""
+    deg = tuple(p.get("deg") or ())
+    want = (p["nu"], p["nv"]) + (deg if len(deg) == 2 else (3, 3))
+    faces = store.get_brep(obj).faces()
+    k = store._k()[1]
+    q = tuple(float(x) for x in p["face_local"])
+    best = None
+    for j, f in enumerate(faces):
+        d = k.surface_cvs(f.surface())
+        lay = (d["count_u"], d["count_v"], d["degree_u"], d["degree_v"])
+        if lay not in (want, (want[1], want[0], want[3], want[2])):     # u and v may come back swapped
+            continue
+        dist = f.closest_point(q)[1]
+        if best is None or dist < best[0]:
+            best = (dist, j)
+    return None if best is None else best[1]
+
+
+STEP_FACE_OPS = ("edge_fillet", "push_pull", "rotate_face", "move_face", "replace_face", "face_cvs",
+                 "shell", "remove_fillets", "merge_faces", "remove_faces")
+MADE_OPS = ("shell", "remove_fillets", "merge_faces", "remove_faces")   # faces kept by steps.store_made
+
+
 def step_faces(obj):
-    """The faces the history step open in the panel made (an edge fillet:
-    its fillet faces), while that body is the active one; [] otherwise."""
+    """The faces the history step open in the panel made or moved (an edge
+    fillet: its fillet faces; Push / Pull, Rotate Face, Replace Face: the
+    faces it moved or put in; Move Face: the whole feature it moved; Face
+    CVs: the sculpted face; Shell, Remove Fillets / Edges / Faces: the faces
+    it made or changed, kept by steps.store_made), while that body is the
+    active one; [] otherwise."""
     pg = getattr(obj, "nproto_step", None)
     if (pg is None or not pg.focus or pg.index < 0 or obj != bpy.context.view_layer.objects.active
             or not store.is_nurbs(obj)):
@@ -253,16 +380,46 @@ def step_faces(obj):
         e = raw[pg.index]
     except (ValueError, IndexError, TypeError):
         return []
-    if e.get("op") != "edge_fillet":
+    op = e.get("op")
+    if op not in STEP_FACE_OPS:
         return []
     from . import steps
-    info = steps.rims_of(obj, e["params"].get("mids_local", [])) or {}
-    pts = info.get("faces") or []
-    skeys = info.get("keys") or []
-    key = (obj.get(store.PROP_REV, 0), pg.index, json.dumps(pts), json.dumps(skeys))
+    p = e.get("params") or {}
+    surf = obj.get(f"nproto_sin_{pg.index}_0") if op == "replace_face" else None
+    key = (obj.get(store.PROP_REV, 0), pg.index, json.dumps(e, sort_keys=True),
+           tuple(tuple(r) for r in obj.matrix_world),
+           obj.get(steps.PROP_RIMS, "") if op == "edge_fillet" else obj.get(steps.PROP_MADE, "") if op in MADE_OPS else "",
+           (surf.name, surf.get(store.PROP_REV, 0), tuple(tuple(r) for r in surf.matrix_world))
+           if surf is not None else None)
     hit = _stepf.get(obj.session_uid)
     if hit and hit[0] == key:
         return hit[1]
+    skeys = []
+    try:
+        if op == "edge_fillet":
+            info = steps.rims_of(obj, p.get("mids_local", [])) or {}
+            pts = info.get("faces") or []
+            skeys = info.get("keys") or []
+        elif op == "push_pull":
+            pts = _pushed_points(obj, p)
+        elif op == "rotate_face":
+            pts = _rotated_points(obj, p)
+        elif op == "move_face":
+            pts = _moved_points(obj, p)
+        elif op == "replace_face":
+            pts = _replaced_points(obj, p, surf)
+        elif op == "face_cvs":
+            j = _sculpted_face(obj, p)
+            idx = [] if j is None else [j]
+            _stepf[obj.session_uid] = (key, idx)
+            return idx
+        else:
+            info = steps.made_of(obj, op, p) or {}
+            pts = info.get("faces") or []
+            skeys = info.get("keys") or []
+    except Exception as exc:
+        print("NURBS step faces:", exc)
+        pts = []
     idx = []
     try:
         size = _size(obj)
@@ -276,9 +433,75 @@ def step_faces(obj):
                 j = _locate(obj, "FACE", -1, p, size)
                 js = [] if j is None else [j]
             idx += [j for j in js if j not in idx]
+        if op == "move_face" and idx:        # the whole feature lights up, as when it is picked
+            from .pushpull import feature_of
+            feat = feature_of(obj, idx)
+            if feat is not None:
+                idx = sorted(set(idx) | set(feat[0]))
     except Exception as exc:
         print("NURBS step faces:", exc)
     _stepf[obj.session_uid] = (key, idx)
+    return idx
+
+
+_stepe = {}    # session_uid -> (key, [edge indices])
+STEP_EDGE_OPS = ("imprint", "extend_surface", "match_surface", "surface_align")
+
+
+def _iso_edges(obj, isos, at=None):
+    """Indices of obj's edges on its surface's own boundary sides isos
+    (U0/U1/V0/V1); with `at` (a point along that side, picked on a trimmed
+    surface) only the pieces there, all of the side when none is."""
+    from .kernel import trimext
+    on = [(i, a0, a1) for i, (iso, a0, a1) in trimext.boundary_edges(store.get_brep(obj)).items() if iso in isos]
+    if at is not None:
+        here = [i for i, a0, a1 in on if min(a0, a1) - 1e-9 <= float(at) <= max(a0, a1) + 1e-9]
+        if here:
+            return sorted(here)
+    return sorted(i for i, _, _ in on)
+
+
+def step_edges(obj):
+    """The edges the history step open in the panel made or acted on
+    (Imprint: its new edges, kept by steps.store_made; Extend: the side it
+    grew; Match / Align: the sides it matched), while that body is the
+    active one; [] otherwise."""
+    pg = getattr(obj, "nproto_step", None)
+    if (pg is None or not pg.focus or pg.index < 0 or obj != bpy.context.view_layer.objects.active
+            or not store.is_nurbs(obj)):
+        return []
+    try:
+        raw = json.loads(obj.get("nproto_stack", "[]"))
+        e = raw[pg.index]
+    except (ValueError, IndexError, TypeError):
+        return []
+    op = e.get("op")
+    if op not in STEP_EDGE_OPS:
+        return []
+    from . import steps
+    p = e.get("params") or {}
+    names = steps.step_input_names(obj, pg.index, len(e.get("refs") or []))
+    key = (obj.get(store.PROP_REV, 0), pg.index, json.dumps(e, sort_keys=True), tuple(names),
+           obj.get(steps.PROP_MADE, "") if op == "imprint" else "")
+    hit = _stepe.get(obj.session_uid)
+    if hit and hit[0] == key:
+        return hit[1]
+    idx = []
+    try:
+        if op == "imprint":
+            size = _size(obj)
+            for q in (steps.made_of(obj, op, p, names) or {}).get("edges") or []:
+                j = _locate(obj, "EDGE", -1, q, size)
+                if j is not None and j not in idx:
+                    idx.append(j)
+            idx.sort()
+        elif op == "extend_surface":
+            idx = _iso_edges(obj, {p.get("edge")}, p.get("at"))
+        else:
+            idx = _iso_edges(obj, set(p.get("edges") or ()))
+    except Exception as exc:
+        print("NURBS step edges:", exc)
+    _stepe[obj.session_uid] = (key, idx)
     return idx
 
 
@@ -916,6 +1139,11 @@ def draw_view(ctx, draw_lines, draw_tris, edge_bias):
                 _draw_face(ctx, act, i, COL_STEP, COL_STEP_LINE, 2.5, draw_lines, draw_tris, edge_bias)
             except Exception as exc:
                 print("NURBS step faces: draw", exc)
+        for i in step_edges(act):
+            try:
+                _draw_edge(ctx, act, i, COL_STEP_LINE, 4.0, draw_lines, edge_bias)
+            except Exception as exc:
+                print("NURBS step edges: draw", exc)
     key = HOVER["key"]
     if key is not None and key[1] in kinds(ctx):
         ob = bpy.data.objects.get(key[0])

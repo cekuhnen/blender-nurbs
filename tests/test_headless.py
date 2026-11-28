@@ -6005,7 +6005,7 @@ _lbl = steps.LABEL["edge_fillet"](features.stack(_L4)[0]["params"])
 _pg.rail_type = "RADIUS"                      # step editor: back to a rolling ball of 0.3
 _dA_r = _ea0 - A(_L4)
 check("edge fillet step shows Rail = Chord (label 'chord'); switching it to Rolling Ball rebuilds with radius 0.3",
-      _shown == ("CHORD", 0.3, "rail_type") and "chord 0.3" in _lbl
+      _shown == ("CHORD", 0.3, "rail_type") and "chord 0.3 m" in _lbl
       and abs(_dA_r - 0.3 * 4 * (2 - math.pi / 2)) < 2e-3 and not features.stack(_L4)[0]["params"].get("chord"),
       f"{_shown} {_lbl} dA {_dA_r:.5f}")
 

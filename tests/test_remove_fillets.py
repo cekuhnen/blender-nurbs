@@ -29,6 +29,23 @@ def clear():
 
 def vol(o): return abs(store.get_brep(o).volume(1e-6))
 def nfaces(o): return store.get_brep(o).face_count()
+
+def step_hl(o, k):
+    """Faces the history panel outlines in blue with step k of o picked."""
+    from blender_nurbs import subsel as _ss
+    ctx.view_layer.objects.active = o
+    bpy.ops.nproto.tree_step(name=o.name, root=o.name, index=k)
+    out = sorted(_ss.step_faces(o))
+    o.nproto_step.focus = False
+    return out
+
+def near_face(o, q):
+    fs = store.get_brep(o).faces()
+    return min(range(len(fs)), key=lambda j: fs[j].closest_point(tuple(map(float, q)))[1])
+
+def face_info(o, js):
+    fs = store.get_brep(o).faces()
+    return [(j, [round(float(x), 3) for x in fs[j].centroid()], round(fs[j].area(), 3)) for j in js]
 def solid(o): return bool(store.get_brep(o).is_manifold_solid())
 
 def body(name, b, matrix=None):
@@ -87,6 +104,9 @@ for hist in (True, False):
         st = features.stack(B)
         check("history: one remove_fillets step", len(st) == 1 and st[0]["op"] == "remove_fillets"
               and steps.LABEL["remove_fillets"](st[0]["params"]) == "Remove Fillets · all", str(st)[:200])
+        hl = step_hl(B, 0)
+        check("history: picked Remove Fillets step highlights the faces that took over (all six)",
+              hl == list(range(6)), f"{face_info(B, hl)}")
         B.location.x = 10; ctx.view_layer.update()
         features.rebuild(B, ctx, force=True)
         check("history: moved body rebuilds sharp", nfaces(B) == 6 and abs(vol(B) - 3.0) < 1e-7,
