@@ -449,6 +449,8 @@ def draw_analyze(col, context):
     (sidebar and the viewport header's Analyze popover)."""
     v = context.window_manager.nproto_view
     col.operator("nproto.measure", icon='DRIVER_DISTANCE')
+    from . import measureinfo
+    measureinfo.draw_panel(col, context)
     col.separator(factor=0.5)
     row = col.row(align=True)
     row.prop(v, "show_zebra", toggle=True, icon='MOD_WAVE')

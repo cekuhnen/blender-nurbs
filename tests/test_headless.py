@@ -5278,6 +5278,7 @@ _not_tools = {"add_primitive", "cvs_cancel", "cvs_done", "click_continuity", "cy
               "face_cvs_refine",    # Face CVs' Add CVs / Rebuild: the open face cage's panel buttons
               "move", "rotate", "scale", "transform_hold",   # by Points: hold G / R / S (movetool keymap), no button
               "align_parts",    # Align Parts: Object > Transform and the NURBS Proto menu
+              "measure_copy",   # Copy Measurements: the Analyze panel's Selection box
               "delete_faces_key", "remove_edges_key", "remove_faces_key",   # X / Delete / Shift with picks (keymap)
               "square"}     # Square: merged into Patch (Quad Sided); kept for older files, off the menus
 _all_tools = {"nproto." + n for n in dir(bpy.ops.nproto)

@@ -8,7 +8,7 @@ One tool, M cycles the mode:
 * Radius / Diameter: whatever is under the mouse. A curve or a surface edge:
   a true circle (or an arc of one) gives its exact radius and centre; any
   other curve its radius of curvature at the nearest point (the osculating
-  circle drawn), a straight one "straight". A NURBS face: its two principal
+  circle drawn), a straight one "straight"; each also its whole length. A NURBS face: its two principal
   radii of curvature there (a cylinder: its radius and "flat" along it; a
   sphere: the same both ways), with the osculating circles.
 
@@ -125,8 +125,8 @@ def surface_radius(obj, P):
 # --------------------------------------------------------------------------
 
 def _fmt(context, x):
-    from .valuedrag import fmt_length
-    return fmt_length(context, x)
+    from .measureinfo import fmt
+    return fmt(context, x)
 
 
 def label(context, m, diameter=False):
@@ -139,9 +139,10 @@ def label(context, m, diameter=False):
     sym, f = ("Ø", 2.0) if diameter else ("R", 1.0)
     if m["kind"] == "radius":
         if m["source"] == "straight":
-            return "straight"
+            return "straight" + (f"  ·  L {_fmt(context, m['length'])}" if m.get("length") is not None else "")
         what = {"circle": "circle", "curvature": "curvature"}[m["source"]]
-        return f"{sym} {_fmt(context, f * m['radius'])}  ·  {what}"
+        txt = f"{sym} {_fmt(context, f * m['radius'])}  ·  {what}"
+        return txt + (f"  ·  L {_fmt(context, m['length'])}" if m.get("length") is not None else "")
     parts = []
     for r, _, _ in m["principal"]:
         parts.append("flat" if math.isinf(r) else f"{sym} {_fmt(context, f * r)}")
@@ -330,15 +331,19 @@ class NPROTO_OT_measure(SketchMixin, bpy.types.Operator):
 
     # -- what is under the mouse ------------------------------------------------
     def _curve(self, key):
+        """(linesolve Curve, its length) of a curve spline or surface edge, world space."""
         if key not in self._curves:
-            c = None
+            c, L = None, None
             obj = bpy.data.objects.get(key[0])
             if obj is not None:
                 try:
-                    c = linesolve.kernel_curve(features.input_curve(obj, key[1]), store._k()[0])
+                    kc = features.input_curve(obj, key[1])
+                    c = linesolve.kernel_curve(kc, store._k()[0])
+                    from .measureinfo import curve_length
+                    L = curve_length(kc)
                 except Exception as exc:
                     print("Measure: cannot evaluate", key, exc)
-            self._curves[key] = c
+            self._curves[key] = (c, L)
         return self._curves[key]
 
     def _reading(self, context, event):
@@ -355,7 +360,7 @@ class NPROTO_OT_measure(SketchMixin, bpy.types.Operator):
         hit = self._ray(context, event)
         for k_line, _ in self._snaps.near_lines(view, mouse, SNAP_PX, limit=4):
             W, src = self._snaps.line_info(k_line)
-            c = self._curve(tuple(src[:2])) if src is not None else None
+            c, L = self._curve(tuple(src[:2])) if src is not None else (None, None)
             if c is None:
                 continue
             # the curve's point under the mouse: the nearest of its samples on screen
@@ -363,7 +368,10 @@ class NPROTO_OT_measure(SketchMixin, bpy.types.Operator):
             k = int(np.argmin(np.where(ok, np.linalg.norm(a - np.asarray(mouse, float), axis=1), np.inf)))
             if hit is not None and self._hidden(context, event, c.W[k], hit[1]):
                 continue                     # behind the surface under the mouse (a rim's back): not this one
-            return curve_radius(c, c.W[k])
+            m = curve_radius(c, c.W[k])
+            if m is not None and L is not None:
+                m["length"] = L
+            return m
         if hit is not None:
             obj, P = hit
             try:
@@ -431,6 +439,8 @@ class NPROTO_OT_measure(SketchMixin, bpy.types.Operator):
         self._count += 1
         what = {"distance": "Distance", "radius": "Diameter" if dia else "Radius",
                 "surface": "Surface " + ("diameters" if dia else "radii")}[m["kind"]]
+        if m["kind"] == "radius" and m["source"] == "straight":
+            what = "Length"
         self.report({'INFO'}, f"{what}: {txt}")
         print(f"Measure · {what}: {txt}")
 
@@ -458,7 +468,7 @@ class NPROTO_OT_measure(SketchMixin, bpy.types.Operator):
                     elif m is not None and m["kind"] == "distance":
                         self._keep(context, m)
                         self._A = None
-            elif m is not None and not (m["kind"] == "radius" and m["source"] == "straight"):
+            elif m is not None and not (m["kind"] == "radius" and m["source"] == "straight" and m.get("length") is None):
                 self._keep(context, m)
             self._update(context, event)
         elif event.value == 'PRESS' and event.type == 'M':
