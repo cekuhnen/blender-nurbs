@@ -489,6 +489,21 @@ def _draw_cage(ctx):
 
 
 def _draw():
+    """Every overlay tests against the scene's depth but writes none of its
+    own: Blender hands POST_VIEW callbacks depth writes on, and then the
+    plain edge lines, a picked face's fill and its border (all pulled toward
+    the viewer by about the same amount, each sampled a little differently)
+    hide one another in a pixel-wise speckle -- dashed highlight edges. With
+    no writes, what is drawn later simply lies over what was drawn before."""
+    mask = gpu.state.depth_mask_get()
+    gpu.state.depth_mask_set(False)
+    try:
+        _draw_overlays()
+    finally:
+        gpu.state.depth_mask_set(mask)
+
+
+def _draw_overlays():
     ctx = bpy.context
     scn = ctx.scene
     v = getattr(ctx.window_manager, "nproto_view", None)
