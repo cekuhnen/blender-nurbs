@@ -17,7 +17,7 @@ from bpy.app.handlers import persistent
 
 from . import (anamesh, blendedit, brep_mesh, contlabels, cvnudge, cvs, curvejoin, curveoffset, diagnostics, draw,
                drawtools, extend, facetex, feature_ui, flow, pattern, features, hints, history, isocombs, isodetach, loft_rails, loftslide, merge, ops, patch, refit,
-               scanfit, scanpatch, sections, snapframes, snapping, square, steps, store, subd_brep, subsel, surfoffset, flange, network, railrevolve, measure, measureinfo, measurepair, sweeps,
+               scanfit, scanpatch, sections, snapframes, snapping, square, steps, store, subd_brep, subsel, surfoffset, flange, network, railrevolve, measure, measureinfo, measurepair, measurepin, sweeps,
                symmetry, unroll, workplanes)
 
 # overlays and tool flags with a fixed shape: put back to how they start
@@ -48,7 +48,7 @@ def _emptied():
         scanfit._SCANS, scanfit._SAMPLERS, scanfit.DEV_CACHE, scanfit.DEV_BATCHES, scanfit.STATS,
         extend._EDGE_CACHE, blendedit._frames, isodetach._trim_cache, pattern._BUILD_CACHE, symmetry._last,
         facetex._cache, facetex.LAST, measureinfo._cache, measureinfo._errors, measureinfo._cost, measureinfo._seen,
-        measurepair._world, measureinfo._pairs,
+        measurepair._world, measureinfo._pairs, measurepin._cache, measurepin._last,
         subsel._valid, subsel._ftris, subsel._epts, subsel._stepf, subsel._mtris, subsel._cpoly,
     )
 

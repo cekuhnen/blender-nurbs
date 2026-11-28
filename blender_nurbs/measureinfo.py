@@ -424,12 +424,9 @@ def gather(context, settle=False):
     return info
 
 
-def _pair_into(info, objs):
-    """Two things selected (picked edges / faces, curve splines) or two whole
-    bodies: info["pair"] = what they measure against each other
-    (measurepair.relate), info["clearance"] = (gap, how) of two bodies."""
-    from . import measurepair
-    info["pair"], info["clearance"] = None, None
+def _pair_els(objs):
+    """([(kind, object, index)] of the picked edges / faces and curve splines,
+    [whole bodies]) of the selected objects; None when more than two of either."""
     els, bodies = [], []
     for o in sorted(objs, key=lambda o: o.name):
         if store.is_nurbs(o):
@@ -441,7 +438,29 @@ def _pair_into(info, objs):
         else:
             els += [("S", o, f"S{k}") for k in range(len(o.data.splines))]
         if len(els) > 2 or len(bodies) > 2:
-            return
+            return None
+    return els, bodies
+
+
+def pair_refs(context):
+    """The two picked things (kind, object, index) the readout measures against
+    each other, or None."""
+    got = _pair_els([o for o in context.selected_objects if measurable(o)])
+    if got is None or len(got[0]) != 2 or got[1]:
+        return None
+    return got[0]
+
+
+def _pair_into(info, objs):
+    """Two things selected (picked edges / faces, curve splines) or two whole
+    bodies: info["pair"] = what they measure against each other
+    (measurepair.relate), info["clearance"] = (gap, how) of two bodies."""
+    from . import measurepair
+    info["pair"], info["clearance"] = None, None
+    got = _pair_els(objs)
+    if got is None:
+        return
+    els, bodies = got
     if len(els) == 2 and not bodies:
         k = ("pair",) + tuple((t, o.name, i, _key(o)) for t, o, i in els)
         if k not in _pairs:
@@ -814,6 +833,8 @@ def draw_panel(col, context):
                   emboss=False)
     sub = head.row(align=True)
     sub.enabled = bool(lines)
+    if info and info.get("pair") is not None:
+        sub.operator("nproto.measure_pin_selection", text="", icon='PINNED', emboss=False)
     sub.operator("nproto.measure_copy", text="", icon='COPYDOWN', emboss=False)
     if not lines:
         box.label(text="Select curves, bodies, or pick faces / edges")

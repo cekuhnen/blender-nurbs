@@ -16,7 +16,8 @@ whatever is under the mouse.
   axes' distance apart, and centre to centre for circles, holes and spheres.
   Click the first thing again to keep its own reading.
 * D: radius / diameter. Alt: a plain point (no edge or face). Ctrl+C copies
-  the last reading.
+  the last reading. P pins the reading under the mouse (else the last kept):
+  it stays in the file and follows the model (measurepin).
 
 A kept reading stays on screen while the tool runs and goes to the Info log;
 Backspace drops the first pick or the last reading, Esc / right click ends.
@@ -403,6 +404,9 @@ class NPROTO_OT_measure(SketchMixin, bpy.types.Operator):
         P, snap = self.pick_point(context, event, prev=prev)
         self._P = P
         kind = snap[0] if snap is not None else None
+        src = snap[2][0] if snap is not None and snap[2] is not None else None
+        self._snap_obj = bpy.data.objects.get(src if isinstance(src, str) else getattr(src, "name", "")) \
+            if src is not None else None
         if P is not None and (event.alt or kind in POINT_KINDS or getattr(self, "_lock", None)):
             return ("point", np.asarray(P, float))
         view, mouse = self._view(context), self._mouse(context, event)
@@ -451,6 +455,18 @@ class NPROTO_OT_measure(SketchMixin, bpy.types.Operator):
             return surface_radius(obj, tg[2]) if obj is not None else None
         except Exception as exc:
             print("Measure:", exc)
+            return None
+
+    def _ref(self, tg):
+        """What a pin keeps of a target (measurepin): the point (on the object it
+        snapped to), the edge, curve or face and where on it."""
+        from . import measurepin
+        try:
+            if tg[0] == "point":
+                return measurepin.point_ref(tg[1], getattr(self, "_snap_obj", None))
+            return measurepin.element_ref(tg[1], at=tg[2])
+        except Exception as exc:
+            print("Measure: cannot pin", tg[:2], exc)
             return None
 
     def _element(self, tg):
@@ -524,8 +540,8 @@ class NPROTO_OT_measure(SketchMixin, bpy.types.Operator):
                      "keep its own reading)" + self.lock_text()]
         if live and live.get("text"):
             state.append(live["text"])
-        rows = [("Keep", [hints.key("LMB", "pick / keep"), hints.key("Backspace", "drop the last"),
-                          hints.key("Ctrl C", "copy"), hints.key("Esc", "done")]),
+        rows = [("Keep", [hints.key("LMB", "pick / keep"), hints.key("P", "pin (stays, follows the model)"),
+                          hints.key("Backspace", "drop the last"), hints.key("Ctrl C", "copy"), hints.key("Esc", "done")]),
                 ("Show", [hints.toggle("D", "diameter", self.diameter)])]
         if self._A is not None and self._A["type"] == "point":
             rows.append(("Axis", [hints.key("X Y Z", "along an axis",
@@ -533,9 +549,9 @@ class NPROTO_OT_measure(SketchMixin, bpy.types.Operator):
         rows.append(("Snap", self.snap_hints()))
         hints.show(context, "Measure", state, rows, MOUSE)
 
-    def _keep(self, context, m):
+    def _keep(self, context, m, refs=None):
         txt = label(context, m, self.diameter)
-        OVERLAY["items"].append({"m": m, "text": txt, "dia": self.diameter})
+        OVERLAY["items"].append({"m": m, "text": txt, "dia": self.diameter, "refs": refs})
         self._count += 1
         self._last = txt
         what = {"distance": "Distance", "point": "Point", "pair": "Between",
@@ -546,9 +562,10 @@ class NPROTO_OT_measure(SketchMixin, bpy.types.Operator):
         self.report({'INFO'}, f"{what}: {txt}")
         print(f"Measure · {what}: {txt}")
 
-    def _set_first(self, el):
+    def _set_first(self, el, ref=None):
         from . import measurepair
         self._A = el
+        self._A_ref = ref
         OVERLAY["first"] = measurepair.outline(el) if el is not None else []
 
     def _end(self, context):
@@ -566,18 +583,41 @@ class NPROTO_OT_measure(SketchMixin, bpy.types.Operator):
         if el is None:
             return
         if self._A is None:
-            self._set_first(el)
+            self._set_first(el, self._ref(tg))
             if el["type"] == "point":
                 self.fix_plane(context, el["P"])
             return
         if el["key"] == self._A["key"]:
             if m is not None and not (m["kind"] == "radius" and m["source"] == "straight" and m.get("length") is None):
-                self._keep(context, m)
+                self._keep(context, m, (self._ref(tg), None))
         elif m is not None:
-            self._keep(context, m)
+            self._keep(context, m, (self._A_ref, self._ref(tg)))
         self._set_first(None)
         if getattr(self, "_lock", None) in ("X", "Y", "Z", "-X", "-Y", "-Z"):
             self._lock = None
+
+    def _pin(self, context, event):
+        """P: pin the reading under the mouse (else the last one kept)."""
+        from . import measurepin
+        tg, m = self._reading(context, event)
+        refs = None
+        if tg is not None and m is not None:
+            el = self._element(tg)
+            if self._A is None or (el is not None and el["key"] == self._A["key"]):
+                refs = (self._ref(tg), None)
+            else:
+                refs = (self._A_ref, self._ref(tg))
+        elif OVERLAY["items"]:
+            refs = OVERLAY["items"][-1].get("refs")
+        if not refs or refs[0] is None or (refs[1] is None and m is not None and m.get("kind") == "pair"):
+            self.report({'WARNING'}, "Nothing to pin here")
+            return
+        p = measurepin.add(context.scene, refs[0], refs[1], self.diameter)
+        txt, _ = measurepin.text(context, p)
+        bpy.ops.ed.undo_push(message="Pin Measurement")
+        self.report({'INFO'}, f"Pinned {p.label}: {txt}")
+        if self._A is not None and refs[1] is not None:
+            self._set_first(None)
 
     def modal(self, context, event):
         if self.passthrough(context, event):
@@ -588,6 +628,9 @@ class NPROTO_OT_measure(SketchMixin, bpy.types.Operator):
             self._update(context, event)
         elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
             self._click(context, event)
+            self._update(context, event)
+        elif event.value == 'PRESS' and event.type == 'P' and not event.ctrl:
+            self._pin(context, event)
             self._update(context, event)
         elif event.value == 'PRESS' and event.type == 'D' and not event.ctrl:
             self.diameter = not self.diameter
