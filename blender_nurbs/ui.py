@@ -449,6 +449,9 @@ def draw_analyze(col, context):
     (sidebar and the viewport header's Analyze popover)."""
     v = context.window_manager.nproto_view
     col.operator("nproto.measure", icon='DRIVER_DISTANCE')
+    from . import measureinfo, measurepin
+    measureinfo.draw_panel(col, context)
+    measurepin.draw_panel(col, context)
     col.separator(factor=0.5)
     row = col.row(align=True)
     row.prop(v, "show_zebra", toggle=True, icon='MOD_WAVE')
@@ -585,6 +588,8 @@ def header_analyze(self, context):
     if v.env_coat and coat_applies(v):
         on.append("Coat")
     self.layout.popover("VIEW3D_PT_nproto_analyze", text=" · ".join(on) if on else "", icon='MOD_WAVE')
+    from . import measurepin
+    measurepin.header(self.layout, context)             # the ruler: pinned measurements on / off
 
 
 class _SidePanel:

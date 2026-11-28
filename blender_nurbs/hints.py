@@ -24,7 +24,7 @@ A tool calls show() whenever its state changes and clear() when it ends:
 import bpy
 from bpy.props import BoolProperty, EnumProperty, IntProperty
 
-HUD = {"spec": None, "area": None, "collapsed": False, "top": 0.0}
+HUD = {"spec": None, "area": None, "collapsed": False, "top": 0.0, "box": None}
 FONT = 0
 SIZE = 11                   # points, times the UI scale
 COL_BG = (0.11, 0.11, 0.11, 0.84)
@@ -276,6 +276,7 @@ def draw(context, region, box):
     import blf
     spec = HUD["spec"]
     HUD["top"] = 0.0
+    HUD["box"] = None
     if not spec or context.area is None or _area_key(context.area) != HUD["area"]:
         return
     s = getattr(context.preferences.system, "ui_scale", 1.0) or 1.0
@@ -290,6 +291,7 @@ def draw(context, region, box):
     max_w = region.width - ins[0] - ins[1] - 20 * s
     w, h, ops = layout(rows, measure, max_w, s)
     X, Y = place(w, h, region.width, ins, s)        # bottom-left corner of the panel
+    HUD["box"] = (X, Y, w, h)                       # (the selection readout keeps clear of it)
     box(X, Y, w, h, COL_BG)
     th = measure("Ag")[1]
     asc = measure("A")[1]                           # text sits on its baseline: the descender hangs below
@@ -340,12 +342,40 @@ class NPROTO_AP_preferences(bpy.types.AddonPreferences):
                                              "copies). Tap . for Blender's Pivot Point pie, hold it for "
                                              "Move Pivot. Tap A to select all, hold it (Object Mode) for "
                                              "Align Parts. Off: the keys are always Blender's")
+    selection_readout: BoolProperty(
+        name="Selection Readout", default=True,
+        description="Show what the selection measures at the bottom right of the 3D view: the length of picked "
+                    "edges and curves, the area of picked faces, a solid's volume, area and centroid (the "
+                    "Analyze panel shows it too, with Copy)",
+        update=lambda s, c: [a.tag_redraw() for w in c.window_manager.windows for a in w.screen.areas
+                             if a.type == 'VIEW_3D'])
+    selection_centroid: BoolProperty(
+        name="Mark Centroid", default=False,
+        description="Mark a selected solid's centroid in the 3D view, with the Centroid Marker picked beside "
+                    "it (off: only its X Y Z in the readout, so the object's origin stays the one point marked)",
+        update=lambda s, c: [a.tag_redraw() for w in c.window_manager.windows for a in w.screen.areas
+                             if a.type == 'VIEW_3D'])
+    centroid_style: EnumProperty(
+        name="Centroid Marker",
+        items=[('CROSS', "Cross", "A small yellow plus", 'ADD', 0),
+               ('COG', "Centre of Mass", "The centre-of-mass symbol: a ring in black and white quarters",
+                'PIVOT_MEDIAN', 1)],
+        default='CROSS',
+        description="How the centroid is marked in the 3D view when Mark Centroid is on",
+        update=lambda s, c: [a.tag_redraw() for w in c.window_manager.windows for a in w.screen.areas
+                             if a.type == 'VIEW_3D'])
     hold_ms: IntProperty(name="Hold Time (ms)", default=300, min=120, max=1500,
                          description="How long (milliseconds) G, R, S, . or A is held before the add-on's tool starts")
 
     def draw(self, context):
         self.layout.prop(self, "value_input")
         self.layout.prop(self, "hints_collapsed")
+        self.layout.prop(self, "selection_readout")
+        row = self.layout.row()
+        row.prop(self, "selection_centroid")
+        sub = row.row()
+        sub.active = self.selection_centroid
+        sub.prop(self, "centroid_style", text="")
         row = self.layout.row()
         row.prop(self, "hold_transform")
         sub = row.row()

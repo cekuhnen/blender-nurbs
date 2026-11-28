@@ -896,6 +896,15 @@ def _draw_px():
         _draw_preview_px(region, rv3d)
     except Exception as exc:
         print("NURBS value preview:", exc)
+    from . import measureinfo, measurepin
+    try:
+        measurepin.draw_px(ctx, region, rv3d, _box)         # pinned measurements
+    except Exception as exc:
+        print("NURBS pinned measurements:", exc)
+    try:
+        measureinfo.draw_px(ctx, region, rv3d, _box)        # after the key hints: it keeps clear of them
+    except Exception as exc:
+        print("NURBS selection readout:", exc)
     from . import contcheck
     try:
         contcheck.draw_px(ctx, region, rv3d, _box)
